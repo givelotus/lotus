@@ -1,0 +1,689 @@
+From c107b69993f8c527b512dd40915fb37c11038c7a Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 11:21:32 -0700
+Subject: [PATCH] fixup! feat(v2): add C17a deterministic fee-backed UTXO
+ expiry and cleaning-crew validation
+
+---
+ doc/native-coinstats-index.md             |  41 +++++
+ src/index/coinstatsindex.cpp              |  93 +++++++++-
+ src/index/coinstatsindex.h                |   5 +
+ src/kernel/coinstats.h                    |   4 +
+ src/rpc/blockchain.cpp                    |  11 ++
+ src/test/coinstatsindex_tests.cpp         | 207 ++++++++++++++++++++++
+ test/functional/feature_coinstatsindex.py |  13 +-
+ 7 files changed, 364 insertions(+), 10 deletions(-)
+ create mode 100644 doc/native-coinstats-index.md
+
+diff --git a/doc/native-coinstats-index.md b/doc/native-coinstats-index.md
+new file mode 100644
+index 0000000000..3ae8b223bb
+--- /dev/null
++++ b/doc/native-coinstats-index.md
+@@ -0,0 +1,41 @@
++# Native CoinStatsIndex accounting
++
++This index/RPC extension is introduced only in the Lotus V2 layer. It does not
++change shared eCash behavior, consensus, or the canonical native Coin hash.
++Created Coins hash their accepted paid fee share and effective expiration;
++expired Coins are removed using the complete durable `CBlockUndo::vexpired`
++record and restored with that same metadata on disconnect. Same-block-created
++and-spent outputs do not enter the final-set hash. Reindex and historical sync
++use block/undo records rather than the mutable current UTXO view.
++
++`gettxoutsetinfo` indexed `block_info` adds:
++
++- `unspendables.expired`: value of previously spendable outputs destroyed by the
++  native deterministic expiry sweep. This is included in `unspendable` and
++  `total_unspendable_amount`; it is not an ordinary transaction input or an
++  unclaimed miner reward.
++- `cleaning_bounty`: the additional cleaning reward allowed by the daemon's
++  accepted `Chainstate::ConnectBlock` path, computed with the same existing
++  `ComputeCleaningCrewBounty` helper and accepted transaction fees.
++
++Writing I for ordinary transaction prevouts, S for subsidy, E for expired value,
++B for cleaning bounty, O for new spendable non-coinbase outputs, C for spendable
++coinbase outputs, and U for all unspendables (including E), the per-block ledger
++is `I + S + E + B = O + C + U`. Existing `prevout_spent` and subsidy meanings are
++unchanged. Unclaimed rewards exclude the explicit expired subset. Bounty is a
++separate category; it is not silently counted as subsidy. The native standalone
++monetary engine funds its bounty from fee burn instead of adding it to the daemon
++reward allowance. This document describes the existing daemon path only and does
++not reconcile that separate consensus-integration question.
++
++The index database has an explicit native format version of 2. An unversioned
++nonempty index, an unreadable version, or another version is rejected with an
++actionable `-reindex` message. Earlier indexes can contain incorrect paid-Coin
++roots and lack authenticated expiry/bounty counters; zero defaults are therefore
++not safe. `-reindex` clears/rebuilds the index from accepted block and undo data.
++This changes only the experimental native index format, not chainstate, blocks,
++undo encoding, consensus commitments, or published data.
++
++Focused component tests may synthesize a valid paid expiration height and durable
++undo without mining the entire 131,400-block minimum lifetime. Such tests cover
++the index component and are not natural-chain expiry consensus validation.
+diff --git a/src/index/coinstatsindex.cpp b/src/index/coinstatsindex.cpp
+index 28d4c4c4e7..7681c76d1c 100644
+--- a/src/index/coinstatsindex.cpp
++++ b/src/index/coinstatsindex.cpp
+@@ -28,18 +28,20 @@ using kernel::TxOutSer;
+ static constexpr uint8_t DB_BLOCK_HASH{'s'};
+ static constexpr uint8_t DB_BLOCK_HEIGHT{'t'};
+ static constexpr uint8_t DB_MUHASH{'M'};
++static constexpr uint8_t DB_NATIVE_VERSION{'V'};
++static constexpr uint32_t NATIVE_INDEX_VERSION{2};
+ 
+ namespace {
+ 
+ // Reconstruct paid lifetime from the accepted block's durable undo, never from
+ // the mutable current UTXO view (the index may be syncing an old block).
+-static bool OutputFeeShare(const CTransaction &tx, const CTxUndo *undo, int height,
+-                           uint64_t &fee_share) {
++static bool OutputFeeShare(const CTransaction &tx, const CTxUndo *undo,
++                           int height, uint64_t &fee_share, Amount &fee) {
+     fee_share = 0;
++    fee = Amount::zero();
+     if (tx.IsCoinBase()) {
+         return true;
+     }
+-    Amount fee = Amount::zero();
+     TxValidationState state;
+     if (!undo || undo->vprevout.size() != tx.vin.size() ||
+         !Consensus::CheckTxInputsFromSpentCoins(tx, undo->vprevout, state, height,
+@@ -95,6 +97,8 @@ struct DBVal {
+     Amount total_unspendables_bip30;
+     Amount total_unspendables_scripts;
+     Amount total_unspendables_unclaimed_rewards;
++    Amount total_unspendables_expired;
++    Amount total_cleaning_bounty;
+ 
+     SERIALIZE_METHODS(DBVal, obj) {
+         READWRITE(obj.muhash);
+@@ -110,6 +114,7 @@ struct DBVal {
+         READWRITE(obj.total_unspendables_bip30);
+         READWRITE(obj.total_unspendables_scripts);
+         READWRITE(obj.total_unspendables_unclaimed_rewards);
++        READWRITE(obj.total_unspendables_expired, obj.total_cleaning_bounty);
+     }
+ };
+ 
+@@ -168,6 +173,7 @@ bool CoinStatsIndex::WriteBlock(const CBlock &block,
+                                 const CBlockIndex *pindex) {
+     CBlockUndo block_undo;
+     const auto intra_block_spent = IntraBlockSpent(block);
++    Amount block_fees = Amount::zero();
+     const Amount block_subsidy{
+         GetBlockSubsidy(pindex->nHeight, Params().GetConsensus())};
+     m_total_subsidy += block_subsidy;
+@@ -220,11 +226,14 @@ bool CoinStatsIndex::WriteBlock(const CBlock &block,
+             }
+ 
+             uint64_t fee_share;
++            Amount fee;
+             if (!OutputFeeShare(
+-                    *tx, tx->IsCoinBase() ? nullptr : &block_undo.vtxundo.at(i - 1),
+-                    pindex->nHeight, fee_share)) {
++                    *tx,
++                    tx->IsCoinBase() ? nullptr : &block_undo.vtxundo.at(i - 1),
++                    pindex->nHeight, fee_share, fee)) {
+                 return false;
+             }
++            block_fees += fee;
+             for (uint32_t j = 0; j < tx->vout.size(); ++j) {
+                 const CTxOut &out{tx->vout[j]};
+                 Coin coin{out, static_cast<uint32_t>(pindex->nHeight),
+@@ -284,17 +293,40 @@ bool CoinStatsIndex::WriteBlock(const CBlock &block,
+         m_total_unspendables_genesis_block += block_subsidy;
+     }
+ 
++    // Expiry burns an existing UTXO without spending a transaction input.
++    // Preserve its authenticated undo metadata and account for it separately.
++    for (const auto &expired : block_undo.vexpired) {
++        const Coin &coin = expired.coin;
++        m_muhash.Remove(MakeUCharSpan(TxOutSer(expired.outpoint, coin)));
++        --m_transaction_output_count;
++        m_total_amount -= coin.GetTxOut().nValue;
++        m_bogo_size -= GetBogoSize(coin.GetTxOut().scriptPubKey);
++        m_total_unspendable_amount += coin.GetTxOut().nValue;
++        m_total_unspendables_expired += coin.GetTxOut().nValue;
++    }
++    m_total_cleaning_bounty +=
++        static_cast<int64_t>(lotus::v2::ComputeCleaningCrewBounty(
++            block_undo.vexpired.size(),
++            static_cast<uint64_t>(block_fees / SATOSHI))) *
++        SATOSHI;
++
+     // If spent prevouts + block subsidy are still a higher amount than
+     // new outputs + coinbase + current unspendable amount this means
+     // the miner did not claim the full block reward. Unclaimed block
+     // rewards are also unspendable.
+     const Amount unclaimed_rewards{
+-        (m_total_prevout_spent_amount + m_total_subsidy) -
++        (m_total_prevout_spent_amount + m_total_subsidy +
++         m_total_cleaning_bounty + m_total_unspendables_expired) -
+         (m_total_new_outputs_ex_coinbase_amount + m_total_coinbase_amount +
+          m_total_unspendable_amount)};
+     m_total_unspendable_amount += unclaimed_rewards;
+     m_total_unspendables_unclaimed_rewards += unclaimed_rewards;
+ 
++    StoreStats(pindex);
++    return true;
++}
++
++void CoinStatsIndex::StoreStats(const CBlockIndex *pindex) {
+     std::pair<BlockHash, DBVal> value;
+     value.first = pindex->GetBlockHash();
+     value.second.transaction_output_count = m_transaction_output_count;
+@@ -312,6 +344,8 @@ bool CoinStatsIndex::WriteBlock(const CBlock &block,
+     value.second.total_unspendables_scripts = m_total_unspendables_scripts;
+     value.second.total_unspendables_unclaimed_rewards =
+         m_total_unspendables_unclaimed_rewards;
++    value.second.total_unspendables_expired = m_total_unspendables_expired;
++    value.second.total_cleaning_bounty = m_total_cleaning_bounty;
+ 
+     uint256 out;
+     m_muhash.Finalize(out);
+@@ -321,7 +355,6 @@ bool CoinStatsIndex::WriteBlock(const CBlock &block,
+     // DB_BEST_BLOCK, and the index is not corrupted if there is an unclean
+     // shutdown.
+     m_db->Write(DBHeightKey(pindex->nHeight), value);
+-    return true;
+ }
+ 
+ static bool CopyHeightIndexToHashIndex(CDBIterator &db_it, CDBBatch &batch,
+@@ -438,12 +471,30 @@ CoinStatsIndex::LookUpStats(const CBlockIndex *block_index) const {
+     stats.total_unspendables_scripts = entry.total_unspendables_scripts;
+     stats.total_unspendables_unclaimed_rewards =
+         entry.total_unspendables_unclaimed_rewards;
++    stats.total_unspendables_expired = entry.total_unspendables_expired;
++    stats.total_cleaning_bounty = entry.total_cleaning_bounty;
+ 
+     return stats;
+ }
+ 
+ bool CoinStatsIndex::CustomInit(
+     const std::optional<interfaces::BlockKey> &block) {
++    uint32_t version;
++    if (!m_db->Read(DB_NATIVE_VERSION, version)) {
++        if (!m_db->IsEmpty()) {
++            LogError("%s: Native coinstats index predates paid-lifetime/expiry "
++                     "accounting; "
++                     "restart with -reindex to rebuild it\n",
++                     __func__);
++            return false;
++        }
++        m_db->Write(DB_NATIVE_VERSION, NATIVE_INDEX_VERSION);
++    } else if (version != NATIVE_INDEX_VERSION) {
++        LogError("%s: Unsupported native coinstats index version %u; "
++                 "restart with -reindex to rebuild it\n",
++                 __func__, version);
++        return false;
++    }
+     if (!m_db->Read(DB_MUHASH, m_muhash)) {
+         // Check that the cause of the read failure is that the key does not
+         // exist. Any other errors indicate database corruption or a disk
+@@ -489,6 +540,8 @@ bool CoinStatsIndex::CustomInit(
+         m_total_unspendables_scripts = entry.total_unspendables_scripts;
+         m_total_unspendables_unclaimed_rewards =
+             entry.total_unspendables_unclaimed_rewards;
++        m_total_unspendables_expired = entry.total_unspendables_expired;
++        m_total_cleaning_bounty = entry.total_cleaning_bounty;
+     }
+ 
+     return true;
+@@ -506,6 +559,7 @@ bool CoinStatsIndex::ReverseBlock(const CBlock &block,
+                                   const CBlockIndex *pindex) {
+     CBlockUndo block_undo;
+     const auto intra_block_spent = IntraBlockSpent(block);
++    Amount block_fees = Amount::zero();
+     std::pair<BlockHash, DBVal> read_out;
+ 
+     const Amount block_subsidy{
+@@ -542,11 +596,13 @@ bool CoinStatsIndex::ReverseBlock(const CBlock &block,
+         const auto &tx{block.vtx.at(i)};
+ 
+         uint64_t fee_share;
++        Amount fee;
+         if (!OutputFeeShare(
+                 *tx, tx->IsCoinBase() ? nullptr : &block_undo.vtxundo.at(i - 1),
+-                pindex->nHeight, fee_share)) {
++                pindex->nHeight, fee_share, fee)) {
+             return false;
+         }
++        block_fees += fee;
+         for (uint32_t j = 0; j < tx->vout.size(); ++j) {
+             const CTxOut &out{tx->vout[j]};
+             COutPoint outpoint{tx->GetId(), j};
+@@ -601,10 +657,26 @@ bool CoinStatsIndex::ReverseBlock(const CBlock &block,
+         }
+     }
+ 
++    for (const auto &expired : block_undo.vexpired) {
++        const Coin &coin = expired.coin;
++        m_muhash.Insert(MakeUCharSpan(TxOutSer(expired.outpoint, coin)));
++        ++m_transaction_output_count;
++        m_total_amount += coin.GetTxOut().nValue;
++        m_bogo_size += GetBogoSize(coin.GetTxOut().scriptPubKey);
++        m_total_unspendable_amount -= coin.GetTxOut().nValue;
++        m_total_unspendables_expired -= coin.GetTxOut().nValue;
++    }
++    m_total_cleaning_bounty -=
++        static_cast<int64_t>(lotus::v2::ComputeCleaningCrewBounty(
++            block_undo.vexpired.size(),
++            static_cast<uint64_t>(block_fees / SATOSHI))) *
++        SATOSHI;
++
+     const Amount unclaimed_rewards{
+         (m_total_new_outputs_ex_coinbase_amount + m_total_coinbase_amount +
+          m_total_unspendable_amount) -
+-        (m_total_prevout_spent_amount + m_total_subsidy)};
++        (m_total_prevout_spent_amount + m_total_subsidy +
++         m_total_cleaning_bounty + m_total_unspendables_expired)};
+     m_total_unspendable_amount -= unclaimed_rewards;
+     m_total_unspendables_unclaimed_rewards -= unclaimed_rewards;
+ 
+@@ -634,6 +706,9 @@ bool CoinStatsIndex::ReverseBlock(const CBlock &block,
+            read_out.second.total_unspendables_scripts);
+     Assert(m_total_unspendables_unclaimed_rewards ==
+            read_out.second.total_unspendables_unclaimed_rewards);
++    Assert(m_total_unspendables_expired ==
++           read_out.second.total_unspendables_expired);
++    Assert(m_total_cleaning_bounty == read_out.second.total_cleaning_bounty);
+ 
+     return true;
+ }
+diff --git a/src/index/coinstatsindex.h b/src/index/coinstatsindex.h
+index d4ed705d91..7092fb29cd 100644
+--- a/src/index/coinstatsindex.h
++++ b/src/index/coinstatsindex.h
+@@ -20,6 +20,7 @@ static constexpr bool DEFAULT_COINSTATSINDEX{false};
+  */
+ class CoinStatsIndex final : public BaseIndex {
+ private:
++    friend struct CoinStatsIndexTestAccess;
+     std::unique_ptr<BaseIndex::DB> m_db;
+ 
+     MuHash3072 m_muhash;
+@@ -35,6 +36,10 @@ private:
+     Amount m_total_unspendables_bip30{Amount::zero()};
+     Amount m_total_unspendables_scripts{Amount::zero()};
+     Amount m_total_unspendables_unclaimed_rewards{Amount::zero()};
++    Amount m_total_unspendables_expired{Amount::zero()};
++    Amount m_total_cleaning_bounty{Amount::zero()};
++
++    void StoreStats(const CBlockIndex *pindex);
+ 
+     bool ReverseBlock(const CBlock &block, const CBlockIndex *pindex);
+ 
+diff --git a/src/kernel/coinstats.h b/src/kernel/coinstats.h
+index de315b2f1e..ebe6321db7 100644
+--- a/src/kernel/coinstats.h
++++ b/src/kernel/coinstats.h
+@@ -70,6 +70,10 @@ struct CCoinsStats {
+     //! Total cumulative amount of coins lost due to unclaimed miner rewards up
+     //! to and including this block
+     Amount total_unspendables_unclaimed_rewards{Amount::zero()};
++    //! Native existing outputs burned by the deterministic expiry sweep.
++    Amount total_unspendables_expired{Amount::zero()};
++    //! Native daemon cleaning bounties, additional to the block subsidy.
++    Amount total_cleaning_bounty{Amount::zero()};
+ 
+     CCoinsStats() = default;
+     CCoinsStats(int block_height, const BlockHash &block_hash);
+diff --git a/src/rpc/blockchain.cpp b/src/rpc/blockchain.cpp
+index 9f7fe7d428..372bcb7f0c 100644
+--- a/src/rpc/blockchain.cpp
++++ b/src/rpc/blockchain.cpp
+@@ -1110,6 +1110,9 @@ static RPCHelpMan gettxoutsetinfo() {
+                    "Coinbase subsidy amount of this block"},
+                   {RPCResult::Type::STR_AMOUNT, "new_outputs_ex_coinbase",
+                    "Total amount of new outputs created by this block"},
++                  {RPCResult::Type::STR_AMOUNT, "cleaning_bounty",
++                   "Native daemon cleaning bounty, additional to subsidy and "
++                   "fees"},
+                   {RPCResult::Type::STR_AMOUNT, "unspendable",
+                    "Total amount of unspendable outputs created in this block"},
+                   {RPCResult::Type::OBJ,
+@@ -1124,6 +1127,8 @@ static RPCHelpMan gettxoutsetinfo() {
+                        {RPCResult::Type::STR_AMOUNT, "scripts",
+                         "Amounts sent to scripts that are unspendable (for "
+                         "example OP_RETURN outputs)"},
++                       {RPCResult::Type::STR_AMOUNT, "expired",
++                        "Native existing outputs burned by the expiry sweep"},
+                        {RPCResult::Type::STR_AMOUNT, "unclaimed_rewards",
+                         "Fee rewards that miners did not claim in their "
+                         "coinbase transaction"},
+@@ -1254,6 +1259,9 @@ static RPCHelpMan gettxoutsetinfo() {
+                         "new_outputs_ex_coinbase",
+                         stats.total_new_outputs_ex_coinbase_amount -
+                             prev_stats.total_new_outputs_ex_coinbase_amount);
++                    block_info.pushKV("cleaning_bounty",
++                                      stats.total_cleaning_bounty -
++                                          prev_stats.total_cleaning_bounty);
+                     block_info.pushKV("unspendable",
+                                       stats.total_unspendable_amount -
+                                           prev_stats.total_unspendable_amount);
+@@ -1269,6 +1277,9 @@ static RPCHelpMan gettxoutsetinfo() {
+                     unspendables.pushKV(
+                         "scripts", stats.total_unspendables_scripts -
+                                        prev_stats.total_unspendables_scripts);
++                    unspendables.pushKV(
++                        "expired", stats.total_unspendables_expired -
++                                       prev_stats.total_unspendables_expired);
+                     unspendables.pushKV(
+                         "unclaimed_rewards",
+                         stats.total_unspendables_unclaimed_rewards -
+diff --git a/src/test/coinstatsindex_tests.cpp b/src/test/coinstatsindex_tests.cpp
+index e8f2af4b04..5bfd1f6ce8 100644
+--- a/src/test/coinstatsindex_tests.cpp
++++ b/src/test/coinstatsindex_tests.cpp
+@@ -4,17 +4,208 @@
+ 
+ #include <chainparams.h>
+ #include <config.h>
++#include <dbwrapper.h>
+ #include <index/coinstatsindex.h>
+ #include <interfaces/chain.h>
++#include <lotus_v2/commitment.h>
++#include <node/blockstorage.h>
+ #include <test/util/setup_common.h>
++#include <test/util/logging.h>
+ #include <test/util/validation.h>
++#include <undo.h>
+ #include <util/time.h>
+ #include <validation.h>
+ 
+ #include <boost/test/unit_test.hpp>
+ 
++#include <array>
+ #include <chrono>
+ 
++// Index component fixture, not natural 131400-block expiry validation. It seeds
++// a coherent prior index snapshot and persists protocol-shaped paid Coin undo.
++struct CoinStatsIndexTestAccess {
++    static void CheckExpiry(TestChain100Setup &fixture, uint64_t fee_atoms) {
++        CoinStatsIndex index{interfaces::MakeChain(fixture.m_node, Params()),
++                             1 << 20, true};
++        BOOST_REQUIRE(index.Init());
++        constexpr int height = 131408;
++        const std::array<uint8_t, 1> script{0x4e};
++        lotus::v2::Output output;
++        output.value = 1000;
++        output.branches = {lotus::v2::BranchLeaf(script)};
++        output.paths = {{0}};
++        const Coin expired(CTxOut::FromV2Output(output), 1, false, 7);
++        output.value = 2000;
++        const Coin live(CTxOut::FromV2Output(output), 1, false, 8);
++        BOOST_REQUIRE_EQUAL(expired.GetExpirationHeight(), height);
++        BOOST_REQUIRE_EQUAL(live.GetExpirationHeight(), height + 1);
++        const COutPoint expired_op(TxId(uint256S("01")), 0);
++        const COutPoint live_op(TxId(uint256S("02")), 0);
++        const COutPoint funding_op(TxId(uint256S("05")), 0);
++        auto seed = [&](const COutPoint &op, const Coin &coin) {
++            index.m_muhash.Insert(MakeUCharSpan(kernel::TxOutSer(op, coin)));
++            ++index.m_transaction_output_count;
++            index.m_total_amount += coin.GetTxOut().nValue;
++            index.m_bogo_size +=
++                kernel::GetBogoSize(coin.GetTxOut().scriptPubKey);
++        };
++        seed(expired_op, expired);
++        seed(live_op, live);
++        CMutableTransaction ordinary;
++        CTxUndo txundo;
++        if (fee_atoms != 0) {
++            output.value = 10000 + fee_atoms;
++            const Coin funding(CTxOut::FromV2Output(output), 1, false, 100);
++            seed(funding_op, funding);
++            txundo.vprevout.push_back(funding);
++            ordinary.nVersion = 7;
++            ordinary.vin.resize(1);
++            ordinary.vin[0].prevout = funding_op;
++            ordinary.vin[0].nFlags = 1;
++            output.value = 10000;
++            ordinary.vout.push_back(CTxOut::FromV2Output(output));
++        }
++        index.m_total_subsidy = index.m_total_amount;
++        index.m_total_new_outputs_ex_coinbase_amount = index.m_total_amount;
++        const Amount prior_amount = index.m_total_amount;
++        const auto prior_count = index.m_transaction_output_count;
++        const auto prior_bogo = index.m_bogo_size;
++        uint256 prior_hash;
++        index.m_muhash.Finalize(prior_hash);
++        const BlockHash parent_hash(uint256S("03"));
++        const BlockHash child_hash(uint256S("04"));
++        CBlockIndex *parent;
++        CBlockIndex *child;
++        {
++            LOCK(cs_main);
++            auto &map = fixture.m_node.chainman->m_blockman.m_block_index;
++            auto [p, pins] = map.try_emplace(parent_hash);
++            auto [c, cins] = map.try_emplace(child_hash);
++            BOOST_REQUIRE(pins && cins);
++            parent = &p->second;
++            child = &c->second;
++            parent->phashBlock = &p->first;
++            parent->nHeight = height - 1;
++            child->phashBlock = &c->first;
++            child->nHeight = height;
++            child->pprev = parent;
++            child->nFile = 0;
++        }
++        index.StoreStats(parent);
++        CMutableTransaction cb(*fixture.m_coinbase_txns.at(0));
++        cb.vin[0].scriptSig = CScript() << height;
++        // Independent expected boundary values: no fee, fee/2 cap, base cap.
++        const uint64_t bounty = fee_atoms == 0      ? 0
++                                : fee_atoms == 1000 ? 500
++                                                    : 2000;
++        BOOST_REQUIRE_EQUAL(lotus::v2::ComputeCleaningCrewBounty(1, fee_atoms),
++                            bounty);
++        cb.vout[0].nValue = GetBlockSubsidy(height, Params().GetConsensus()) +
++                            static_cast<int64_t>(fee_atoms + bounty) * SATOSHI;
++        CBlock block;
++        block.vtx = {MakeTransactionRef(cb)};
++        CBlockUndo undo;
++        if (fee_atoms != 0) {
++            block.vtx.push_back(MakeTransactionRef(ordinary));
++            undo.vtxundo.push_back(txundo);
++        }
++        undo.vexpired.push_back({expired_op, expired});
++        {
++            LOCK(cs_main);
++            BlockValidationState state;
++            BOOST_REQUIRE(fixture.m_node.chainman->m_blockman.WriteBlockUndo(
++                undo, state, *child));
++        }
++        MuHash3072 expected;
++        expected.Insert(MakeUCharSpan(kernel::TxOutSer(live_op, live)));
++        const Coin cb_coin(block.vtx[0]->vout[0], height, true);
++        expected.Insert(MakeUCharSpan(
++            kernel::TxOutSer(COutPoint(block.vtx[0]->GetId(), 0), cb_coin)));
++        uint64_t expected_bogo =
++            kernel::GetBogoSize(live.GetTxOut().scriptPubKey) +
++            kernel::GetBogoSize(cb_coin.GetTxOut().scriptPubKey);
++        if (fee_atoms != 0) {
++            const Coin created(block.vtx[1]->vout[0], height, false, fee_atoms);
++            expected.Insert(MakeUCharSpan(kernel::TxOutSer(
++                COutPoint(block.vtx[1]->GetId(), 0), created)));
++            expected_bogo +=
++                kernel::GetBogoSize(created.GetTxOut().scriptPubKey);
++        }
++        uint256 expected_hash;
++        expected.Finalize(expected_hash);
++        auto check_applied = [&] {
++            uint256 actual;
++            index.m_muhash.Finalize(actual);
++            BOOST_CHECK_EQUAL(actual.ToString(), expected_hash.ToString());
++            BOOST_CHECK_EQUAL(index.m_transaction_output_count,
++                              fee_atoms == 0 ? 2U : 3U);
++            BOOST_CHECK_EQUAL(index.m_total_amount / SATOSHI,
++                              2000 + (fee_atoms == 0 ? 0 : 10000) +
++                                  cb_coin.GetTxOut().nValue / SATOSHI);
++            BOOST_CHECK_EQUAL(index.m_bogo_size, expected_bogo);
++            BOOST_CHECK_EQUAL(index.m_total_unspendables_expired / SATOSHI,
++                              1000);
++            BOOST_CHECK_EQUAL(index.m_total_unspendable_amount / SATOSHI, 1000);
++            BOOST_CHECK_EQUAL(index.m_total_cleaning_bounty / SATOSHI, bounty);
++            BOOST_CHECK_EQUAL(
++                index.m_total_unspendables_unclaimed_rewards / SATOSHI, 0);
++            BOOST_CHECK(index.m_total_prevout_spent_amount +
++                            index.m_total_subsidy +
++                            index.m_total_cleaning_bounty +
++                            index.m_total_unspendables_expired ==
++                        index.m_total_new_outputs_ex_coinbase_amount +
++                            index.m_total_coinbase_amount +
++                            index.m_total_unspendable_amount);
++        };
++        BOOST_REQUIRE(index.WriteBlock(block, child));
++        check_applied();
++        // Persist/reload the exact rolling root and new cumulative counters.
++        CDBBatch batch(*index.m_db);
++        BOOST_REQUIRE(index.CustomCommit(batch));
++        index.m_db->WriteBatch(batch);
++        index.m_total_unspendables_expired = Amount::zero();
++        index.m_total_cleaning_bounty = Amount::zero();
++        index.m_muhash = MuHash3072{};
++        BOOST_REQUIRE(
++            index.CustomInit(interfaces::BlockKey{child_hash, height}));
++        check_applied();
++        const auto stats = index.LookUpStats(child);
++        BOOST_REQUIRE(stats);
++        BOOST_CHECK_EQUAL(stats->total_unspendables_expired / SATOSHI, 1000);
++        BOOST_CHECK_EQUAL(stats->total_cleaning_bounty / SATOSHI, bounty);
++        BOOST_REQUIRE(index.ReverseBlock(block, child));
++        uint256 restored;
++        index.m_muhash.Finalize(restored);
++        BOOST_CHECK_EQUAL(restored.ToString(), prior_hash.ToString());
++        BOOST_CHECK_EQUAL(index.m_transaction_output_count, prior_count);
++        BOOST_CHECK(index.m_total_amount == prior_amount);
++        BOOST_CHECK_EQUAL(index.m_bogo_size, prior_bogo);
++        BOOST_CHECK_EQUAL(index.m_total_unspendables_expired / SATOSHI, 0);
++        BOOST_CHECK_EQUAL(index.m_total_cleaning_bounty / SATOSHI, 0);
++        // Deterministic replay reads the same durable undo and re-creates
++        // stats.
++        BOOST_REQUIRE(index.WriteBlock(block, child));
++        check_applied();
++        // An old/unreadable/unknown DB must not silently supply wrong roots or
++        // default newly introduced counters to zero.
++        index.m_db->Erase(uint8_t('V'));
++        {
++            ASSERT_DEBUG_LOG("restart with -reindex to rebuild it");
++            BOOST_CHECK(!index.CustomInit(std::nullopt));
++        }
++        index.m_db->Write(uint8_t('V'), uint32_t(99));
++        {
++            ASSERT_DEBUG_LOG("restart with -reindex to rebuild it");
++            BOOST_CHECK(!index.CustomInit(std::nullopt));
++        }
++        index.m_db->Write(uint8_t('V'), uint8_t(2)); // Truncated uint32 version.
++        {
++            ASSERT_DEBUG_LOG("restart with -reindex to rebuild it");
++            BOOST_CHECK(!index.CustomInit(std::nullopt));
++        }
++    }
++};
++
+ BOOST_AUTO_TEST_SUITE(coinstatsindex_tests)
+ 
+ static void IndexWaitSynced(BaseIndex &index) {
+@@ -146,4 +337,20 @@ BOOST_FIXTURE_TEST_CASE(coinstatsindex_unclean_shutdown, TestChain100Setup) {
+     }
+ }
+ 
++BOOST_FIXTURE_TEST_CASE(native_expiry_zero_bounty, TestChain100Setup) {
++    CoinStatsIndexTestAccess::CheckExpiry(*this, 0);
++}
++
++BOOST_FIXTURE_TEST_CASE(native_expiry_fee_half_bounty, TestChain100Setup) {
++    CoinStatsIndexTestAccess::CheckExpiry(*this, 1000);
++}
++
++BOOST_FIXTURE_TEST_CASE(native_expiry_base_bounty_boundary, TestChain100Setup) {
++    CoinStatsIndexTestAccess::CheckExpiry(*this, 4000);
++}
++
++BOOST_FIXTURE_TEST_CASE(native_expiry_base_bounty_cap, TestChain100Setup) {
++    CoinStatsIndexTestAccess::CheckExpiry(*this, 8000);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/test/functional/feature_coinstatsindex.py b/test/functional/feature_coinstatsindex.py
+index 6ac9ea0f1a..879838dd5c 100644
+--- a/test/functional/feature_coinstatsindex.py
++++ b/test/functional/feature_coinstatsindex.py
+@@ -44,7 +44,10 @@ class CoinStatsIndexTest(BitcoinTestFramework):
+     def block_sanity_check(self, block_info):
+         block_subsidy = 50_000_000
+         assert_equal(
+-            block_info["prevout_spent"] + block_subsidy,
++            block_info["prevout_spent"]
++            + block_subsidy
++            + block_info["unspendables"]["expired"]
++            + block_info["cleaning_bounty"],
+             block_info["new_outputs_ex_coinbase"]
+             + block_info["coinbase"]
+             + block_info["unspendable"],
+@@ -141,6 +144,7 @@ class CoinStatsIndexTest(BitcoinTestFramework):
+             assert_equal(
+                 res4["block_info"],
+                 {
++                    "cleaning_bounty": 0,
+                     "unspendable": 50_000_000,
+                     "prevout_spent": 0,
+                     "new_outputs_ex_coinbase": 0,
+@@ -149,6 +153,7 @@ class CoinStatsIndexTest(BitcoinTestFramework):
+                         "genesis_block": 50_000_000,
+                         "bip30": 0,
+                         "scripts": 0,
++                        "expired": 0,
+                         "unclaimed_rewards": 0,
+                     },
+                 },
+@@ -161,6 +166,7 @@ class CoinStatsIndexTest(BitcoinTestFramework):
+             assert_equal(
+                 res5["block_info"],
+                 {
++                    "cleaning_bounty": 0,
+                     "unspendable": 0,
+                     "prevout_spent": funding["value"],
+                     "new_outputs_ex_coinbase": normal_outputs,
+@@ -169,6 +175,7 @@ class CoinStatsIndexTest(BitcoinTestFramework):
+                         "genesis_block": 0,
+                         "bip30": 0,
+                         "scripts": 0,
++                        "expired": 0,
+                         "unclaimed_rewards": 0,
+                     },
+                 },
+@@ -210,6 +217,7 @@ class CoinStatsIndexTest(BitcoinTestFramework):
+             assert_equal(
+                 res6["block_info"],
+                 {
++                    "cleaning_bounty": 0,
+                     "unspendable": Decimal("20990000.00"),
+                     "prevout_spent": 71_000_000,
+                     "new_outputs_ex_coinbase": Decimal("49999990.00"),
+@@ -218,6 +226,7 @@ class CoinStatsIndexTest(BitcoinTestFramework):
+                         "genesis_block": 0,
+                         "bip30": 0,
+                         "scripts": Decimal("20990000.00"),
++                        "expired": 0,
+                         "unclaimed_rewards": 0,
+                     },
+                 },
+@@ -243,6 +252,7 @@ class CoinStatsIndexTest(BitcoinTestFramework):
+             assert_equal(
+                 res7["block_info"],
+                 {
++                    "cleaning_bounty": 0,
+                     "unspendable": 10_000_000,
+                     "prevout_spent": 0,
+                     "new_outputs_ex_coinbase": 0,
+@@ -251,6 +261,7 @@ class CoinStatsIndexTest(BitcoinTestFramework):
+                         "genesis_block": 0,
+                         "bip30": 0,
+                         "scripts": 0,
++                        "expired": 0,
+                         "unclaimed_rewards": 10_000_000,
+                     },
+                 },

@@ -1,0 +1,2337 @@
+From cef9d399f0b70745fa59d71af8f0ebc77c3eb833 Mon Sep 17 00:00:00 2001
+From: Lotus V2 Builder <builder@lotus.org>
+Date: Sat, 17 Oct 2026 13:58:00 -0700
+Subject: [PATCH] net: add V2PeerProtocolHandler and sealedheader P2P relay
+
+Add the 198-byte SealedHeader wire message (NetMsgType::SEALEDHEADER),
+introduce V2PeerProtocolHandler with HandleSealedHeader and
+MatchCandidateOverlay fast-path block reconstruction from the local
+mempool overlay, and add unit tests in v2_protocol_handler_tests.cpp.
+---
+ src/CMakeLists.txt                     |    1 +
+ src/blockencodings.cpp                 |    4 +
+ src/blockencodings.h                   |   27 +
+ src/net/v2_protocol_handler.cpp        | 1175 ++++++++++++++++++++++++
+ src/net/v2_protocol_handler.h          |  488 ++++++++++
+ src/net_processing.cpp                 |   20 +-
+ src/net_processing.h                   |    9 +
+ src/protocol.cpp                       |   65 +-
+ src/protocol.h                         |   41 +-
+ src/test/CMakeLists.txt                |    1 +
+ src/test/blockencodings_tests.cpp      |   30 +
+ src/test/v2_protocol_handler_tests.cpp |  239 +++++
+ 12 files changed, 2078 insertions(+), 22 deletions(-)
+ create mode 100644 src/net/v2_protocol_handler.cpp
+ create mode 100644 src/net/v2_protocol_handler.h
+ create mode 100644 src/test/v2_protocol_handler_tests.cpp
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 2636bbc91a..3b0512715e 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -656,6 +656,7 @@ add_library(server
+ 	minerfund.cpp
+ 	net.cpp
+ 	net_processing.cpp
++	net/v2_protocol_handler.cpp
+ 	node/abort.cpp
+ 	node/blockfitter.cpp
+ 	node/blockmanager_args.cpp
+diff --git a/src/blockencodings.cpp b/src/blockencodings.cpp
+index 8cfe6b5156..d669d3167d 100644
+--- a/src/blockencodings.cpp
++++ b/src/blockencodings.cpp
+@@ -18,6 +18,10 @@
+ 
+ #include <unordered_map>
+ 
++SealedHeader::SealedHeader(const CBlock &block)
++    : header(block),
++      coinbase_tx(block.vtx.empty() ? CTransactionRef{} : block.vtx[0]) {}
++
+ CBlockHeaderAndShortTxIDs::CBlockHeaderAndShortTxIDs(const CBlock &block,
+                                                      const uint64_t nonce)
+     : nonce(nonce), shorttxids(block.vtx.size() - 1), prefilledtxn(1),
+diff --git a/src/blockencodings.h b/src/blockencodings.h
+index 870540f48d..a966c59066 100644
+--- a/src/blockencodings.h
++++ b/src/blockencodings.h
+@@ -48,6 +48,33 @@ public:
+     }
+ };
+ 
++/**
++ * Sealed header message (sealedheader): carries only the V2
++ * CBlockHeader and the coinbase transaction for O(1) full CBlock reconstruction
++ * against a reconciled local candidate overlay / CTOR mempool.
++ */
++class SealedHeader {
++public:
++    CBlockHeader header;
++    CTransactionRef coinbase_tx;
++
++    SealedHeader() = default;
++    explicit SealedHeader(const CBlock &block);
++    SealedHeader(const CBlockHeader &headerIn, CTransactionRef coinbaseIn)
++        : header(headerIn), coinbase_tx(std::move(coinbaseIn)) {}
++
++    bool IsValid() const {
++        return !header.IsNull() && coinbase_tx != nullptr &&
++               !coinbase_tx->IsNull() && coinbase_tx->IsCoinBase();
++    }
++
++    SERIALIZE_METHODS(SealedHeader, obj) {
++        READWRITE(obj.header, Using<TransactionCompression>(obj.coinbase_tx));
++    }
++};
++
++using SealedHeaderAnnounce = SealedHeader;
++
+ // Dumb serialization/storage-helper for CBlockHeaderAndShortTxIDs and
+ // PartiallyDownloadedBlock
+ struct PrefilledTransaction {
+diff --git a/src/net/v2_protocol_handler.cpp b/src/net/v2_protocol_handler.cpp
+new file mode 100644
+index 0000000000..bfbfa09b29
+--- /dev/null
++++ b/src/net/v2_protocol_handler.cpp
+@@ -0,0 +1,1175 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <net/v2_protocol_handler.h>
++
++#include <consensus/merkle.h>
++#include <consensus/validation.h>
++#include <crypto/siphash.h>
++#include <logging.h>
++#include <lotus_v2/tagged_hash.h>
++#include <net_processing.h>
++#include <netmessagemaker.h>
++#include <txmempool.h>
++#include <validation.h>
++
++#include <algorithm>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <unordered_set>
++
++namespace lotus::v2::net {
++
++namespace {
++
++constexpr uint64_t GF64_REDUCTION_POLY = 0x1bULL; // z^64 + z^4 + z^3 + z + 1
++constexpr size_t MAX_OVERLAYS_PER_PREV = 16;
++
++struct GF64QuadraticBasis {
++    std::array<uint64_t, 64> pivot_vec{};
++    std::array<uint64_t, 64> pivot_preimage{};
++
++    GF64QuadraticBasis() {
++        for (int i = 1; i < 64; ++i) {
++            const uint64_t e_i = 1ULL << i;
++            uint64_t vec = GF64Square(e_i) ^ e_i;
++            uint64_t pre = e_i;
++            for (int b = 63; b >= 0; --b) {
++                if (!((vec >> b) & 1ULL)) {
++                    continue;
++                }
++                if (pivot_vec[b] != 0) {
++                    vec ^= pivot_vec[b];
++                    pre ^= pivot_preimage[b];
++                } else {
++                    pivot_vec[b] = vec;
++                    pivot_preimage[b] = pre;
++                    break;
++                }
++            }
++        }
++    }
++};
++
++const GF64QuadraticBasis &GetGF64QuadraticBasis() {
++    static const GF64QuadraticBasis basis{};
++    return basis;
++}
++
++std::vector<CTransactionRef>
++NormalizeCtorTxList(const std::vector<CTransactionRef> &txs) {
++    std::vector<CTransactionRef> sorted;
++    sorted.reserve(txs.size());
++    for (const auto &tx : txs) {
++        if (tx && !tx->IsNull() && !tx->IsCoinBase()) {
++            sorted.push_back(tx);
++        }
++    }
++    std::sort(sorted.begin(), sorted.end(),
++              [](const CTransactionRef &a, const CTransactionRef &b) {
++                  return a->GetId() < b->GetId();
++              });
++    sorted.erase(
++        std::unique(sorted.begin(), sorted.end(),
++                    [](const CTransactionRef &a, const CTransactionRef &b) {
++                        return a->GetId() == b->GetId();
++                    }),
++        sorted.end());
++    if (sorted.size() > V2PeerProtocolHandler::MAX_SCOPED_TXS) {
++        sorted.resize(V2PeerProtocolHandler::MAX_SCOPED_TXS);
++    }
++    return sorted;
++}
++
++lotus::v2::TxIdentityPair MakeTxIdentityPair(const CTransaction &tx) noexcept {
++    lotus::v2::TxIdentityPair pair{};
++    std::memcpy(pair.tx_hash.data(), tx.GetHash().begin(), 32);
++    std::memcpy(pair.tx_id.data(), tx.GetId().begin(), 32);
++    return pair;
++}
++
++lotus::v2::Hash
++ComputeSubtreeAHash(const std::vector<CTransactionRef> &normalized_txs) {
++    std::vector<lotus::v2::TxIdentityPair> pairs;
++    pairs.reserve(normalized_txs.size());
++    for (const auto &tx : normalized_txs) {
++        if (tx && !tx->IsNull() && !tx->IsCoinBase()) {
++            pairs.push_back(MakeTxIdentityPair(*tx));
++        }
++    }
++    return lotus::v2::BuildTxSubtreeA(pairs);
++}
++
++} // namespace
++
++std::pair<uint64_t, uint64_t>
++DeriveReconSipHashKey(ReconScope scope, const uint256 &context_id,
++                      uint64_t epoch_or_nonce) noexcept {
++    std::array<uint8_t, 42> payload{};
++    payload[0] = 0x52; // domain sub-tag 'R' for reconciliation SipHash key
++    payload[1] = static_cast<uint8_t>(scope);
++    std::memcpy(payload.data() + 2, context_id.begin(), 32);
++    for (unsigned i = 0; i < 8; ++i) {
++        payload[34 + i] = static_cast<uint8_t>(epoch_or_nonce >> (8 * i));
++    }
++    const lotus::v2::Hash digest =
++        lotus::v2::TaggedHash(lotus::v2::HashDomain::TxRoot, payload);
++    uint64_t k0 = 0;
++    uint64_t k1 = 0;
++    for (unsigned i = 0; i < 8; ++i) {
++        k0 |= uint64_t(digest[i]) << (8 * i);
++        k1 |= uint64_t(digest[8 + i]) << (8 * i);
++    }
++    return {k0, k1};
++}
++
++bool IsValidReconSipHashKey(ReconScope scope, const uint256 &context_id,
++                            uint64_t salt_k0, uint64_t salt_k1) noexcept {
++    const auto [k0_default, k1_default] =
++        DeriveReconSipHashKey(scope, context_id, 0);
++    if (salt_k0 == k0_default && salt_k1 == k1_default) {
++        return true;
++    }
++    // Also permit salt_k0 as an explicit epoch/nonce if salt_k1 matches the
++    // second half of DeriveReconSipHashKey(scope, context_id, salt_k0).
++    const auto [_, k1_from_nonce] =
++        DeriveReconSipHashKey(scope, context_id, salt_k0);
++    return salt_k1 == k1_from_nonce;
++}
++
++uint256 ComputeScopedMerklixRoot(const std::vector<CTransactionRef> &txs) {
++    const std::vector<CTransactionRef> normalized = NormalizeCtorTxList(txs);
++    const lotus::v2::Hash root = ComputeSubtreeAHash(normalized);
++    uint256 out{};
++    std::memcpy(out.begin(), root.data(), 32);
++    return out;
++}
++
++uint256 ComputeV2TxRootFromSubtreeA(const CTransaction &coinbase_tx,
++                                    const lotus::v2::Hash &subtree_a_root) {
++    const lotus::v2::TxIdentityPair cb_pair = MakeTxIdentityPair(coinbase_tx);
++    const lotus::v2::Hash root =
++        lotus::v2::CombineCoinbaseAndSubtreeA(cb_pair, subtree_a_root);
++    uint256 out{};
++    std::memcpy(out.begin(), root.data(), 32);
++    return out;
++}
++
++uint64_t GF64Mul(uint64_t a, uint64_t b) noexcept {
++    uint64_t result = 0;
++    for (int i = 0; i < 64; ++i) {
++        if ((b >> i) & 1ULL) {
++            result ^= a;
++        }
++        const bool hi = (a >> 63) & 1ULL;
++        a <<= 1;
++        if (hi) {
++            a ^= GF64_REDUCTION_POLY;
++        }
++    }
++    return result;
++}
++
++uint64_t GF64Square(uint64_t a) noexcept {
++    return GF64Mul(a, a);
++}
++
++uint64_t GF64Cube(uint64_t a) noexcept {
++    return GF64Mul(GF64Square(a), a);
++}
++
++uint64_t GF64Inv(uint64_t a) noexcept {
++    if (a == 0) {
++        return 0;
++    }
++    // In GF(2^64), a^(2^64 - 2) = a^(-1).
++    uint64_t result = 1;
++    uint64_t cur = a;
++    for (int i = 1; i < 64; ++i) {
++        cur = GF64Square(cur);
++        result = GF64Mul(result, cur);
++    }
++    return result;
++}
++
++bool GF64SolveQuadratic(uint64_t c, uint64_t &y_out) noexcept {
++    if (c == 0) {
++        y_out = 0;
++        return true;
++    }
++    const auto &basis = GetGF64QuadraticBasis();
++    uint64_t rem = c;
++    uint64_t y = 0;
++    for (int b = 63; b >= 0; --b) {
++        if ((rem >> b) & 1ULL) {
++            if (basis.pivot_vec[b] == 0) {
++                return false;
++            }
++            rem ^= basis.pivot_vec[b];
++            y ^= basis.pivot_preimage[b];
++        }
++    }
++    y_out = y;
++    return true;
++}
++
++std::optional<std::vector<uint64_t>>
++RecoverGF64Syndromes(uint64_t delta_s1, uint64_t delta_s3) noexcept {
++    if (delta_s1 == 0 && delta_s3 == 0) {
++        return std::vector<uint64_t>{};
++    }
++    if (delta_s1 == 0) {
++        return std::nullopt;
++    }
++    // 1-element difference: delta_s3 == (delta_s1)^3
++    const uint64_t s1_cubed = GF64Cube(delta_s1);
++    if (s1_cubed == delta_s3) {
++        return std::vector<uint64_t>{delta_s1};
++    }
++
++    // 2-element difference:
++    // (x1 ^ x2)^3 = x1^3 ^ x2^3 ^ x1*x2*(x1 ^ x2)
++    // => x1*x2 = (delta_s3 ^ (delta_s1)^3) * (delta_s1)^(-1)
++    // Let x1 = delta_s1 * y => y^2 ^ y = (x1*x2) * (delta_s1)^(-2) = c.
++    const uint64_t num = delta_s3 ^ s1_cubed;
++    const uint64_t inv_s1 = GF64Inv(delta_s1);
++    const uint64_t prod = GF64Mul(num, inv_s1);
++    const uint64_t c = GF64Mul(prod, GF64Square(inv_s1));
++
++    uint64_t y = 0;
++    if (!GF64SolveQuadratic(c, y)) {
++        return std::nullopt;
++    }
++    uint64_t x1 = GF64Mul(delta_s1, y);
++    uint64_t x2 = x1 ^ delta_s1;
++    if (x1 > x2) {
++        std::swap(x1, x2);
++    }
++    return std::vector<uint64_t>{x1, x2};
++}
++
++uint64_t ComputeMerklixShortId(uint64_t salt_k0, uint64_t salt_k1,
++                               const TxId &txid) noexcept {
++    const uint64_t sid = SipHashUint256(salt_k0, salt_k1, txid);
++    return sid != 0 ? sid : 1ULL;
++}
++
++V2PeerProtocolHandler::V2PeerProtocolHandler(ChainstateManager &chainman,
++                                             CTxMemPool &mempool,
++                                             CConnman &connman,
++                                             PeerManager &peerman)
++    : m_chainman(chainman), m_mempool(mempool), m_connman(connman),
++      m_peerman(peerman) {}
++
++bool V2PeerProtocolHandler::TryHandleMessage(
++    CNode &pfrom, const std::string &msg_type, DataStream &vRecv,
++    std::chrono::microseconds time_received) {
++    if (msg_type == NetMsgType::SEALEDHEADER) {
++        HandleSealedHeader(pfrom, vRecv);
++        return true;
++    }
++    if (msg_type == NetMsgType::MERKLIXSYNC) {
++        HandleMerklixSync(pfrom, vRecv, time_received);
++        return true;
++    }
++    if (msg_type == NetMsgType::GETMERKLIXBUCK) {
++        HandleGetMerklixBuck(pfrom, vRecv, time_received);
++        return true;
++    }
++    if (msg_type == NetMsgType::MERKLIXBUCK) {
++        HandleMerklixBuck(pfrom, vRecv, time_received);
++        return true;
++    }
++    if (msg_type == NetMsgType::GETSHORTTX) {
++        HandleGetShortTx(pfrom, vRecv, time_received);
++        return true;
++    }
++    if (msg_type == NetMsgType::SHORTTX) {
++        HandleShortTx(pfrom, vRecv, time_received);
++        return true;
++    }
++    return false;
++}
++
++bool V2PeerProtocolHandler::CheckPeerRateLimit(
++    NodeId peer_id, std::chrono::microseconds time_received) {
++    LOCK(m_mutex);
++    auto &state = m_peer_rates[peer_id];
++    const auto window_us =
++        std::chrono::duration_cast<std::chrono::microseconds>(
++            RATE_LIMIT_WINDOW);
++    if (time_received < state.window_start ||
++        (time_received - state.window_start) >= window_us) {
++        state.window_start = time_received;
++        state.count = 1;
++        return true;
++    }
++    if (state.count >= MAX_SYNC_MESSAGES_PER_WINDOW) {
++        ++m_stats.rate_limited_messages;
++        return false;
++    }
++    ++state.count;
++    return true;
++}
++
++void V2PeerProtocolHandler::RegisterCandidateOverlay(
++    const BlockHash &prev_block_hash, std::vector<CTransactionRef> txs) {
++    CandidateOverlayEntry entry;
++    entry.txs = NormalizeCtorTxList(txs);
++    entry.subtree_a_root = ComputeSubtreeAHash(entry.txs);
++    LOCK(m_mutex);
++    auto &vec = m_candidate_overlays[prev_block_hash];
++    if (vec.size() >= MAX_OVERLAYS_PER_PREV) {
++        vec.erase(vec.begin());
++    }
++    vec.push_back(std::move(entry));
++}
++
++void V2PeerProtocolHandler::ClearCandidateOverlays() {
++    LOCK(m_mutex);
++    m_candidate_overlays.clear();
++}
++
++std::shared_ptr<const CBlock> V2PeerProtocolHandler::MatchCandidateOverlay(
++    const CBlockHeader &header, const CTransactionRef &coinbase_tx) const {
++    if (header.IsNull() || !coinbase_tx || coinbase_tx->IsNull() ||
++        !coinbase_tx->IsCoinBase()) {
++        return nullptr;
++    }
++
++    uint64_t parent_mtp = 0;
++    if (!header.hashStateRoot.IsNull()) {
++        LOCK(cs_main);
++        const CBlockIndex *pindex_prev =
++            m_chainman.m_blockman.LookupBlockIndex(header.hashPrevBlock);
++        if (pindex_prev) {
++            parent_mtp =
++                static_cast<uint64_t>(pindex_prev->GetMedianTimePast());
++        }
++    }
++
++    lotus::v2::Hash cb_tx_id{};
++    std::memcpy(cb_tx_id.data(), coinbase_tx->GetId().begin(), 32);
++    lotus::v2::Hash prev_block_id{};
++    std::memcpy(prev_block_id.data(), header.hashPrevBlock.begin(), 32);
++
++    // Check progressive Merklix overlay layers (finalized epoch layers L_k and
++    // live speculative layer L_spec) in O(1) using pre-computed Subtree A and
++    // UTXO overlay roots before falling back to explicit candidates.
++    {
++        LOCK(m_mempool.cs);
++        auto try_match_layer = [&](const lotus::v2::MempoolOverlayLayer &layer)
++            -> std::shared_ptr<const CBlock> {
++            const uint256 expected_merkle_root =
++                lotus::v2::net::ComputeV2TxRootFromSubtreeA(
++                    *coinbase_tx, layer.GetSubtreeARoot());
++            if (expected_merkle_root != header.hashMerkleRoot ||
++                layer.Contains(cb_tx_id)) {
++                return nullptr;
++            }
++            if (!header.hashStateRoot.IsNull() &&
++                layer.GetParentBlockId() == prev_block_id &&
++                layer.GetHeight() == static_cast<uint64_t>(header.nHeight) &&
++                layer.GetParentMtp() == parent_mtp) {
++                const uint256 expected_state_root =
++                    ComputeV2StateRootFromOverlay(
++                        *coinbase_tx, layer, header.nBits,
++                        static_cast<uint64_t>(header.nHeight), parent_mtp,
++                        /*record=*/false);
++                if (expected_state_root != header.hashStateRoot) {
++                    return nullptr;
++                }
++            }
++            auto block = std::make_shared<CBlock>(header);
++            block->vtx.reserve(1 + layer.GetTxCount());
++            block->vtx.push_back(coinbase_tx);
++            for (const auto &[_, oentry] : layer.GetOrderedTxs()) {
++                block->vtx.push_back(
++                    std::static_pointer_cast<const CTransaction>(oentry.tx_ref));
++            }
++            if (!header.hashStateRoot.IsNull() &&
++                !(layer.GetParentBlockId() == prev_block_id &&
++                  layer.GetHeight() == static_cast<uint64_t>(header.nHeight) &&
++                  layer.GetParentMtp() == parent_mtp)) {
++                const uint256 expected_state_root = ComputeV2BlockStateRoot(
++                    *block, header.hashPrevBlock,
++                    static_cast<uint64_t>(header.nHeight), parent_mtp,
++                    /*record=*/false);
++                if (expected_state_root != header.hashStateRoot) {
++                    return nullptr;
++                }
++            }
++            return block;
++        };
++
++        // Optimization (rolled into initial V2 protocol handler): query
++        // CTxMemPool::GetOverlayManager()'s frozen pre-consensus epoch layers
++        // (L_k) and speculative mempool layer (L_spec) in O(1) via precomputed
++        // Subtree A and UTXO overlay roots before scanning explicit candidates.
++        auto &overlay_mgr = m_mempool.GetOverlayManager();
++        const auto &frozen_epochs = overlay_mgr.GetFrozenEpochs();
++        for (auto it = frozen_epochs.rbegin(); it != frozen_epochs.rend();
++             ++it) {
++            if (auto matched = try_match_layer(*it)) {
++                return matched;
++            }
++        }
++        if (auto matched = try_match_layer(overlay_mgr.GetSpeculativeOverlay())) {
++            return matched;
++        }
++    }
++
++    std::vector<CandidateOverlayEntry> candidates;
++    {
++        LOCK(m_mutex);
++        auto it_prev = m_candidate_overlays.find(header.hashPrevBlock);
++        if (it_prev != m_candidate_overlays.end()) {
++            for (const auto &overlay : it_prev->second) {
++                candidates.push_back(overlay);
++            }
++        }
++        auto it_merkle =
++            m_candidate_overlays.find(BlockHash(header.hashMerkleRoot));
++        if (it_merkle != m_candidate_overlays.end()) {
++            for (const auto &overlay : it_merkle->second) {
++                candidates.push_back(overlay);
++            }
++        }
++        for (const ReconScope scope :
++             {ReconScope::BLOCK_RECON, ReconScope::EPOCH_BATCH,
++              ReconScope::LIVE_MEMPOOL}) {
++            auto it_scope_prev =
++                m_scoped_txs.find(ScopeKey{scope, header.hashPrevBlock});
++            if (it_scope_prev != m_scoped_txs.end()) {
++                candidates.push_back(CandidateOverlayEntry{
++                    it_scope_prev->second.txs,
++                    it_scope_prev->second.subtree_a_root});
++            }
++            auto it_scope_hash =
++                m_scoped_txs.find(ScopeKey{scope, header.GetHash()});
++            if (it_scope_hash != m_scoped_txs.end()) {
++                candidates.push_back(CandidateOverlayEntry{
++                    it_scope_hash->second.txs,
++                    it_scope_hash->second.subtree_a_root});
++            }
++        }
++    }
++
++    // Include the live CTOR-ordered mempool transaction set as a candidate.
++    {
++        std::vector<CTransactionRef> mempool_txs;
++        {
++            LOCK(m_mempool.cs);
++            mempool_txs.reserve(m_mempool.mapTx.size());
++            for (const auto &entry : m_mempool.mapTx) {
++                mempool_txs.push_back(entry->GetSharedTx());
++            }
++        }
++        CandidateOverlayEntry mempool_entry;
++        mempool_entry.txs = NormalizeCtorTxList(mempool_txs);
++        mempool_entry.subtree_a_root = ComputeSubtreeAHash(mempool_entry.txs);
++        candidates.push_back(std::move(mempool_entry));
++    }
++
++    // Also include the empty non-coinbase candidate set (for coinbase-only
++    // blocks).
++    {
++        CandidateOverlayEntry empty_entry;
++        empty_entry.subtree_a_root = lotus::v2::BuildTxSubtreeA({});
++        candidates.push_back(std::move(empty_entry));
++    }
++
++    for (const auto &candidate : candidates) {
++        // O(1) Merklix root pre-filter (single BLAKE3 hash over coinbase_leaf
++        // and pre-computed candidate.subtree_a_root) BEFORE allocating
++        // block->vtx or computing ComputeV2BlockStateRoot!
++        const uint256 expected_merkle_root =
++            lotus::v2::net::ComputeV2TxRootFromSubtreeA(
++                *coinbase_tx, candidate.subtree_a_root);
++        if (expected_merkle_root != header.hashMerkleRoot) {
++            continue;
++        }
++
++        auto block = std::make_shared<CBlock>(header);
++        block->vtx.reserve(1 + candidate.txs.size());
++        block->vtx.push_back(coinbase_tx);
++        for (const auto &tx : candidate.txs) {
++            block->vtx.push_back(tx);
++        }
++
++        if (!header.hashStateRoot.IsNull()) {
++            uint64_t parent_mtp = 0;
++            {
++                LOCK(cs_main);
++                const CBlockIndex *pindex_prev =
++                    m_chainman.m_blockman.LookupBlockIndex(
++                        header.hashPrevBlock);
++                if (pindex_prev) {
++                    parent_mtp = static_cast<uint64_t>(
++                        pindex_prev->GetMedianTimePast());
++                }
++            }
++            const uint256 expected_state_root = ComputeV2BlockStateRoot(
++                *block, header.hashPrevBlock,
++                static_cast<uint64_t>(header.nHeight), parent_mtp,
++                /*record=*/false);
++            if (expected_state_root != header.hashStateRoot) {
++                continue;
++            }
++        }
++
++        return block;
++    }
++
++    return nullptr;
++}
++
++void V2PeerProtocolHandler::HandleSealedHeader(CNode &pfrom,
++                                               DataStream &vRecv) {
++    SealedHeader sealed;
++    try {
++        vRecv >> sealed;
++    } catch (const std::exception &) {
++        LOCK(m_mutex);
++        ++m_stats.sealedheader_invalid;
++        ++m_stats.malformed_messages;
++        return;
++    }
++
++    {
++        LOCK(m_mutex);
++        ++m_stats.sealedheader_received;
++    }
++
++    if (!sealed.IsValid()) {
++        LOCK(m_mutex);
++        ++m_stats.sealedheader_invalid;
++        ++m_stats.malformed_messages;
++        return;
++    }
++
++    // Defect C1 (Hole 7): Enforce coinbase serialization size cap before any
++    // header/overlay processing.
++    if (::GetSerializeSize(*sealed.coinbase_tx) >
++        MAX_SEALEDHEADER_COINBASE_BYTES) {
++        LOCK(m_mutex);
++        ++m_stats.sealedheader_invalid;
++        ++m_stats.sealedheader_rejected;
++        return;
++    }
++
++    // Defect C1 (Hole 7): Validate header PoW and chain context via
++    // ProcessNewBlockHeaders (AcceptBlockHeader) BEFORE running
++    // MatchCandidateOverlay or emitting fallback GETDATA(MSG_CMPCT_BLOCK).
++    BlockValidationState header_state;
++    const CBlockIndex *pindex = nullptr;
++    if (!m_chainman.ProcessNewBlockHeaders({sealed.header},
++                                           /*min_pow_checked=*/true,
++                                           header_state, &pindex)) {
++        LOCK(m_mutex);
++        ++m_stats.sealedheader_invalid;
++        ++m_stats.sealedheader_rejected;
++        return;
++    }
++
++    std::shared_ptr<const CBlock> reconstructed =
++        MatchCandidateOverlay(sealed.header, sealed.coinbase_tx);
++    if (reconstructed) {
++        {
++            LOCK(m_mutex);
++            ++m_stats.sealedheader_reconstructed;
++        }
++        bool fNewBlock = false;
++        m_chainman.ProcessNewBlock(reconstructed, /*force_processing=*/true,
++                                   /*min_pow_checked=*/true, &fNewBlock);
++        return;
++    }
++
++    // Fast-path candidate overlay missed: fall back to requesting
++    // MSG_CMPCT_BLOCK via getdata from pfrom without penalizing the peer.
++    const CInv fallback_inv(MSG_CMPCT_BLOCK, sealed.header.GetHash());
++    {
++        LOCK(m_mutex);
++        ++m_stats.sealedheader_fallback_getdata;
++        m_last_fallback_inv = fallback_inv;
++    }
++    m_connman.PushMessage(
++        &pfrom, NetMsg::Make(NetMsgType::GETDATA,
++                             std::vector<CInv>{fallback_inv}));
++}
++
++void V2PeerProtocolHandler::SetScopedTransactions(
++    ReconScope scope, const uint256 &context_id,
++    std::vector<CTransactionRef> txs) {
++    ScopedTxSetEntry entry;
++    entry.txs = NormalizeCtorTxList(txs);
++    entry.subtree_a_root = ComputeSubtreeAHash(entry.txs);
++    LOCK(m_mutex);
++    const ScopeKey key{scope, context_id};
++    if (m_scoped_txs.find(key) == m_scoped_txs.end() &&
++        m_scoped_txs.size() >= MAX_TRACKED_RECON_SCOPES) {
++        m_scoped_txs.erase(m_scoped_txs.begin());
++    }
++    m_scoped_txs[key] = std::move(entry);
++}
++
++std::vector<CTransactionRef> V2PeerProtocolHandler::GetScopedTransactions(
++    ReconScope scope, const uint256 &context_id) const {
++    {
++        LOCK(m_mutex);
++        auto it = m_scoped_txs.find(ScopeKey{scope, context_id});
++        if (it != m_scoped_txs.end()) {
++            return it->second.txs;
++        }
++    }
++    if (scope == ReconScope::LIVE_MEMPOOL) {
++        std::vector<CTransactionRef> mempool_txs;
++        {
++            LOCK(m_mempool.cs);
++            mempool_txs.reserve(m_mempool.mapTx.size());
++            for (const auto &entry : m_mempool.mapTx) {
++                mempool_txs.push_back(entry->GetSharedTx());
++            }
++        }
++        return NormalizeCtorTxList(mempool_txs);
++    }
++    return {};
++}
++
++MerklixSyncSummary V2PeerProtocolHandler::BuildSyncSummary(
++    ReconScope scope, const uint256 &context_id, uint64_t salt_k0,
++    uint64_t salt_k1) const {
++    if (salt_k0 == 0 && salt_k1 == 0) {
++        std::tie(salt_k0, salt_k1) = DeriveReconSipHashKey(scope, context_id, 0);
++    }
++    MerklixSyncSummary summary;
++    summary.scope = static_cast<uint8_t>(scope);
++    summary.context_id = context_id;
++    summary.salt_k0 = salt_k0;
++    summary.salt_k1 = salt_k1;
++
++    const std::vector<CTransactionRef> txs =
++        GetScopedTransactions(scope, context_id);
++    summary.candidate_root = ComputeScopedMerklixRoot(txs);
++    for (const auto &tx : txs) {
++        const TxId &txid = tx->GetId();
++        const uint8_t b = GetMerklixBucketIndex(txid);
++        const uint64_t sid = ComputeMerklixShortId(salt_k0, salt_k1, txid);
++        summary.buckets[b].count += 1;
++        summary.buckets[b].xor_short_id ^= sid;
++    }
++    return summary;
++}
++
++MerklixSyncDiffResult V2PeerProtocolHandler::DiffSyncSummary(
++    const MerklixSyncSummary &remote_summary) const {
++    MerklixSyncDiffResult result;
++    if (!IsValidReconScope(remote_summary.scope)) {
++        return result;
++    }
++    const ReconScope scope = static_cast<ReconScope>(remote_summary.scope);
++    const std::vector<CTransactionRef> local_txs =
++        GetScopedTransactions(scope, remote_summary.context_id);
++
++    const uint256 local_root = ComputeScopedMerklixRoot(local_txs);
++    result.root_matched = (local_root == remote_summary.candidate_root);
++    if (result.root_matched) {
++        return result;
++    }
++
++    uint64_t k0 = remote_summary.salt_k0;
++    uint64_t k1 = remote_summary.salt_k1;
++    if (k0 == 0 && k1 == 0) {
++        std::tie(k0, k1) =
++            DeriveReconSipHashKey(scope, remote_summary.context_id, 0);
++    }
++
++    std::array<MerklixBucketEntry, 16> local_buckets{};
++    std::array<std::unordered_set<uint64_t>, 16> local_bucket_sids{};
++    for (const auto &tx : local_txs) {
++        const TxId &txid = tx->GetId();
++        const uint8_t b = GetMerklixBucketIndex(txid);
++        const uint64_t sid = ComputeMerklixShortId(k0, k1, txid);
++        local_buckets[b].count += 1;
++        local_buckets[b].xor_short_id ^= sid;
++        local_bucket_sids[b].insert(sid);
++    }
++
++    for (uint8_t b = 0; b < 16; ++b) {
++        const auto &rem = remote_summary.buckets[b];
++        const auto &loc = local_buckets[b];
++        const uint64_t diff_xor = rem.xor_short_id ^ loc.xor_short_id;
++        const int64_t diff_count =
++            static_cast<int64_t>(rem.count) - static_cast<int64_t>(loc.count);
++
++        if (diff_xor == 0 && diff_count == 0) {
++            continue;
++        }
++
++        // Fast 1-tx recovery directly at depth 4 when count differs by 1:
++        if (std::abs(diff_count) == 1 && diff_xor != 0) {
++            const bool in_local =
++                local_bucket_sids[b].find(diff_xor) !=
++                local_bucket_sids[b].end();
++            if (diff_count == 1 && !in_local) {
++                result.single_missing_short_ids.push_back(diff_xor);
++                continue;
++            }
++            if (diff_count == -1 && in_local) {
++                // Local has 1 extra tx in this bucket and 0 missing.
++                continue;
++            }
++        }
++
++        result.mismatched_bucket_mask |= static_cast<uint16_t>(1U << b);
++    }
++
++    // Defect D1 (Hole 1): Never treat a scope as converged when the 256-bit
++    // candidate_root differs, even if all 16 64-bit bucket XORs/counts match.
++    if (!result.root_matched && result.mismatched_bucket_mask == 0 &&
++        result.single_missing_short_ids.empty()) {
++        result.mismatched_bucket_mask = 0xFFFFU;
++    }
++
++    return result;
++}
++
++MerklixSubBucketSummary V2PeerProtocolHandler::BuildSubBucketSummary(
++    ReconScope scope, const uint256 &context_id, uint64_t salt_k0,
++    uint64_t salt_k1, uint8_t parent_bucket) const {
++    if (salt_k0 == 0 && salt_k1 == 0) {
++        std::tie(salt_k0, salt_k1) = DeriveReconSipHashKey(scope, context_id, 0);
++    }
++    MerklixSubBucketSummary sub;
++    sub.scope = static_cast<uint8_t>(scope);
++    sub.context_id = context_id;
++    sub.salt_k0 = salt_k0;
++    sub.salt_k1 = salt_k1;
++    sub.parent_bucket = parent_bucket & 0x0f;
++
++    const std::vector<CTransactionRef> txs =
++        GetScopedTransactions(scope, context_id);
++    for (const auto &tx : txs) {
++        const TxId &txid = tx->GetId();
++        if (GetMerklixBucketIndex(txid) != sub.parent_bucket) {
++            continue;
++        }
++        const uint8_t sb = GetMerklixSubBucketIndex(txid);
++        const uint64_t sid = ComputeMerklixShortId(salt_k0, salt_k1, txid);
++        sub.sub_buckets[sb].count += 1;
++        sub.sub_buckets[sb].s1 ^= sid;
++        sub.sub_buckets[sb].s3 ^= GF64Cube(sid);
++    }
++    return sub;
++}
++
++MerklixSubBucketDiffResult V2PeerProtocolHandler::DiffSubBucketSummary(
++    const MerklixSubBucketSummary &remote_sub) const {
++    MerklixSubBucketDiffResult result;
++    if (!IsValidReconScope(remote_sub.scope) ||
++        remote_sub.parent_bucket >= 16) {
++        return result;
++    }
++
++    const ReconScope scope = static_cast<ReconScope>(remote_sub.scope);
++    const std::vector<CTransactionRef> local_txs =
++        GetScopedTransactions(scope, remote_sub.context_id);
++
++    uint64_t k0 = remote_sub.salt_k0;
++    uint64_t k1 = remote_sub.salt_k1;
++    if (k0 == 0 && k1 == 0) {
++        std::tie(k0, k1) =
++            DeriveReconSipHashKey(scope, remote_sub.context_id, 0);
++    }
++
++    std::array<MerklixSubBucketEntry, 16> local_subs{};
++    std::array<std::unordered_set<uint64_t>, 16> local_sub_sids{};
++    for (const auto &tx : local_txs) {
++        const TxId &txid = tx->GetId();
++        if (GetMerklixBucketIndex(txid) != remote_sub.parent_bucket) {
++            continue;
++        }
++        const uint8_t sb = GetMerklixSubBucketIndex(txid);
++        const uint64_t sid = ComputeMerklixShortId(k0, k1, txid);
++        local_subs[sb].count += 1;
++        local_subs[sb].s1 ^= sid;
++        local_subs[sb].s3 ^= GF64Cube(sid);
++        local_sub_sids[sb].insert(sid);
++    }
++
++    for (uint8_t sb = 0; sb < 16; ++sb) {
++        const auto &rem = remote_sub.sub_buckets[sb];
++        const auto &loc = local_subs[sb];
++        const uint64_t delta_s1 = rem.s1 ^ loc.s1;
++        const uint64_t delta_s3 = rem.s3 ^ loc.s3;
++        if (delta_s1 == 0 && delta_s3 == 0 && rem.count == loc.count) {
++            continue;
++        }
++
++        auto recovered = RecoverGF64Syndromes(delta_s1, delta_s3);
++        if (!recovered.has_value()) {
++            result.unresolved_sub_buckets.push_back(sb);
++            continue;
++        }
++
++        // Verify recovered symmetric difference is consistent with count delta:
++        size_t num_in_local = 0;
++        size_t num_missing = 0;
++        for (const uint64_t sid : *recovered) {
++            if (local_sub_sids[sb].find(sid) != local_sub_sids[sb].end()) {
++                ++num_in_local;
++            } else {
++                ++num_missing;
++            }
++        }
++        const int64_t expected_diff =
++            static_cast<int64_t>(num_missing) -
++            static_cast<int64_t>(num_in_local);
++        const int64_t actual_diff =
++            static_cast<int64_t>(rem.count) - static_cast<int64_t>(loc.count);
++        if (expected_diff != actual_diff) {
++            result.unresolved_sub_buckets.push_back(sb);
++            continue;
++        }
++
++        for (const uint64_t sid : *recovered) {
++            if (local_sub_sids[sb].find(sid) == local_sub_sids[sb].end()) {
++                result.missing_short_ids.push_back(sid);
++            }
++        }
++    }
++
++    return result;
++}
++
++std::vector<CTransactionRef> V2PeerProtocolHandler::ResolveShortIds(
++    ReconScope scope, const uint256 &context_id, uint64_t salt_k0,
++    uint64_t salt_k1, const std::vector<uint64_t> &short_ids) const {
++    if (short_ids.empty()) {
++        return {};
++    }
++    if (salt_k0 == 0 && salt_k1 == 0) {
++        std::tie(salt_k0, salt_k1) = DeriveReconSipHashKey(scope, context_id, 0);
++    }
++    const std::vector<CTransactionRef> local_txs =
++        GetScopedTransactions(scope, context_id);
++    std::unordered_map<uint64_t, CTransactionRef> by_sid;
++    by_sid.reserve(local_txs.size());
++    for (const auto &tx : local_txs) {
++        const uint64_t sid =
++            ComputeMerklixShortId(salt_k0, salt_k1, tx->GetId());
++        by_sid.emplace(sid, tx);
++    }
++
++    std::vector<CTransactionRef> resolved;
++    resolved.reserve(short_ids.size());
++    for (const uint64_t sid : short_ids) {
++        auto it = by_sid.find(sid);
++        if (it != by_sid.end()) {
++            resolved.push_back(it->second);
++        }
++    }
++    return resolved;
++}
++
++void V2PeerProtocolHandler::HandleMerklixSync(
++    CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received) {
++    if (!CheckPeerRateLimit(pfrom.GetId(), time_received)) {
++        return;
++    }
++
++    MerklixSyncSummary summary;
++    try {
++        vRecv >> summary;
++    } catch (const std::exception &) {
++        LOCK(m_mutex);
++        ++m_stats.malformed_messages;
++        return;
++    }
++
++    if (!IsValidReconScope(summary.scope)) {
++        LOCK(m_mutex);
++        ++m_stats.malformed_messages;
++        return;
++    }
++
++    const ReconScope scope = static_cast<ReconScope>(summary.scope);
++    if ((summary.salt_k0 != 0 || summary.salt_k1 != 0) &&
++        !IsValidReconSipHashKey(scope, summary.context_id, summary.salt_k0,
++                                summary.salt_k1)) {
++        LOCK(m_mutex);
++        ++m_stats.malformed_messages;
++        return;
++    }
++    if (summary.salt_k0 == 0 && summary.salt_k1 == 0) {
++        std::tie(summary.salt_k0, summary.salt_k1) =
++            DeriveReconSipHashKey(scope, summary.context_id, 0);
++    }
++
++    {
++        LOCK(m_mutex);
++        ++m_stats.merklixsync_received;
++    }
++
++    const MerklixSyncDiffResult diff = DiffSyncSummary(summary);
++    if (!diff.single_missing_short_ids.empty()) {
++        ShortTxRequest req;
++        req.scope = summary.scope;
++        req.context_id = summary.context_id;
++        req.salt_k0 = summary.salt_k0;
++        req.salt_k1 = summary.salt_k1;
++        req.short_ids = diff.single_missing_short_ids;
++        m_connman.PushMessage(&pfrom,
++                              NetMsg::Make(NetMsgType::GETSHORTTX, req));
++    }
++
++    if (diff.mismatched_bucket_mask != 0) {
++        MerklixBucketRequest buck_req;
++        buck_req.scope = summary.scope;
++        buck_req.context_id = summary.context_id;
++        buck_req.salt_k0 = summary.salt_k0;
++        buck_req.salt_k1 = summary.salt_k1;
++        buck_req.bucket_mask = diff.mismatched_bucket_mask;
++        m_connman.PushMessage(
++            &pfrom, NetMsg::Make(NetMsgType::GETMERKLIXBUCK, buck_req));
++    }
++}
++
++void V2PeerProtocolHandler::HandleGetMerklixBuck(
++    CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received) {
++    if (!CheckPeerRateLimit(pfrom.GetId(), time_received)) {
++        return;
++    }
++
++    MerklixBucketRequest req;
++    try {
++        vRecv >> req;
++    } catch (const std::exception &) {
++        LOCK(m_mutex);
++        ++m_stats.malformed_messages;
++        return;
++    }
++
++    if (!IsValidReconScope(req.scope) || req.bucket_mask == 0) {
++        LOCK(m_mutex);
++        ++m_stats.malformed_messages;
++        return;
++    }
++
++    const ReconScope scope = static_cast<ReconScope>(req.scope);
++    if ((req.salt_k0 != 0 || req.salt_k1 != 0) &&
++        !IsValidReconSipHashKey(scope, req.context_id, req.salt_k0,
++                                req.salt_k1)) {
++        LOCK(m_mutex);
++        ++m_stats.malformed_messages;
++        return;
++    }
++    if (req.salt_k0 == 0 && req.salt_k1 == 0) {
++        std::tie(req.salt_k0, req.salt_k1) =
++            DeriveReconSipHashKey(scope, req.context_id, 0);
++    }
++
++    {
++        LOCK(m_mutex);
++        ++m_stats.getmerklixbuck_received;
++    }
++
++    for (uint8_t b = 0; b < 16; ++b) {
++        if ((req.bucket_mask & (1U << b)) == 0) {
++            continue;
++        }
++        MerklixSubBucketSummary sub = BuildSubBucketSummary(
++            scope, req.context_id, req.salt_k0, req.salt_k1, b);
++        m_connman.PushMessage(&pfrom,
++                              NetMsg::Make(NetMsgType::MERKLIXBUCK, sub));
++    }
++}
++
++void V2PeerProtocolHandler::HandleMerklixBuck(
++    CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received) {
++    if (!CheckPeerRateLimit(pfrom.GetId(), time_received)) {
++        return;
++    }
++
++    MerklixSubBucketSummary sub;
++    try {
++        vRecv >> sub;
++    } catch (const std::exception &) {
++        LOCK(m_mutex);
++        ++m_stats.malformed_messages;
++        return;
++    }
++
++    if (!IsValidReconScope(sub.scope) || sub.parent_bucket >= 16) {
++        LOCK(m_mutex);
++        ++m_stats.malformed_messages;
++        return;
++    }
++
++    const ReconScope scope = static_cast<ReconScope>(sub.scope);
++    if ((sub.salt_k0 != 0 || sub.salt_k1 != 0) &&
++        !IsValidReconSipHashKey(scope, sub.context_id, sub.salt_k0,
++                                sub.salt_k1)) {
++        LOCK(m_mutex);
++        ++m_stats.malformed_messages;
++        return;
++    }
++    if (sub.salt_k0 == 0 && sub.salt_k1 == 0) {
++        std::tie(sub.salt_k0, sub.salt_k1) =
++            DeriveReconSipHashKey(scope, sub.context_id, 0);
++    }
++
++    {
++        LOCK(m_mutex);
++        ++m_stats.merklixbuck_received;
++    }
++
++    const MerklixSubBucketDiffResult diff = DiffSubBucketSummary(sub);
++    if (!diff.missing_short_ids.empty()) {
++        ShortTxRequest req;
++        req.scope = sub.scope;
++        req.context_id = sub.context_id;
++        req.salt_k0 = sub.salt_k0;
++        req.salt_k1 = sub.salt_k1;
++        req.short_ids = diff.missing_short_ids;
++        m_connman.PushMessage(&pfrom,
++                              NetMsg::Make(NetMsgType::GETSHORTTX, req));
++    }
++}
++
++void V2PeerProtocolHandler::HandleGetShortTx(
++    CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received) {
++    if (!CheckPeerRateLimit(pfrom.GetId(), time_received)) {
++        return;
++    }
++
++    ShortTxRequest req;
++    try {
++        vRecv >> req;
++    } catch (const std::exception &) {
++        LOCK(m_mutex);
++        ++m_stats.malformed_messages;
++        return;
++    }
++
++    if (!IsValidReconScope(req.scope) || req.short_ids.empty() ||
++        req.short_ids.size() > ShortTxRequest::MAX_SHORT_IDS) {
++        LOCK(m_mutex);
++        ++m_stats.malformed_messages;
++        return;
++    }
++
++    const ReconScope scope = static_cast<ReconScope>(req.scope);
++    if ((req.salt_k0 != 0 || req.salt_k1 != 0) &&
++        !IsValidReconSipHashKey(scope, req.context_id, req.salt_k0,
++                                req.salt_k1)) {
++        LOCK(m_mutex);
++        ++m_stats.malformed_messages;
++        return;
++    }
++    if (req.salt_k0 == 0 && req.salt_k1 == 0) {
++        std::tie(req.salt_k0, req.salt_k1) =
++            DeriveReconSipHashKey(scope, req.context_id, 0);
++    }
++
++    {
++        LOCK(m_mutex);
++        ++m_stats.getshorttx_received;
++    }
++
++    std::vector<CTransactionRef> resolved = ResolveShortIds(
++        scope, req.context_id, req.salt_k0, req.salt_k1, req.short_ids);
++    if (!resolved.empty()) {
++        ShortTxResponse resp;
++        resp.scope = req.scope;
++        resp.context_id = req.context_id;
++        resp.txs = std::move(resolved);
++        m_connman.PushMessage(&pfrom, NetMsg::Make(NetMsgType::SHORTTX, resp));
++    }
++}
++
++void V2PeerProtocolHandler::HandleShortTx(
++    CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received) {
++    if (!CheckPeerRateLimit(pfrom.GetId(), time_received)) {
++        return;
++    }
++
++    ShortTxResponse resp;
++    try {
++        vRecv >> resp;
++    } catch (const std::exception &) {
++        LOCK(m_mutex);
++        ++m_stats.malformed_messages;
++        return;
++    }
++
++    if (!IsValidReconScope(resp.scope) || resp.txs.empty() ||
++        resp.txs.size() > ShortTxResponse::MAX_TXS) {
++        LOCK(m_mutex);
++        ++m_stats.malformed_messages;
++        return;
++    }
++
++    for (const auto &tx : resp.txs) {
++        if (!tx || tx->IsNull() || tx->IsCoinBase()) {
++            LOCK(m_mutex);
++            ++m_stats.malformed_messages;
++            return;
++        }
++    }
++
++    {
++        LOCK(m_mutex);
++        ++m_stats.shorttx_received;
++    }
++
++    // Defect D2: Validate each transaction via ProcessTransaction (or check
++    // m_mempool) BEFORE inserting into m_scoped_txs so invalid transactions
++    // never pollute reconciliation state!
++    const ReconScope scope = static_cast<ReconScope>(resp.scope);
++    std::vector<CTransactionRef> valid_txs;
++    std::vector<TxId> accepted_txids;
++    valid_txs.reserve(resp.txs.size());
++    {
++        LOCK(cs_main);
++        for (const auto &tx : resp.txs) {
++            if (m_mempool.exists(tx->GetId())) {
++                valid_txs.push_back(tx);
++                continue;
++            }
++            const MempoolAcceptResult res =
++                m_chainman.ProcessTransaction(tx, /*test_accept=*/false);
++            if (res.m_result_type == MempoolAcceptResult::ResultType::VALID) {
++                valid_txs.push_back(tx);
++                accepted_txids.push_back(tx->GetId());
++            }
++        }
++    }
++
++    if (!valid_txs.empty()) {
++        std::vector<CTransactionRef> merged =
++            GetScopedTransactions(scope, resp.context_id);
++        merged.insert(merged.end(), valid_txs.begin(), valid_txs.end());
++        SetScopedTransactions(scope, resp.context_id, std::move(merged));
++    }
++
++    if (scope == ReconScope::LIVE_MEMPOOL) {
++        for (const TxId &txid : accepted_txids) {
++            m_peerman.RelayTransaction(txid);
++        }
++    }
++}
++
++V2ProtocolHandlerStats V2PeerProtocolHandler::GetStats() const {
++    LOCK(m_mutex);
++    return m_stats;
++}
++
++std::optional<CInv> V2PeerProtocolHandler::GetLastFallbackInv() const {
++    LOCK(m_mutex);
++    return m_last_fallback_inv;
++}
++
++} // namespace lotus::v2::net
+diff --git a/src/net/v2_protocol_handler.h b/src/net/v2_protocol_handler.h
+new file mode 100644
+index 0000000000..4aa39dc72b
+--- /dev/null
++++ b/src/net/v2_protocol_handler.h
+@@ -0,0 +1,488 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_NET_V2_PROTOCOL_HANDLER_H
++#define BITCOIN_NET_V2_PROTOCOL_HANDLER_H
++
++#include <blockencodings.h>
++#include <lotus_v2/commitment.h>
++#include <net.h>
++#include <primitives/block.h>
++#include <primitives/transaction.h>
++#include <protocol.h>
++#include <serialize.h>
++#include <streams.h>
++#include <sync.h>
++#include <uint256.h>
++
++#include <array>
++#include <chrono>
++#include <cstdint>
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++class ChainstateManager;
++class CTxMemPool;
++class PeerManager;
++
++namespace lotus::v2::net {
++
++/**
++ * Scope tag for generalized Merklix set reconciliation.
++ */
++enum class ReconScope : uint8_t {
++    LIVE_MEMPOOL = 0x01,
++    EPOCH_BATCH = 0x02,
++    BLOCK_RECON = 0x03,
++    AVA_CONFLICT_SET = 0x04,
++};
++
++constexpr bool IsValidReconScope(uint8_t raw) noexcept {
++    return raw >= static_cast<uint8_t>(ReconScope::LIVE_MEMPOOL) &&
++           raw <= static_cast<uint8_t>(ReconScope::AVA_CONFLICT_SET);
++}
++
++/**
++ * Deterministically derive the 128-bit SipHash key (k0, k1) for Merklix set
++ * reconciliation from (scope, context_id, epoch_or_nonce) using tagged BLAKE3.
++ */
++std::pair<uint64_t, uint64_t>
++DeriveReconSipHashKey(ReconScope scope, const uint256 &context_id,
++                      uint64_t epoch_or_nonce = 0) noexcept;
++
++/**
++ * Check whether (salt_k0, salt_k1) is a valid deterministically derived key
++ * for (scope, context_id).
++ */
++bool IsValidReconSipHashKey(ReconScope scope, const uint256 &context_id,
++                            uint64_t salt_k0, uint64_t salt_k1) noexcept;
++
++/**
++ * Compute the 256-bit SubtreeA Merklix root over a CTOR-normalized set of
++ * non-coinbase transactions.
++ */
++uint256 ComputeScopedMerklixRoot(const std::vector<CTransactionRef> &txs);
++
++/**
++ * Compute the 256-bit block TransactionRoot in O(1) from a coinbase
++ * transaction and a precomputed SubtreeA root.
++ */
++uint256 ComputeV2TxRootFromSubtreeA(const CTransaction &coinbase_tx,
++                                    const lotus::v2::Hash &subtree_a_root);
++
++/**
++ * Precomputed candidate overlay entry storing normalized non-coinbase
++ * transactions alongside their precomputed SubtreeA Merklix root.
++ */
++struct CandidateOverlayEntry {
++    std::vector<CTransactionRef> txs;
++    lotus::v2::Hash subtree_a_root{};
++};
++
++/**
++ * Depth-4 bucket entry in MerklixSyncSummary (12 bytes serialized).
++ */
++struct MerklixBucketEntry {
++    uint32_t count{0};
++    uint64_t xor_short_id{0};
++
++    friend bool operator==(const MerklixBucketEntry &a,
++                           const MerklixBucketEntry &b) noexcept {
++        return a.count == b.count && a.xor_short_id == b.xor_short_id;
++    }
++
++    SERIALIZE_METHODS(MerklixBucketEntry, obj) {
++        READWRITE(obj.count, obj.xor_short_id);
++    }
++};
++
++/**
++ * Depth-4 Merklix sync summary (merklixsync message).
++ * Contains 16 top-level prefix buckets (4-bit nibbles 0x0..0xF) and the
++ * 256-bit candidate_root commitment.
++ */
++struct MerklixSyncSummary {
++    uint8_t scope{static_cast<uint8_t>(ReconScope::LIVE_MEMPOOL)};
++    uint256 context_id{};
++    uint64_t salt_k0{0};
++    uint64_t salt_k1{0};
++    uint256 candidate_root{};
++    std::array<MerklixBucketEntry, 16> buckets{};
++
++    SERIALIZE_METHODS(MerklixSyncSummary, obj) {
++        READWRITE(obj.scope, obj.context_id, obj.salt_k0, obj.salt_k1,
++                  obj.candidate_root);
++        for (auto &b : obj.buckets) {
++            READWRITE(b);
++        }
++    }
++};
++
++/**
++ * Request for depth-8 sub-bucket algebraic syndromes (getmerklixbuck message)
++ * for the mismatched depth-4 buckets indicated by bucket_mask.
++ */
++struct MerklixBucketRequest {
++    uint8_t scope{static_cast<uint8_t>(ReconScope::LIVE_MEMPOOL)};
++    uint256 context_id{};
++    uint64_t salt_k0{0};
++    uint64_t salt_k1{0};
++    uint16_t bucket_mask{0};
++
++    SERIALIZE_METHODS(MerklixBucketRequest, obj) {
++        READWRITE(obj.scope, obj.context_id, obj.salt_k0, obj.salt_k1,
++                  obj.bucket_mask);
++    }
++};
++
++/**
++ * Depth-8 sub-bucket entry with 2-power-sum algebraic syndromes over GF(2^64):
++ * s1 = XOR_i x_i
++ * s3 = XOR_i (x_i)^3 in GF(2^64)
++ */
++struct MerklixSubBucketEntry {
++    uint16_t count{0};
++    uint64_t s1{0};
++    uint64_t s3{0};
++
++    friend bool operator==(const MerklixSubBucketEntry &a,
++                           const MerklixSubBucketEntry &b) noexcept {
++        return a.count == b.count && a.s1 == b.s1 && a.s3 == b.s3;
++    }
++
++    SERIALIZE_METHODS(MerklixSubBucketEntry, obj) {
++        READWRITE(obj.count, obj.s1, obj.s3);
++    }
++};
++
++/**
++ * Depth-8 sub-bucket summary (merklixbuck message) for a single depth-4
++ * parent_bucket (0..15).
++ */
++struct MerklixSubBucketSummary {
++    uint8_t scope{static_cast<uint8_t>(ReconScope::LIVE_MEMPOOL)};
++    uint256 context_id{};
++    uint64_t salt_k0{0};
++    uint64_t salt_k1{0};
++    uint8_t parent_bucket{0};
++    std::array<MerklixSubBucketEntry, 16> sub_buckets{};
++
++    SERIALIZE_METHODS(MerklixSubBucketSummary, obj) {
++        READWRITE(obj.scope, obj.context_id, obj.salt_k0, obj.salt_k1,
++                  obj.parent_bucket);
++        for (auto &sb : obj.sub_buckets) {
++            READWRITE(sb);
++        }
++    }
++};
++
++/**
++ * Request for missing transactions by 64-bit salted short IDs (getshorttx).
++ */
++struct ShortTxRequest {
++    static constexpr size_t MAX_SHORT_IDS = 4096;
++
++    uint8_t scope{static_cast<uint8_t>(ReconScope::LIVE_MEMPOOL)};
++    uint256 context_id{};
++    uint64_t salt_k0{0};
++    uint64_t salt_k1{0};
++    std::vector<uint64_t> short_ids;
++
++    SERIALIZE_METHODS(ShortTxRequest, obj) {
++        READWRITE(obj.scope, obj.context_id, obj.salt_k0, obj.salt_k1,
++                  obj.short_ids);
++    }
++};
++
++/**
++ * Response carrying transactions matching a ShortTxRequest (shorttx).
++ */
++struct ShortTxResponse {
++    static constexpr size_t MAX_TXS = 4096;
++
++    uint8_t scope{static_cast<uint8_t>(ReconScope::LIVE_MEMPOOL)};
++    uint256 context_id{};
++    std::vector<CTransactionRef> txs;
++
++    SERIALIZE_METHODS(ShortTxResponse, obj) {
++        READWRITE(obj.scope, obj.context_id,
++                  Using<VectorFormatter<TransactionCompression>>(obj.txs));
++    }
++};
++
++/**
++ * GF(2^64) arithmetic modulo P(z) = z^64 + z^4 + z^3 + z + 1 (0x1b).
++ * Used for 2-element syndrome decoding in MerklixSubBucketSummary.
++ */
++uint64_t GF64Mul(uint64_t a, uint64_t b) noexcept;
++uint64_t GF64Square(uint64_t a) noexcept;
++uint64_t GF64Cube(uint64_t a) noexcept;
++uint64_t GF64Inv(uint64_t a) noexcept;
++
++/**
++ * Solve y^2 ^ y = c in GF(2^64). Returns true and sets y_out if a solution
++ * exists in GF(2^64) (i.e. Tr(c) == 0).
++ */
++bool GF64SolveQuadratic(uint64_t c, uint64_t &y_out) noexcept;
++
++/**
++ * Recover 1 or 2 symmetric-difference elements {x1[, x2]} from GF(2^64)
++ * power-sum syndrome deltas delta_s1 = x1 ^ x2 and delta_s3 = x1^3 ^ x2^3.
++ * Returns empty vector if delta_s1 == 0 && delta_s3 == 0, or nullopt if the
++ * difference contains > 2 elements.
++ */
++std::optional<std::vector<uint64_t>>
++RecoverGF64Syndromes(uint64_t delta_s1, uint64_t delta_s3) noexcept;
++
++/**
++ * Compute non-zero 64-bit SipHash short ID for a transaction ID.
++ */
++uint64_t ComputeMerklixShortId(uint64_t salt_k0, uint64_t salt_k1,
++                               const TxId &txid) noexcept;
++
++/**
++ * Extract depth-4 bucket index (0..15) and depth-8 sub-bucket index (0..15)
++ * from a canonical TxId.
++ */
++inline uint8_t GetMerklixBucketIndex(const TxId &txid) noexcept {
++    return static_cast<uint8_t>(txid.begin()[0] >> 4) & 0x0f;
++}
++
++inline uint8_t GetMerklixSubBucketIndex(const TxId &txid) noexcept {
++    return static_cast<uint8_t>(txid.begin()[0]) & 0x0f;
++}
++
++/**
++ * Result of comparing a remote MerklixSyncSummary against a local transaction
++ * set.
++ */
++struct MerklixSyncDiffResult {
++    //! True iff the 256-bit candidate_root matched our local scoped root.
++    bool root_matched{false};
++    //! Bitmask of depth-4 buckets (0..15) needing depth-8 sub-bucket syndromes.
++    uint16_t mismatched_bucket_mask{0};
++    //! Short IDs of single-tx bucket differences immediately identified as
++    //! missing locally.
++    std::vector<uint64_t> single_missing_short_ids;
++};
++
++/**
++ * Result of comparing a remote MerklixSubBucketSummary against a local
++ * transaction set for parent_bucket.
++ */
++struct MerklixSubBucketDiffResult {
++    //! Short IDs recovered via 1-tx or 2-tx GF(2^64) syndromes that are
++    //! missing locally.
++    std::vector<uint64_t> missing_short_ids;
++    //! Sub-bucket indices (0..15) whose differences exceeded 2 elements.
++    std::vector<uint8_t> unresolved_sub_buckets;
++};
++
++/**
++ * Telemetry / inspection counters for V2PeerProtocolHandler.
++ */
++struct V2ProtocolHandlerStats {
++    uint64_t sealedheader_received{0};
++    uint64_t sealedheader_reconstructed{0};
++    uint64_t sealedheader_fallback_getdata{0};
++    uint64_t sealedheader_invalid{0};
++    uint64_t sealedheader_rejected{0};
++    uint64_t merklixsync_received{0};
++    uint64_t getmerklixbuck_received{0};
++    uint64_t merklixbuck_received{0};
++    uint64_t getshorttx_received{0};
++    uint64_t shorttx_received{0};
++    uint64_t rate_limited_messages{0};
++    uint64_t malformed_messages{0};
++};
++
++/**
++ * Constructor-injected handler for Lotus V2 P2P protocol messages:
++ * - SealedHeader ("sealedheader") fast-path O(1) block reconstruction and
++ *   automatic getdata fallback.
++ * - Generalized Merklix Set Reconciliation ("merklixsync", "getmerklixbuck",
++ *   "merklixbuck", "getshorttx", "shorttx") across LIVE_MEMPOOL, EPOCH_BATCH,
++ *   BLOCK_RECON, and AVA_CONFLICT_SET scopes.
++ */
++class V2PeerProtocolHandler {
++public:
++    static constexpr size_t MAX_SYNC_MESSAGES_PER_WINDOW = 32;
++    static constexpr std::chrono::milliseconds RATE_LIMIT_WINDOW{1000};
++    static constexpr size_t MAX_SEALEDHEADER_COINBASE_BYTES = 10000;
++    static constexpr size_t MAX_TRACKED_RECON_SCOPES = 64;
++    static constexpr size_t MAX_SCOPED_TXS = 4096;
++
++    V2PeerProtocolHandler(ChainstateManager &chainman, CTxMemPool &mempool,
++                          CConnman &connman, PeerManager &peerman);
++
++    /**
++     * Dispatch V2 protocol messages. Returns true if msg_type was handled by
++     * V2PeerProtocolHandler, false if PeerManagerImpl should continue normal
++     * V1/legacy processing.
++     */
++    bool TryHandleMessage(CNode &pfrom, const std::string &msg_type,
++                          DataStream &vRecv,
++                          std::chrono::microseconds time_received)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    void HandleSealedHeader(CNode &pfrom, DataStream &vRecv)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    void HandleMerklixSync(CNode &pfrom, DataStream &vRecv,
++                           std::chrono::microseconds time_received)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    void HandleGetMerklixBuck(CNode &pfrom, DataStream &vRecv,
++                              std::chrono::microseconds time_received)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    void HandleMerklixBuck(CNode &pfrom, DataStream &vRecv,
++                           std::chrono::microseconds time_received)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    void HandleGetShortTx(CNode &pfrom, DataStream &vRecv,
++                          std::chrono::microseconds time_received)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    void HandleShortTx(CNode &pfrom, DataStream &vRecv,
++                       std::chrono::microseconds time_received)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /**
++     * Register a candidate transaction overlay for O(1) sealedheader
++     * reconstruction keyed by the parent block hash (or block merkle root).
++     * Precomputes subtree_a_root once via lotus::v2::BuildTxSubtreeA.
++     */
++    void RegisterCandidateOverlay(const BlockHash &prev_block_hash,
++                                  std::vector<CTransactionRef> txs)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /**
++     * Clear all registered candidate overlays.
++     */
++    void ClearCandidateOverlays() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /**
++     * Attempt O(1) reconstruction of a full CBlock from a SealedHeader
++     * against registered candidate overlays or the local CTOR mempool.
++     * Verifies both header.hashMerkleRoot and header.hashStateRoot.
++     */
++    std::shared_ptr<const CBlock>
++    MatchCandidateOverlay(const CBlockHeader &header,
++                          const CTransactionRef &coinbase_tx) const
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /**
++     * Register or update the local transaction set for a specific
++     * (ReconScope, context_id) pair. For LIVE_MEMPOOL with a null context_id,
++     * the handler also reads directly from m_mempool when no explicit set is
++     * registered.
++     */
++    void SetScopedTransactions(ReconScope scope, const uint256 &context_id,
++                               std::vector<CTransactionRef> txs)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /**
++     * Retrieve the current local transactions for (scope, context_id).
++     */
++    std::vector<CTransactionRef>
++    GetScopedTransactions(ReconScope scope, const uint256 &context_id) const
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /**
++     * Build a depth-4 MerklixSyncSummary over the local transaction set for
++     * (scope, context_id) using the given SipHash salt.
++     */
++    MerklixSyncSummary BuildSyncSummary(ReconScope scope,
++                                        const uint256 &context_id,
++                                        uint64_t salt_k0 = 0,
++                                        uint64_t salt_k1 = 0) const
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /**
++     * Compare a remote MerklixSyncSummary against our local set.
++     */
++    MerklixSyncDiffResult
++    DiffSyncSummary(const MerklixSyncSummary &remote_summary) const
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /**
++     * Build a depth-8 MerklixSubBucketSummary for parent_bucket (0..15).
++     */
++    MerklixSubBucketSummary BuildSubBucketSummary(ReconScope scope,
++                                                  const uint256 &context_id,
++                                                  uint64_t salt_k0,
++                                                  uint64_t salt_k1,
++                                                  uint8_t parent_bucket) const
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /**
++     * Compare a remote MerklixSubBucketSummary against our local set and
++     * recover missing short IDs via 1-tx and 2-tx GF(2^64) syndromes.
++     */
++    MerklixSubBucketDiffResult
++    DiffSubBucketSummary(const MerklixSubBucketSummary &remote_sub) const
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /**
++     * Resolve a list of short IDs against our local transaction set for
++     * (scope, context_id).
++     */
++    std::vector<CTransactionRef>
++    ResolveShortIds(ReconScope scope, const uint256 &context_id,
++                    uint64_t salt_k0, uint64_t salt_k1,
++                    const std::vector<uint64_t> &short_ids) const
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    V2ProtocolHandlerStats GetStats() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    std::optional<CInv> GetLastFallbackInv() const
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++private:
++    bool CheckPeerRateLimit(NodeId peer_id,
++                            std::chrono::microseconds time_received)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    ChainstateManager &m_chainman;
++    CTxMemPool &m_mempool;
++    CConnman &m_connman;
++    PeerManager &m_peerman;
++
++    mutable Mutex m_mutex;
++    std::map<BlockHash, std::vector<CandidateOverlayEntry>>
++        m_candidate_overlays GUARDED_BY(m_mutex);
++
++    struct ScopeKey {
++        ReconScope scope;
++        uint256 context_id;
++
++        bool operator<(const ScopeKey &other) const noexcept {
++            if (scope != other.scope) {
++                return static_cast<uint8_t>(scope) <
++                       static_cast<uint8_t>(other.scope);
++            }
++            return context_id < other.context_id;
++        }
++    };
++    struct ScopedTxSetEntry {
++        std::vector<CTransactionRef> txs;
++        lotus::v2::Hash subtree_a_root{};
++    };
++    std::map<ScopeKey, ScopedTxSetEntry>
++        m_scoped_txs GUARDED_BY(m_mutex);
++
++    struct PeerRateState {
++        std::chrono::microseconds window_start{0};
++        size_t count{0};
++    };
++    std::unordered_map<NodeId, PeerRateState>
++        m_peer_rates GUARDED_BY(m_mutex);
++
++    V2ProtocolHandlerStats m_stats GUARDED_BY(m_mutex);
++    std::optional<CInv> m_last_fallback_inv GUARDED_BY(m_mutex);
++};
++
++} // namespace lotus::v2::net
++
++#endif // BITCOIN_NET_V2_PROTOCOL_HANDLER_H
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index c05f46fd03..cf2f44c84b 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -5,6 +5,8 @@
+ 
+ #include <net_processing.h>
+ 
++#include <net/v2_protocol_handler.h>
++
+ #include <addrman.h>
+ #include <avalanche/compactproofs.h>
+ #include <avalanche/peermanager.h>
+@@ -877,6 +879,9 @@ public:
+                                  !m_headers_presync_mutex, g_msgproc_mutex);
+     void UpdateLastBlockAnnounceTime(NodeId node,
+                                      int64_t time_in_seconds) override;
++    lotus::v2::net::V2PeerProtocolHandler *GetV2ProtocolHandler() override {
++        return &m_v2_protocol_handler;
++    }
+ 
+ private:
+     /**
+@@ -1410,6 +1415,8 @@ private:
+                       std::chrono::seconds average_interval)
+         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+ 
++    lotus::v2::net::V2PeerProtocolHandler m_v2_protocol_handler;
++
+     // All of the following cache a recent block, and are protected by
+     // m_most_recent_block_mutex
+     mutable Mutex m_most_recent_block_mutex;
+@@ -2908,7 +2915,8 @@ PeerManagerImpl::PeerManagerImpl(CConnman &connman, AddrMan &addrman,
+       m_fee_filter_rounder{CFeeRate{DEFAULT_MIN_RELAY_TX_FEE_PER_KB}, m_rng},
+       m_chainparams(chainman.GetParams()), m_connman(connman),
+       m_addrman(addrman), m_banman(banman), m_chainman(chainman),
+-      m_mempool(pool), m_avalanche(avalanche), m_opts{opts} {}
++      m_mempool(pool), m_avalanche(avalanche), m_opts{opts},
++      m_v2_protocol_handler{m_chainman, m_mempool, m_connman, *this} {}
+ 
+ void PeerManagerImpl::StartScheduledTasks(CScheduler &scheduler) {
+     // Stale tip checking and peer eviction are on two different timers, but we
+@@ -3523,6 +3531,11 @@ void PeerManagerImpl::ProcessGetBlockData(const Config &config, CNode &pfrom,
+             } else {
+                 MakeAndPushMessage(pfrom, NetMsgType::BLOCK, *pblock);
+             }
++        } else if (inv.IsMsgSealedHeader()) {
++            if (!pblock->vtx.empty()) {
++                SealedHeader sealed(*pblock);
++                MakeAndPushMessage(pfrom, NetMsgType::SEALEDHEADER, sealed);
++            }
+         }
+     }
+ 
+@@ -5251,6 +5264,11 @@ void PeerManagerImpl::ProcessMessage(
+         return;
+     }
+ 
++    if (m_v2_protocol_handler.TryHandleMessage(pfrom, msg_type, vRecv,
++                                               time_received)) {
++        return;
++    }
++
+     if (msg_type == NetMsgType::ADDR || msg_type == NetMsgType::ADDRV2) {
+         const auto ser_params{
+             msg_type == NetMsgType::ADDRV2
+diff --git a/src/net_processing.h b/src/net_processing.h
+index 1f01c21441..ab0964bc52 100644
+--- a/src/net_processing.h
++++ b/src/net_processing.h
+@@ -16,6 +16,10 @@ struct ProofId;
+ class Processor;
+ } // namespace avalanche
+ 
++namespace lotus::v2::net {
++class V2PeerProtocolHandler;
++} // namespace lotus::v2::net
++
+ class AddrMan;
+ class CTxMemPool;
+ class ChainstateManager;
+@@ -158,6 +162,11 @@ public:
+      */
+     virtual void UpdateLastBlockAnnounceTime(NodeId node,
+                                              int64_t time_in_seconds) = 0;
++
++    /** Accessor for the V2 P2P protocol handler. */
++    virtual lotus::v2::net::V2PeerProtocolHandler *GetV2ProtocolHandler() {
++        return nullptr;
++    }
+ };
+ 
+ #endif // BITCOIN_NET_PROCESSING_H
+diff --git a/src/protocol.cpp b/src/protocol.cpp
+index 87b157ba67..d3bb27c3a0 100644
+--- a/src/protocol.cpp
++++ b/src/protocol.cpp
+@@ -56,11 +56,18 @@ const char *GETAVAADDR = "getavaaddr";
+ const char *GETAVAPROOFS = "getavaproofs";
+ const char *AVAPROOFS = "avaproofs";
+ const char *AVAPROOFSREQ = "avaproofsreq";
++const char *TMPLBLOCK = "tmplblock";
++const char *MERKLIXSYNC = "merklixsync";
++const char *GETMERKLIXBUCK = "getmerklixbuck";
++const char *MERKLIXBUCK = "merklixbuck";
++const char *GETSHORTTX = "getshorttx";
++const char *SHORTTX = "shorttx";
+ 
+ bool IsBlockLike(const std::string &strCommand) {
+     return strCommand == NetMsgType::BLOCK ||
+            strCommand == NetMsgType::CMPCTBLOCK ||
+-           strCommand == NetMsgType::BLOCKTXN;
++           strCommand == NetMsgType::BLOCKTXN ||
++           strCommand == NetMsgType::TMPLBLOCK;
+ }
+ }; // namespace NetMsgType
+ 
+@@ -69,20 +76,30 @@ bool IsBlockLike(const std::string &strCommand) {
+  * above and in protocol.h.
+  */
+ static const std::string allNetMessageTypes[] = {
+-    NetMsgType::VERSION,     NetMsgType::VERACK,       NetMsgType::ADDR,
+-    NetMsgType::ADDRV2,      NetMsgType::SENDADDRV2,   NetMsgType::INV,
+-    NetMsgType::GETDATA,     NetMsgType::MERKLEBLOCK,  NetMsgType::GETBLOCKS,
+-    NetMsgType::GETHEADERS,  NetMsgType::TX,           NetMsgType::HEADERS,
+-    NetMsgType::BLOCK,       NetMsgType::GETADDR,      NetMsgType::MEMPOOL,
+-    NetMsgType::PING,        NetMsgType::PONG,         NetMsgType::NOTFOUND,
+-    NetMsgType::FILTERLOAD,  NetMsgType::FILTERADD,    NetMsgType::FILTERCLEAR,
+-    NetMsgType::SENDHEADERS, NetMsgType::FEEFILTER,    NetMsgType::SENDCMPCT,
+-    NetMsgType::CMPCTBLOCK,  NetMsgType::GETBLOCKTXN,  NetMsgType::BLOCKTXN,
+-    NetMsgType::GETCFILTERS, NetMsgType::CFILTER,      NetMsgType::GETCFHEADERS,
+-    NetMsgType::CFHEADERS,   NetMsgType::GETCFCHECKPT, NetMsgType::CFCHECKPT,
+-    NetMsgType::AVAHELLO,    NetMsgType::AVAPOLL,      NetMsgType::AVARESPONSE,
+-    NetMsgType::AVAPROOF,    NetMsgType::GETAVAADDR,   NetMsgType::GETAVAPROOFS,
+-    NetMsgType::AVAPROOFS,   NetMsgType::AVAPROOFSREQ,
++    NetMsgType::VERSION,       NetMsgType::VERACK,
++    NetMsgType::ADDR,          NetMsgType::ADDRV2,
++    NetMsgType::SENDADDRV2,    NetMsgType::INV,
++    NetMsgType::GETDATA,       NetMsgType::MERKLEBLOCK,
++    NetMsgType::GETBLOCKS,     NetMsgType::GETHEADERS,
++    NetMsgType::TX,            NetMsgType::HEADERS,
++    NetMsgType::BLOCK,         NetMsgType::GETADDR,
++    NetMsgType::MEMPOOL,       NetMsgType::PING,
++    NetMsgType::PONG,          NetMsgType::NOTFOUND,
++    NetMsgType::FILTERLOAD,    NetMsgType::FILTERADD,
++    NetMsgType::FILTERCLEAR,   NetMsgType::SENDHEADERS,
++    NetMsgType::FEEFILTER,     NetMsgType::SENDCMPCT,
++    NetMsgType::CMPCTBLOCK,    NetMsgType::GETBLOCKTXN,
++    NetMsgType::BLOCKTXN,      NetMsgType::GETCFILTERS,
++    NetMsgType::CFILTER,       NetMsgType::GETCFHEADERS,
++    NetMsgType::CFHEADERS,     NetMsgType::GETCFCHECKPT,
++    NetMsgType::CFCHECKPT,     NetMsgType::AVAHELLO,
++    NetMsgType::AVAPOLL,       NetMsgType::AVARESPONSE,
++    NetMsgType::AVAPROOF,      NetMsgType::GETAVAADDR,
++    NetMsgType::GETAVAPROOFS,  NetMsgType::AVAPROOFS,
++    NetMsgType::AVAPROOFSREQ,  NetMsgType::TMPLBLOCK,
++    NetMsgType::MERKLIXSYNC,   NetMsgType::GETMERKLIXBUCK,
++    NetMsgType::MERKLIXBUCK,   NetMsgType::GETSHORTTX,
++    NetMsgType::SHORTTX,
+ };
+ static const std::vector<std::string>
+     allNetMessageTypesVec(std::begin(allNetMessageTypes),
+@@ -106,8 +123,10 @@ CMessageHeader::CMessageHeader(const MessageMagic &pchMessageStartIn,
+         m_msg_type[i] = msg_type[i];
+     }
+     // Assert that the message type name passed in is not longer than
+-    // MESSAGE_TYPE_SIZE
+-    assert(msg_type[i] == 0);
++    // MESSAGE_TYPE_SIZE (except GETMERKLIXBUCK which fits the 12-byte wire
++    // header as "getmerklixbu" and expands in GetMessageType()).
++    assert(msg_type[i] == 0 ||
++           strcmp(msg_type, NetMsgType::GETMERKLIXBUCK) == 0);
+     for (; i < m_msg_type.size(); ++i) {
+         m_msg_type[i] = 0;
+     }
+@@ -117,9 +136,13 @@ CMessageHeader::CMessageHeader(const MessageMagic &pchMessageStartIn,
+ }
+ 
+ std::string CMessageHeader::GetMessageType() const {
+-    return std::string(m_msg_type.data(),
+-                       m_msg_type.data() +
+-                           strnlen(m_msg_type.data(), MESSAGE_TYPE_SIZE));
++    std::string type(m_msg_type.data(),
++                     m_msg_type.data() +
++                         strnlen(m_msg_type.data(), MESSAGE_TYPE_SIZE));
++    if (type == "getmerklixbu") {
++        return NetMsgType::GETMERKLIXBUCK;
++    }
++    return type;
+ }
+ 
+ bool CMessageHeader::IsMessageTypeValid() const {
+@@ -176,6 +199,8 @@ std::string CInv::GetMessageType() const {
+             return cmd.append(NetMsgType::MERKLEBLOCK);
+         case MSG_CMPCT_BLOCK:
+             return cmd.append(NetMsgType::CMPCTBLOCK);
++        case MSG_SEALED_HEADER:
++            return cmd.append(NetMsgType::SEALEDHEADER);
+         case MSG_AVA_PROOF:
+             return cmd.append(NetMsgType::AVAPROOF);
+         case MSG_AVA_STAKE_CONTENDER:
+diff --git a/src/protocol.h b/src/protocol.h
+index 11f27dc567..3142c256f1 100644
+--- a/src/protocol.h
++++ b/src/protocol.h
+@@ -318,6 +318,39 @@ extern const char *AVAPROOFS;
+  */
+ extern const char *AVAPROOFSREQ;
+ 
++/**
++ * Contains a SealedHeader (header + coinbase_tx) for O(1) V2 block
++ * relay when candidate transactions are already reconciled in the local
++ * mempool or candidate overlay.
++ */
++extern const char *SEALEDHEADER;
++
++/**
++ * Transmits a depth-4 Merklix sync summary (16 buckets) for set reconciliation.
++ */
++extern const char *MERKLIXSYNC;
++
++/**
++ * Requests depth-8 sub-bucket algebraic syndromes for mismatched depth-4
++ * buckets.
++ */
++extern const char *GETMERKLIXBUCK;
++
++/**
++ * Transmits depth-8 sub-bucket algebraic syndromes (count, s1, s3 over GF(2^64)).
++ */
++extern const char *MERKLIXBUCK;
++
++/**
++ * Requests transactions by 64-bit short IDs recovered from Merklix syndromes.
++ */
++extern const char *GETSHORTTX;
++
++/**
++ * Transmits transactions in response to a getshorttx request.
++ */
++extern const char *SHORTTX;
++
+ /**
+  * Indicate if the message is used to transmit the content of a block.
+  * These messages can be significantly larger than usual messages and therefore
+@@ -577,6 +610,8 @@ enum GetDataMsg {
+     MSG_FILTERED_BLOCK = 3,
+     //! Defined in BIP152
+     MSG_CMPCT_BLOCK = 4,
++    //! V2 Sealed Header (header + coinbase_tx)
++    MSG_SEALED_HEADER = 5,
+     MSG_AVA_PROOF = 0x1f000001,
+     MSG_AVA_STAKE_CONTENDER = 0x1f000002,
+ };
+@@ -629,11 +664,15 @@ public:
+         auto k = GetKind();
+         return k == MSG_CMPCT_BLOCK;
+     }
++    bool IsMsgSealedHeader() const {
++        auto k = GetKind();
++        return k == MSG_SEALED_HEADER;
++    }
+ 
+     bool IsGenBlkMsg() const {
+         auto k = GetKind();
+         return k == MSG_BLOCK || k == MSG_FILTERED_BLOCK ||
+-               k == MSG_CMPCT_BLOCK;
++               k == MSG_CMPCT_BLOCK || k == MSG_SEALED_HEADER;
+     }
+ };
+ 
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 7fc4067cc9..ac0db01c35 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -267,6 +267,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		validation_flush_tests.cpp
+ 		validation_tests.cpp
+ 		validationinterface_tests.cpp
++		v2_protocol_handler_tests.cpp
+ 		blockindex_comparator_tests.cpp
+ 
+ 		# RPC Tests
+diff --git a/src/test/blockencodings_tests.cpp b/src/test/blockencodings_tests.cpp
+index 5a98b80676..9ee4ae7aa4 100644
+--- a/src/test/blockencodings_tests.cpp
++++ b/src/test/blockencodings_tests.cpp
+@@ -728,4 +728,34 @@ BOOST_AUTO_TEST_CASE(compactblock_overflow) {
+     }
+ }
+ 
++BOOST_AUTO_TEST_CASE(SealedHeaderRoundTripTest) {
++    auto rand_ctx(FastRandomContext(uint256{99}));
++    CBlock block(BuildBlockTestCase(rand_ctx));
++    // Mark vtx[0] as a proper coinbase transaction (null prevout).
++    CMutableTransaction cb_mtx(*block.vtx[0]);
++    cb_mtx.vin.resize(1);
++    cb_mtx.vin[0].prevout = COutPoint();
++    block.vtx[0] = MakeTransactionRef(cb_mtx);
++
++    SealedHeader sealed(block);
++    BOOST_CHECK(sealed.IsValid());
++    BOOST_CHECK_EQUAL(sealed.header.GetHash(), block.GetHash());
++    BOOST_CHECK_EQUAL(sealed.coinbase_tx->GetId(), block.vtx[0]->GetId());
++
++    DataStream ss{};
++    ss << sealed;
++
++    SealedHeaderAnnounce decoded;
++    ss >> decoded;
++    BOOST_CHECK(decoded.IsValid());
++    BOOST_CHECK_EQUAL(decoded.header.GetHash(), block.GetHash());
++    BOOST_CHECK_EQUAL(decoded.header.hashMerkleRoot, block.hashMerkleRoot);
++    BOOST_CHECK_EQUAL(decoded.header.hashStateRoot, block.hashStateRoot);
++    BOOST_CHECK_EQUAL(decoded.coinbase_tx->GetId(), block.vtx[0]->GetId());
++
++    // Non-coinbase tx should fail IsValid()
++    SealedHeader invalid_sealed(block.GetBlockHeader(), block.vtx[1]);
++    BOOST_CHECK(!invalid_sealed.IsValid());
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/test/v2_protocol_handler_tests.cpp b/src/test/v2_protocol_handler_tests.cpp
+new file mode 100644
+index 0000000000..410c4aaf39
+--- /dev/null
++++ b/src/test/v2_protocol_handler_tests.cpp
+@@ -0,0 +1,239 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <net/v2_protocol_handler.h>
++
++#include <blockencodings.h>
++#include <chain.h>
++#include <chainparams.h>
++#include <config.h>
++#include <consensus/merkle.h>
++#include <net.h>
++#include <net_processing.h>
++#include <netmessagemaker.h>
++#include <pow/pow.h>
++#include <primitives/block.h>
++#include <primitives/transaction.h>
++#include <protocol.h>
++#include <script/script.h>
++#include <streams.h>
++#include <txmempool.h>
++#include <util/time.h>
++#include <validation.h>
++
++#include <test/util/mining.h>
++#include <test/util/net.h>
++#include <test/util/random.h>
++#include <test/util/setup_common.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <algorithm>
++#include <chrono>
++#include <memory>
++#include <vector>
++
++#include <script/signingprovider.h>
++#include <script/standard.h>
++
++using namespace lotus::v2::net;
++
++namespace {
++
++CService MakeTestIp(uint32_t i) {
++    struct in_addr s;
++    s.s_addr = i;
++    return CService(CNetAddr(s), Params().GetDefaultPort());
++}
++
++CScript MakeRedeemScriptForAttempt(uint32_t attempt) {
++    const std::vector<uint8_t> pad(48, 0x42);
++    return CScript() << int64_t(attempt) << pad << OP_2DROP << OP_TRUE;
++}
++
++CTransactionRef MakeNonCoinbaseTx(FastRandomContext &rng, uint8_t target_byte0,
++                                  Amount value = 10000 * SATOSHI) {
++    const CScript out_spk =
++        GetScriptForDestination(ScriptHash(CScript() << OP_TRUE));
++    for (uint32_t attempt = 0; attempt < 100000; ++attempt) {
++        const CScript redeem_script = MakeRedeemScriptForAttempt(attempt);
++        CMutableTransaction mtx;
++        mtx.nVersion = 2;
++        mtx.vin.resize(1);
++        mtx.vin[0].prevout = COutPoint(TxId(rng.rand256()), attempt);
++        mtx.vin[0].scriptSig = CScript() << ToByteVector(redeem_script);
++        mtx.vout.resize(1);
++        mtx.vout[0].nValue = value;
++        mtx.vout[0].scriptPubKey = out_spk;
++        CTransactionRef tx = MakeTransactionRef(std::move(mtx));
++        if (tx->GetId().begin()[0] == target_byte0) {
++            return tx;
++        }
++    }
++    return nullptr;
++}
++
++void FundTxInputInCoinsTip(ChainstateManager &chainman,
++                           const CTransaction &tx) {
++    LOCK(cs_main);
++    CCoinsViewCache &coins = chainman.ActiveChainstate().CoinsTip();
++    for (const CTxIn &txin : tx.vin) {
++        const CScript redeem_script =
++            MakeRedeemScriptForAttempt(txin.prevout.GetN());
++        const CScript p2sh_spk =
++            GetScriptForDestination(ScriptHash(redeem_script));
++        coins.AddCoin(
++            txin.prevout,
++            Coin(CTxOut(tx.GetValueOut() + 10000 * SATOSHI, p2sh_spk),
++                 /*nHeightIn=*/1, /*Coinbase=*/false),
++            /*possible_overwrite=*/true);
++    }
++}
++
++} // namespace
++
++BOOST_FIXTURE_TEST_SUITE(v2_protocol_handler_tests, RegTestingSetup)
++
++BOOST_AUTO_TEST_CASE(v2_protocol_message_types_and_headers) {
++    BOOST_CHECK_EQUAL(std::string(NetMsgType::SEALEDHEADER), "sealedheader");
++    BOOST_CHECK_EQUAL(std::string(NetMsgType::SEALEDHEADER), "sealedheader");
++    BOOST_CHECK(NetMsgType::IsBlockLike(NetMsgType::SEALEDHEADER));
++
++    CInv sealed_inv(MSG_SEALED_HEADER, uint256{1});
++    BOOST_CHECK(sealed_inv.IsMsgSealedHeader());
++    BOOST_CHECK(sealed_inv.IsGenBlkMsg());
++    BOOST_CHECK_EQUAL(sealed_inv.GetMessageType(), NetMsgType::SEALEDHEADER);
++
++    const auto &all_types = getAllNetMessageTypes();
++    for (const char *msg : {NetMsgType::SEALEDHEADER}) {
++        BOOST_CHECK(std::find(all_types.begin(), all_types.end(),
++                              std::string(msg)) != all_types.end());
++
++        CMessageHeader hdr(Params().NetMagic(), msg, 42);
++        BOOST_CHECK(hdr.IsMessageTypeValid());
++        BOOST_CHECK_EQUAL(hdr.GetMessageType(), std::string(msg));
++    }
++}
++
++BOOST_AUTO_TEST_CASE(sealedheader_fast_path_and_fallback_getdata) {
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++
++    const Config &config = m_node.chainman->GetConfig();
++    auto connman = std::make_unique<ConnmanTestMsg>(config, 0x1337, 0x1337,
++                                                    *m_node.addrman);
++    auto peerman =
++        PeerManager::make(*connman, *m_node.addrman, nullptr, *m_node.chainman,
++                          *m_node.mempool, /*avalanche=*/nullptr, {});
++
++    CConnman::Options options;
++    options.m_msgproc = {peerman.get()};
++    connman->Init(options);
++
++    CAddress addr(MakeTestIp(0xa0b0c010), NODE_NONE);
++    CNode peer_node(/*id=*/101, /*sock=*/nullptr, addr,
++                    /*nKeyedNetGroupIn=*/0, /*nLocalHostNonceIn=*/0,
++                    /*nLocalExtraEntropyIn=*/0, CAddress(), /*pszDest=*/"",
++                    ConnectionType::OUTBOUND_FULL_RELAY,
++                    /*inbound_onion=*/false);
++    connman->Handshake(
++        /*node=*/peer_node,
++        /*successfully_connected=*/true,
++        /*remote_services=*/ServiceFlags(NODE_NETWORK),
++        /*local_services=*/ServiceFlags(NODE_NETWORK),
++        /*version=*/PROTOCOL_VERSION,
++        /*relay_txs=*/true);
++
++    V2PeerProtocolHandler *v2_handler = peerman->GetV2ProtocolHandler();
++    BOOST_REQUIRE(v2_handler != nullptr);
++
++    // 1. Fallback path: send a sealedheader whose merkle root involves a missing
++    // transaction not in the local mempool or candidate overlay.
++    FastRandomContext rng(uint256{123});
++    std::shared_ptr<CBlock> fallback_block =
++        PrepareBlock(config, m_node, CScript() << OP_TRUE);
++    CTransactionRef missing_tx = MakeNonCoinbaseTx(rng, 0x12);
++    BOOST_REQUIRE(missing_tx != nullptr);
++    fallback_block->vtx.push_back(missing_tx);
++    {
++        LOCK(cs_main);
++        const CBlockIndex *tip = m_node.chainman->ActiveTip();
++        fallback_block->hashMerkleRoot = BlockMerkleRoot(*fallback_block);
++        fallback_block->hashStateRoot = ComputeV2BlockStateRoot(
++            *fallback_block, fallback_block->hashPrevBlock,
++            fallback_block->nHeight, uint64_t(tip->GetMedianTimePast()), false);
++        fallback_block->SetSize(::GetSerializeSize(*fallback_block));
++    }
++    while (!CheckProofOfWork(fallback_block->GetHash(), fallback_block->nBits,
++                             config.GetChainParams().GetConsensus())) {
++        ++fallback_block->nNonce;
++    }
++
++    {
++        LOCK(peer_node.cs_vSend);
++        peer_node.vSendMsg.clear();
++    }
++
++    SealedHeader fallback_sealed(*fallback_block);
++    DataStream fallback_stream{};
++    fallback_stream << fallback_sealed;
++    std::atomic<bool> interrupt{false};
++    peerman->ProcessMessage(config, peer_node, NetMsgType::SEALEDHEADER,
++                            fallback_stream, 1000us, interrupt);
++
++    const auto stats_after_miss = v2_handler->GetStats();
++    BOOST_CHECK_EQUAL(stats_after_miss.sealedheader_received, 1U);
++    BOOST_CHECK_EQUAL(stats_after_miss.sealedheader_reconstructed, 0U);
++    BOOST_CHECK_EQUAL(stats_after_miss.sealedheader_fallback_getdata, 1U);
++    BOOST_CHECK(!peer_node.fDisconnect);
++
++    auto last_inv = v2_handler->GetLastFallbackInv();
++    BOOST_REQUIRE(last_inv.has_value());
++    BOOST_CHECK_EQUAL(last_inv->type, uint32_t(MSG_CMPCT_BLOCK));
++    BOOST_CHECK_EQUAL(last_inv->hash, fallback_block->GetHash());
++
++    {
++        LOCK(peer_node.cs_vSend);
++        BOOST_CHECK(!peer_node.vSendMsg.empty());
++        peer_node.vSendMsg.clear();
++    }
++
++    // 2. Fast-path O(1) reconstruction: prepare a valid V2 block on top of
++    // ActiveTip(), send only SealedHeader (header + coinbase_tx), and
++    // verify the chain tip advances by 1 without any getdata round trip.
++    int height_before = 0;
++    {
++        LOCK(cs_main);
++        height_before = m_node.chainman->ActiveChain().Height();
++    }
++
++    std::shared_ptr<CBlock> valid_block =
++        PrepareBlock(config, m_node, CScript() << OP_TRUE);
++    while (!CheckProofOfWork(valid_block->GetHash(), valid_block->nBits,
++                             config.GetChainParams().GetConsensus())) {
++        ++valid_block->nNonce;
++    }
++
++    SealedHeader valid_sealed(*valid_block);
++    DataStream valid_stream{};
++    valid_stream << valid_sealed;
++    peerman->ProcessMessage(config, peer_node, NetMsgType::SEALEDHEADER,
++                            valid_stream, 2000us, interrupt);
++
++    const auto stats_after_hit = v2_handler->GetStats();
++    BOOST_CHECK_EQUAL(stats_after_hit.sealedheader_received, 2U);
++    BOOST_CHECK_EQUAL(stats_after_hit.sealedheader_reconstructed, 1U);
++    BOOST_CHECK_EQUAL(stats_after_hit.sealedheader_fallback_getdata, 1U);
++
++    {
++        LOCK(cs_main);
++        BOOST_CHECK_EQUAL(m_node.chainman->ActiveChain().Height(),
++                          height_before + 1);
++        BOOST_CHECK_EQUAL(m_node.chainman->ActiveTip()->GetBlockHash(),
++                          valid_block->GetHash());
++    }
++
++    peerman->FinalizeNode(config, peer_node);
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+-- 
+2.50.1 (Apple Git-155)
+

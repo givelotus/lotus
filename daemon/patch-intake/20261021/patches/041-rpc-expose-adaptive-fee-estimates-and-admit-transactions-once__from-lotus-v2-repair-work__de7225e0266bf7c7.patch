@@ -1,0 +1,764 @@
+From 77e24401e8a57fef8bd7a3869237929428814cd0 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:30 -0700
+Subject: [PATCH] rpc: expose adaptive fee estimates and admit transactions
+ once
+
+Expose local admission, relay and wallet recommendation rates and current
+adaptive-capacity/history availability through RPC. Enforce the caller's maximum
+fee and the RPC hysteresis floor within the same ATMP before any mempool
+insertion. Remove both redundant preflights: the congestion dry run and the
+older broadcast maximum-fee dry run. Other admission callers retain defaults.
+
+Count actual single-transaction admission attempts. Test one accepted RPC call
+and fee-limit rejections, including no insertion on failure. Move the existing
+RPC estimate test here so each prerequisite boundary tests methods that exist.
+
+Original-Commit: 1e3b144a4d743cf802e0a3a90e9a4367da034b77
+Original-Patch: ecash/029
+Split-Concern: rpc
+---
+ src/node/transaction.cpp      |  22 ++--
+ src/node/transaction.h        |   2 +-
+ src/rpc/client.cpp            |   1 +
+ src/rpc/mempool.cpp           | 133 ++++++++++++++++++++++-
+ src/rpc/mining.cpp            | 101 ++++++++++++++++++
+ src/test/policy_fee_tests.cpp | 192 ++++++++++++++++++++++++++++++++++
+ src/validation.cpp            |  42 +++++++-
+ src/validation.h              |  15 ++-
+ 8 files changed, 484 insertions(+), 24 deletions(-)
+
+diff --git a/src/node/transaction.cpp b/src/node/transaction.cpp
+index b718976d9032b795fee07e9f1237bd8a8e012640..f81c04d81b87aeeba3d7e79d10b317044eabf5bb 100644
+--- a/src/node/transaction.cpp
++++ b/src/node/transaction.cpp
+@@ -39,7 +39,7 @@ TransactionError BroadcastTransaction(const NodeContext &node,
+                                       const CTransactionRef tx,
+                                       std::string &err_string,
+                                       const Amount max_tx_fee, bool relay,
+-                                      bool wait_callback) {
++                                      bool wait_callback, bool rpc_fee_hysteresis) {
+     // BroadcastTransaction can be called by either sendrawtransaction RPC or
+     // the wallet. chainman, mempool and peerman are initialized before the RPC
+     // server and wallet are started and reset after the RPC server and wallet
+@@ -70,23 +70,15 @@ TransactionError BroadcastTransaction(const NodeContext &node,
+ 
+         if (!node.mempool->exists(txid)) {
+             // Transaction is not already in the mempool.
+-            if (max_tx_fee > Amount::zero()) {
+-                // First, call ATMP with test_accept and check the fee. If ATMP
+-                // fails here, return error immediately.
+-                const MempoolAcceptResult result =
+-                    node.chainman->ProcessTransaction(tx, /*test_accept=*/true);
+-                if (result.m_result_type !=
+-                    MempoolAcceptResult::ResultType::VALID) {
+-                    return HandleATMPError(result.m_state, err_string);
+-                } else if (result.m_base_fees.value() > max_tx_fee) {
+-                    return TransactionError::MAX_FEE_EXCEEDED;
+-                }
+-            }
+-            // Try to submit the transaction to the mempool.
++            // Validate caller fee bounds before insertion in this one ATMP pass.
++            const MempoolAdmissionLimits limits{max_tx_fee, rpc_fee_hysteresis};
+             const MempoolAcceptResult result =
+-                node.chainman->ProcessTransaction(tx, /*test_accept=*/false);
++                node.chainman->ProcessTransaction(tx, /*test_accept=*/false, limits);
+             if (result.m_result_type !=
+                 MempoolAcceptResult::ResultType::VALID) {
++                if (result.m_state.GetRejectReason() == "max-fee-exceeded") {
++                    return TransactionError::MAX_FEE_EXCEEDED;
++                }
+                 return HandleATMPError(result.m_state, err_string);
+             }
+ 
+diff --git a/src/node/transaction.h b/src/node/transaction.h
+index bbf07bafbc62d8ce7c5c609f20d322ce354305c4..a61c13ff41b0d521ba330257aebd881b370c8937 100644
+--- a/src/node/transaction.h
++++ b/src/node/transaction.h
+@@ -56,7 +56,7 @@ static const CFeeRate DEFAULT_MAX_RAW_TX_FEE_RATE{COIN / 10};
+ [[nodiscard]] TransactionError
+ BroadcastTransaction(const NodeContext &node, CTransactionRef tx,
+                      std::string &err_string, Amount max_tx_fee, bool relay,
+-                     bool wait_callback);
++                     bool wait_callback, bool rpc_fee_hysteresis = false);
+ 
+ /**
+  * Return transaction with a given txid.
+diff --git a/src/rpc/client.cpp b/src/rpc/client.cpp
+index ae03f03ae8d5a4383152aeca1a7ec5a9f164df81..17357bee0d3a13a55084c69f031f79b1186225dd 100644
+--- a/src/rpc/client.cpp
++++ b/src/rpc/client.cpp
+@@ -231,6 +231,7 @@ static const CRPCConvertParam vRPCConvertParams[] = {
+     {"setstakingreward", 2, "append"},
+     {"setflakyproof", 1, "flaky"},
+     {"getfinaltransactions", 0, "verbose"},
++    {"estimatesmartfee", 0, "conf_target"},
+ };
+ 
+ /**
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index 2ec0a967266ccab6a8ec7573bafe3e114fb31d77..abb4c08e5aba62847c1df075974971cbed76cad2 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -98,10 +98,36 @@ static RPCHelpMan sendrawtransaction() {
+             std::string err_string;
+             AssertLockNotHeld(cs_main);
+             NodeContext &node = EnsureAnyNodeContext(request.context);
++            const int64_t now_ms =
++                TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
++            const auto &fee_ctrl =
++                lotus::v2::GetGlobalFeeHysteresisController();
++            const lotus::v2::FeeRateInfo fee_info =
++                fee_ctrl.GetFeeRateInfo(now_ms);
+             const TransactionError err = BroadcastTransaction(
+                 node, tx, err_string, max_raw_tx_fee, /*relay*/ true,
+-                /*wait_callback*/ true);
++                /*wait_callback*/ true, /*rpc_fee_hysteresis=*/true);
+             if (err != TransactionError::OK) {
++                if (err == TransactionError::MEMPOOL_REJECTED &&
++                    (err_string.find("min relay fee not met") !=
++                         std::string::npos ||
++                     err_string.find("mempool min fee not met") !=
++                         std::string::npos)) {
++                    const uint64_t tx_cu =
++                        static_cast<uint64_t>(std::max<int64_t>(0, virtual_size));
++                    const lotus::v2::FeeCheckResult fee_eval =
++                        fee_ctrl.EvaluateTransactionFee(
++                            lotus::v2::FeeTier::RpcAdmission, tx_cu, 0, now_ms);
++                    err_string += strprintf(
++                        " (required_fee_sats=%llu, required_rate_per_kcu=%llu, "
++                        "recommended_sdk_feerate_per_kcu=%llu)",
++                        static_cast<unsigned long long>(
++                            fee_eval.required_fee_sats),
++                        static_cast<unsigned long long>(
++                            fee_eval.required_rate_per_kcu),
++                        static_cast<unsigned long long>(
++                            fee_info.recommended_sdk_feerate_per_kcu));
++                }
+                 throw JSONRPCTransactionError(err, err_string);
+             }
+ 
+@@ -759,8 +785,15 @@ UniValue MempoolInfoToJSON(const CTxMemPool &pool) {
+                 pow(2.0, (time - snap.last_rolling_fee_update) / halflife);
+         }
+     }
++    const int64_t now_ms =
++        TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
++    const lotus::v2::FeeRateInfo fee_info =
++        lotus::v2::GetGlobalFeeHysteresisController().GetFeeRateInfo(now_ms);
++    const CFeeRate hysteresis_admission_fee(Amount(
++        static_cast<int64_t>(fee_info.rpc_admission_feerate_per_kcu) * SATOSHI));
+     const CFeeRate decayed_min_fee = std::max(
+-        CFeeRate(int64_t(ceill(rolling_fee)) * SATOSHI), snap.min_relay_tx_fee);
++        {CFeeRate(int64_t(ceill(rolling_fee)) * SATOSHI), snap.min_relay_tx_fee,
++         hysteresis_admission_fee});
+     UniValue ret(UniValue::VOBJ);
+     ret.pushKV("loaded", snap.mempool_loaded);
+     ret.pushKV("size", (int64_t)snap.mempool_size);
+@@ -774,6 +807,12 @@ UniValue MempoolInfoToJSON(const CTxMemPool &pool) {
+     ret.pushKV("maxmempool", snap.max_mempool);
+     ret.pushKV("mempoolminfee", decayed_min_fee.GetFeePerK());
+     ret.pushKV("minrelaytxfee", snap.min_relay_tx_fee.GetFeePerK());
++    ret.pushKV("rpc_admission_feerate_sats_per_kb",
++               fee_info.rpc_admission_feerate_per_kcu);
++    ret.pushKV("recommended_feerate_sats_per_kb",
++               fee_info.recommended_sdk_feerate_per_kcu);
++    ret.pushKV("p2p_relay_feerate_sats_per_kb",
++               fee_info.p2p_relay_feerate_per_kcu);
+     ret.pushKV("unbroadcastcount", uint64_t{snap.unbroadcast_count});
+     return ret;
+ }
+@@ -810,9 +849,17 @@ static RPCHelpMan getmempoolinfo() {
+                 {RPCResult::Type::STR_AMOUNT, "mempoolminfee",
+                  "Minimum fee rate in " + ticker +
+                      "/kB for tx to be accepted. Is the maximum of "
+-                     "minrelaytxfee and minimum mempool fee"},
++                     "minrelaytxfee, minimum mempool fee, and RPC admission "
++                     "fee hysteresis rate"},
+                 {RPCResult::Type::STR_AMOUNT, "minrelaytxfee",
+                  "Current minimum relay fee for transactions"},
++                {RPCResult::Type::NUM, "rpc_admission_feerate_sats_per_kb",
++                 "Tier 1 local RPC admission fee rate in satoshis per kB"},
++                {RPCResult::Type::NUM, "recommended_feerate_sats_per_kb",
++                 "Recommended wallet/SDK fee rate in satoshis per kB (+5% "
++                 "anti-bounce cushion)"},
++                {RPCResult::Type::NUM, "p2p_relay_feerate_sats_per_kb",
++                 "Tier 2 P2P relay hysteresis fee rate in satoshis per kB"},
+                 {RPCResult::Type::NUM, "unbroadcastcount",
+                  "Current number of transactions that haven't passed initial "
+                  "broadcast yet"},
+@@ -1791,6 +1838,85 @@ static RPCHelpMan submitrawtxbatch() {
+     };
+ }
+ 
++static RPCHelpMan getfeerateinfo() {
++    return RPCHelpMan{
++        "getfeerateinfo",
++        "Returns the active Lotus V2 three-tier fee hysteresis schedule "
++        "(consensus floor, P2P relay hysteresis rate, RPC admission rate, and "
++        "recommended SDK fee rate with anti-bounce cushion).\n",
++        {},
++        RPCResult{
++            RPCResult::Type::OBJ,
++            "",
++            "",
++            {
++                {RPCResult::Type::NUM, "consensus_floor_per_kcu",
++                 "Tier 3 consensus floor fee rate in satoshis per 1,000 CU"},
++                {RPCResult::Type::NUM, "p2p_relay_feerate_per_kcu",
++                 "Tier 2 P2P relay and orphan admission fee rate in satoshis "
++                 "per 1,000 CU"},
++                {RPCResult::Type::NUM, "rpc_admission_feerate_per_kcu",
++                 "Tier 1 local RPC admission fee rate in satoshis per 1,000 "
++                 "CU"},
++                {RPCResult::Type::NUM, "recommended_sdk_feerate_per_kcu",
++                 "Recommended wallet/SDK fee rate in satoshis per 1,000 CU "
++                 "(+5% anti-bounce cushion above Tier 1)"},
++                {RPCResult::Type::NUM, "marginal_burn_feerate_per_kcu",
++                 "Marginal P05 burn fee rate in satoshis per 1,000 CU"},
++                {RPCResult::Type::NUM, "hysteresis_window_ms",
++                 "Rolling P2P relay hysteresis window in milliseconds"},
++                {RPCResult::Type::NUM, "hysteresis_discount_permille",
++                 "Hysteresis discount below rolling minimum RPC rate in "
++                 "permille"},
++                {RPCResult::Type::BOOL, "adaptive_history_available",
++                 "Whether complete ancestor block sizes are available for deterministic adaptive capacity"},
++                {RPCResult::Type::NUM, "ema_block_size_bytes",
++                 "Exponential moving average of connected block size in bytes"},
++                {RPCResult::Type::NUM, "adaptive_target_block_size",
++                 "Target block size before fee pressure rises"},
++                {RPCResult::Type::NUM, "adaptive_max_block_size",
++                 "Adaptive maximum excessive block size in bytes"},
++                {RPCResult::Type::NUM, "adaptive_max_generated_block_size",
++                 "Adaptive maximum miner generated block size in bytes"},
++                {RPCResult::Type::NUM, "mempool_backlog_bytes",
++                 "Current mempool backlog in bytes"},
++            }},
++        RPCExamples{HelpExampleCli("getfeerateinfo", "") +
++                    HelpExampleRpc("getfeerateinfo", "")},
++        [&](const RPCHelpMan &self, const Config &config,
++            const JSONRPCRequest &request) -> UniValue {
++            const int64_t now_ms =
++                TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
++            const lotus::v2::FeeRateInfo info =
++                lotus::v2::GetGlobalFeeHysteresisController().GetFeeRateInfo(
++                    now_ms);
++            UniValue ret(UniValue::VOBJ);
++            ret.pushKV("consensus_floor_per_kcu",
++                       info.consensus_floor_per_kcu);
++            ret.pushKV("p2p_relay_feerate_per_kcu",
++                       info.p2p_relay_feerate_per_kcu);
++            ret.pushKV("rpc_admission_feerate_per_kcu",
++                       info.rpc_admission_feerate_per_kcu);
++            ret.pushKV("recommended_sdk_feerate_per_kcu",
++                       info.recommended_sdk_feerate_per_kcu);
++            ret.pushKV("marginal_burn_feerate_per_kcu",
++                       info.marginal_burn_feerate_per_kcu);
++            ret.pushKV("hysteresis_window_ms", info.hysteresis_window_ms);
++            ret.pushKV("hysteresis_discount_permille",
++                       info.hysteresis_discount_permille);
++            ret.pushKV("adaptive_history_available", info.adaptive_history_available);
++            ret.pushKV("ema_block_size_bytes", info.ema_block_size_bytes);
++            ret.pushKV("adaptive_target_block_size",
++                       info.adaptive_target_block_size);
++            ret.pushKV("adaptive_max_block_size", info.adaptive_max_block_size);
++            ret.pushKV("adaptive_max_generated_block_size",
++                       info.adaptive_max_generated_block_size);
++            ret.pushKV("mempool_backlog_bytes", info.mempool_backlog_bytes);
++            return ret;
++        },
++    };
++}
++
+ void RegisterMempoolRPCCommands(CRPCTable &t) {
+     static const CRPCCommand commands[]{
+         // category     actor (function)
+@@ -1799,6 +1925,7 @@ void RegisterMempoolRPCCommands(CRPCTable &t) {
+         {"rawtransactions", testmempoolaccept},
+         {"rawtransactions", testrawtxbatch},
+         {"rawtransactions", submitrawtxbatch},
++        {"blockchain", getfeerateinfo},
+         {"blockchain", getmempoolancestors},
+         {"blockchain", getmempooldescendants},
+         {"blockchain", getmempoolentry},
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index d69171039d1644b449018b52a1df9e05949093a4..ffe47f742408c56169ea3561a8c8de0f9843e7a0 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -19,6 +19,9 @@
+ #include <consensus/validation.h>
+ #include <core_io.h>
+ #include <key_io.h>
++#include <lotus_v2/fee_hysteresis.h>
++#include <lotus_v2/mempool_overlay.h>
++#include <node/snapshot.h>
+ #include <minerfund.h>
+ #include <net.h>
+ #include <node/context.h>
+@@ -1440,6 +1443,103 @@ static RPCHelpMan estimatefee() {
+     };
+ }
+ 
++static RPCHelpMan estimatesmartfee() {
++    return RPCHelpMan{
++        "estimatesmartfee",
++        "Estimates the approximate fee per kilobyte needed for a transaction "
++        "to be admitted and mined, incorporating live mempool congestion, "
++        "adaptive block size targets, and three-tier fee hysteresis.\n",
++        {
++            {"conf_target", RPCArg::Type::NUM, RPCArg::Default{1},
++             "Confirmation target in blocks (1 - 1008)"},
++            {"estimate_mode", RPCArg::Type::STR,
++             RPCArg::Default{"CONSERVATIVE"},
++             "The fee estimate mode.\n"
++             "                   Whether to return the exact RPC admission "
++             "floor (\"ECONOMICAL\") or include the +5% SDK anti-bounce "
++             "cushion (\"CONSERVATIVE\" / \"UNSET\")."},
++        },
++        RPCResult{
++            RPCResult::Type::OBJ,
++            "",
++            "",
++            {
++                {RPCResult::Type::STR_AMOUNT, "feerate",
++                 "estimate fee rate in " + Currency::getTicker() + "/kB"},
++                {RPCResult::Type::NUM, "feerate_sats_per_kb",
++                 "estimate fee rate in satoshis per kB"},
++                {RPCResult::Type::NUM, "rpc_admission_feerate_per_kcu",
++                 "Tier 1 local RPC admission fee rate in satoshis per 1,000 CU"},
++                {RPCResult::Type::NUM, "recommended_sdk_feerate_per_kcu",
++                 "Recommended wallet/SDK fee rate in satoshis per 1,000 CU "
++                 "(+5% anti-bounce cushion)"},
++                {RPCResult::Type::NUM, "p2p_relay_feerate_per_kcu",
++                 "Tier 2 P2P relay hysteresis fee rate in satoshis per 1,000 CU"},
++                {RPCResult::Type::NUM, "blocks",
++                 "block number where estimate was found"},
++            }},
++        RPCExamples{HelpExampleCli("estimatesmartfee", "1") +
++                    HelpExampleCli("estimatesmartfee", "1 \"ECONOMICAL\"") +
++                    HelpExampleRpc("estimatesmartfee", "1, \"CONSERVATIVE\"")},
++        [&](const RPCHelpMan &self, const Config &config,
++            const JSONRPCRequest &request) -> UniValue {
++            int64_t conf_target = 1;
++            if (!request.params[0].isNull()) {
++                conf_target = request.params[0].getInt<int64_t>();
++                if (conf_target < 1) {
++                    throw JSONRPCError(
++                        RPC_INVALID_PARAMETER,
++                        "Invalid conf_target, must be at least 1");
++                }
++            }
++
++            bool economical = false;
++            if (!request.params[1].isNull()) {
++                const std::string mode = ToUpper(request.params[1].get_str());
++                if (mode == "ECONOMICAL") {
++                    economical = true;
++                } else if (mode == "CONSERVATIVE" || mode == "UNSET") {
++                    economical = false;
++                } else {
++                    throw JSONRPCError(
++                        RPC_INVALID_PARAMETER,
++                        "Invalid estimate_mode parameter, must be one of: "
++                        "\"UNSET\", \"ECONOMICAL\", \"CONSERVATIVE\"");
++                }
++            }
++
++            const CTxMemPool &mempool = EnsureAnyMemPool(request.context);
++            const int64_t now_ms =
++                TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
++            const lotus::v2::FeeRateInfo info =
++                lotus::v2::GetGlobalFeeHysteresisController().GetFeeRateInfo(
++                    now_ms);
++
++            const uint64_t target_hysteresis_sats_per_kb =
++                economical ? info.rpc_admission_feerate_per_kcu
++                           : info.recommended_sdk_feerate_per_kcu;
++            const CFeeRate hysteresis_feerate(Amount(
++                static_cast<int64_t>(target_hysteresis_sats_per_kb) * SATOSHI));
++            const CFeeRate final_feerate =
++                std::max(mempool.estimateFee(), hysteresis_feerate);
++            const uint64_t feerate_sats_per_kb = static_cast<uint64_t>(
++                std::max<int64_t>(0, final_feerate.GetFeePerK() / SATOSHI));
++
++            UniValue ret(UniValue::VOBJ);
++            ret.pushKV("feerate", final_feerate.GetFeePerK());
++            ret.pushKV("feerate_sats_per_kb", feerate_sats_per_kb);
++            ret.pushKV("rpc_admission_feerate_per_kcu",
++                       info.rpc_admission_feerate_per_kcu);
++            ret.pushKV("recommended_sdk_feerate_per_kcu",
++                       info.recommended_sdk_feerate_per_kcu);
++            ret.pushKV("p2p_relay_feerate_per_kcu",
++                       info.p2p_relay_feerate_per_kcu);
++            ret.pushKV("blocks", conf_target);
++            return ret;
++        },
++    };
++}
++
+ void RegisterMiningRPCCommands(CRPCTable &t) {
+     // clang-format off
+     static const CRPCCommand commands[] = {
+@@ -1457,6 +1557,7 @@ void RegisterMiningRPCCommands(CRPCTable &t) {
+         {"generating",  generateblock,         },
+ 
+         {"util",        estimatefee,           },
++        {"util",        estimatesmartfee,      },
+ 
+         {"hidden",      generate,              },
+     };
+diff --git a/src/test/policy_fee_tests.cpp b/src/test/policy_fee_tests.cpp
+index 6d5eba472718a70116a16996515214f15faba782..68a71e17b80558630e2f4f9d346ab9e54b164cc7 100644
+--- a/src/test/policy_fee_tests.cpp
++++ b/src/test/policy_fee_tests.cpp
+@@ -3,8 +3,10 @@
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
+ #include <config.h>
++#include <core_io.h>
+ #include <protocol.h>
+ #include <streams.h>
++#include <script/standard.h>
+ #include <common/args.h>
+ #include <consensus/consensus.h>
+ #include <validation.h>
+@@ -13,6 +15,7 @@
+ #include <lotus_v2/fee_hysteresis.h>
+ #include <policy/fees.h>
+ #include <rpc/server.h>
++#include <rpc/protocol.h>
+ #include <txmempool.h>
+ #include <univalue.h>
+ #include <util/moneystr.h>
+@@ -87,6 +90,195 @@ BOOST_AUTO_TEST_CASE(AdaptiveBlockSizeAndFeeHysteresis) {
+     BOOST_CHECK_GT(burn_rate_1gb, 100'000ULL);
+ }
+ 
++BOOST_FIXTURE_TEST_CASE(UnifiedFeeEstimationRpcsUnderCongestion,
++                        TestChain100Setup) {
++    GlobalConfig config;
++    auto &fee_ctrl = lotus::v2::GetGlobalFeeHysteresisController();
++    const int64_t base_ms =
++        TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
++    fee_ctrl.Reset(base_ms);
++
++    auto call_rpc = [&](const std::string &method,
++                        UniValue params = UniValue(UniValue::VARR)) {
++        JSONRPCRequest req;
++        req.context = &m_node;
++        req.strMethod = method;
++        req.params = std::move(params);
++        return tableRPC.execute(config, req);
++    };
++
++    // 1. At idle, estimatefee, estimatesmartfee("ECONOMICAL"), and getmempoolinfo
++    // report 1,000 sats/kB (10.00 XEC/kB), and estimatesmartfee("CONSERVATIVE")
++    // reports 1,050 sats/kB.
++    {
++        const UniValue info_res = call_rpc("getfeerateinfo");
++        BOOST_CHECK_EQUAL(
++            info_res.find_value("rpc_admission_feerate_per_kcu").getInt<uint64_t>(),
++            1000ULL);
++        BOOST_CHECK_EQUAL(
++            info_res.find_value("recommended_sdk_feerate_per_kcu").getInt<uint64_t>(),
++            1050ULL);
++
++        const UniValue est_res = call_rpc("estimatefee");
++        Amount est_amt;
++        BOOST_CHECK(ParseMoney(est_res.getValStr(), est_amt));
++        BOOST_CHECK_EQUAL(est_amt, 1000 * SATOSHI);
++
++        const UniValue smart_cons = call_rpc("estimatesmartfee");
++        BOOST_CHECK_EQUAL(
++            smart_cons.find_value("feerate_sats_per_kb").getInt<uint64_t>(),
++            1050ULL);
++        BOOST_CHECK_EQUAL(
++            smart_cons.find_value("rpc_admission_feerate_per_kcu").getInt<uint64_t>(),
++            1000ULL);
++        BOOST_CHECK_EQUAL(
++            smart_cons.find_value("recommended_sdk_feerate_per_kcu").getInt<uint64_t>(),
++            1050ULL);
++
++        UniValue econ_params(UniValue::VARR);
++        econ_params.push_back(1);
++        econ_params.push_back("ECONOMICAL");
++        const UniValue smart_econ =
++            call_rpc("estimatesmartfee", std::move(econ_params));
++        BOOST_CHECK_EQUAL(
++            smart_econ.find_value("feerate_sats_per_kb").getInt<uint64_t>(),
++            1000ULL);
++
++        const UniValue mp_info = call_rpc("getmempoolinfo");
++        Amount mp_min_amt;
++        BOOST_CHECK(
++            ParseMoney(mp_info.find_value("mempoolminfee").getValStr(), mp_min_amt));
++        BOOST_CHECK_EQUAL(mp_min_amt, 1000 * SATOSHI);
++        BOOST_CHECK_EQUAL(
++            mp_info.find_value("rpc_admission_feerate_sats_per_kb").getInt<uint64_t>(),
++            1000ULL);
++        BOOST_CHECK_EQUAL(
++            mp_info.find_value("recommended_feerate_sats_per_kb").getInt<uint64_t>(),
++            1050ULL);
++    }
++
++    // 2. Simulate 1 GB block / high congestion where fees rise above 100,000 sats/kB.
++    // All fee RPCs (getfeerateinfo, estimatefee, estimatesmartfee, getmempoolinfo)
++    // must consistently return the elevated fee rate.
++    const int64_t congested_ms =
++        TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
++    const uint64_t congested_rpc_rate =
++        fee_ctrl.UpdateCongestion(1'000'000'000ULL, 100'000'000ULL, congested_ms);
++    // At 1 GB utilization vs 100 MB target (excess = 9x target):
++    // rate = 1000 * (1 + 9 + 81) = 91,000 sats/kB; at 80 MB target, > 140,000 sats/kB.
++    BOOST_CHECK_EQUAL(congested_rpc_rate, 91'000ULL);
++    const uint64_t high_rpc_rate =
++        fee_ctrl.UpdateCongestion(1'000'000'000ULL, 80'000'000ULL, congested_ms);
++    BOOST_CHECK_GT(high_rpc_rate, 100'000ULL);
++
++    {
++        const UniValue info_res = call_rpc("getfeerateinfo");
++        const uint64_t expected_sdk_rate =
++            info_res.find_value("recommended_sdk_feerate_per_kcu").getInt<uint64_t>();
++        BOOST_CHECK_EQUAL(
++            info_res.find_value("rpc_admission_feerate_per_kcu").getInt<uint64_t>(),
++            high_rpc_rate);
++        BOOST_CHECK_GT(expected_sdk_rate, high_rpc_rate);
++
++        const UniValue est_res = call_rpc("estimatefee");
++        Amount est_amt;
++        BOOST_CHECK(ParseMoney(est_res.getValStr(), est_amt));
++        BOOST_CHECK_EQUAL(est_amt,
++                          static_cast<int64_t>(high_rpc_rate) * SATOSHI);
++
++        const UniValue smart_cons = call_rpc("estimatesmartfee");
++        BOOST_CHECK_EQUAL(
++            smart_cons.find_value("feerate_sats_per_kb").getInt<uint64_t>(),
++            expected_sdk_rate);
++
++        UniValue econ_params(UniValue::VARR);
++        econ_params.push_back(1);
++        econ_params.push_back("ECONOMICAL");
++        const UniValue smart_econ =
++            call_rpc("estimatesmartfee", std::move(econ_params));
++        BOOST_CHECK_EQUAL(
++            smart_econ.find_value("feerate_sats_per_kb").getInt<uint64_t>(),
++            high_rpc_rate);
++
++        const UniValue mp_info = call_rpc("getmempoolinfo");
++        Amount mp_min_amt;
++        BOOST_CHECK(
++            ParseMoney(mp_info.find_value("mempoolminfee").getValStr(), mp_min_amt));
++        BOOST_CHECK_EQUAL(mp_min_amt,
++                          static_cast<int64_t>(high_rpc_rate) * SATOSHI);
++        BOOST_CHECK_EQUAL(
++            mp_info.find_value("rpc_admission_feerate_sats_per_kb").getInt<uint64_t>(),
++            high_rpc_rate);
++        BOOST_CHECK_EQUAL(
++            mp_info.find_value("recommended_feerate_sats_per_kb").getInt<uint64_t>(),
++            expected_sdk_rate);
++    }
++
++    fee_ctrl.Reset(TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now()));
++}
++
++
++BOOST_FIXTURE_TEST_CASE(single_rpc_admission_attempt_under_congestion, TestChain100Setup) {
++    auto &controller = lotus::v2::GetGlobalFeeHysteresisController();
++    const auto now = TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
++    controller.Reset(now);
++    controller.SetRpcAdmissionRatePerKCu(9000, now);
++    CMutableTransaction tx;
++    const COutPoint funding(TxId(uint256S("123456")), 0);
++    const CScript redeem = CScript() << OP_TRUE;
++    const CScript standard = GetScriptForDestination(ScriptHash(redeem));
++    tx.vin.emplace_back(funding, CScript() << std::vector<uint8_t>{OP_TRUE});
++    tx.vout.emplace_back(10 * COIN - 2000 * SATOSHI, standard);
++    tx.vout.emplace_back(Amount::zero(), CScript() << OP_RETURN << std::vector<uint8_t>(32));
++    {
++        LOCK(cs_main);
++        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
++            funding, Coin(CTxOut(10 * COIN, standard), 0, false), false);
++    }
++    JSONRPCRequest req;
++    req.context = &m_node;
++    req.strMethod = "sendrawtransaction";
++    req.params = UniValue(UniValue::VARR);
++    req.params.push_back(EncodeHexTx(CTransaction(tx)));
++    const auto before = GetMempoolAdmissionAttempts();
++    UniValue result;
++    try {
++        result = tableRPC.execute(m_node.chainman->GetConfig(), req);
++    } catch (const UniValue &error) {
++        controller.Reset(now);
++        BOOST_FAIL(error.write());
++    }
++    BOOST_CHECK_EQUAL(result.get_str(), tx.GetId().ToString());
++    BOOST_CHECK_EQUAL(GetMempoolAdmissionAttempts() - before, 1);
++    BOOST_CHECK(m_node.mempool->exists(tx.GetId()));
++    auto reject_without_insertion = [&](const char *id, Amount fee, bool cap_maximum) {
++        auto rejected = tx;
++        rejected.vin[0].prevout = COutPoint(TxId(uint256S(id)), 0);
++        rejected.vout[0].nValue = 10 * COIN - fee;
++        {
++            LOCK(cs_main);
++            m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
++                rejected.vin[0].prevout, Coin(CTxOut(10 * COIN, standard), 0, false), false);
++        }
++        req.params = UniValue(UniValue::VARR);
++        req.params.push_back(EncodeHexTx(CTransaction(rejected)));
++        if (cap_maximum) req.params.push_back(UniValue(UniValue::VNUM, "0.01"));
++        const auto attempts = GetMempoolAdmissionAttempts();
++        try {
++            tableRPC.execute(m_node.chainman->GetConfig(), req);
++            BOOST_ERROR("fee-constrained transaction unexpectedly admitted");
++        } catch (const UniValue &error) {
++            if (cap_maximum) BOOST_CHECK_EQUAL(error.find_value("code").getInt<int>(), RPC_VERIFY_ERROR);
++            else BOOST_CHECK(error.find_value("message").get_str().find("rpc-fee-hysteresis-insufficient") != std::string::npos);
++        }
++        BOOST_CHECK_EQUAL(GetMempoolAdmissionAttempts() - attempts, 1);
++        BOOST_CHECK(!m_node.mempool->exists(rejected.GetId()));
++    };
++    reject_without_insertion("123457", 500 * SATOSHI, false);
++    reject_without_insertion("123458", 2000 * SATOSHI, true);
++    controller.Reset(now);
++}
++
+ BOOST_AUTO_TEST_CASE(adaptive_history_reorg_cache_eviction_and_unavailable_ancestry) {
+     std::vector<CBlockIndex> chain(4098);
+     std::vector<BlockHash> hashes(chain.size());
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 7e394b086d402e32724e5842ecc0a9936f543726..e15d59553e50718cbc64632b8fc34c0ef75c53cd 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -478,6 +478,7 @@ public:
+          * fee.
+          */
+         const bool m_package_feerates;
++        MempoolAdmissionLimits m_limits{};
+ 
+         /** Parameters for single transaction mempool validation. */
+         static ATMPArgs SingleAccept(const Config &config, int64_t accept_time,
+@@ -1182,6 +1183,30 @@ MemPoolAccept::AcceptSingleTransaction(const CTransactionRef &ptx,
+         return MempoolAcceptResult::Failure(ws.m_state);
+     }
+ 
++    if (args.m_limits.max_fee > Amount::zero() && ws.m_base_fees > args.m_limits.max_fee) {
++        ws.m_state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "max-fee-exceeded");
++        return MempoolAcceptResult::Failure(ws.m_state);
++    }
++    if (args.m_limits.rpc_fee_hysteresis) {
++        const auto now = TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
++        const auto &controller = lotus::v2::GetGlobalFeeHysteresisController();
++        const auto info = controller.GetFeeRateInfo(now);
++        if (info.rpc_admission_feerate_per_kcu > info.consensus_floor_per_kcu) {
++            const auto check = controller.EvaluateTransactionFee(
++                lotus::v2::FeeTier::RpcAdmission, ws.m_vsize,
++                std::max<int64_t>(0, ws.m_base_fees / SATOSHI), now);
++            if (!check.accepted) {
++                ws.m_state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
++                    "rpc-fee-hysteresis-insufficient",
++                    strprintf("required_fee_sats=%u, required_rate_per_kcu=%u, "
++                              "recommended_sdk_feerate_per_kcu=%u, recommended_sdk_fee_sats=%u",
++                              check.required_fee_sats, check.required_rate_per_kcu,
++                              info.recommended_sdk_feerate_per_kcu, check.recommended_sdk_fee_sats));
++                return MempoolAcceptResult::Failure(ws.m_state);
++            }
++        }
++    }
++
+     if (!ConsensusScriptChecks(args, ws)) {
+         return MempoolAcceptResult::Failure(ws.m_state);
+     }
+@@ -2015,12 +2040,21 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package &package,
+ }
+ } // namespace
+ 
++namespace {
++std::atomic<uint64_t> g_mempool_admission_attempts{0};
++}
++uint64_t GetMempoolAdmissionAttempts() noexcept {
++    return g_mempool_admission_attempts.load(std::memory_order_relaxed);
++}
++
+ MempoolAcceptResult AcceptToMemoryPool(Chainstate &active_chainstate,
+                                        const CTransactionRef &tx,
+                                        int64_t accept_time, bool bypass_limits,
+                                        bool test_accept,
+-                                       unsigned int heightOverride) {
++                                       unsigned int heightOverride,
++                                       const MempoolAdmissionLimits &limits) {
+     AssertLockHeld(::cs_main);
++    g_mempool_admission_attempts.fetch_add(1, std::memory_order_relaxed);
+     assert(active_chainstate.GetMempool() != nullptr);
+     CTxMemPool &pool{*active_chainstate.GetMempool()};
+ 
+@@ -2028,6 +2062,7 @@ MempoolAcceptResult AcceptToMemoryPool(Chainstate &active_chainstate,
+     auto args = MemPoolAccept::ATMPArgs::SingleAccept(
+         active_chainstate.m_chainman.GetConfig(), accept_time, bypass_limits,
+         coins_to_uncache, test_accept, heightOverride);
++    args.m_limits = limits;
+     MempoolAcceptResult result = MemPoolAccept(pool, active_chainstate)
+                                      .AcceptSingleTransaction(tx, args);
+     if (result.m_result_type != MempoolAcceptResult::ResultType::VALID) {
+@@ -6062,7 +6097,8 @@ bool ChainstateManager::ProcessNewBlock(
+ 
+ MempoolAcceptResult
+ ChainstateManager::ProcessTransaction(const CTransactionRef &tx,
+-                                      bool test_accept) {
++                                      bool test_accept,
++                                      const MempoolAdmissionLimits &limits) {
+     AssertLockHeld(cs_main);
+     Chainstate &active_chainstate = ActiveChainstate();
+     if (!active_chainstate.GetMempool()) {
+@@ -6071,7 +6107,7 @@ ChainstateManager::ProcessTransaction(const CTransactionRef &tx,
+         return MempoolAcceptResult::Failure(state);
+     }
+     auto result = AcceptToMemoryPool(active_chainstate, tx, GetTime(),
+-                                     /*bypass_limits=*/false, test_accept);
++                                     /*bypass_limits=*/false, test_accept, 0, limits);
+     active_chainstate.GetMempool()->check(
+         active_chainstate.CoinsTip(), active_chainstate.m_chain.Height() + 1);
+     return result;
+diff --git a/src/validation.h b/src/validation.h
+index c837302e67c8f857ca7d055d24684b9dd67cc4b1..a841de2cb146f896a5b8bc97208da46fae63fef9 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -323,6 +323,15 @@ struct PackageMempoolAcceptResult {
+         : m_tx_results{{txid, result}} {}
+ };
+ 
++/** Optional caller fee limits, enforced before any mempool mutation in the same ATMP. */
++struct MempoolAdmissionLimits {
++    Amount max_fee{Amount::zero()};
++    bool rpc_fee_hysteresis{false};
++};
++
++/** Diagnostic count of single-transaction admission attempts, including dry runs. */
++uint64_t GetMempoolAdmissionAttempts() noexcept;
++
+ /**
+  * Try to add a transaction to the mempool. This is an internal function and is
+  * exposed only for testing. Client code should use
+@@ -348,7 +357,8 @@ struct PackageMempoolAcceptResult {
+ MempoolAcceptResult
+ AcceptToMemoryPool(Chainstate &active_chainstate, const CTransactionRef &tx,
+                    int64_t accept_time, bool bypass_limits,
+-                   bool test_accept = false, unsigned int heightOverride = 0)
++                   bool test_accept = false, unsigned int heightOverride = 0,
++                   const MempoolAdmissionLimits &limits = {})
+     EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+ 
+ /**
+@@ -1743,7 +1753,8 @@ public:
+      *                             submit to mempool.
+      */
+     [[nodiscard]] MempoolAcceptResult
+-    ProcessTransaction(const CTransactionRef &tx, bool test_accept = false)
++    ProcessTransaction(const CTransactionRef &tx, bool test_accept = false,
++                       const MempoolAdmissionLimits &limits = {})
+         EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+ 
+     //! Load the block tree and coins database from disk, initializing state if
+-- 
+2.50.1 (Apple Git-155)
+

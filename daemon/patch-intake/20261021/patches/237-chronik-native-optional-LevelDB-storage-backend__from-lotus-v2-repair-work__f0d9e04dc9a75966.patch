@@ -1,0 +1,1998 @@
+From beaaaa5ead721dddee43affae46d178b5a3bb84f Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 07:37:30 -0700
+Subject: [PATCH] chronik: native optional LevelDB storage backend
+
+Adds chronik_native_store_leveldb (CHRONIK_NATIVE_LEVELDB=ON, default
+OFF), a second KvStore implementation on the node's vendored LevelDB. The
+core is unchanged: it still sees only the KvStore interface, and a
+LevelDB-only build (CHRONIK_NATIVE_MDBX=OFF) links no MDBX code.
+
+Layout (documented in leveldb_store.h): one LevelDB at
+indexes/chronik-leveldb, never the MDBX/Rust directory. Plain table keys
+are varint(id) || key; dup table keys are varint(id) || escaped(key) ||
+dup, where the escaping (0x00 -> 0x00 0xff, terminator 0x00 0x00) is
+order-preserving, so keys and dups iterate in MDBX order, including plain
+cursors over dup tables (used by group UTXO prefix scans and the dump).
+Table ids are assigned on first open and persisted with each table's
+kind, so tables added later are never renumbered and a changed kind is
+refused. A ReadTxn is a snapshot; a WriteTxn is an ordered overlay over a
+snapshot (read-your-writes, Clear as a table tombstone), committed as one
+WriteBatch with sync=false; Sync() writes an empty synced batch. Opening an
+MDBX directory, or a foreign LevelDB, is refused. EstimateEntries counts
+exactly (LevelDB has no counts; it is only used for progress logs).
+
+The node selects the backend with the hidden -chronikdbbackend=mdbx|leveldb
+(default mdbx, or leveldb in LevelDB-only builds); an unknown or unbuilt
+backend is an init error. The legacy-RocksDB refusal applies only to the
+MDBX directory, since a LevelDB directory also has CURRENT/MANIFEST files.
+
+Tests: the KvStore conformance suite gains a randomized model test (Get,
+both cursor directions, seeks, dup cursors and plain cursors over dup
+tables, against an in-memory model, before and after commits) and LevelDB
+table-id/refusal tests; every other suite runs on the backend chosen by
+CHRONIK_NATIVE_TEST_BACKEND (default MDBX when linked). The standalone
+build vendors src/leveldb and src/crc32c without their tests.
+
+Tier: eCash
+
+Coordinator integration provenance (reference405):
+Preserve earlier purposeful source repairs through downstream consumer/context adaptations; exact conflict ledger retained.
+All60 authored input payloads retained, with prerequisite-aware same-purpose splits; distinct legacy-index and inherited CXX compatibility remain independent. Pre-format source equals exact403+all60 control tree95718fceff83364b74294a751bd752b2f1a4e384. Only pinnedRuff import/format cleanup follows. Original author commands/hashes are historical reference evidence, not combined405 approval. Reference OFF/native/Rust full gates are preserved separately; combined compile/runtime NOT_RUN.
+---
+ chronik/native/CMakeLists.txt                 |    5 +
+ chronik/native/core/db/store_registry.cpp     |   19 +
+ chronik/native/core/indexer/indexer.cpp       |    8 +-
+ chronik/native/hosts/abc/abc_entry.cpp        |   40 +-
+ .../native/include/chronik/native/indexer.h   |    5 +-
+ .../include/chronik/native/leveldb_store.h    |   56 +
+ chronik/native/include/chronik/native/store.h |    8 +
+ .../native/store/leveldb/leveldb_store.cpp    | 1012 +++++++++++++++++
+ chronik/native/store/store.cmake              |   29 +
+ chronik/native/test/db_dump_tests.cpp         |    4 +
+ chronik/native/test/index_test_util.h         |    6 +-
+ .../native/test/indexer_property_tests.cpp    |    5 +-
+ chronik/native/test/indexer_tests.cpp         |   18 +-
+ chronik/native/test/metadata_tests.cpp        |    8 +-
+ chronik/native/test/query_tests.cpp           |    5 +-
+ chronik/native/test/service_tests.cpp         |    5 +-
+ chronik/native/test/store_tests.cpp           |  230 ++++
+ chronik/native/test/test_backend.h            |   65 ++
+ src/init.cpp                                  |    9 +
+ 19 files changed, 1508 insertions(+), 29 deletions(-)
+ create mode 100644 chronik/native/include/chronik/native/leveldb_store.h
+ create mode 100644 chronik/native/store/leveldb/leveldb_store.cpp
+ create mode 100644 chronik/native/test/test_backend.h
+
+diff --git a/chronik/native/CMakeLists.txt b/chronik/native/CMakeLists.txt
+index d6f85223480ac5d3eeee41d864ff7497157e8740..60da031952ea7406544e1b6fc57737a1874f4978 100644
+--- a/chronik/native/CMakeLists.txt
++++ b/chronik/native/CMakeLists.txt
+@@ -134,6 +134,11 @@ if(NOT CHRONIK_NATIVE_STANDALONE)
+         target_compile_definitions(chronik_native_host_abc
+             PRIVATE CHRONIK_NATIVE_HAVE_MDBX=1)
+     endif()
++    if(CHRONIK_NATIVE_LEVELDB)
++        target_link_libraries(chronik_native_host_abc chronik_native_store_leveldb)
++        target_compile_definitions(chronik_native_host_abc
++            PRIVATE CHRONIK_NATIVE_HAVE_LEVELDB=1)
++    endif()
+     target_link_libraries(server chronik_native_host_abc)
+ endif()
+ 
+diff --git a/chronik/native/core/db/store_registry.cpp b/chronik/native/core/db/store_registry.cpp
+index 0aecea79b71e5e8577694eb2580fad320b0af5d2..8bc57e8fd2f305c62b29fc60cdd16ca7a3e3c0fb 100644
+--- a/chronik/native/core/db/store_registry.cpp
++++ b/chronik/native/core/db/store_registry.cpp
+@@ -48,6 +48,25 @@ std::string_view StoreBackendName(StoreBackend backend) {
+     return "unknown";
+ }
+ 
++std::optional<StoreBackend> ParseStoreBackend(std::string_view name) {
++    for (StoreBackend b : {StoreBackend::Mdbx, StoreBackend::LevelDb}) {
++        if (StoreBackendName(b) == name) {
++            return b;
++        }
++    }
++    return std::nullopt;
++}
++
++std::string_view StoreIndexDirName(StoreBackend backend) {
++    switch (backend) {
++        case StoreBackend::Mdbx:
++            return "chronik";
++        case StoreBackend::LevelDb:
++            return "chronik-leveldb";
++    }
++    return "chronik";
++}
++
+ void RegisterStoreBackend(StoreBackend backend, StoreOpenFn open,
+                           StoreDestroyFn destroy) {
+     std::lock_guard<std::mutex> lock(RegistryMutex());
+diff --git a/chronik/native/core/indexer/indexer.cpp b/chronik/native/core/indexer/indexer.cpp
+index 42729e17487a34733fb071917f5cacfd5fd90de5..cecb0bf3979faa4207eb0f02149f0a7efebfb805 100644
+--- a/chronik/native/core/indexer/indexer.cpp
++++ b/chronik/native/core/indexer/indexer.cpp
+@@ -289,7 +289,8 @@ IndexerImpl::IndexerImpl(const Host &host, IndexerParams params,
+     if (m_params.perf_stats) {
+         CreateDirIfMissing(perf_path);
+     }
+-    const std::filesystem::path db_path = indexes_path / "chronik";
++    const std::filesystem::path db_path =
++        indexes_path / std::string(StoreIndexDirName(m_params.backend));
+     m_config.db_path = db_path;
+     m_config.perf_path = perf_path;
+     if (m_params.wipe) {
+@@ -318,7 +319,10 @@ IndexerImpl::IndexerImpl(const Host &host, IndexerParams params,
+             schema.Add(spec);
+         }
+     }
+-    RefuseLegacyRocksDb(db_path);
++    if (m_params.backend == StoreBackend::Mdbx) {
++        // (A LevelDB directory also has CURRENT/MANIFEST-* files.)
++        RefuseLegacyRocksDb(db_path);
++    }
+     StoreOptions store_opts;
+     store_opts.sha256 = HostSha256(m_host);
+     m_store = OpenStore(m_params.backend, db_path, schema.Tables(), store_opts);
+diff --git a/chronik/native/hosts/abc/abc_entry.cpp b/chronik/native/hosts/abc/abc_entry.cpp
+index e58fb0c0c54330450fdd33c4d6d05ab2b6b40ece..1dc5f9366367fff640aabb8304f330d3914cd9bc 100644
+--- a/chronik/native/hosts/abc/abc_entry.cpp
++++ b/chronik/native/hosts/abc/abc_entry.cpp
+@@ -26,6 +26,9 @@
+ #include <chronik-cpp/chronik.h>
+ 
+ #include <chronik/native/error.h>
++#ifdef CHRONIK_NATIVE_HAVE_LEVELDB
++#include <chronik/native/leveldb_store.h>
++#endif
+ #ifdef CHRONIK_NATIVE_HAVE_MDBX
+ #include <chronik/native/mdbx_store.h>
+ #endif
+@@ -43,6 +46,16 @@ namespace chronik {
+ 
+ namespace {
+ 
++/** Registers the storage backends linked into this build (idempotent). */
++void RegisterStoreBackends() {
++#ifdef CHRONIK_NATIVE_HAVE_MDBX
++    native::RegisterMdbxStore();
++#endif
++#ifdef CHRONIK_NATIVE_HAVE_LEVELDB
++    native::RegisterLevelDbStore();
++#endif
++}
++
+ // Duration between WebSocket pings initiated by Chronik.
+ // 45s has been empirically established as a reliable duration for both browser
+ // and NodeJS WebSockets.
+@@ -152,7 +165,29 @@ ParseChronikParams(const ArgsManager &args, const Config &config, bool fWipe) {
+         "-chroniktxnumcachebuckets", DEFAULT_TX_NUM_CACHE_BUCKETS);
+     out.indexer.tx_num_cache_bucket_size = (size_t)args.GetIntArg(
+         "-chroniktxnumcachebucketsize", DEFAULT_TX_NUM_CACHE_BUCKET_SIZE);
+-    out.indexer.backend = native::StoreBackend::Mdbx;
++#ifdef CHRONIK_NATIVE_HAVE_MDBX
++    const std::string default_backend = "mdbx";
++#else
++    const std::string default_backend = "leveldb";
++#endif
++    const std::string backend_name =
++        args.GetArg("-chronikdbbackend", default_backend);
++    const std::optional<native::StoreBackend> backend =
++        native::ParseStoreBackend(backend_name);
++    if (!backend) {
++        return {{_(strprintf("Unknown -chronikdbbackend %s (expected mdbx "
++                             "or leveldb).",
++                             backend_name)
++                       .c_str())}};
++    }
++    RegisterStoreBackends();
++    if (!native::HasStoreBackend(*backend)) {
++        return {{_(strprintf("-chronikdbbackend=%s is not available in this "
++                             "build.",
++                             backend_name)
++                       .c_str())}};
++    }
++    out.indexer.backend = *backend;
+     out.indexer.token_index_factory = native::token_io::MakeEcashTokenIndex;
+     out.indexer.decompress_pubkey =
+         [](native::ByteView form) -> std::optional<native::Bytes> {
+@@ -223,9 +258,6 @@ bool Start(const ArgsManager &args, const Config &config,
+     caps.default_http_port = BaseParams().ChronikPort();
+     caps.client_name = CLIENT_NAME;
+ 
+-#ifdef CHRONIK_NATIVE_HAVE_MDBX
+-    native::RegisterMdbxStore();
+-#endif
+     g_host = std::make_unique<native::abc::AbcHost>(node, std::move(caps));
+     try {
+         std::unique_ptr<native::Service> service =
+diff --git a/chronik/native/include/chronik/native/indexer.h b/chronik/native/include/chronik/native/indexer.h
+index 9823de50d0c0145e0659db0943f43c4b6295cbaf..67e41f651d5a76428f545f8b677ce6e93a7fbfc6 100644
+--- a/chronik/native/include/chronik/native/indexer.h
++++ b/chronik/native/include/chronik/native/indexer.h
+@@ -22,7 +22,10 @@ namespace chronik::native {
+ 
+ /** Port of ChronikIndexerParams (chronik-indexer/src/indexer.rs). */
+ struct IndexerParams {
+-    /** Index at <datadir_net>/indexes/chronik (same as Rust). */
++    /**
++     * Index at <datadir_net>/indexes/chronik (MDBX, same as Rust) or
++     * indexes/chronik-leveldb (LevelDB), see StoreIndexDirName.
++     */
+     std::filesystem::path datadir_net;
+     /** -chronikreindex / -reindex */
+     bool wipe = false;
+diff --git a/chronik/native/include/chronik/native/leveldb_store.h b/chronik/native/include/chronik/native/leveldb_store.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e13bc5458e1df38ff85ce7c371088b1a7b085c82
+--- /dev/null
++++ b/chronik/native/include/chronik/native/leveldb_store.h
+@@ -0,0 +1,56 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef CHRONIK_NATIVE_LEVELDB_STORE_H
++#define CHRONIK_NATIVE_LEVELDB_STORE_H
++
++#include <chronik/native/store.h>
++
++#include <filesystem>
++#include <memory>
++#include <span>
++
++/**
++ * Optional LevelDB storage backend (library chronik_native_store_leveldb,
++ * built with CHRONIK_NATIVE_LEVELDB=ON). Only this library includes LevelDB
++ * headers; the core reaches it only through the KvStore interface.
++ *
++ * The logical schema is the same as with MDBX, but the physical layout is
++ * not byte-compatible with Rust Chronik data (switching backends needs a
++ * reindex). Physical layout, in one LevelDB with the bytewise comparator:
++ *
++ *   store metadata  0x00 || "format"           -> "chronik-native-leveldb-1"
++ *                   0x00 || "table:" || name   -> varint(id) || kind
++ *                                                 [|| varint(dup_fixed_size)]
++ *   plain table     varint(id) || key          -> value
++ *   dup table       varint(id) || escaped(key) || dup_value -> ""
++ *
++ * varint is unsigned LEB128. escaped(key) is the key with every 0x00 byte
++ * written as 0x00 0xff, followed by 0x00 0x00: prefix-free and
++ * order-preserving, so keys iterate in memcmp order (as in MDBX, also for a
++ * plain cursor over a dup table) and the dups of one key are a prefix scan
++ * in memcmp order, which is the MDBX DUPSORT order. Table ids start at 1 and
++ * are assigned the first time a table name is opened, then persisted, so
++ * adding tables later (e.g. by a tier extension) never renumbers existing
++ * ones. Keys are never hashed (LevelDB has no key-length limit).
++ *
++ * A ReadTxn is a LevelDB snapshot. A WriteTxn is an in-memory ordered overlay
++ * over a snapshot (read-your-writes), written as one WriteBatch on Commit
++ * with sync=false; Sync() writes an empty batch with sync=true.
++ */
++namespace chronik::native {
++
++/** Registers StoreBackend::LevelDb in the registry. */
++void RegisterLevelDbStore();
++
++std::unique_ptr<KvStore> OpenLevelDbStore(const std::filesystem::path &dir,
++                                          std::span<const TableSpec> tables,
++                                          const StoreOptions &opts);
++
++/** Deletes the LevelDB files (and the directory if then empty). */
++void DestroyLevelDbStore(const std::filesystem::path &dir);
++
++} // namespace chronik::native
++
++#endif // CHRONIK_NATIVE_LEVELDB_STORE_H
+diff --git a/chronik/native/include/chronik/native/store.h b/chronik/native/include/chronik/native/store.h
+index d5a87c3c824972b52d7c07c1be2a60d7bf8aea89..6a363d16689f8d44aecc66438e131f1929e8004c 100644
+--- a/chronik/native/include/chronik/native/store.h
++++ b/chronik/native/include/chronik/native/store.h
+@@ -145,6 +145,14 @@ std::unique_ptr<KvStore> OpenStore(StoreBackend,
+                                    const StoreOptions &opts);
+ void DestroyStore(StoreBackend, const std::filesystem::path &dir);
+ std::string_view StoreBackendName(StoreBackend);
++/** Inverse of StoreBackendName ("mdbx", "leveldb"); nullopt if unknown. */
++std::optional<StoreBackend> ParseStoreBackend(std::string_view name);
++/**
++ * Index directory under <datadir_net>/indexes: "chronik" for MDBX (shared
++ * with Rust Chronik), "chronik-leveldb" for LevelDB, so the two layouts are
++ * never confused.
++ */
++std::string_view StoreIndexDirName(StoreBackend);
+ 
+ } // namespace chronik::native
+ 
+diff --git a/chronik/native/store/leveldb/leveldb_store.cpp b/chronik/native/store/leveldb/leveldb_store.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..db0e39fab8af582b70dcf14b0bf5b4b5792b847e
+--- /dev/null
++++ b/chronik/native/store/leveldb/leveldb_store.cpp
+@@ -0,0 +1,1012 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++// Optional LevelDB backend of the native Chronik KvStore. The physical layout
++// is documented in include/chronik/native/leveldb_store.h.
++
++#include <chronik/native/codec/bytes.h>
++#include <chronik/native/error.h>
++#include <chronik/native/leveldb_store.h>
++
++#include <leveldb/cache.h>
++#include <leveldb/db.h>
++#include <leveldb/filter_policy.h>
++#include <leveldb/iterator.h>
++#include <leveldb/options.h>
++#include <leveldb/write_batch.h>
++
++#include <algorithm>
++#include <cstdio>
++#include <deque>
++#include <map>
++#include <optional>
++#include <set>
++#include <string>
++#include <vector>
++
++namespace chronik::native {
++
++namespace {
++
++constexpr std::string_view kFormat = "chronik-native-leveldb-1";
++constexpr char kStoreMetaPrefix = 0x00;
++constexpr std::string_view kFormatKey = "format";
++constexpr std::string_view kTableKeyPrefix = "table:";
++constexpr size_t kBlockCacheBytes = size_t(32) << 20;
++constexpr size_t kWriteBufferBytes = size_t(16) << 20;
++
++[[noreturn]] void ThrowLevelDb(const leveldb::Status &status,
++                               std::string_view context) {
++    throw ChronikError("LevelDB error: " + std::string(context) + ": " +
++                       status.ToString());
++}
++
++void CheckStatus(const leveldb::Status &status, std::string_view context) {
++    if (!status.ok()) {
++        ThrowLevelDb(status, context);
++    }
++}
++
++void AppendVarint(std::string &out, uint64_t v) {
++    while (v >= 0x80) {
++        out.push_back(char(uint8_t(v) | 0x80));
++        v >>= 7;
++    }
++    out.push_back(char(uint8_t(v)));
++}
++
++/** Parses a varint at the start of s; nullopt if malformed. */
++std::optional<uint64_t> ReadVarint(std::string_view &s) {
++    uint64_t v = 0;
++    for (unsigned shift = 0; shift < 64 && !s.empty(); shift += 7) {
++        const uint8_t byte = uint8_t(s.front());
++        s.remove_prefix(1);
++        v |= uint64_t(byte & 0x7f) << shift;
++        if (!(byte & 0x80)) {
++            return v;
++        }
++    }
++    return std::nullopt;
++}
++
++/** Smallest string greater than every string starting with prefix. */
++std::optional<std::string> PrefixSuccessor(std::string prefix) {
++    while (!prefix.empty()) {
++        if (uint8_t(prefix.back()) != 0xff) {
++            prefix.back() = char(uint8_t(prefix.back()) + 1);
++            return prefix;
++        }
++        prefix.pop_back();
++    }
++    return std::nullopt;
++}
++
++inline leveldb::Slice ToSlice(ByteView v) {
++    return leveldb::Slice(reinterpret_cast<const char *>(v.data()), v.size());
++}
++
++inline leveldb::Slice ToSlice(const std::string &s) {
++    return leveldb::Slice(s);
++}
++
++inline ByteView ToView(std::string_view s) {
++    if (s.empty()) {
++        return ByteView();
++    }
++    return ByteView(reinterpret_cast<const uint8_t *>(s.data()), s.size());
++}
++
++inline std::string_view ToStringView(const leveldb::Slice &s) {
++    return std::string_view(s.data(), s.size());
++}
++
++void AppendBytes(std::string &out, ByteView v) {
++    out.append(reinterpret_cast<const char *>(v.data()), v.size());
++}
++
++/**
++ * Order-preserving, prefix-free encoding of a dup table's key: 0x00 becomes
++ * 0x00 0xff and the key ends with 0x00 0x00. Encoded keys compare like the
++ * keys themselves (memcmp), so a plain cursor over a dup table visits keys
++ * in MDBX order, and the dup value can follow without a length.
++ */
++void AppendEscapedKey(std::string &out, ByteView key) {
++    for (uint8_t b : key) {
++        out.push_back(char(b));
++        if (b == 0x00) {
++            out.push_back(char(0xff));
++        }
++    }
++    out.push_back(char(0x00));
++    out.push_back(char(0x00));
++}
++
++/**
++ * Splits the part of a dup table's physical key after the table prefix into
++ * the key (unescaped into key_out) and the dup value.
++ */
++std::string_view SplitEscapedKey(std::string_view rest, Bytes &key_out) {
++    key_out.clear();
++    for (size_t i = 0; i < rest.size(); ++i) {
++        const uint8_t b = uint8_t(rest[i]);
++        if (b != 0x00) {
++            key_out.push_back(b);
++            continue;
++        }
++        if (i + 1 >= rest.size()) {
++            break;
++        }
++        if (uint8_t(rest[i + 1]) == 0x00) {
++            return rest.substr(i + 2);
++        }
++        key_out.push_back(0x00);
++        ++i;
++    }
++    throw ChronikError("Corrupted Chronik LevelDB dup key");
++}
++
++/** Pending writes of a WriteTxn: physical key -> value (nullopt = deleted). */
++using Overlay = std::map<std::string, std::optional<std::string>, std::less<>>;
++
++/**
++ * What a cursor reads: a snapshot of the DB, optionally overlaid by a write
++ * txn's pending writes, within one half-open physical key range [lo, hi).
++ */
++struct View {
++    leveldb::DB *db = nullptr;
++    const leveldb::Snapshot *snapshot = nullptr;
++    /** Write txns only */
++    const Overlay *overlay = nullptr;
++    /** Write txns only: tables whose snapshot data was cleared */
++    const std::set<TableId> *cleared = nullptr;
++};
++
++/**
++ * Ordered cursor over the merge of the snapshot and the overlay, restricted
++ * to [lo, hi). Overlay entries win over snapshot entries with the same key;
++ * deleted overlay entries hide them. Positions are re-derived from the
++ * current key on every move, so the overlay may change between moves; the
++ * snapshot iterator is reused when it is still positioned on that key.
++ */
++class MergedCursor {
++public:
++    MergedCursor(const View &view, TableId table) : m_view(view), m_table(table) {
++        leveldb::ReadOptions ro;
++        ro.snapshot = view.snapshot;
++        m_base.reset(view.db->NewIterator(ro));
++    }
++
++    void SetBounds(std::string lo, std::optional<std::string> hi) {
++        m_lo = std::move(lo);
++        m_hi = std::move(hi);
++        m_valid = false;
++    }
++
++    bool FindGe(const std::string &target, bool inclusive) {
++        std::string t = target;
++        bool incl = inclusive;
++        while (true) {
++            const bool have_base = BaseGe(t, incl);
++            const Overlay::const_iterator ov = OverlayGe(t, incl);
++            const bool have_ov = m_view.overlay && ov != m_view.overlay->end();
++            if (!have_base && !have_ov) {
++                return m_valid = false;
++            }
++            if (have_ov &&
++                (!have_base || std::string_view(ov->first) <= BaseKey())) {
++                if (!ov->second) {
++                    t = ov->first;
++                    incl = false;
++                    continue;
++                }
++                return Set(ov->first, *ov->second);
++            }
++            return Set(BaseKey(), BaseValue());
++        }
++    }
++
++    bool FindLe(const std::string &target, bool inclusive) {
++        std::string t = target;
++        bool incl = inclusive;
++        while (true) {
++            const bool have_base = BaseLe(t, incl);
++            const std::optional<Overlay::const_iterator> ov = OverlayLe(t, incl);
++            if (!have_base && !ov) {
++                return m_valid = false;
++            }
++            if (ov && (!have_base || std::string_view((*ov)->first) >= BaseKey())) {
++                if (!(*ov)->second) {
++                    t = (*ov)->first;
++                    incl = false;
++                    continue;
++                }
++                return Set((*ov)->first, *(*ov)->second);
++            }
++            return Set(BaseKey(), BaseValue());
++        }
++    }
++
++    bool Valid() const { return m_valid; }
++    const std::string &Key() const { return m_key; }
++    const std::string &Value() const { return m_value; }
++    const std::string &Lo() const { return m_lo; }
++    const std::optional<std::string> &Hi() const { return m_hi; }
++
++private:
++    bool BaseEnabled() const {
++        return !(m_view.cleared && m_view.cleared->count(m_table));
++    }
++
++    bool InBounds(std::string_view key) const {
++        return key >= std::string_view(m_lo) &&
++               (!m_hi || key < std::string_view(*m_hi));
++    }
++
++    std::string_view BaseKey() const { return ToStringView(m_base->key()); }
++    std::string_view BaseValue() const { return ToStringView(m_base->value()); }
++
++    void CheckBase() const {
++        if (!m_base->Valid()) {
++            CheckStatus(m_base->status(), "iterator");
++        }
++    }
++
++    /** Positions the snapshot iterator at the first key >(=) t in bounds. */
++    bool BaseGe(const std::string &t, bool incl) {
++        if (!BaseEnabled()) {
++            return false;
++        }
++        if (m_base->Valid() && BaseKey() == t) {
++            if (!incl) {
++                m_base->Next();
++            }
++        } else {
++            m_base->Seek(ToSlice(t));
++            if (!incl && m_base->Valid() && BaseKey() == t) {
++                m_base->Next();
++            }
++        }
++        CheckBase();
++        return m_base->Valid() && InBounds(BaseKey());
++    }
++
++    /** Positions the snapshot iterator at the last key <(=) t in bounds. */
++    bool BaseLe(const std::string &t, bool incl) {
++        if (!BaseEnabled()) {
++            return false;
++        }
++        if (m_base->Valid() && BaseKey() == t) {
++            if (!incl) {
++                m_base->Prev();
++            }
++        } else {
++            m_base->Seek(ToSlice(t));
++            if (!m_base->Valid()) {
++                CheckBase();
++                m_base->SeekToLast();
++            } else if (BaseKey() > std::string_view(t) ||
++                       (!incl && BaseKey() == t)) {
++                m_base->Prev();
++            }
++        }
++        CheckBase();
++        return m_base->Valid() && InBounds(BaseKey());
++    }
++
++    Overlay::const_iterator OverlayGe(const std::string &t, bool incl) const {
++        if (!m_view.overlay) {
++            return {};
++        }
++        const Overlay &ov = *m_view.overlay;
++        auto it = incl ? ov.lower_bound(t) : ov.upper_bound(t);
++        if (it != ov.end() && !InBounds(it->first)) {
++            return ov.end();
++        }
++        return it;
++    }
++
++    std::optional<Overlay::const_iterator> OverlayLe(const std::string &t,
++                                                     bool incl) const {
++        if (!m_view.overlay) {
++            return std::nullopt;
++        }
++        const Overlay &ov = *m_view.overlay;
++        auto it = incl ? ov.upper_bound(t) : ov.lower_bound(t);
++        if (it == ov.begin()) {
++            return std::nullopt;
++        }
++        --it;
++        if (!InBounds(it->first)) {
++            return std::nullopt;
++        }
++        return it;
++    }
++
++    bool Set(std::string_view key, std::string_view value) {
++        m_key.assign(key);
++        m_value.assign(value);
++        return m_valid = true;
++    }
++
++    View m_view;
++    TableId m_table;
++    std::unique_ptr<leveldb::Iterator> m_base;
++    std::string m_lo;
++    std::optional<std::string> m_hi;
++    std::string m_key;
++    std::string m_value;
++    bool m_valid = false;
++};
++
++class LevelDbStore;
++
++class LevelDbCursor final : public Cursor {
++public:
++    LevelDbCursor(const View &view, TableId table, const std::string &prefix,
++                  const std::string &prefix_end)
++        : m_cursor(view, table), m_prefix_len(prefix.size()) {
++        m_cursor.SetBounds(prefix, prefix_end);
++    }
++
++    bool SeekFirst() override { return m_cursor.FindGe(m_cursor.Lo(), true); }
++    bool SeekLast() override { return m_cursor.FindLe(*m_cursor.Hi(), false); }
++    bool SeekGe(ByteView key) override {
++        return m_cursor.FindGe(Phys(key), true);
++    }
++    bool SeekLe(ByteView key) override {
++        return m_cursor.FindLe(Phys(key), true);
++    }
++    bool Next() override {
++        return m_cursor.Valid() && m_cursor.FindGe(Current(), false);
++    }
++    bool Prev() override {
++        return m_cursor.Valid() && m_cursor.FindLe(Current(), false);
++    }
++    bool Valid() const override { return m_cursor.Valid(); }
++    ByteView Key() const override {
++        return ToView(std::string_view(m_cursor.Key()).substr(m_prefix_len));
++    }
++    ByteView Value() const override { return ToView(m_cursor.Value()); }
++
++private:
++    std::string Phys(ByteView key) const {
++        std::string phys = m_cursor.Lo();
++        AppendBytes(phys, key);
++        return phys;
++    }
++    /** Copy: FindGe/FindLe overwrite the current key. */
++    std::string Current() const { return m_cursor.Key(); }
++
++    MergedCursor m_cursor;
++    size_t m_prefix_len;
++};
++
++/**
++ * Plain cursor over a dup table, like an MDBX cursor on a DUPSORT DBI: it
++ * visits every (key, dup) pair, ordered by key then dup.
++ */
++class LevelDbDupTableCursor final : public Cursor {
++public:
++    LevelDbDupTableCursor(const View &view, TableId table,
++                          const std::string &prefix,
++                          const std::string &prefix_end)
++        : m_cursor(view, table), m_prefix_len(prefix.size()) {
++        m_cursor.SetBounds(prefix, prefix_end);
++    }
++
++    bool SeekFirst() override {
++        return Decode(m_cursor.FindGe(m_cursor.Lo(), true));
++    }
++    bool SeekLast() override {
++        return Decode(m_cursor.FindLe(*m_cursor.Hi(), false));
++    }
++    /** First dup of the first key >= key (MDBX_SET_RANGE) */
++    bool SeekGe(ByteView key) override {
++        return Decode(m_cursor.FindGe(KeyPrefix(key), true));
++    }
++    /** Last dup of the last key <= key */
++    bool SeekLe(ByteView key) override {
++        // The key prefix ends with 0x00 0x00, so its successor exists.
++        return Decode(
++            m_cursor.FindLe(*PrefixSuccessor(KeyPrefix(key)), false));
++    }
++    bool Next() override {
++        return m_cursor.Valid() &&
++               Decode(m_cursor.FindGe(std::string(m_cursor.Key()), false));
++    }
++    bool Prev() override {
++        return m_cursor.Valid() &&
++               Decode(m_cursor.FindLe(std::string(m_cursor.Key()), false));
++    }
++    bool Valid() const override { return m_cursor.Valid(); }
++    ByteView Key() const override { return m_key; }
++    ByteView Value() const override { return ToView(m_value); }
++
++private:
++    std::string KeyPrefix(ByteView key) const {
++        std::string phys = m_cursor.Lo();
++        AppendEscapedKey(phys, key);
++        return phys;
++    }
++    bool Decode(bool ok) {
++        if (ok) {
++            m_value = SplitEscapedKey(
++                std::string_view(m_cursor.Key()).substr(m_prefix_len), m_key);
++        }
++        return ok;
++    }
++
++    MergedCursor m_cursor;
++    size_t m_prefix_len;
++    Bytes m_key;
++    std::string_view m_value;
++};
++
++class LevelDbDupCursor final : public DupCursor {
++public:
++    LevelDbDupCursor(const View &view, TableId table, const std::string &prefix,
++                     const std::string &prefix_end,
++                     std::optional<uint32_t> fixed)
++        : m_view(view), m_table(table), m_cursor(view, table),
++          m_table_prefix(prefix), m_table_end(prefix_end), m_fixed(fixed) {}
++
++    bool Seek(ByteView key) override {
++        SetKey(key);
++        return m_cursor.FindGe(m_key_prefix, true);
++    }
++    bool SeekValueGe(ByteView key, ByteView value_prefix) override {
++        SetKey(key);
++        std::string target = m_key_prefix;
++        // Like MDBX GET_BOTH_RANGE on a DUPFIXED table, a longer prefix is
++        // truncated; a shorter one compares like its zero-padded form.
++        ByteView prefix = value_prefix;
++        if (m_fixed && prefix.size() > *m_fixed) {
++            prefix = prefix.first(*m_fixed);
++        }
++        AppendBytes(target, prefix);
++        return m_cursor.FindGe(target, true);
++    }
++    bool Next() override {
++        if (!m_cursor.Valid()) {
++            return false;
++        }
++        const std::string current = m_cursor.Key();
++        return m_cursor.FindGe(current, false);
++    }
++    bool Valid() const override { return m_cursor.Valid(); }
++    ByteView Value() const override {
++        return ToView(
++            std::string_view(m_cursor.Key()).substr(m_key_prefix.size()));
++    }
++    size_t CountRemaining() override {
++        if (!m_cursor.Valid()) {
++            return 0;
++        }
++        MergedCursor copy(m_view, m_table);
++        copy.SetBounds(m_cursor.Lo(), m_cursor.Hi());
++        size_t count = 0;
++        for (bool ok = copy.FindGe(m_cursor.Key(), true); ok;
++             ok = copy.FindGe(std::string(copy.Key()), false)) {
++            ++count;
++        }
++        return count;
++    }
++
++    /** Physical key of (key, value) in this dup table. */
++    static std::string DupPhys(const std::string &table_prefix, ByteView key,
++                               ByteView value) {
++        std::string phys = table_prefix;
++        AppendEscapedKey(phys, key);
++        AppendBytes(phys, value);
++        return phys;
++    }
++
++private:
++    void SetKey(ByteView key) {
++        m_key_prefix = DupPhys(m_table_prefix, key, ByteView());
++        std::optional<std::string> end = PrefixSuccessor(m_key_prefix);
++        m_cursor.SetBounds(m_key_prefix, end ? *end : m_table_end);
++    }
++
++    View m_view;
++    TableId m_table;
++    MergedCursor m_cursor;
++    std::string m_table_prefix;
++    std::string m_table_end;
++    std::optional<uint32_t> m_fixed;
++    std::string m_key_prefix;
++};
++
++class LevelDbStore final : public KvStore {
++public:
++    LevelDbStore(const std::filesystem::path &dir,
++                 std::span<const TableSpec> tables);
++    ~LevelDbStore() override;
++
++    TableId Table(std::string_view name) const override {
++        auto it = m_by_name.find(std::string(name));
++        if (it == m_by_name.end()) {
++            throw ChronikError("Column family " + std::string(name) +
++                               " doesn't exist");
++        }
++        return it->second;
++    }
++    std::vector<std::string> TableNames() const override { return m_names; }
++    std::unique_ptr<ReadTxn> BeginRead() const override;
++    std::unique_ptr<WriteTxn> BeginWrite() override;
++    void Sync(bool /*force*/) override {
++        leveldb::WriteOptions wo;
++        wo.sync = true;
++        leveldb::WriteBatch empty;
++        CheckStatus(m_db->Write(wo, &empty), "sync");
++    }
++
++    leveldb::DB *Db() const { return m_db.get(); }
++    const TableSpec &Spec(TableId id) const {
++        if (id >= m_specs.size()) {
++            throw ChronikError("Unknown Chronik table id " +
++                               std::to_string(id));
++        }
++        return m_specs[id];
++    }
++    bool IsDup(TableId id) const {
++        return Spec(id).kind == TableSpec::Kind::Dup;
++    }
++    const std::string &Prefix(TableId id) const {
++        Spec(id);
++        return m_prefixes[id];
++    }
++    const std::string &PrefixEnd(TableId id) const {
++        Spec(id);
++        return m_prefix_ends[id];
++    }
++    std::string PlainPhys(TableId id, ByteView key) const {
++        std::string phys = Prefix(id);
++        AppendBytes(phys, key);
++        return phys;
++    }
++
++private:
++    std::unique_ptr<leveldb::Cache> m_cache;
++    std::unique_ptr<const leveldb::FilterPolicy> m_filter;
++    std::unique_ptr<leveldb::DB> m_db;
++    std::vector<std::string> m_names;
++    std::vector<TableSpec> m_specs; // names point into m_names
++    std::vector<std::string> m_prefixes;
++    std::vector<std::string> m_prefix_ends;
++    std::map<std::string, TableId> m_by_name;
++};
++
++/** Read operations shared by read and write txns. */
++class TxnBase {
++public:
++    TxnBase(const LevelDbStore &store, const leveldb::Snapshot *snapshot)
++        : m_store(store), m_snapshot(snapshot) {}
++
++    std::optional<ByteView> BaseGet(TableId table, ByteView key) const {
++        if (m_store.IsDup(table)) {
++            throw ChronikError("Get on a dup table");
++        }
++        leveldb::ReadOptions ro;
++        ro.snapshot = m_snapshot;
++        std::string value;
++        const std::string phys = m_store.PlainPhys(table, key);
++        const leveldb::Status status =
++            m_store.Db()->Get(ro, ToSlice(phys), &value);
++        if (status.IsNotFound()) {
++            return std::nullopt;
++        }
++        CheckStatus(status, "get");
++        m_values.push_back(std::move(value));
++        return ToView(m_values.back());
++    }
++
++    /**
++     * LevelDB keeps no entry counts, so this counts the entries of the view
++     * (exact; used only for progress logs before a reindex).
++     */
++    uint64_t Count(const View &view, TableId table) const {
++        MergedCursor cursor(view, table);
++        cursor.SetBounds(m_store.Prefix(table), m_store.PrefixEnd(table));
++        uint64_t count = 0;
++        for (bool ok = cursor.FindGe(m_store.Prefix(table), true); ok;
++             ok = cursor.FindGe(std::string(cursor.Key()), false)) {
++            ++count;
++        }
++        return count;
++    }
++
++    View MakeView(const Overlay *overlay,
++                  const std::set<TableId> *cleared) const {
++        return View{m_store.Db(), m_snapshot, overlay, cleared};
++    }
++
++    std::unique_ptr<Cursor> MakeCursor(const View &view, TableId table) const {
++        if (m_store.IsDup(table)) {
++            return std::make_unique<LevelDbDupTableCursor>(
++                view, table, m_store.Prefix(table), m_store.PrefixEnd(table));
++        }
++        return std::make_unique<LevelDbCursor>(view, table,
++                                               m_store.Prefix(table),
++                                               m_store.PrefixEnd(table));
++    }
++
++    std::unique_ptr<DupCursor> MakeDup(const View &view, TableId table) const {
++        if (!m_store.IsDup(table)) {
++            throw ChronikError("Dup cursor on a plain table");
++        }
++        return std::make_unique<LevelDbDupCursor>(
++            view, table, m_store.Prefix(table), m_store.PrefixEnd(table),
++            m_store.Spec(table).dup_fixed_size);
++    }
++
++    const LevelDbStore &m_store;
++    const leveldb::Snapshot *m_snapshot;
++    /** Owns returned Get views (stable addresses) until the txn ends. */
++    mutable std::deque<std::string> m_values;
++};
++
++class LevelDbReadTxn final : public ReadTxn {
++public:
++    explicit LevelDbReadTxn(const LevelDbStore &store)
++        : m_base(store, store.Db()->GetSnapshot()) {}
++    ~LevelDbReadTxn() override {
++        m_base.m_store.Db()->ReleaseSnapshot(m_base.m_snapshot);
++    }
++
++    std::optional<ByteView> Get(TableId table, ByteView key) const override {
++        return m_base.BaseGet(table, key);
++    }
++    std::unique_ptr<Cursor> OpenCursor(TableId table) const override {
++        return m_base.MakeCursor(m_base.MakeView(nullptr, nullptr), table);
++    }
++    std::unique_ptr<DupCursor> OpenDupCursor(TableId table) const override {
++        return m_base.MakeDup(m_base.MakeView(nullptr, nullptr), table);
++    }
++    uint64_t EstimateEntries(TableId table) const override {
++        return m_base.Count(m_base.MakeView(nullptr, nullptr), table);
++    }
++
++private:
++    TxnBase m_base;
++};
++
++class LevelDbWriteTxn final : public WriteTxn {
++public:
++    explicit LevelDbWriteTxn(LevelDbStore &store)
++        : m_store(store), m_base(store, store.Db()->GetSnapshot()) {}
++    ~LevelDbWriteTxn() override { Release(); }
++
++    std::optional<ByteView> Get(TableId table, ByteView key) const override {
++        Live();
++        if (m_store.IsDup(table)) {
++            throw ChronikError("Get on a dup table");
++        }
++        auto it = m_overlay.find(m_store.PlainPhys(table, key));
++        if (it != m_overlay.end()) {
++            if (!it->second) {
++                return std::nullopt;
++            }
++            return ToView(*it->second);
++        }
++        if (m_cleared.count(table)) {
++            return std::nullopt;
++        }
++        return m_base.BaseGet(table, key);
++    }
++    std::unique_ptr<Cursor> OpenCursor(TableId table) const override {
++        Live();
++        return m_base.MakeCursor(m_base.MakeView(&m_overlay, &m_cleared), table);
++    }
++    std::unique_ptr<DupCursor> OpenDupCursor(TableId table) const override {
++        Live();
++        return m_base.MakeDup(m_base.MakeView(&m_overlay, &m_cleared), table);
++    }
++    uint64_t EstimateEntries(TableId table) const override {
++        Live();
++        return m_base.Count(m_base.MakeView(&m_overlay, &m_cleared), table);
++    }
++
++    void Put(TableId table, ByteView key, ByteView value) override {
++        Write();
++        PlainOnly(table);
++        m_overlay.insert_or_assign(
++            m_store.PlainPhys(table, key),
++            std::string(reinterpret_cast<const char *>(value.data()),
++                        value.size()));
++    }
++    void Del(TableId table, ByteView key) override {
++        Write();
++        PlainOnly(table);
++        m_overlay.insert_or_assign(m_store.PlainPhys(table, key),
++                                   std::nullopt);
++    }
++    void PutDup(TableId table, ByteView key, ByteView value) override {
++        Write();
++        DupOnly(table);
++        m_overlay.insert_or_assign(
++            LevelDbDupCursor::DupPhys(m_store.Prefix(table), key, value),
++            std::string());
++    }
++    void DelDup(TableId table, ByteView key, ByteView value) override {
++        Write();
++        DupOnly(table);
++        m_overlay.insert_or_assign(
++            LevelDbDupCursor::DupPhys(m_store.Prefix(table), key, value),
++            std::nullopt);
++    }
++    void DelDupByPrefix(TableId table, ByteView key,
++                        ByteView value_prefix) override {
++        Write();
++        DupOnly(table);
++        // Same as the MDBX backend: the first dup >= the prefix, deleted
++        // only if it starts with the prefix.
++        auto cursor = OpenDupCursor(table);
++        if (!cursor->SeekValueGe(key, value_prefix) ||
++            !StartsWith(cursor->Value(), value_prefix)) {
++            return;
++        }
++        m_overlay.insert_or_assign(
++            LevelDbDupCursor::DupPhys(m_store.Prefix(table), key,
++                                      cursor->Value()),
++            std::nullopt);
++    }
++    void Clear(TableId table) override {
++        Write();
++        const std::string &lo = m_store.Prefix(table);
++        const std::string &hi = m_store.PrefixEnd(table);
++        m_overlay.erase(m_overlay.lower_bound(lo), m_overlay.lower_bound(hi));
++        m_cleared.insert(table);
++    }
++    void Commit() override {
++        Live();
++        leveldb::WriteBatch batch;
++        // Snapshot entries of cleared tables first; overlay entries written
++        // after the Clear come later in the batch and so win.
++        for (TableId table : m_cleared) {
++            leveldb::ReadOptions ro;
++            ro.snapshot = m_base.m_snapshot;
++            ro.fill_cache = false;
++            std::unique_ptr<leveldb::Iterator> it(
++                m_store.Db()->NewIterator(ro));
++            const std::string &hi = m_store.PrefixEnd(table);
++            for (it->Seek(ToSlice(m_store.Prefix(table)));
++                 it->Valid() && ToStringView(it->key()) < std::string_view(hi);
++                 it->Next()) {
++                batch.Delete(it->key());
++            }
++            CheckStatus(it->status(), "iterator(clear)");
++        }
++        for (const auto &[key, value] : m_overlay) {
++            if (value) {
++                batch.Put(ToSlice(key), ToSlice(*value));
++            } else {
++                batch.Delete(ToSlice(key));
++            }
++        }
++        Release();
++        leveldb::WriteOptions wo;
++        wo.sync = false;
++        CheckStatus(m_store.Db()->Write(wo, &batch), "write_batch");
++    }
++
++private:
++    void Live() const {
++        if (m_done) {
++            throw ChronikError("Chronik write txn used after commit");
++        }
++    }
++    /** Views returned by earlier Gets are valid until the next write. */
++    void Write() {
++        Live();
++        m_base.m_values.clear();
++    }
++    void PlainOnly(TableId table) const {
++        if (m_store.IsDup(table)) {
++            throw ChronikError("Plain write on a dup table");
++        }
++    }
++    void DupOnly(TableId table) const {
++        if (!m_store.IsDup(table)) {
++            throw ChronikError("Dup write on a plain table");
++        }
++    }
++    void Release() {
++        if (!m_done) {
++            m_store.Db()->ReleaseSnapshot(m_base.m_snapshot);
++            m_done = true;
++            m_overlay.clear();
++            m_cleared.clear();
++            m_base.m_values.clear();
++        }
++    }
++
++    LevelDbStore &m_store;
++    TxnBase m_base;
++    Overlay m_overlay;
++    std::set<TableId> m_cleared;
++    bool m_done = false;
++};
++
++std::unique_ptr<ReadTxn> LevelDbStore::BeginRead() const {
++    return std::make_unique<LevelDbReadTxn>(*this);
++}
++
++std::unique_ptr<WriteTxn> LevelDbStore::BeginWrite() {
++    return std::make_unique<LevelDbWriteTxn>(*this);
++}
++
++std::string StoreMetaKey(std::string_view name) {
++    std::string key(1, kStoreMetaPrefix);
++    key.append(name);
++    return key;
++}
++
++LevelDbStore::LevelDbStore(const std::filesystem::path &dir,
++                           std::span<const TableSpec> tables) {
++    std::error_code ec;
++    std::filesystem::create_directories(dir, ec);
++    if (ec) {
++        throw ChronikError("LevelDB error: Failed to create DB directory " +
++                           dir.string() + ": " + ec.message());
++    }
++    if (std::filesystem::exists(dir / "mdbx.dat")) {
++        throw ChronikError(
++            "Chronik LevelDB directory " + dir.string() +
++            " contains an MDBX index; the backends are not compatible");
++    }
++    m_names.reserve(tables.size());
++    for (const TableSpec &spec : tables) {
++        m_names.emplace_back(spec.name);
++    }
++    for (size_t i = 0; i < tables.size(); ++i) {
++        TableSpec spec = tables[i];
++        spec.name = m_names[i];
++        m_specs.push_back(spec);
++        if (!m_by_name.emplace(m_names[i], TableId(i)).second) {
++            throw ChronikError("Duplicate Chronik table " + m_names[i]);
++        }
++    }
++
++    m_cache.reset(leveldb::NewLRUCache(kBlockCacheBytes));
++    m_filter.reset(leveldb::NewBloomFilterPolicy(10));
++    leveldb::Options options;
++    options.create_if_missing = true;
++    options.block_cache = m_cache.get();
++    options.filter_policy = m_filter.get();
++    options.write_buffer_size = kWriteBufferBytes;
++    options.compression = leveldb::kNoCompression;
++    leveldb::DB *db = nullptr;
++    CheckStatus(leveldb::DB::Open(options, dir.string(), &db), "open");
++    m_db.reset(db);
++
++    // ---- format marker and persistent table ids ----
++    leveldb::ReadOptions ro;
++    std::string format;
++    leveldb::Status status = m_db->Get(ro, StoreMetaKey(kFormatKey), &format);
++    leveldb::WriteBatch batch;
++    if (status.IsNotFound()) {
++        std::unique_ptr<leveldb::Iterator> it(m_db->NewIterator(ro));
++        it->SeekToFirst();
++        CheckStatus(it->status(), "iterator");
++        if (it->Valid()) {
++            throw ChronikError("LevelDB directory " + dir.string() +
++                               " is not a native Chronik index");
++        }
++        batch.Put(StoreMetaKey(kFormatKey), ToSlice(std::string(kFormat)));
++    } else {
++        CheckStatus(status, "get(format)");
++        if (format != kFormat) {
++            throw ChronikError("Unsupported Chronik LevelDB format \"" +
++                               format + "\" in " + dir.string());
++        }
++    }
++
++    std::map<std::string, uint64_t> ids;
++    uint64_t max_id = 0;
++    {
++        const std::string prefix = StoreMetaKey(kTableKeyPrefix);
++        std::unique_ptr<leveldb::Iterator> it(m_db->NewIterator(ro));
++        for (it->Seek(prefix);
++             it->Valid() && it->key().starts_with(ToSlice(prefix));
++             it->Next()) {
++            std::string_view value = ToStringView(it->value());
++            const std::optional<uint64_t> id = ReadVarint(value);
++            if (!id || *id == 0) {
++                throw ChronikError("Corrupted Chronik LevelDB table id");
++            }
++            std::string name(ToStringView(it->key()).substr(prefix.size()));
++            const auto spec_it = m_by_name.find(name);
++            if (spec_it != m_by_name.end()) {
++                const TableSpec &spec = m_specs[spec_it->second];
++                std::string expected;
++                expected.push_back(spec.kind == TableSpec::Kind::Dup ? 1 : 0);
++                if (spec.dup_fixed_size) {
++                    AppendVarint(expected, *spec.dup_fixed_size);
++                }
++                if (value != expected) {
++                    throw ChronikError("Chronik LevelDB table " + name +
++                                       " has a different layout; reindex "
++                                       "with -chronikreindex");
++                }
++            }
++            max_id = std::max(max_id, *id);
++            ids.emplace(std::move(name), *id);
++        }
++        CheckStatus(it->status(), "iterator(tables)");
++    }
++    for (const TableSpec &spec : m_specs) {
++        const std::string name(spec.name);
++        auto it = ids.find(name);
++        uint64_t id;
++        if (it != ids.end()) {
++            id = it->second;
++        } else {
++            id = ++max_id;
++            std::string value;
++            AppendVarint(value, id);
++            value.push_back(spec.kind == TableSpec::Kind::Dup ? 1 : 0);
++            if (spec.dup_fixed_size) {
++                AppendVarint(value, *spec.dup_fixed_size);
++            }
++            batch.Put(StoreMetaKey(std::string(kTableKeyPrefix) + name),
++                      value);
++        }
++        std::string prefix;
++        AppendVarint(prefix, id);
++        // The last varint byte is < 0x80, so the successor always exists.
++        m_prefix_ends.push_back(*PrefixSuccessor(prefix));
++        m_prefixes.push_back(std::move(prefix));
++    }
++    leveldb::WriteOptions wo;
++    wo.sync = true;
++    CheckStatus(m_db->Write(wo, &batch), "write(tables)");
++}
++
++LevelDbStore::~LevelDbStore() {
++    if (m_db) {
++        leveldb::WriteOptions wo;
++        wo.sync = true;
++        leveldb::WriteBatch empty;
++        const leveldb::Status status = m_db->Write(wo, &empty);
++        if (!status.ok()) {
++            std::fprintf(stderr, "Chronik LevelDB shutdown sync failed: %s\n",
++                         status.ToString().c_str());
++        }
++    }
++    // The DB must close before its cache and filter policy are freed.
++    m_db.reset();
++}
++
++} // namespace
++
++std::unique_ptr<KvStore> OpenLevelDbStore(const std::filesystem::path &dir,
++                                          std::span<const TableSpec> tables,
++                                          const StoreOptions & /*opts*/) {
++    return std::make_unique<LevelDbStore>(dir, tables);
++}
++
++void DestroyLevelDbStore(const std::filesystem::path &dir) {
++    if (!std::filesystem::exists(dir)) {
++        return;
++    }
++    CheckStatus(leveldb::DestroyDB(dir.string(), leveldb::Options()),
++                "destroy");
++    std::error_code ec;
++    if (std::filesystem::is_empty(dir, ec)) {
++        std::filesystem::remove(dir, ec);
++    }
++}
++
++void RegisterLevelDbStore() {
++    RegisterStoreBackend(
++        StoreBackend::LevelDb,
++        [](const std::filesystem::path &dir, std::span<const TableSpec> tables,
++           const StoreOptions &opts) {
++            return OpenLevelDbStore(dir, tables, opts);
++        },
++        [](const std::filesystem::path &dir) { DestroyLevelDbStore(dir); });
++}
++
++} // namespace chronik::native
+diff --git a/chronik/native/store/store.cmake b/chronik/native/store/store.cmake
+index 820b8d36375d87b92234832a31e9bdeb22a85e66..1188bd48dbe40502469aeab8d9bcb14a634598de 100644
+--- a/chronik/native/store/store.cmake
++++ b/chronik/native/store/store.cmake
+@@ -43,3 +43,32 @@ if(CHRONIK_NATIVE_MDBX)
+         PUBLIC CHRONIK_NATIVE_HAVE_MDBX=1)
+     list(APPEND CHRONIK_NATIVE_TEST_LIBRARIES chronik_native_store_mdbx)
+ endif()
++
++if(CHRONIK_NATIVE_LEVELDB)
++    if(NOT TARGET leveldb)
++        # Standalone build: the node's vendored LevelDB (and its crc32c),
++        # without their tests.
++        list(APPEND CMAKE_MODULE_PATH "${CHRONIK_NATIVE_REPO_ROOT}/cmake/modules")
++        include(AddCompilerFlags)
++        set(LEVELDB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
++        set(CRC32C_BUILD_TESTS OFF CACHE BOOL "" FORCE)
++        add_subdirectory("${CHRONIK_NATIVE_REPO_ROOT}/src/crc32c"
++            "${CMAKE_CURRENT_BINARY_DIR}/vendor/crc32c" EXCLUDE_FROM_ALL)
++        add_subdirectory("${CHRONIK_NATIVE_REPO_ROOT}/src/leveldb"
++            "${CMAKE_CURRENT_BINARY_DIR}/vendor/leveldb" EXCLUDE_FROM_ALL)
++    endif()
++
++    add_library(chronik_native_store_leveldb STATIC
++        "${CHRONIK_NATIVE_ROOT}/store/leveldb/leveldb_store.cpp"
++    )
++    target_include_directories(chronik_native_store_leveldb
++        PUBLIC "${CHRONIK_NATIVE_ROOT}/include")
++    target_link_libraries(chronik_native_store_leveldb
++        PUBLIC chronik_native_core
++        PRIVATE leveldb)
++    set_target_properties(chronik_native_store_leveldb PROPERTIES
++        POSITION_INDEPENDENT_CODE ON)
++    target_compile_definitions(chronik_native_store_leveldb
++        PUBLIC CHRONIK_NATIVE_HAVE_LEVELDB=1)
++    list(APPEND CHRONIK_NATIVE_TEST_LIBRARIES chronik_native_store_leveldb)
++endif()
+diff --git a/chronik/native/test/db_dump_tests.cpp b/chronik/native/test/db_dump_tests.cpp
+index 43e6e327380ce138fbd7b27b70275333c51284a1..d9a47136b06f065c2a93b9eb7399f66b31ca8e57 100644
+--- a/chronik/native/test/db_dump_tests.cpp
++++ b/chronik/native/test/db_dump_tests.cpp
+@@ -76,6 +76,10 @@ BOOST_AUTO_TEST_CASE(dump_plain_and_dup_tables) {
+ }
+ 
+ BOOST_AUTO_TEST_CASE(dump_long_keys_are_physical) {
++    if (test::TestBackend() != StoreBackend::Mdbx) {
++        // Only MDBX hashes long keys (LevelDB stores them as they are).
++        return;
++    }
+     TestDb db("dump_long_keys");
+     const TableId history = db->Table(schema::kScriptHistory);
+     const Bytes long_key(8000, 0x42);
+diff --git a/chronik/native/test/index_test_util.h b/chronik/native/test/index_test_util.h
+index e03bb062dddb3ba37ce058508090298b22a140db..3d9b87849c6ca6b80e774859c5f31da41a38a35e 100644
+--- a/chronik/native/test/index_test_util.h
++++ b/chronik/native/test/index_test_util.h
+@@ -5,11 +5,11 @@
+ #ifndef CHRONIK_NATIVE_TEST_INDEX_TEST_UTIL_H
+ #define CHRONIK_NATIVE_TEST_INDEX_TEST_UTIL_H
+ 
+-#include <chronik/native/mdbx_store.h>
+ #include <chronik/native/schema.h>
+ #include <chronik/native/store.h>
+ #include <chronik/native/types.h>
+ 
++#include <test/test_backend.h>
+ #include <test/test_sha256.h>
+ 
+ #include <atomic>
+@@ -57,7 +57,7 @@ struct TestDb {
+     explicit TestDb(const std::string &name,
+                     const std::vector<TableSpec> &extra = {})
+         : dir(name) {
+-        RegisterMdbxStore();
++        RegisterTestStores();
+         schema::Schema schema;
+         for (const TableSpec &spec : extra) {
+             schema.Add(spec);
+@@ -67,7 +67,7 @@ struct TestDb {
+         opts.sha256 = [](ByteView data, uint8_t out[32]) {
+             TestSha256(data, out);
+         };
+-        store = OpenStore(StoreBackend::Mdbx, dir.path, tables, opts);
++        store = OpenStore(TestBackend(), dir.path, tables, opts);
+     }
+     ~TestDb() { store.reset(); }
+ 
+diff --git a/chronik/native/test/indexer_property_tests.cpp b/chronik/native/test/indexer_property_tests.cpp
+index 7b2a0cfd48cbd06b6e8ba48f3d6a30dd6ad99805..3fe142bcb55c8d4e4602e9e7630edd5356bc0a18 100644
+--- a/chronik/native/test/indexer_property_tests.cpp
++++ b/chronik/native/test/indexer_property_tests.cpp
+@@ -9,13 +9,13 @@
+ 
+ #include <chronik/native/indexer.h>
+ #include <chronik/native/indexer_impl.h>
+-#include <chronik/native/mdbx_store.h>
+ #include <chronik/native/schema.h>
+ #include <chronik/native/token_io/token_index.h>
+ 
+ #include <core/db/dump.h>
+ #include <test/fake_host.h>
+ #include <test/index_test_util.h>
++#include <test/test_backend.h>
+ 
+ #include <boost/test/unit_test.hpp>
+ 
+@@ -42,6 +42,7 @@ IndexerParams MakeParams(const std::filesystem::path &dir,
+                          const PropertyConf &conf) {
+     IndexerParams p;
+     p.datadir_net = dir;
++    p.backend = nt::TestBackend();
+     p.lokad_id_index = conf.lokad_id_index;
+     p.scripthash_index = conf.scripthash_index;
+     p.token_index = conf.tokens;
+@@ -53,7 +54,7 @@ IndexerParams MakeParams(const std::filesystem::path &dir,
+ 
+ /** Returns the number of reorgs performed. */
+ int RunProperty(uint64_t seed, int steps, const PropertyConf &conf) {
+-    RegisterMdbxStore();
++    nt::RegisterTestStores();
+     std::mt19937_64 rng(seed);
+     th::FakeHost host;
+     host.Caps().slp_alp_tokens = conf.tokens;
+diff --git a/chronik/native/test/indexer_tests.cpp b/chronik/native/test/indexer_tests.cpp
+index 3521b177ab950ad27f47fc0e35386b56a6e3b9f5..c911297ac7c18e4378f44a696430218a18706c18 100644
+--- a/chronik/native/test/indexer_tests.cpp
++++ b/chronik/native/test/indexer_tests.cpp
+@@ -13,7 +13,6 @@
+ #include <chronik/native/index/txs.h>
+ #include <chronik/native/indexer.h>
+ #include <chronik/native/indexer_impl.h>
+-#include <chronik/native/mdbx_store.h>
+ #include <chronik/native/metadata.h>
+ #include <chronik/native/schema.h>
+ #include <chronik/native/store.h>
+@@ -23,6 +22,7 @@
+ #include <core/indexer/indexer_errors.h>
+ #include <test/fake_host.h>
+ #include <test/index_test_util.h>
++#include <test/test_backend.h>
+ 
+ #include <boost/test/unit_test.hpp>
+ 
+@@ -52,7 +52,7 @@ struct Env {
+     nt::IndexTempDir dir;
+ 
+     explicit Env(const std::string &name, int num_blocks = 1) : dir(name) {
+-        RegisterMdbxStore();
++        nt::RegisterTestStores();
+         std::filesystem::create_directories(dir.path);
+         for (int i = 0; i < num_blocks; ++i) {
+             host.Extend(host.MakeBlock(host.TipHeight(), {}));
+@@ -61,6 +61,7 @@ struct Env {
+     IndexerParams Params() const {
+         IndexerParams p;
+         p.datadir_net = dir.path;
++        p.backend = nt::TestBackend();
+         p.token_index = false;
+         p.lokad_id_index = true;
+         return p;
+@@ -74,7 +75,7 @@ struct Env {
+         return ix;
+     }
+     std::filesystem::path DbPath() const {
+-        return dir.path / "indexes" / "chronik";
++        return nt::TestIndexDir(dir.path);
+     }
+     /** Dump of a fresh index of the current active chain (separate dir). */
+     std::vector<std::string> FreshDump(std::optional<IndexerParams> p = {}) {
+@@ -103,7 +104,8 @@ std::unique_ptr<KvStore> OpenRaw(const std::filesystem::path &db_path) {
+     opts.sha256 = [](ByteView data, uint8_t out[32]) {
+         nt::TestSha256(data, out);
+     };
+-    return OpenStore(StoreBackend::Mdbx, db_path, schema::EcashTables(), opts);
++    return OpenStore(nt::TestBackend(), db_path, schema::EcashTables(),
++                     opts);
+ }
+ 
+ void SetSchemaVersion(const std::filesystem::path &db_path, uint64_t v) {
+@@ -183,9 +185,9 @@ BOOST_AUTO_TEST_CASE(test_indexer) {
+     // indexes and indexes/chronik now exist
+     BOOST_CHECK(std::filesystem::exists(params.datadir_net / "indexes"));
+     BOOST_CHECK(
+-        std::filesystem::exists(params.datadir_net / "indexes" / "chronik"));
++        std::filesystem::exists(nt::TestIndexDir(params.datadir_net)));
+     BOOST_CHECK(ix->Impl().Config().db_path ==
+-                params.datadir_net / "indexes" / "chronik");
++                nt::TestIndexDir(params.datadir_net));
+ }
+ 
+ BOOST_AUTO_TEST_CASE(test_schema_version) {
+@@ -235,7 +237,7 @@ BOOST_AUTO_TEST_CASE(test_schema_version) {
+     std::filesystem::create_directories(new_dir / "indexes");
+     IndexerParams new_params = env.Params();
+     new_params.datadir_net = new_dir;
+-    PutMeta(new_dir / "indexes" / "chronik", "FOO", {'B', 'A', 'R'});
++    PutMeta(nt::TestIndexDir(new_dir), "FOO", {'B', 'A', 'R'});
+     // Error: non-empty DB without schema version
+     BOOST_CHECK_EQUAL(nt::ErrorMsg([&] { env.Open(new_params); }),
+                       "Missing schema version in non-empty Chronik database, "
+@@ -244,7 +246,7 @@ BOOST_AUTO_TEST_CASE(test_schema_version) {
+     new_params.wipe = true;
+     env.Open(new_params)->Close();
+     BOOST_CHECK(env.host.HasLog("Wiping Chronik at " +
+-                                (new_dir / "indexes" / "chronik").string() +
++                                nt::TestIndexDir(new_dir).string() +
+                                 "\n"));
+ }
+ 
+diff --git a/chronik/native/test/metadata_tests.cpp b/chronik/native/test/metadata_tests.cpp
+index facb3ac8129bd058aa8ad4de148f49bf1f634fd6..dc4b98b3edfc895a6eee9daf547c6b0d908a7826 100644
+--- a/chronik/native/test/metadata_tests.cpp
++++ b/chronik/native/test/metadata_tests.cpp
+@@ -10,10 +10,8 @@
+ #include <chronik/native/metadata.h>
+ #include <chronik/native/schema.h>
+ #include <chronik/native/store.h>
+-#if CHRONIK_NATIVE_HAVE_MDBX
+-#include <chronik/native/mdbx_store.h>
+-#endif
+ 
++#include <test/test_backend.h>
+ #include <test/test_sha256.h>
+ 
+ #include <boost/test/unit_test.hpp>
+@@ -56,13 +54,13 @@ struct Fixture {
+     std::unique_ptr<KvStore> store;
+     Fixture() { Open(); }
+     void Open() {
+-        RegisterMdbxStore();
++        test::RegisterTestStores();
+         store.reset();
+         StoreOptions opts;
+         opts.sha256 = [](ByteView d, uint8_t out[32]) {
+             test::TestSha256(d, out);
+         };
+-        store = OpenStore(StoreBackend::Mdbx, dir.path, schema::EcashTables(),
++        store = OpenStore(test::TestBackend(), dir.path, schema::EcashTables(),
+                           opts);
+     }
+     TableId T(std::string_view name) const { return store->Table(name); }
+diff --git a/chronik/native/test/query_tests.cpp b/chronik/native/test/query_tests.cpp
+index 22c4dde65c645a2825311885c4eefb273cea42e5..5603541a68c6be05506eeb8cc93e0be78ad9874d 100644
+--- a/chronik/native/test/query_tests.cpp
++++ b/chronik/native/test/query_tests.cpp
+@@ -11,7 +11,6 @@
+ #include <chronik/native/http.h>
+ #include <chronik/native/indexer.h>
+ #include <chronik/native/indexer_impl.h>
+-#include <chronik/native/mdbx_store.h>
+ #include <chronik/native/proto.h>
+ #include <chronik/native/routes.h>
+ #include <chronik/native/token_index.h>
+@@ -20,6 +19,7 @@
+ 
+ #include <test/fake_host.h>
+ #include <test/index_test_util.h>
++#include <test/test_backend.h>
+ 
+ #include <boost/test/unit_test.hpp>
+ 
+@@ -243,7 +243,7 @@ struct Env {
+     explicit Env(const std::string &name, bool scripthash = false,
+                  bool tokens = false)
+         : dir(name) {
+-        RegisterMdbxStore();
++        nt::RegisterTestStores();
+         std::filesystem::create_directories(dir.path);
+         fake.Caps().slp_alp_tokens = tokens;
+         fake.Extend(fake.MakeBlock(-1, {}));
+@@ -262,6 +262,7 @@ struct Env {
+             {TxOutput{3800, th::P2pkh(1)}}));
+         IndexerParams params;
+         params.datadir_net = dir.path;
++        params.backend = nt::TestBackend();
+         params.token_index = tokens;
+         params.lokad_id_index = true;
+         params.scripthash_index = scripthash;
+diff --git a/chronik/native/test/service_tests.cpp b/chronik/native/test/service_tests.cpp
+index 516c21804eb61044c140b13f8b9ab6961d444cea..dc6aaa6a76564ac26bcb8dcc289c1753a9a7d2df 100644
+--- a/chronik/native/test/service_tests.cpp
++++ b/chronik/native/test/service_tests.cpp
+@@ -11,7 +11,6 @@
+ #include <chronik/native/http.h>
+ #include <chronik/native/index/blocks.h>
+ #include <chronik/native/indexer_impl.h>
+-#include <chronik/native/mdbx_store.h>
+ #include <chronik/native/pause.h>
+ #include <chronik/native/proto.h>
+ #include <chronik/native/service.h>
+@@ -21,6 +20,7 @@
+ #include <core/service/service_impl.h>
+ #include <test/fake_host.h>
+ #include <test/index_test_util.h>
++#include <test/test_backend.h>
+ 
+ #include <boost/test/unit_test.hpp>
+ 
+@@ -48,7 +48,7 @@ struct ServiceEnv {
+ 
+     explicit ServiceEnv(const std::string &name, int num_blocks = 3)
+         : dir(name) {
+-        RegisterMdbxStore();
++        nt::RegisterTestStores();
+         std::filesystem::create_directories(dir.path);
+         for (int i = 0; i < num_blocks; ++i) {
+             host.Extend(host.MakeBlock(host.TipHeight(), {}));
+@@ -57,6 +57,7 @@ struct ServiceEnv {
+     ServiceParams Params(std::vector<std::string> hosts = {}) const {
+         ServiceParams p;
+         p.indexer.datadir_net = dir.path;
++        p.indexer.backend = nt::TestBackend();
+         p.indexer.token_index = false;
+         p.hosts = std::move(hosts);
+         p.default_port = 8331;
+diff --git a/chronik/native/test/store_tests.cpp b/chronik/native/test/store_tests.cpp
+index b37a4bd897917d0f6eeb3e27973de9b58387380d..beedfc6baeedd6f1c1b0f9f484f998e4cb99101f 100644
+--- a/chronik/native/test/store_tests.cpp
++++ b/chronik/native/test/store_tests.cpp
+@@ -13,15 +13,21 @@
+ #if CHRONIK_NATIVE_HAVE_MDBX
+ #include <chronik/native/mdbx_store.h>
+ #endif
++#if CHRONIK_NATIVE_HAVE_LEVELDB
++#include <chronik/native/leveldb_store.h>
++#endif
+ 
+ #include <test/test_sha256.h>
+ 
+ #include <boost/test/unit_test.hpp>
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <filesystem>
+ #include <chrono>
++#include <map>
+ #include <random>
++#include <set>
+ #include <thread>
+ 
+ using namespace chronik::native;
+@@ -33,6 +39,9 @@ void RegisterTestStoreBackends() {
+ #if CHRONIK_NATIVE_HAVE_MDBX
+     RegisterMdbxStore();
+ #endif
++#if CHRONIK_NATIVE_HAVE_LEVELDB
++    RegisterLevelDbStore();
++#endif
+ }
+ 
+ /** Fresh temporary directory, removed on destruction. */
+@@ -472,6 +481,227 @@ BOOST_AUTO_TEST_CASE(long_keys) {
+     }
+ }
+ 
++BOOST_AUTO_TEST_CASE(randomized_against_model) {
++    // Random writes, clears and commits; after every operation the write
++    // txn (read-your-writes) and, after commits, a read txn must match an
++    // in-memory model through Get, forward/backward cursors and dup cursors.
++    for (StoreBackend backend : Backends()) {
++        BOOST_TEST_CONTEXT("backend " << StoreBackendName(backend)) {
++            TempDir dir("model");
++            auto store = OpenStore(backend, dir.path, kTestTables, Opts());
++            const TableId t = store->Table("plain");
++            const TableId d = store->Table("dup_var");
++            using Plain = std::map<Bytes, Bytes>;
++            using Dups = std::map<Bytes, std::set<Bytes>>;
++            Plain committed_plain, plain;
++            Dups committed_dups, dups;
++            std::mt19937 rng(12345);
++            auto rnd_key = [&]() {
++                // Short keys over a tiny alphabet, incl. 0x00 and 0xff, so
++                // seeks hit exact keys, neighbours and prefix boundaries.
++                static const uint8_t alphabet[] = {0x00, 0x01, 0x7f, 0x80, 0xff};
++                Bytes k(rng() % 3);
++                for (auto &b : k) {
++                    b = alphabet[rng() % 5];
++                }
++                return k;
++            };
++            auto check = [&](const ReadTxn &txn, const Plain &mp,
++                             const Dups &md) {
++                // Forward and backward scans
++                std::vector<std::pair<Bytes, Bytes>> fwd, bwd;
++                auto c = txn.OpenCursor(t);
++                for (bool ok = c->SeekFirst(); ok; ok = c->Next()) {
++                    fwd.emplace_back(ToBytes(c->Key()), ToBytes(c->Value()));
++                }
++                for (bool ok = c->SeekLast(); ok; ok = c->Prev()) {
++                    bwd.emplace_back(ToBytes(c->Key()), ToBytes(c->Value()));
++                }
++                std::vector<std::pair<Bytes, Bytes>> expected(mp.begin(),
++                                                              mp.end());
++                BOOST_REQUIRE(fwd == expected);
++                std::reverse(expected.begin(), expected.end());
++                BOOST_REQUIRE(bwd == expected);
++                // A plain cursor over a dup table visits (key, dup) pairs
++                std::vector<std::pair<Bytes, Bytes>> dfwd, dbwd, dexp;
++                for (const auto &[key, values] : md) {
++                    for (const Bytes &value : values) {
++                        dexp.emplace_back(key, value);
++                    }
++                }
++                auto dt = txn.OpenCursor(d);
++                for (bool ok = dt->SeekFirst(); ok; ok = dt->Next()) {
++                    dfwd.emplace_back(ToBytes(dt->Key()), ToBytes(dt->Value()));
++                }
++                for (bool ok = dt->SeekLast(); ok; ok = dt->Prev()) {
++                    dbwd.emplace_back(ToBytes(dt->Key()), ToBytes(dt->Value()));
++                }
++                BOOST_REQUIRE(dfwd == dexp);
++                std::reverse(dexp.begin(), dexp.end());
++                BOOST_REQUIRE(dbwd == dexp);
++                {
++                    const Bytes k = rnd_key();
++                    auto ge = md.lower_bound(k);
++                    BOOST_REQUIRE_EQUAL(dt->SeekGe(k), ge != md.end());
++                    if (ge != md.end()) {
++                        BOOST_REQUIRE(ToBytes(dt->Key()) == ge->first);
++                        BOOST_REQUIRE(ToBytes(dt->Value()) ==
++                                      *ge->second.begin());
++                    }
++                }
++                // Seeks and gets
++                for (int i = 0; i < 8; ++i) {
++                    const Bytes k = rnd_key();
++                    auto ge = mp.lower_bound(k);
++                    BOOST_REQUIRE_EQUAL(c->SeekGe(k), ge != mp.end());
++                    if (ge != mp.end()) {
++                        BOOST_REQUIRE(ToBytes(c->Key()) == ge->first);
++                    }
++                    auto le = mp.upper_bound(k);
++                    const bool has_le = le != mp.begin();
++                    BOOST_REQUIRE_EQUAL(c->SeekLe(k), has_le);
++                    if (has_le) {
++                        --le;
++                        BOOST_REQUIRE(ToBytes(c->Key()) == le->first);
++                    }
++                    auto got = txn.Get(t, k);
++                    auto it = mp.find(k);
++                    BOOST_REQUIRE_EQUAL(got.has_value(), it != mp.end());
++                    if (got) {
++                        BOOST_REQUIRE(ToBytes(*got) == it->second);
++                    }
++                    // Dups of k
++                    std::vector<Bytes> want;
++                    if (auto dit = md.find(k); dit != md.end()) {
++                        want.assign(dit->second.begin(), dit->second.end());
++                    }
++                    BOOST_REQUIRE(AllDups(txn, d, k) == want);
++                    auto dc = txn.OpenDupCursor(d);
++                    const Bytes vp = rnd_key();
++                    auto vge = std::lower_bound(want.begin(), want.end(), vp);
++                    BOOST_REQUIRE_EQUAL(dc->SeekValueGe(k, vp),
++                                        vge != want.end());
++                    if (vge != want.end()) {
++                        BOOST_REQUIRE(ToBytes(dc->Value()) == *vge);
++                        BOOST_REQUIRE_EQUAL(dc->CountRemaining(),
++                                            size_t(want.end() - vge));
++                    }
++                }
++            };
++            auto txn = store->BeginWrite();
++            for (int step = 0; step < 3000; ++step) {
++                const int op = rng() % 100;
++                const Bytes k = rnd_key();
++                const Bytes v = rnd_key();
++                if (op < 30) {
++                    txn->Put(t, k, v);
++                    plain[k] = v;
++                } else if (op < 45) {
++                    txn->Del(t, k);
++                    plain.erase(k);
++                } else if (op < 70) {
++                    txn->PutDup(d, k, v);
++                    dups[k].insert(v);
++                } else if (op < 82) {
++                    txn->DelDup(d, k, v);
++                    if (auto it = dups.find(k); it != dups.end()) {
++                        it->second.erase(v);
++                        if (it->second.empty()) {
++                            dups.erase(it);
++                        }
++                    }
++                } else if (op < 88) {
++                    txn->DelDupByPrefix(d, k, v);
++                    if (auto it = dups.find(k); it != dups.end()) {
++                        auto first = it->second.lower_bound(v);
++                        if (first != it->second.end() &&
++                            StartsWith(*first, v)) {
++                            it->second.erase(first);
++                            if (it->second.empty()) {
++                                dups.erase(it);
++                            }
++                        }
++                    }
++                } else if (op < 90) {
++                    if (rng() % 2) {
++                        txn->Clear(t);
++                        plain.clear();
++                    } else {
++                        txn->Clear(d);
++                        dups.clear();
++                    }
++                } else if (op < 97) {
++                    check(*txn, plain, dups);
++                } else {
++                    txn->Commit();
++                    committed_plain = plain;
++                    committed_dups = dups;
++                    {
++                        auto read = store->BeginRead();
++                        check(*read, committed_plain, committed_dups);
++                    }
++                    txn = store->BeginWrite();
++                }
++            }
++            txn.reset();
++            auto read = store->BeginRead();
++            check(*read, committed_plain, committed_dups);
++        }
++    }
++}
++
++#if CHRONIK_NATIVE_HAVE_LEVELDB
++BOOST_AUTO_TEST_CASE(leveldb_table_ids_and_refusals) {
++    RegisterTestStoreBackends();
++    TempDir dir("ldbids");
++    {
++        auto store = OpenStore(StoreBackend::LevelDb, dir.path, kTestTables,
++                               Opts());
++        auto txn = store->BeginWrite();
++        txn->Put(store->Table("plain"), S("k"), S("v"));
++        txn->PutDup(store->Table("dup_var"), S("m"), S("x"));
++        txn->Commit();
++    }
++    {
++        // Tables reordered and a new one added: ids are persistent, so the
++        // data stays with its table.
++        const TableSpec reordered[] = {
++            {"extra", TableSpec::Kind::Plain, std::nullopt},
++            {"dup_fixed", TableSpec::Kind::Dup, 20},
++            {"dup_var", TableSpec::Kind::Dup, std::nullopt},
++            {"plain", TableSpec::Kind::Plain, std::nullopt},
++        };
++        auto store =
++            OpenStore(StoreBackend::LevelDb, dir.path, reordered, Opts());
++        auto txn = store->BeginRead();
++        BOOST_CHECK(ToBytes(*txn->Get(store->Table("plain"), S("k"))) == S("v"));
++        BOOST_CHECK(!txn->Get(store->Table("extra"), S("k")));
++        BOOST_CHECK(AllDups(*txn, store->Table("dup_var"), S("m")) ==
++                    std::vector<Bytes>{S("x")});
++        BOOST_CHECK(AllDups(*txn, store->Table("dup_fixed"), S("m")).empty());
++    }
++    {
++        // A table whose kind changed must not be reinterpreted
++        const TableSpec changed[] = {
++            {"plain", TableSpec::Kind::Dup, std::nullopt},
++        };
++        BOOST_CHECK_THROW(
++            OpenStore(StoreBackend::LevelDb, dir.path, changed, Opts()),
++            ChronikError);
++    }
++#if CHRONIK_NATIVE_HAVE_MDBX
++    {
++        // An MDBX index directory is refused
++        TempDir mdbx_dir("ldbmdbx");
++        OpenStore(StoreBackend::Mdbx, mdbx_dir.path, kTestTables, Opts());
++        BOOST_CHECK_THROW(OpenStore(StoreBackend::LevelDb, mdbx_dir.path,
++                                    kTestTables, Opts()),
++                          ChronikError);
++    }
++#endif
++}
++#endif
++
+ BOOST_AUTO_TEST_CASE(sha256_helper) {
+     uint8_t out[32];
+     test::TestSha256(Bytes{}, out);
+diff --git a/chronik/native/test/test_backend.h b/chronik/native/test/test_backend.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..8768375602f536b6c1ef0be0cba807f2434ac45d
+--- /dev/null
++++ b/chronik/native/test/test_backend.h
+@@ -0,0 +1,65 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef CHRONIK_NATIVE_TEST_TEST_BACKEND_H
++#define CHRONIK_NATIVE_TEST_TEST_BACKEND_H
++
++#include <chronik/native/store.h>
++#if CHRONIK_NATIVE_HAVE_LEVELDB
++#include <chronik/native/leveldb_store.h>
++#endif
++#if CHRONIK_NATIVE_HAVE_MDBX
++#include <chronik/native/mdbx_store.h>
++#endif
++
++#include <cstdlib>
++#include <filesystem>
++#include <stdexcept>
++#include <string>
++
++/**
++ * Storage backend used by the tests that are not per-backend (indexer,
++ * queries, service, ...): MDBX when linked, else LevelDB. Setting
++ * CHRONIK_NATIVE_TEST_BACKEND=mdbx|leveldb selects one explicitly, so a build
++ * with both backends can run the whole suite against either. The KvStore
++ * conformance suite (store_tests) always covers every linked backend.
++ */
++namespace chronik::native::test {
++
++/** Registers every backend linked into the test binary. */
++inline void RegisterTestStores() {
++#if CHRONIK_NATIVE_HAVE_MDBX
++    RegisterMdbxStore();
++#endif
++#if CHRONIK_NATIVE_HAVE_LEVELDB
++    RegisterLevelDbStore();
++#endif
++}
++
++inline StoreBackend TestBackend() {
++    RegisterTestStores();
++    if (const char *env = std::getenv("CHRONIK_NATIVE_TEST_BACKEND")) {
++        const auto backend = ParseStoreBackend(env);
++        if (!backend || !HasStoreBackend(*backend)) {
++            throw std::runtime_error(
++                std::string("CHRONIK_NATIVE_TEST_BACKEND=") + env +
++                " is not a backend of this build");
++        }
++        return *backend;
++    }
++#if CHRONIK_NATIVE_HAVE_MDBX
++    return StoreBackend::Mdbx;
++#else
++    return StoreBackend::LevelDb;
++#endif
++}
++
++/** <datadir_net>/indexes/<dir of TestBackend()> */
++inline std::filesystem::path TestIndexDir(const std::filesystem::path &net) {
++    return net / "indexes" / std::string(StoreIndexDirName(TestBackend()));
++}
++
++} // namespace chronik::native::test
++
++#endif // CHRONIK_NATIVE_TEST_TEST_BACKEND_H
+diff --git a/src/init.cpp b/src/init.cpp
+index 7df2920cd0d3b66e4dd27177931bf5b3502c34c6..eec140c5d65b86c03b49de7f5985ec8192ff5c0d 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -846,6 +846,15 @@ void SetupServerArgs(NodeContext &node) {
+                    "seconds spent) into a <datadir>/perf folder. (default: 0)",
+                    ArgsManager::ALLOW_ANY, OptionsCategory::CHRONIK);
+ #if ENABLE_CHRONIK_NATIVE
++    argsman.AddArg("-chronikdbbackend=<backend>",
++                   "Storage backend of the native Chronik index: mdbx "
++                   "(indexes/chronik, shared with Rust Chronik) or leveldb "
++                   "(indexes/chronik-leveldb, if built with "
++                   "CHRONIK_NATIVE_LEVELDB). Switching needs no reindex of "
++                   "the other directory, but the new one is built from "
++                   "scratch (default: mdbx, or leveldb in LevelDB-only builds)",
++                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY,
++                   OptionsCategory::CHRONIK);
+     argsman.AddArg("-chronikqueryworkers=<n>",
+                    "Threads answering Chronik HTTP/WebSocket queries, 0 for "
+                    "min(8, cores / 2) (native Chronik only; default: 0)",
+-- 
+2.50.1 (Apple Git-155)
+

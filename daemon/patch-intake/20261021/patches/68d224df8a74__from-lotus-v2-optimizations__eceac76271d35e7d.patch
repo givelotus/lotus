@@ -1,0 +1,340 @@
+From 68d224df8a748af467904181bbe4926d6002efa7 Mon Sep 17 00:00:00 2001
+From: Canonical endpoint audit <audit@localhost>
+Date: Sun, 18 Oct 2026 22:58:25 -0700
+Subject: [PATCH] fixup! net: batch-validate solicited/high-bandwidth SHORTTX
+ and coalesce incoming TX bursts
+
+Admit untrusted P2P bursts once under a coalesced publication scope instead of atomic batch then whole-burst retry. Preserve decoded good prefix on later malformed message. Add actual queued-wire prefix and 256-member bad-last work-bound regressions, using per-ATMP PreChecks debug trace. This intentionally trades cross-transaction P2P MSM for bounded adversarial work; RPC atomic batching remains unchanged.
+---
+ src/net_processing.cpp                 | 184 ++++---------------------
+ src/test/v2_protocol_handler_tests.cpp |  90 ++++++++++++
+ src/validation.cpp                     |   3 +
+ 3 files changed, 119 insertions(+), 158 deletions(-)
+
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index cd94257d33..cfa6e9b882 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -4708,163 +4708,26 @@ void PeerManagerImpl::ProcessTxBatch(
+         return;
+     }
+ 
+-    std::vector<CTransactionRef> batch_candidates;
+-    std::vector<CTransactionRef> fallback_txs;
+-    batch_candidates.reserve(ptxs.size());
+-    {
+-        LOCK(cs_main);
+-        std::vector<CTransactionRef> unique_unknown;
+-        unique_unknown.reserve(ptxs.size());
+-        std::unordered_set<TxId, SaltedTxIdHasher> seen_txids;
+-        seen_txids.reserve(ptxs.size());
+-        for (const auto &ptx : ptxs) {
+-            if (!ptx) {
+-                continue;
+-            }
+-            const TxId &txid = ptx->GetId();
+-            if (AlreadyHaveTx(txid, /*include_reconsiderable=*/true) ||
+-                !seen_txids.insert(txid).second) {
+-                fallback_txs.push_back(ptx);
+-            } else {
+-                unique_unknown.push_back(ptx);
+-            }
+-        }
+-
+-        if (unique_unknown.size() > 1) {
+-            std::unordered_map<TxId, size_t, SaltedTxIdHasher> txid_to_idx;
+-            txid_to_idx.reserve(unique_unknown.size());
+-            for (size_t i = 0; i < unique_unknown.size(); ++i) {
+-                txid_to_idx.emplace(unique_unknown[i]->GetId(), i);
+-            }
+-            std::vector<std::vector<size_t>> children(unique_unknown.size());
+-            std::vector<size_t> in_degree(unique_unknown.size(), 0);
+-            bool has_internal_deps = false;
+-            for (size_t i = 0; i < unique_unknown.size(); ++i) {
+-                for (const auto &in : unique_unknown[i]->vin) {
+-                    auto it = txid_to_idx.find(in.prevout.GetTxId());
+-                    if (it != txid_to_idx.end() && it->second != i) {
+-                        children[it->second].push_back(i);
+-                        ++in_degree[i];
+-                        has_internal_deps = true;
+-                    }
+-                }
+-            }
+-            if (has_internal_deps) {
+-                std::vector<CTransactionRef> sorted;
+-                sorted.reserve(unique_unknown.size());
+-                std::vector<uint8_t> placed(unique_unknown.size(), 0);
+-                bool progress = true;
+-                while (progress && sorted.size() < unique_unknown.size()) {
+-                    progress = false;
+-                    for (size_t i = 0; i < unique_unknown.size(); ++i) {
+-                        if (!placed[i] && in_degree[i] == 0) {
+-                            placed[i] = 1;
+-                            sorted.push_back(unique_unknown[i]);
+-                            for (const size_t child_idx : children[i]) {
+-                                if (in_degree[child_idx] > 0) {
+-                                    --in_degree[child_idx];
+-                                }
+-                            }
+-                            progress = true;
+-                        }
+-                    }
+-                }
+-                for (size_t i = 0; i < unique_unknown.size(); ++i) {
+-                    if (!placed[i]) {
+-                        sorted.push_back(unique_unknown[i]);
+-                    }
+-                }
+-                unique_unknown = std::move(sorted);
+-            }
+-        }
+-
+-        CCoinsViewCache &coins_tip = m_chainman.ActiveChainstate().CoinsTip();
+-        std::unordered_set<TxId, SaltedTxIdHasher> batch_txids;
+-        batch_txids.reserve(unique_unknown.size());
+-        std::unordered_set<COutPoint, SaltedOutpointHasher> batch_outpoints;
+-        batch_outpoints.reserve(unique_unknown.size() * 2);
+-        for (const auto &ptx : unique_unknown) {
+-            bool can_batch = !ptx->IsCoinBase();
+-            if (can_batch) {
+-                for (const auto &in : ptx->vin) {
+-                    if (batch_outpoints.find(in.prevout) !=
+-                        batch_outpoints.end()) {
+-                        can_batch = false;
+-                        break;
+-                    }
+-                    const TxId &prev_txid = in.prevout.GetTxId();
+-                    if (batch_txids.find(prev_txid) == batch_txids.end() &&
+-                        !coins_tip.HaveCoinInCache(in.prevout) &&
+-                        !m_mempool.exists(prev_txid) &&
+-                        !coins_tip.HaveCoin(in.prevout)) {
+-                        can_batch = false;
+-                        break;
+-                    }
+-                }
+-            }
+-            if (can_batch) {
+-                for (const auto &in : ptx->vin) {
+-                    batch_outpoints.insert(in.prevout);
+-                }
+-                batch_txids.insert(ptx->GetId());
+-                batch_candidates.push_back(ptx);
+-            } else {
+-                fallback_txs.push_back(ptx);
+-            }
+-        }
+-
+-        if (batch_candidates.size() >= 2) {
+-            const PackageMempoolAcceptResult batch_res = ProcessRawTxBatch(
+-                m_chainman.ActiveChainstate(), m_mempool, batch_candidates,
+-                /*test_accept=*/false);
+-            if (batch_res.m_state.IsValid()) {
+-                if (auto tx_relay = peer.GetTxRelay()) {
+-                    LOCK(tx_relay->m_tx_inventory_mutex);
+-                    for (const auto &ptx : batch_candidates) {
+-                        const TxId &txid = ptx->GetId();
+-                        tx_relay->m_tx_inventory_known_filter.insert(txid);
+-                        tx_relay->m_tx_inventory_to_send.erase(txid);
+-                    }
+-                }
+-                std::vector<CTransactionRef> relay_txs;
+-                relay_txs.reserve(batch_candidates.size());
+-                for (const auto &ptx : batch_candidates) {
+-                    const TxId &txid = ptx->GetId();
+-                    m_txrequest.ReceivedResponse(pfrom.GetId(), txid);
+-                    if (m_mempool.exists(txid)) {
+-                        m_txrequest.ForgetInvId(txid);
+-                        relay_txs.push_back(ptx);
+-                    }
+-                }
+-                if (!relay_txs.empty()) {
+-                    m_mempool.withOrphanage([&relay_txs](TxOrphanage &orphanage) {
+-                        if (orphanage.Size() == 0) {
+-                            return;
+-                        }
+-                        for (const auto &ptx : relay_txs) {
+-                            orphanage.AddChildrenToWorkSet(*ptx);
+-                            orphanage.EraseTx(ptx->GetId());
+-                        }
+-                    });
+-                    RelayTransactionBatch(relay_txs);
+-                }
+-                pfrom.m_last_tx_time = GetTime<std::chrono::seconds>();
+-            } else {
+-                for (const auto &ptx : batch_candidates) {
+-                    fallback_txs.push_back(ptx);
+-                }
+-            }
+-        } else {
+-            for (const auto &ptx : batch_candidates) {
+-                fallback_txs.push_back(ptx);
+-            }
+-        }
+-    }
+-
+-    for (const auto &ptx : fallback_txs) {
+-        if (pfrom.fDisconnect) {
+-            break;
+-        }
++    // An untrusted burst is not an atomic RPC package. Never validate the
++    // entire burst and then repeat it after one member fails: a bad final
++    // member otherwise doubles expensive admission work. One pass retains
++    // valid members and gives each transaction the ordinary orphan/reject
++    // handling, while sharing cs_main and deferring snapshot publication.
++    LOCK(cs_main);
++    struct PublicationScope {
++        CTxMemPool &pool;
++        std::optional<CTxMemPool::ScopedSnapshotDefer> defer;
++        explicit PublicationScope(CTxMemPool &p) : pool(p) {
++            LOCK(pool.cs);
++            defer.emplace(pool);
++        }
++        ~PublicationScope() {
++            LOCK(pool.cs);
++            defer.reset();
++        }
++    } publication_scope(m_mempool);
++    for (const auto &ptx : ptxs) {
++        if (pfrom.fDisconnect) break;
+         ProcessSingleTx(pfrom, peer, ptx);
+     }
+ }
+@@ -8659,7 +8522,12 @@ bool PeerManagerImpl::ProcessMessages(const Config &config, CNode *pfrom,
+ 
+                 if (next_msg.m_type == NetMsgType::TX) {
+                     CTransactionRef ptx;
+-                    next_msg.m_recv >> ptx;
++                    try {
++                        next_msg.m_recv >> ptx;
++                    } catch (...) {
++                        ProcessTxBatch(*pfrom, *peer, tx_batch);
++                        throw;
++                    }
+                     tx_batch.push_back(std::move(ptx));
+                 } else {
+                     trailing_non_tx_msg.emplace(std::move(next_msg));
+diff --git a/src/test/v2_protocol_handler_tests.cpp b/src/test/v2_protocol_handler_tests.cpp
+index 5b2d20a94a..5c0ab14a99 100644
+--- a/src/test/v2_protocol_handler_tests.cpp
++++ b/src/test/v2_protocol_handler_tests.cpp
+@@ -27,6 +27,7 @@
+ #include <txmempool.h>
+ #include <util/time.h>
+ #include <validation.h>
++#include <logging.h>
+ #include <validationinterface.h>
+ 
+ #include <test/util/mining.h>
+@@ -1520,6 +1521,95 @@ BOOST_AUTO_TEST_CASE(outbound_inv_queue_suppression_window) {
+     peerman->FinalizeNode(config, peer_node);
+ }
+ 
++BOOST_AUTO_TEST_CASE(malformed_later_tx_does_not_discard_decoded_prefix) {
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    const Config &config = m_node.chainman->GetConfig();
++    auto connman =
++        std::make_unique<ConnmanTestMsg>(config, 987, 654, *m_node.addrman);
++    auto peerman =
++        PeerManager::make(*connman, *m_node.addrman, nullptr, *m_node.chainman,
++                          *m_node.mempool, nullptr, {});
++    CConnman::Options opts;
++    opts.m_msgproc = {peerman.get()};
++    opts.nSendBufferMaxSize = 1024 * 1024;
++    connman->Init(opts);
++    SetMockTime(m_node.chainman->ActiveChain().Tip()->GetBlockTime());
++    BOOST_REQUIRE(!m_node.chainman->IsInitialBlockDownload());
++    CAddress addr(MakeTestIp(0xa0b0c050), NODE_NONE);
++    CNode node(500, nullptr, addr, 0, 0, 0, CAddress(), "",
++               ConnectionType::OUTBOUND_FULL_RELAY, false);
++    connman->Handshake(node, true, NODE_NETWORK, NODE_NETWORK, PROTOCOL_VERSION,
++                       true);
++    FastRandomContext rng(uint256{57});
++    auto tx = MakeNonCoinbaseTx(rng, 0x51);
++    BOOST_REQUIRE(tx);
++    FundTxInputInCoinsTip(*m_node.chainman, *tx);
++    auto good = NetMsg::Make(NetMsgType::TX, tx);
++    CSerializedNetMsg malformed;
++    malformed.m_type = NetMsgType::TX;
++    malformed.data = {0xff};
++    BOOST_REQUIRE(connman->ReceiveMsgFrom(node, good));
++    BOOST_REQUIRE(connman->ReceiveMsgFrom(node, malformed));
++    connman->ProcessMessagesOnce(node);
++    BOOST_CHECK(m_node.mempool->exists(tx->GetId()));
++    peerman->FinalizeNode(config, node);
++    SetMockTime(0);
++}
++
++BOOST_AUTO_TEST_CASE(invalid_last_member_does_not_double_burst_admission_work) {
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    const Config &config = m_node.chainman->GetConfig();
++    auto connman =
++        std::make_unique<ConnmanTestMsg>(config, 987, 655, *m_node.addrman);
++    auto peerman =
++        PeerManager::make(*connman, *m_node.addrman, nullptr, *m_node.chainman,
++                          *m_node.mempool, nullptr, {});
++    CConnman::Options opts;
++    opts.m_msgproc = {peerman.get()};
++    opts.nSendBufferMaxSize = 1024 * 1024;
++    connman->Init(opts);
++    SetMockTime(m_node.chainman->ActiveChain().Tip()->GetBlockTime());
++    BOOST_REQUIRE(!m_node.chainman->IsInitialBlockDownload());
++    CAddress addr(MakeTestIp(0xa0b0c051), NODE_NONE);
++    CNode node(501, nullptr, addr, 0, 0, 0, CAddress(), "",
++               ConnectionType::OUTBOUND_FULL_RELAY, false);
++    connman->Handshake(node, true, NODE_NETWORK, NODE_NETWORK, PROTOCOL_VERSION,
++                       true);
++    FastRandomContext rng(uint256{64});
++    std::vector<TxId> valid_ids;
++    for (unsigned i = 0; i < 256; ++i) {
++        auto tx = MakeNonCoinbaseTx(rng, i);
++        BOOST_REQUIRE(tx);
++        FundTxInputInCoinsTip(*m_node.chainman, *tx);
++        if (i == 255) {
++            CMutableTransaction invalid(*tx);
++            invalid.vin[0].scriptSig = CScript() << OP_FALSE;
++            tx = MakeTransactionRef(std::move(invalid));
++        } else
++            valid_ids.push_back(tx->GetId());
++        auto msg = NetMsg::Make(NetMsgType::TX, tx);
++        BOOST_REQUIRE(connman->ReceiveMsgFrom(node, msg));
++    }
++    const bool logged_before = LogInstance().WillLogCategory(BCLog::TXPACKAGES);
++    LogInstance().EnableCategory(BCLog::TXPACKAGES);
++    std::atomic<size_t> checks{0};
++    auto callback =
++        LogInstance().PushBackCallback([&](const std::string &line) {
++            if (line.find("tx-admission-precheck txid=") != std::string::npos)
++                ++checks;
++        });
++    connman->ProcessMessagesOnce(node);
++    LogInstance().DeleteCallback(callback);
++    if (!logged_before) LogInstance().DisableCategory(BCLog::TXPACKAGES);
++    BOOST_CHECK_GT(checks.load(), 0);
++    BOOST_CHECK_LE(checks.load(), 257);
++    for (const auto &id : valid_ids)
++        BOOST_CHECK(m_node.mempool->exists(id));
++    BOOST_CHECK_EQUAL(m_node.mempool->size(), 255);
++    peerman->FinalizeNode(config, node);
++    SetMockTime(0);
++}
++
+ BOOST_AUTO_TEST_CASE(inventory_broadcast_constants) {
+     // Verify Stage H1 inventory broadcast constants
+     static_assert(INBOUND_INVENTORY_BROADCAST_INTERVAL ==
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 674e15631d..47959b84ed 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -806,6 +806,9 @@ bool MemPoolAccept::PreChecks(ATMPArgs &args, Workspace &ws,
+     const CTransaction &tx = *ws.m_ptx;
+     const TxId &txid = ws.m_ptx->GetId();
+ 
++    LogDebug(BCLog::TXPACKAGES, "tx-admission-precheck txid=%s\n",
++             txid.ToString());
++
+     // Copy/alias what we need out of args
+     std::vector<COutPoint> &coins_to_uncache = args.m_coins_to_uncache;
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,255 @@
+From c97e584899cc981cf0a0e19ac1377bc19ecf3023 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:29 -0700
+Subject: [PATCH] script: shard the signature cache and add bounded TLS lookup
+
+Partition SignatureCache into 16 cache-line-aligned shards with thread-local
+fast lookup and add ParallelScriptWorkerPool.
+
+Original-Commit: c7b441509eb0031241f3df411a09df74652ad12c
+Original-Patch: ecash/018
+Split-Concern: whole
+
+Historical compilation prerequisites are tracked separately in daemon/patch-audit;
+this provenance-preserving split does not imply standalone build validation.
+
+Candidate-Repair: Repair the incomplete cache boundary by moving its TLS/shard implementation from later27 to the header owner24 and adding explicit array/atomic includes and concurrent cache-instance-isolation regression. Keep24 one purpose: relocate original batch collector hooks, all original Schnorr batch assertions, and parallel block script dispatch into their complete legacy batch consumer27; preserve all source contributions and add its missing CMake source registration there. Existing sigcache plus concurrent cache tests pass manually; clean replay pending.
+---
+ src/script/sigcache.cpp              | 79 +++++++++++++++++++++++++---
+ src/script/sigcache.h                | 12 ++++-
+ src/test/CMakeLists.txt              |  1 +
+ src/test/sigcache_sharding_tests.cpp | 48 +++++++++++++++++
+ 4 files changed, 131 insertions(+), 9 deletions(-)
+ create mode 100644 src/test/sigcache_sharding_tests.cpp
+
+diff --git a/src/script/sigcache.cpp b/src/script/sigcache.cpp
+index f2c834e8ff04dcaa7329f1e7741f1ceb79859a9c..2541a6164cdad0f1c60ecc140f7ec9d7275d6db0 100644
+--- a/src/script/sigcache.cpp
++++ b/src/script/sigcache.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <script/sigcache.h>
+ 
++#include <crypto/common.h>
+ #include <crypto/sha256.h>
+ #include <logging.h>
+ #include <pubkey.h>
+@@ -13,10 +14,48 @@
+ #include <span.h>
+ #include <uint256.h>
+ 
++#include <array>
++#include <cstring>
+ #include <mutex>
+ #include <shared_mutex>
+ #include <vector>
+ 
++namespace {
++struct TlsSigCache {
++    static constexpr size_t kMask = 4095;
++    struct Slot {
++        const SignatureCache *owner{nullptr};
++        uint256 entry{};
++    };
++    std::array<Slot, kMask + 1> slots{};
++
++    static size_t Index(const uint256 &entry) noexcept {
++        return static_cast<size_t>(ReadLE64(entry.begin())) & kMask;
++    }
++
++    bool Contains(const SignatureCache *owner,
++                  const uint256 &entry) const noexcept {
++        const Slot &s = slots[Index(entry)];
++        return s.owner == owner && s.entry == entry;
++    }
++
++    void Insert(const SignatureCache *owner, const uint256 &entry) noexcept {
++        Slot &s = slots[Index(entry)];
++        s.owner = owner;
++        s.entry = entry;
++    }
++
++    void Erase(const SignatureCache *owner, const uint256 &entry) noexcept {
++        Slot &s = slots[Index(entry)];
++        if (s.owner == owner && s.entry == entry) {
++            s.owner = nullptr;
++        }
++    }
++};
++
++thread_local TlsSigCache g_tls_sigcache;
++} // namespace
++
+ SignatureCache::SignatureCache(const size_t max_size_bytes) {
+     uint256 nonce = GetRandHash();
+     // We want the nonce to be 64 bytes long to force the hasher to process
+@@ -25,11 +64,18 @@ SignatureCache::SignatureCache(const size_t max_size_bytes) {
+     m_salted_hasher.Write(nonce.begin(), 32);
+     m_salted_hasher.Write(nonce.begin(), 32);
+ 
+-    const auto [num_elems, approx_size_bytes] =
+-        setValid.setup_bytes(max_size_bytes);
++    const size_t per_shard_bytes = std::max<size_t>(1, max_size_bytes / kNumShards);
++    size_t total_elems = 0;
++    size_t total_approx_bytes = 0;
++    for (auto &shard : m_shards) {
++        const auto [num_elems, approx_size_bytes] =
++            shard.setValid.setup_bytes(per_shard_bytes);
++        total_elems += num_elems;
++        total_approx_bytes += approx_size_bytes;
++    }
+     LogPrintf("Using %zu MiB out of %zu MiB requested for signature cache, "
+               "able to store %zu elements\n",
+-              approx_size_bytes >> 20, max_size_bytes >> 20, num_elems);
++              total_approx_bytes >> 20, max_size_bytes >> 20, total_elems);
+ }
+ 
+ void SignatureCache::ComputeEntry(uint256 &entry, const uint256 &hash,
+@@ -43,13 +89,32 @@ void SignatureCache::ComputeEntry(uint256 &entry, const uint256 &hash,
+ }
+ 
+ bool SignatureCache::Get(const uint256 &entry, const bool erase) {
+-    std::shared_lock<std::shared_mutex> lock(cs_sigcache);
+-    return setValid.contains(entry, erase);
++    if (!erase && g_tls_sigcache.Contains(this, entry)) {
++        return true;
++    }
++    if (erase) {
++        g_tls_sigcache.Erase(this, entry);
++    }
++    Shard &shard =
++        m_shards[static_cast<size_t>(ReadLE64(entry.begin())) & (kNumShards - 1)];
++    if (!shard.has_entries.load(std::memory_order_acquire)) {
++        return false;
++    }
++    std::shared_lock<std::shared_mutex> lock(shard.mutex);
++    const bool found = shard.setValid.contains(entry, erase);
++    if (found && !erase) {
++        g_tls_sigcache.Insert(this, entry);
++    }
++    return found;
+ }
+ 
+ void SignatureCache::Set(const uint256 &entry) {
+-    std::unique_lock<std::shared_mutex> lock(cs_sigcache);
+-    setValid.insert(entry);
++    g_tls_sigcache.Insert(this, entry);
++    Shard &shard =
++        m_shards[static_cast<size_t>(ReadLE64(entry.begin())) & (kNumShards - 1)];
++    std::unique_lock<std::shared_mutex> lock(shard.mutex);
++    shard.setValid.insert(entry);
++    shard.has_entries.store(true, std::memory_order_release);
+ }
+ 
+ template <typename F>
+diff --git a/src/script/sigcache.h b/src/script/sigcache.h
+index b9c038e90e5ecc561386553c1708dc06ab9c5470..2810cb694124db46e2e760ed2e9099d6e8fee6dd 100644
+--- a/src/script/sigcache.h
++++ b/src/script/sigcache.h
+@@ -13,6 +13,8 @@
+ #include <uint256.h>
+ #include <util/hasher.h>
+ 
++#include <array>
++#include <atomic>
+ #include <cstddef>
+ #include <shared_mutex>
+ #include <vector>
+@@ -32,13 +34,18 @@ static constexpr size_t DEFAULT_SIGNATURE_CACHE_BYTES{32 << 20};
+  */
+ class SignatureCache {
+ private:
++    static constexpr size_t kNumShards = 16;
+     //! Entries are SHA256(nonce || signature hash || public key || signature):
+     CSHA256 m_salted_hasher;
+     typedef CuckooCache::cache<CuckooCache::KeyOnly<uint256>,
+                                SignatureCacheHasher>
+         map_type;
+-    map_type setValid;
+-    std::shared_mutex cs_sigcache;
++    struct alignas(64) Shard {
++        std::shared_mutex mutex;
++        map_type setValid;
++        std::atomic<bool> has_entries{false};
++    };
++    std::array<Shard, kNumShards> m_shards;
+ 
+ public:
+     SignatureCache(size_t max_size_bytes);
+@@ -53,6 +60,7 @@ public:
+     bool Get(const uint256 &entry, const bool erase);
+ 
+     void Set(const uint256 &entry);
++
+ };
+ 
+ class CachingTransactionSignatureChecker : public TransactionSignatureChecker {
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 6363fe68f945088fcabce2df865a1d701c6d869c..f1af4c3473bf7f53eff4bbfe3b0e52cfc9fc01eb 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -241,6 +241,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		settings_tests.cpp
+ 		shortidprocessor_tests.cpp
+ 		sigcache_tests.cpp
++		sigcache_sharding_tests.cpp
+ 		sigencoding_tests.cpp
+ 		sighash_tests.cpp
+ 		sighashtype_tests.cpp
+diff --git a/src/test/sigcache_sharding_tests.cpp b/src/test/sigcache_sharding_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..2e12539bc6c69a15974560c9ee5d020eacfb70f9
+--- /dev/null
++++ b/src/test/sigcache_sharding_tests.cpp
+@@ -0,0 +1,48 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <hash.h>
++#include <script/sigcache.h>
++#include <test/util/setup_common.h>
++#include <tinyformat.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <atomic>
++#include <thread>
++#include <vector>
++
++BOOST_FIXTURE_TEST_SUITE(sigcache_sharding_tests, BasicTestingSetup)
++
++BOOST_AUTO_TEST_CASE(concurrent_shard_and_tls_cache_isolation) {
++    SignatureCache cache(2 << 20);
++    SignatureCache other_cache(2 << 20);
++    std::vector<uint256> entries;
++    for (size_t i = 0; i < 1024; ++i) {
++        entries.push_back(Hash(strprintf("signature cache shard fixture %u", i)));
++        cache.Set(entries.back());
++    }
++    std::atomic<size_t> failures{0};
++    std::vector<std::thread> workers;
++    for (size_t worker = 0; worker < 8; ++worker) {
++        workers.emplace_back([&, worker] {
++            for (size_t round = 0; round < 8; ++round) {
++                for (size_t i = worker; i < entries.size(); i += 8) {
++                    if (!cache.Get(entries[i], false)) ++failures;
++                    // A TLS hit in one cache must never leak into another.
++                    if (other_cache.Get(entries[i], false)) ++failures;
++                    cache.Set(entries[i]);
++                    if (!cache.Get(entries[i], false)) ++failures;
++                }
++            }
++        });
++    }
++    for (auto &worker : workers) worker.join();
++    BOOST_CHECK_EQUAL(failures.load(), 0U);
++    // Upstream erase marks cache entries for collection; it does not promise
++    // immediate absence. Preserve that behavior while checking lookup success.
++    for (const auto &entry : entries) BOOST_CHECK(cache.Get(entry, true));
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+-- 
+2.50.1 (Apple Git-155)
+

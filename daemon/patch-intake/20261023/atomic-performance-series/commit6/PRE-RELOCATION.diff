@@ -1,0 +1,228 @@
+diff --git a/src/net/v2_protocol_handler.cpp b/src/net/v2_protocol_handler.cpp
+index 927314a362..8d0a0bfc65 100644
+--- a/src/net/v2_protocol_handler.cpp
++++ b/src/net/v2_protocol_handler.cpp
+@@ -19,11 +19,13 @@
+ #include <netmessagemaker.h>
+ #include <node/metrics.h>
+ #include <txmempool.h>
++#include <util/parallel_range.h>
+ #include <validation.h>
+ 
+ #include <algorithm>
+ #include <cstdlib>
+ #include <cstring>
++#include <exception>
+ #include <mutex>
+ #include <unordered_set>
+ 
+@@ -1740,11 +1742,66 @@ void V2PeerProtocolHandler::HandleGetShortTx(
+     }
+ }
+ 
++ShortTxResponse DecodeShortTxResponse(DataStream &stream) {
++    ShortTxResponse response;
++    stream >> response.scope >> response.context_id;
++    const uint64_t count = ReadCompactSize(stream);
++    if (count > ShortTxResponse::MAX_TXS) {
++        throw std::ios_base::failure("SHORTTX transaction count exceeds limit");
++    }
++
++    // Reuse the transaction decoder's exact structural scanner. Its spans
++    // borrow the receive buffer until all synchronous workers have finished.
++    // This pass neither copies script bytes nor constructs transactions in the
++    // shared tier. Hosts extending the wire grammar extend that same scanner.
++    std::vector<TransactionWire> wires;
++    wires.reserve(count);
++    auto remaining = Span<const uint8_t>{UCharCast(stream.data()), stream.size()};
++    size_t consumed = 0;
++    for (uint64_t i = 0; i < count; ++i) {
++        auto wire = ScanTransactionWire(remaining);
++        consumed += wire.bytes.size();
++        remaining = remaining.subspan(wire.bytes.size());
++        wires.push_back(wire);
++    }
++
++    response.txs.resize(count);
++    std::vector<std::exception_ptr> errors(count);
++    auto decode = [&](size_t begin, size_t end) {
++        for (size_t i = begin; i < end; ++i) {
++            try {
++                auto tx = MakeTransactionRef(wires[i]);
++                // Keep null/coinbase rejection in the existing handler. The
++                // preparation is context-free and never admits a transaction.
++                if (tx) {
++                    (void)tx->GetId();
++                    PrecomputedBatchTxData regular;
++                    PrecomputeSingleTxData(*tx, regular);
++                }
++                response.txs[i] = std::move(tx);
++            } catch (...) {
++                errors[i] = std::current_exception();
++            }
++        }
++    };
++    if (count >= 8) {
++        util::GetParallelRangeExecutor().Run(count, 1, decode, 8);
++    } else {
++        decode(0, count);
++    }
++    // Worker scheduling must not select which exception reaches the caller.
++    for (const auto &error : errors) {
++        if (error) std::rethrow_exception(error);
++    }
++    stream.ignore(consumed);
++    return response;
++}
++
+ void V2PeerProtocolHandler::HandleShortTx(
+     CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received) {
+     ShortTxResponse resp;
+     try {
+-        vRecv >> resp;
++        resp = DecodeShortTxResponse(vRecv);
+     } catch (const std::exception &) {
+         if (!CheckPeerRateLimit(pfrom.GetId(), time_received)) {
+             return;
+diff --git a/src/net/v2_protocol_handler.h b/src/net/v2_protocol_handler.h
+index 95d27f46bc..4a39950774 100644
+--- a/src/net/v2_protocol_handler.h
++++ b/src/net/v2_protocol_handler.h
+@@ -237,6 +237,11 @@ struct ShortTxResponse {
+     }
+ };
+ 
++/** Decode bounded SHORTTX bodies in wire order, warming transaction caches.
++ * Leaves any trailing message bytes unread, like ShortTxResponse deserialization.
++ */
++ShortTxResponse DecodeShortTxResponse(DataStream &stream);
++
+ /**
+  * GF(2^64) arithmetic modulo P(z) = z^64 + z^4 + z^3 + z + 1 (0x1b).
+  * Used for 2-element syndrome decoding and s5 checksum verification in
+diff --git a/src/test/v2_protocol_handler_tests.cpp b/src/test/v2_protocol_handler_tests.cpp
+index ec72197610..448ac91a54 100644
+--- a/src/test/v2_protocol_handler_tests.cpp
++++ b/src/test/v2_protocol_handler_tests.cpp
+@@ -116,6 +116,121 @@ void FundTxInputInCoinsTip(ChainstateManager &chainman,
+ 
+ BOOST_FIXTURE_TEST_SUITE(v2_protocol_handler_tests, RegTestingSetup)
+ 
++BOOST_AUTO_TEST_CASE(shorttx_parallel_decode_matches_serial_wire) {
++    ShortTxResponse response;
++    response.context_id = uint256::ONE;
++    for (size_t i = 0; i < 16; ++i) {
++        CMutableTransaction tx;
++        tx.vin.emplace_back(TxId{uint256::ONE}, uint32_t(i), CScript() << OP_TRUE);
++        tx.vout.emplace_back((1000 + int64_t(i)) * SATOSHI, CScript() << OP_TRUE);
++        if (i == 1) {
++            tx.vin[0].scriptSig = CScript{} << std::vector<uint8_t>(253, 0x42);
++        }
++        response.txs.push_back(MakeTransactionRef(tx));
++    }
++    auto check_same = [](const DataStream &input) {
++        DataStream serial = input;
++        DataStream parallel = input;
++        ShortTxResponse expected;
++        bool serial_valid = true;
++        try {
++            serial >> expected;
++            serial_valid = expected.txs.size() <= ShortTxResponse::MAX_TXS;
++        } catch (const std::exception &) {
++            serial_valid = false;
++        }
++        bool parallel_valid = true;
++        ShortTxResponse actual;
++        try {
++            actual = DecodeShortTxResponse(parallel);
++        } catch (const std::exception &) {
++            parallel_valid = false;
++        }
++        BOOST_REQUIRE_EQUAL(serial_valid, parallel_valid);
++        if (!serial_valid) return;
++        BOOST_CHECK_EQUAL(actual.scope, expected.scope);
++        BOOST_CHECK(actual.context_id == expected.context_id);
++        BOOST_REQUIRE_EQUAL(actual.txs.size(), expected.txs.size());
++        for (size_t i = 0; i < actual.txs.size(); ++i) {
++            BOOST_REQUIRE(actual.txs[i]);
++            BOOST_CHECK(actual.txs[i]->GetId() == expected.txs[i]->GetId());
++            DataStream a, b;
++            a << actual.txs[i];
++            b << expected.txs[i];
++            BOOST_CHECK(a.str() == b.str());
++            const auto &cached = actual.txs[i]->GetPrecomputedData();
++            const auto &reference = expected.txs[i]->GetPrecomputedData();
++            BOOST_CHECK(cached.hashPrevouts == reference.hashPrevouts);
++            BOOST_CHECK(cached.hashSequence == reference.hashSequence);
++            BOOST_CHECK(cached.hashOutputs == reference.hashOutputs);
++        }
++        BOOST_CHECK(serial.str() == parallel.str());
++    };
++    // Exercise both sides of the dispatch threshold, the maximum count,
++    // repeated bodies and null transactions (handler eligibility is separate).
++    for (size_t count : {size_t{0}, size_t{1}, size_t{7}, size_t{8},
++                         size_t{16}, ShortTxResponse::MAX_TXS}) {
++        auto batch = response;
++        batch.txs.resize(count, response.txs[0]);
++        DataStream wire;
++        wire << batch;
++        check_same(wire);
++    }
++    {
++        auto batch = response;
++        batch.txs[5] = MakeTransactionRef();
++        DataStream wire;
++        wire << batch;
++        check_same(wire);
++    }
++    DataStream wire;
++    wire << response;
++    check_same(wire);
++    // Every truncated field/script/transaction boundary must reject.
++    const auto bytes = wire.str();
++    for (size_t end = 0; end < bytes.size(); ++end) {
++        DataStream truncated = wire;
++        truncated.resize(end);
++        check_same(truncated);
++    }
++    // Existing SHORTTX parsing leaves trailing bytes to its caller.
++    wire << uint32_t{0xdeadbeef};
++    check_same(wire);
++
++    // Count and every nested legacy CompactSize use the canonical reader.
++    // One input/output with one-byte scripts: offsets within the first tx.
++    const size_t tx_start = 1 + 32 + 1;
++    for (size_t offset : {size_t{33}, tx_start + 4, tx_start + 41,
++                          tx_start + 47, tx_start + 56}) {
++        auto malformed = bytes;
++        const char value = malformed[offset];
++        malformed.replace(offset, 1, std::string{char(253), value, char(0)});
++        DataStream stream{Span<const uint8_t>{
++            reinterpret_cast<const uint8_t *>(malformed.data()), malformed.size()}};
++        check_same(stream);
++        DataStream excessive_size;
++        WriteCompactSize(excessive_size, uint64_t{MAX_SIZE} + 1);
++        malformed = bytes;
++        malformed.replace(offset, 1, excessive_size.str());
++        DataStream excessive{Span<const uint8_t>{
++            reinterpret_cast<const uint8_t *>(malformed.data()), malformed.size()}};
++        check_same(excessive);
++        for (uint8_t marker : {uint8_t{253}, uint8_t{254}, uint8_t{255}}) {
++            malformed = bytes.substr(0, offset);
++            malformed.push_back(char(marker));
++            DataStream partial{Span<const uint8_t>{
++                reinterpret_cast<const uint8_t *>(malformed.data()), malformed.size()}};
++            check_same(partial);
++        }
++    }
++    for (uint64_t count : {uint64_t{4097}, uint64_t{MAX_SIZE} + 1}) {
++        DataStream oversized;
++        oversized << response.scope << response.context_id;
++        WriteCompactSize(oversized, count);
++        BOOST_CHECK_THROW(DecodeShortTxResponse(oversized), std::ios_base::failure);
++    }
++}
++
+ BOOST_AUTO_TEST_CASE(v2_protocol_message_types_and_headers) {
+     BOOST_CHECK_EQUAL(std::string(NetMsgType::SEALEDHEADER), "sealedheader");
+     BOOST_CHECK_EQUAL(std::string(NetMsgType::MERKLIXSYNC), "merklixsync");

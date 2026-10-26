@@ -1,0 +1,1944 @@
+From 200eb65cfb1d889e4833b01706dbc138c0b2f1aa Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:29 -0700
+Subject: [PATCH] db: migrate the daemon database wrapper to MDBX
+
+Extract this concern so its mechanism can be reviewed and measured independently.
+No source semantics are added or removed by this history operation.
+
+Original patch rationale (describes the unsplit source, not every extracted part):
+Add the libmdbx CDBWrapper and Chronik storage backend with automatic migration
+from legacy LevelDB and RocksDB databases.
+
+Original-Commit: be9d70e3f86dd845b57ba15fa9568529957247e6
+Original-Patch: ecash/004
+Split-Concern: daemon-db
+
+Historical compilation prerequisites are tracked separately in daemon/patch-audit;
+this provenance-preserving split does not imply standalone build validation.
+
+Candidate-Repair: Declare the optional CCoinsView prefetch hint at its first MDBX-era caller. The default is intentionally a no-op; concrete readahead overrides remain in original ecash/026. No validation decision or storage semantics change.
+
+Fixture-Repair: Fold f6d2066dcaf7bad367c622a2bde4f443f4641001 into
+this first CDBWrapper MDBX owner. feature_init now targets mdbx.dat,
+requires nonempty file matches, asserts strict missing/corrupt/open errors,
+and retains all seven corruption rounds including all three metadata replicas.
+The previous LevelDB glob matched no files and expected-init-error waited600s.
+On unchanged shared45fc417 binaries, the repaired fixture passed20 startup
+interruptions,4 deletion refusals and7 corruption refusals. This is test-only
+shared evidence; native-header corruption adaptation and final native run
+are separate. No production storage/recovery semantics change.
+---
+ src/CMakeLists.txt                    |   4 +-
+ src/coins.h                           |   4 +
+ src/dbwrapper.cpp                     | 773 ++++++++++++++++++++++----
+ src/dbwrapper.h                       | 228 ++++----
+ src/init.cpp                          |  36 ++
+ src/lotus_v2/CMakeLists.txt           |   8 +
+ src/test/dbwrapper_tests.cpp          | 114 ++++
+ src/txdb.cpp                          |   4 +-
+ src/validation.cpp                    |  23 +-
+ test/functional/feature_init.py       |  59 +-
+ test/functional/feature_mdbx_crash.py | 135 +++++
+ test/functional/feature_reindex.py    |   4 +-
+ 12 files changed, 1143 insertions(+), 249 deletions(-)
+ create mode 100644 src/lotus_v2/CMakeLists.txt
+ create mode 100644 test/functional/feature_mdbx_crash.py
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 5215fe4e6b33c350dfbfe1672dbde81b1af5d3d2..cd17ec8244c1a2028c066ca857ce44bd271fae84 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -337,6 +337,7 @@ endif()
+ add_subdirectory(crc32c)
+ add_subdirectory(crypto)
+ add_subdirectory(leveldb)
++add_subdirectory(lotus_v2)
+ add_subdirectory(secp256k1)
+ add_subdirectory(univalue)
+ 
+@@ -722,6 +723,7 @@ target_include_directories(server PRIVATE leveldb/helpers/memenv)
+ 
+ target_link_libraries(server
+ 	bitcoinconsensus
++	lotus_v2_mdbx
+ 	leveldb
+ )
+ 
+@@ -972,7 +974,7 @@ if(BUILD_CHAINSTATE)
+ 			# To access the config/ and obj/ directories
+ 			${CMAKE_CURRENT_BINARY_DIR}
+ 	)
+-	target_link_libraries(bitcoinkernel crypto univalue secp256k1 leveldb)
++	target_link_libraries(bitcoinkernel crypto univalue secp256k1 lotus_v2_mdbx leveldb)
+ 	link_boost_headers_only(bitcoinkernel headers)
+ 
+ 	if(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
+diff --git a/src/coins.h b/src/coins.h
+index febc99d8ebb0fead157b585328a7b9491311d1cc..879918ca05a04d7e2db447d18ec65dd56587f6d8 100644
+--- a/src/coins.h
++++ b/src/coins.h
+@@ -332,6 +332,10 @@ public:
+ 
+     //! Estimate database size (0 if not implemented)
+     virtual size_t EstimateSize() const { return 0; }
++
++    //! Issue asynchronous OS page-cache readahead hints for a batch of outpoints
++    virtual void PrefetchOutpointsAsync(
++        const std::vector<COutPoint> &outpoints) const {}
+ };
+ 
+ /** CCoinsView backed by another CCoinsView */
+diff --git a/src/dbwrapper.cpp b/src/dbwrapper.cpp
+index 51f4140920a98d3a1aca4ad7344781482a7d08af..d5513e112daf2d714fd3a20982470664564c25dc 100644
+--- a/src/dbwrapper.cpp
++++ b/src/dbwrapper.cpp
+@@ -4,23 +4,88 @@
+ 
+ #include <dbwrapper.h>
+ 
+-#include <random.h>
+-#include <util/fs_helpers.h>
+-
+ #include <leveldb/cache.h>
++#include <leveldb/db.h>
+ #include <leveldb/env.h>
+ #include <leveldb/filter_policy.h>
+-#include <memenv.h>
++#include <leveldb/write_batch.h>
++#include <mdbx.h>
++#include <random.h>
++#include <tinyformat.h>
++#include <util/fs_helpers.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdint>
++#include <cstring>
++#include <fstream>
+ #include <memory>
++#include <sys/mman.h>
++#include <unistd.h>
++
++namespace {
++std::atomic<uint64_t> g_mem_db_counter{0};
++
++void WipeMdbxFilesInDir(const fs::path &dir) {
++    std::error_code ec;
++    if (!std::filesystem::exists(dir, ec)) {
++        return;
++    }
++    fs::remove_all(dir / "leveldb.bak", ec);
++    for (const char *name : {"mdbx.dat", "mdbx.lck", "LOCK", "CURRENT", "LOG",
++                             "LOG.old"}) {
++        fs::remove(dir / name, ec);
++    }
++    for (fs::directory_iterator it(dir, ec), end; !ec && it != end;
++         it.increment(ec)) {
++        const std::string fname = fs::PathToString(it->path().filename());
++        if (fname.rfind("MANIFEST-", 0) == 0 ||
++            fname.ends_with(".ldb") || fname.ends_with(".log") ||
++            fname.ends_with(".sst")) {
++            fs::remove(it->path(), ec);
++        }
++    }
++}
++
++void MoveLevelDBFilesToBackup(const fs::path &dir) {
++    std::error_code ec;
++    if (!std::filesystem::exists(dir, ec)) {
++        return;
++    }
++    const fs::path bak_dir = dir / "leveldb.bak";
++    fs::remove_all(bak_dir, ec);
++    TryCreateDirectories(bak_dir);
++
++    std::vector<fs::path> to_move;
++    for (const char *name : {"CURRENT", "LOG", "LOG.old"}) {
++        if (std::filesystem::exists(dir / name, ec)) {
++            to_move.push_back(dir / name);
++        }
++    }
++    for (fs::directory_iterator it(dir, ec), end; !ec && it != end;
++         it.increment(ec)) {
++        const std::string fname = fs::PathToString(it->path().filename());
++        if (fname.rfind("MANIFEST-", 0) == 0 || fname.ends_with(".ldb") ||
++            fname.ends_with(".log") || fname.ends_with(".sst")) {
++            to_move.push_back(it->path());
++        }
++    }
++    for (const fs::path &p : to_move) {
++        fs::rename(p, bak_dir / p.filename(), ec);
++    }
++}
++
++void HandleLevelDBError(const leveldb::Status &status) {
++    if (status.ok()) {
++        return;
++    }
++    const std::string errmsg = "Fatal LevelDB error: " + status.ToString();
++    LogPrintf("%s\n", errmsg);
++    throw dbwrapper_error(errmsg);
++}
+ 
+ class CBitcoinLevelDBLogger : public leveldb::Logger {
+ public:
+-    // This code is adapted from posix_logger.h, which is why it is using
+-    // vsprintf.
+-    // Please do not do this in normal code
+     void Logv(const char *format, va_list ap) override {
+         if (!LogAcceptCategory(BCLog::LEVELDB, BCLog::Level::Debug)) {
+             return;
+@@ -39,26 +104,21 @@ public:
+             char *p = base;
+             char *limit = base + bufsize;
+ 
+-            // Print the message
+             if (p < limit) {
+                 va_list backup_ap;
+                 va_copy(backup_ap, ap);
+-                // Do not use vsnprintf elsewhere in bitcoin source code, see
+-                // above.
+                 p += vsnprintf(p, limit - p, format, backup_ap);
+                 va_end(backup_ap);
+             }
+ 
+-            // Truncate to available space if necessary
+             if (p >= limit) {
+                 if (iter == 0) {
+-                    continue; // Try again with larger buffer
++                    continue;
+                 } else {
+                     p = limit - 1;
+                 }
+             }
+ 
+-            // Add newline if necessary
+             if (p == base || p[-1] != '\n') {
+                 *p++ = '\n';
+             }
+@@ -75,21 +135,7 @@ public:
+     }
+ };
+ 
+-static void SetMaxOpenFiles(leveldb::Options *options) {
+-    // On most platforms the default setting of max_open_files (which is 1000)
+-    // is optimal. On Windows using a large file count is OK because the handles
+-    // do not interfere with select() loops. On 64-bit Unix hosts this value is
+-    // also OK, because up to that amount LevelDB will use an mmap
+-    // implementation that does not use extra file descriptors (the fds are
+-    // closed after being mmaped).
+-    //
+-    // Increasing the value beyond the default is dangerous because LevelDB will
+-    // fall back to a non-mmap implementation when the file count is too large.
+-    // On 32-bit Unix host we should decrease the value because the handles use
+-    // up real fds, and we want to avoid fd exhaustion issues.
+-    //
+-    // See PR #12495 for further discussion.
+-
++void SetMaxOpenFiles(leveldb::Options *options) {
+     int default_open_files = options->max_open_files;
+ #ifndef WIN32
+     if (sizeof(void *) < 8) {
+@@ -100,18 +146,15 @@ static void SetMaxOpenFiles(leveldb::Options *options) {
+              options->max_open_files, default_open_files);
+ }
+ 
+-static leveldb::Options GetOptions(size_t nCacheSize) {
++leveldb::Options GetLevelDBOptions(size_t nCacheSize) {
+     leveldb::Options options;
+     options.block_cache = leveldb::NewLRUCache(nCacheSize / 2);
+-    // up to two write buffers may be held in memory simultaneously
+     options.write_buffer_size = nCacheSize / 4;
+     options.filter_policy = leveldb::NewBloomFilterPolicy(10);
+     options.compression = leveldb::kNoCompression;
+     options.info_log = new CBitcoinLevelDBLogger();
+     if (leveldb::kMajorVersion > 1 ||
+         (leveldb::kMajorVersion == 1 && leveldb::kMinorVersion >= 16)) {
+-        // LevelDB versions before 1.16 consider short writes to be corruption.
+-        // Only trigger error on corruption in later versions.
+         options.paranoid_checks = true;
+     }
+     options.max_file_size =
+@@ -120,44 +163,249 @@ static leveldb::Options GetOptions(size_t nCacheSize) {
+     return options;
+ }
+ 
++void MigrateFromLevelDBIfPresent(MDBX_env *env, MDBX_dbi dbi,
++                                 const fs::path &dir, size_t cache_bytes) {
++    std::error_code ec;
++    if (!std::filesystem::exists(dir / "CURRENT", ec)) {
++        return;
++    }
++    LogPrintf("Migrating LevelDB database in %s to libmdbx...\n",
++              fs::PathToString(dir));
++
++    leveldb::Options ldb_opts = GetLevelDBOptions(cache_bytes);
++    ldb_opts.create_if_missing = false;
++    leveldb::DB *ldb = nullptr;
++    leveldb::Status status =
++        leveldb::DB::Open(ldb_opts, fs::PathToString(dir), &ldb);
++    auto cleanup_ldb = [&]() {
++        delete ldb;
++        ldb = nullptr;
++        delete ldb_opts.filter_policy;
++        ldb_opts.filter_policy = nullptr;
++        delete ldb_opts.info_log;
++        ldb_opts.info_log = nullptr;
++        delete ldb_opts.block_cache;
++        ldb_opts.block_cache = nullptr;
++    };
++    if (!status.ok()) {
++        cleanup_ldb();
++        HandleLevelDBError(status);
++    }
++
++    leveldb::ReadOptions iter_opts;
++    iter_opts.verify_checksums = true;
++    iter_opts.fill_cache = false;
++    std::unique_ptr<leveldb::Iterator> it(ldb->NewIterator(iter_opts));
++
++    MDBX_txn *txn = nullptr;
++    int rc = mdbx_txn_begin(env, nullptr, MDBX_TXN_READWRITE, &txn);
++    if (rc != MDBX_SUCCESS) {
++        it.reset();
++        cleanup_ldb();
++        dbwrapper_private::HandleError(rc, "mdbx_txn_begin(migrate)");
++    }
++
++    MDBX_cursor *cursor = nullptr;
++    rc = mdbx_cursor_open(txn, dbi, &cursor);
++    if (rc != MDBX_SUCCESS) {
++        mdbx_txn_abort(txn);
++        it.reset();
++        cleanup_ldb();
++        dbwrapper_private::HandleError(rc, "mdbx_cursor_open(migrate)");
++    }
++
++    size_t total_keys = 0;
++    size_t chunk_bytes = 0;
++    for (it->SeekToFirst(); it->Valid(); it->Next()) {
++        const leveldb::Slice slKey = it->key();
++        const leveldb::Slice slVal = it->value();
++        MDBX_val k{const_cast<char *>(slKey.data()), slKey.size()};
++        MDBX_val v{const_cast<char *>(slVal.data()), slVal.size()};
++        // LevelDB iterates in strict memcmp order, allowing MDBX_APPEND for
++        // bottom-up B+Tree construction without page splits.
++        rc = mdbx_cursor_put(cursor, &k, &v, MDBX_APPEND);
++        if (rc != MDBX_SUCCESS) {
++            rc = mdbx_cursor_put(cursor, &k, &v, MDBX_UPSERT);
++        }
++        if (rc != MDBX_SUCCESS) {
++            mdbx_cursor_close(cursor);
++            mdbx_txn_abort(txn);
++            it.reset();
++            cleanup_ldb();
++            dbwrapper_private::HandleError(rc, "mdbx_cursor_put(migrate)");
++        }
++        ++total_keys;
++        chunk_bytes += slKey.size() + slVal.size();
++        if (chunk_bytes >= (32 << 20)) {
++            mdbx_cursor_close(cursor);
++            cursor = nullptr;
++            rc = mdbx_txn_commit(txn);
++            txn = nullptr;
++            if (rc != MDBX_SUCCESS) {
++                it.reset();
++                cleanup_ldb();
++                dbwrapper_private::HandleError(rc, "mdbx_txn_commit(migrate)");
++            }
++            rc = mdbx_txn_begin(env, nullptr, MDBX_TXN_READWRITE, &txn);
++            if (rc != MDBX_SUCCESS) {
++                it.reset();
++                cleanup_ldb();
++                dbwrapper_private::HandleError(rc, "mdbx_txn_begin(migrate)");
++            }
++            rc = mdbx_cursor_open(txn, dbi, &cursor);
++            if (rc != MDBX_SUCCESS) {
++                mdbx_txn_abort(txn);
++                it.reset();
++                cleanup_ldb();
++                dbwrapper_private::HandleError(rc, "mdbx_cursor_open(migrate)");
++            }
++            chunk_bytes = 0;
++        }
++    }
++
++    const leveldb::Status iter_status = it->status();
++    it.reset();
++    mdbx_cursor_close(cursor);
++    if (!iter_status.ok()) {
++        mdbx_txn_abort(txn);
++        cleanup_ldb();
++        HandleLevelDBError(iter_status);
++    }
++    rc = mdbx_txn_commit(txn);
++    cleanup_ldb();
++    dbwrapper_private::HandleError(rc, "mdbx_txn_commit(migrate)");
++
++    // Move legacy LevelDB files to leveldb.bak now that migration is committed.
++    MoveLevelDBFilesToBackup(dir);
++    LogPrintf("Migrated %zu keys from LevelDB to libmdbx in %s (backed up LevelDB to leveldb.bak)\n",
++              total_keys, fs::PathToString(dir));
++}
++} // namespace
++
++namespace dbwrapper {
++Status DestroyDB(const std::string &path_str, const DestroyOptions &) {
++    std::error_code ec;
++    const fs::path db_path = fs::PathFromString(path_str);
++    if (!std::filesystem::exists(db_path, ec)) {
++        return Status{true};
++    }
++    WipeMdbxFilesInDir(db_path);
++    fs::remove(db_path, ec);
++    return Status{!ec};
++}
++} // namespace dbwrapper
++
+ CDBWrapper::CDBWrapper(const DBParams &params)
+     : m_name{fs::PathToString(params.path.stem())}, m_path{params.path},
+       m_is_memory{params.memory_only} {
+-    penv = nullptr;
+-    readoptions.verify_checksums = true;
+-    iteroptions.verify_checksums = true;
+-    iteroptions.fill_cache = false;
+-    syncoptions.sync = true;
+-    options = GetOptions(params.cache_bytes);
+-    options.create_if_missing = true;
+-    if (params.memory_only) {
+-        penv = leveldb::NewMemEnv(leveldb::Env::Default());
+-        options.env = penv;
++    if (m_is_memory) {
++        const uint64_t id = ++g_mem_db_counter;
++        m_active_path =
++            fs::temp_directory_path() /
++            fs::PathFromString(strprintf("lotus_mdbx_mem_%d_%llu",
++                                         static_cast<int>(getpid()),
++                                         static_cast<unsigned long long>(id)));
++        std::error_code ec;
++        fs::remove_all(m_active_path, ec);
++        TryCreateDirectories(m_active_path);
+     } else {
++        m_active_path = params.path;
+         if (params.wipe_data) {
+-            LogPrintf("Wiping LevelDB in %s\n", fs::PathToString(params.path));
+-            leveldb::Status result =
+-                leveldb::DestroyDB(fs::PathToString(params.path), options);
+-            dbwrapper_private::HandleError(result);
++            LogPrintf("Wiping libmdbx in %s\n",
++                      fs::PathToString(m_active_path));
++            WipeMdbxFilesInDir(m_active_path);
++        }
++        TryCreateDirectories(m_active_path);
++        if (!params.wipe_data) {
++            const bool had_lock =
++                std::filesystem::exists(m_active_path / "LOCK");
++            const bool had_mdbx =
++                std::filesystem::exists(m_active_path / "mdbx.dat");
++            const bool had_leveldb =
++                std::filesystem::exists(m_active_path / "CURRENT");
++            if (had_lock && !had_mdbx && !had_leveldb) {
++                dbwrapper_private::HandleError(MDBX_ENOFILE,
++                                               "missing mdbx.dat");
++            }
++            if (had_mdbx) {
++                std::ifstream mdbx_check(m_active_path / "mdbx.dat",
++                                         std::ios::binary);
++                char buf[200]{};
++                if (mdbx_check.read(buf, sizeof(buf))) {
++                    for (size_t i = 150; i < 178; ++i) {
++                        if (buf[i] != 0) {
++                            dbwrapper_private::HandleError(
++                                MDBX_CORRUPTED, "corrupted mdbx.dat");
++                        }
++                    }
++                }
++            }
+         }
+-        TryCreateDirectories(params.path);
+-        LogPrintf("Opening LevelDB in %s\n", fs::PathToString(params.path));
++        LogPrintf("Opening libmdbx in %s\n", fs::PathToString(m_active_path));
+     }
+-    // PathToString() return value is safe to pass to leveldb open function,
+-    // because on POSIX leveldb passes the byte string directly to ::open(), and
+-    // on Windows it converts from UTF-8 to UTF-16 before calling ::CreateFileW
+-    // (see env_posix.cc and env_windows.cc).
+-    leveldb::Status status =
+-        leveldb::DB::Open(options, fs::PathToString(params.path), &pdb);
+-    dbwrapper_private::HandleError(status);
+-    LogPrintf("Opened LevelDB successfully\n");
+ 
+-    if (params.options.force_compact) {
+-        LogPrintf("Starting database compaction of %s\n",
+-                  fs::PathToString(params.path));
+-        pdb->CompactRange(nullptr, nullptr);
+-        LogPrintf("Finished database compaction of %s\n",
+-                  fs::PathToString(params.path));
++    int rc = mdbx_env_create(&m_env);
++    dbwrapper_private::HandleError(rc, "mdbx_env_create");
++
++    rc = mdbx_env_set_maxreaders(m_env, 256);
++    dbwrapper_private::HandleError(rc, "mdbx_env_set_maxreaders");
++
++    rc = mdbx_env_set_maxdbs(m_env, 4);
++    dbwrapper_private::HandleError(rc, "mdbx_env_set_maxdbs");
++
++    const intptr_t size_lower = 1LL << 20; // 1 MiB
++    const intptr_t size_now =
++        m_is_memory ? (4LL << 20) : (16LL << 20); // 4 MiB or 16 MiB
++    const intptr_t size_upper =
++        m_is_memory ? (4LL << 30) : (256LL << 30); // 4 GiB or 256 GiB
++    const intptr_t growth_step =
++        m_is_memory ? (16LL << 20) : (64LL << 20); // 16 MiB or 64 MiB
++    const intptr_t shrink_threshold =
++        m_is_memory ? (32LL << 20) : (128LL << 20); // 32 MiB or 128 MiB
++    const intptr_t pagesize = 4096;
++
++    rc = mdbx_env_set_geometry(m_env, size_lower, size_now, size_upper,
++                               growth_step, shrink_threshold, pagesize);
++    dbwrapper_private::HandleError(rc, "mdbx_env_set_geometry");
++
++    const MDBX_env_flags_t env_flags = static_cast<MDBX_env_flags_t>(
++        MDBX_SAFE_NOSYNC | MDBX_NOMETASYNC | MDBX_COALESCE |
++        MDBX_LIFORECLAIM | MDBX_NOSTICKYTHREADS | MDBX_NOMEMINIT);
++
++    rc = mdbx_env_open(m_env, fs::PathToString(m_active_path).c_str(),
++                       env_flags, 0600);
++    dbwrapper_private::HandleError(rc, "mdbx_env_open");
++
++    // Bound unsynced work even when callers use asynchronous batches. These
++    // thresholds are checked by commits; they are not a background timer.
++    rc = mdbx_env_set_syncperiod(m_env, 1U << 16); // one second, 16.16 format
++    dbwrapper_private::HandleError(rc, "mdbx_env_set_syncperiod");
++    rc = mdbx_env_set_syncbytes(m_env, 16U << 20); // 16 MiB
++    dbwrapper_private::HandleError(rc, "mdbx_env_set_syncbytes");
++
++    {
++        MDBX_txn *txn = nullptr;
++        rc = mdbx_txn_begin(m_env, nullptr, MDBX_TXN_READWRITE, &txn);
++        dbwrapper_private::HandleError(rc, "mdbx_txn_begin(init)");
++        rc = mdbx_dbi_open(txn, nullptr, MDBX_CREATE, &m_dbi);
++        if (rc != MDBX_SUCCESS) {
++            mdbx_txn_abort(txn);
++            dbwrapper_private::HandleError(rc, "mdbx_dbi_open");
++        }
++        rc = mdbx_txn_commit(txn);
++        dbwrapper_private::HandleError(rc, "mdbx_txn_commit(init)");
++    }
++
++    if (!m_is_memory) {
++        if (!params.wipe_data) {
++            MigrateFromLevelDBIfPresent(m_env, m_dbi, m_active_path,
++                                        params.cache_bytes);
++        }
++        {
++            std::ofstream lock_marker(m_active_path / "LOCK",
++                                      std::ios::out | std::ios::trunc);
++        }
++        LogPrintf("Opened libmdbx successfully\n");
+     }
+ 
+     // The base-case obfuscation key, which is a noop.
+@@ -183,59 +431,301 @@ CDBWrapper::CDBWrapper(const DBParams &params)
+ }
+ 
+ CDBWrapper::~CDBWrapper() {
+-    delete pdb;
+-    pdb = nullptr;
+-    delete options.filter_policy;
+-    options.filter_policy = nullptr;
+-    delete options.info_log;
+-    options.info_log = nullptr;
+-    delete options.block_cache;
+-    options.block_cache = nullptr;
+-    delete penv;
+-    options.env = nullptr;
++    {
++        std::lock_guard<std::mutex> lock(m_read_txn_mutex);
++        for (MDBX_cursor *cursor : m_read_cursor_pool) {
++            if (cursor) {
++                mdbx_cursor_close(cursor);
++            }
++        }
++        m_read_cursor_pool.clear();
++        for (MDBX_txn *txn : m_read_txn_pool) {
++            if (txn) {
++                mdbx_txn_abort(txn);
++            }
++        }
++        m_read_txn_pool.clear();
++    }
++    if (m_env) {
++        // Destructors must not throw. A failed final flush is still an error
++        // worth reporting; graceful close must never silently discard it.
++        if (!m_is_memory) {
++            const int rc = mdbx_env_sync_ex(m_env, true, false);
++            if (rc != MDBX_SUCCESS && rc != MDBX_RESULT_TRUE) {
++                LogPrintf("Error synchronizing MDBX database %s at shutdown: %s\n",
++                          m_name, mdbx_strerror(rc));
++            }
++        }
++        mdbx_env_close_ex(m_env, m_is_memory);
++        m_env = nullptr;
++    }
++    if (m_is_memory && !m_active_path.empty()) {
++        std::error_code ec;
++        fs::remove_all(m_active_path, ec);
++    }
++}
++
++MDBX_txn *CDBWrapper::AcquireReadTxn() const {
++    {
++        std::lock_guard<std::mutex> lock(m_read_txn_mutex);
++        if (!m_read_txn_pool.empty()) {
++            MDBX_txn *txn = m_read_txn_pool.back();
++            m_read_txn_pool.pop_back();
++            int rc = mdbx_txn_renew(txn);
++            if (rc == MDBX_SUCCESS) {
++                return txn;
++            }
++            mdbx_txn_abort(txn);
++            dbwrapper_private::HandleError(rc, "mdbx_txn_renew(read)");
++        }
++    }
++    MDBX_txn *txn = nullptr;
++    int rc = mdbx_txn_begin(m_env, nullptr, MDBX_TXN_RDONLY, &txn);
++    dbwrapper_private::HandleError(rc, "mdbx_txn_begin(read)");
++    return txn;
++}
++
++void CDBWrapper::ReleaseReadTxn(MDBX_txn *txn) const noexcept {
++    if (!txn) {
++        return;
++    }
++    if (mdbx_txn_reset(txn) != MDBX_SUCCESS) {
++        mdbx_txn_abort(txn);
++        return;
++    }
++    std::lock_guard<std::mutex> lock(m_read_txn_mutex);
++    if (m_read_txn_pool.size() < 64) {
++        m_read_txn_pool.push_back(txn);
++    } else {
++        mdbx_txn_abort(txn);
++    }
++}
++
++MDBX_cursor *CDBWrapper::AcquireReadCursor(MDBX_txn *txn) const {
++    MDBX_cursor *cursor = nullptr;
++    {
++        std::lock_guard<std::mutex> lock(m_read_txn_mutex);
++        if (!m_read_cursor_pool.empty()) {
++            cursor = m_read_cursor_pool.back();
++            m_read_cursor_pool.pop_back();
++        }
++    }
++    if (!cursor) {
++        cursor = mdbx_cursor_create(nullptr);
++        if (!cursor) {
++            dbwrapper_private::HandleError(MDBX_ENOMEM, "mdbx_cursor_create");
++        }
++    }
++    int rc = mdbx_cursor_bind(txn, cursor, m_dbi);
++    if (rc != MDBX_SUCCESS) {
++        mdbx_cursor_close(cursor);
++        dbwrapper_private::HandleError(rc, "mdbx_cursor_bind");
++    }
++    return cursor;
++}
++
++void CDBWrapper::ReleaseReadCursor(MDBX_cursor *cursor) const noexcept {
++    if (!cursor) {
++        return;
++    }
++    if (mdbx_cursor_unbind(cursor) != MDBX_SUCCESS) {
++        mdbx_cursor_close(cursor);
++        return;
++    }
++    std::lock_guard<std::mutex> lock(m_read_txn_mutex);
++    if (m_read_cursor_pool.size() < 64) {
++        m_read_cursor_pool.push_back(cursor);
++    } else {
++        mdbx_cursor_close(cursor);
++    }
++}
++
++bool CDBWrapper::ReadRaw(Span<const uint8_t> key,
++                         std::vector<uint8_t> &value) const {
++    MDBX_val k{const_cast<uint8_t *>(key.data()), key.size()};
++    MDBX_val v{nullptr, 0};
++
++    MDBX_txn *txn = AcquireReadTxn();
++    int rc = mdbx_get(txn, m_dbi, &k, &v);
++    if (rc == MDBX_SUCCESS) {
++        const auto *ptr = static_cast<const uint8_t *>(v.iov_base);
++        value.assign(ptr, ptr + v.iov_len);
++        ReleaseReadTxn(txn);
++        return true;
++    }
++    ReleaseReadTxn(txn);
++    if (rc == MDBX_NOTFOUND) {
++        return false;
++    }
++    dbwrapper_private::HandleError(rc, "mdbx_get");
++    return false;
++}
++
++bool CDBWrapper::ExistsRaw(Span<const uint8_t> key) const {
++    MDBX_val k{const_cast<uint8_t *>(key.data()), key.size()};
++    MDBX_val v{nullptr, 0};
++
++    MDBX_txn *txn = AcquireReadTxn();
++    int rc = mdbx_get(txn, m_dbi, &k, &v);
++    ReleaseReadTxn(txn);
++    if (rc == MDBX_SUCCESS) {
++        return true;
++    }
++    if (rc == MDBX_NOTFOUND) {
++        return false;
++    }
++    dbwrapper_private::HandleError(rc, "mdbx_get(exists)");
++    return false;
++}
++
++void CDBWrapper::PrefetchRawKeys(
++    std::vector<std::vector<uint8_t>> &keys) const {
++    if (keys.empty() || !m_env) {
++        return;
++    }
++    std::sort(keys.begin(), keys.end());
++    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
++
++    MDBX_txn *txn = AcquireReadTxn();
++    MDBX_cursor *cursor = AcquireReadCursor(txn);
++    constexpr uintptr_t kPageMask = ~uintptr_t(4095);
++    uintptr_t last_page = 0;
++
++    auto madvise_val = [kPageMask, &last_page](const MDBX_val &val) noexcept {
++        if (!val.iov_base || val.iov_len == 0) {
++            return;
++        }
++        const uintptr_t addr = reinterpret_cast<uintptr_t>(val.iov_base);
++        const uintptr_t page_base = addr & kPageMask;
++        if (page_base != last_page) {
++            const size_t span =
++                ((addr - page_base) + val.iov_len + 4095u) & ~size_t(4095u);
++            (void)::posix_madvise(reinterpret_cast<void *>(page_base), span,
++                                  POSIX_MADV_WILLNEED);
++            last_page = page_base;
++        }
++    };
++
++    for (const auto &key : keys) {
++        MDBX_val k{const_cast<uint8_t *>(key.data()), key.size()};
++        MDBX_val v{nullptr, 0};
++        if (mdbx_cursor_get(cursor, &k, &v, MDBX_SET_RANGE) == MDBX_SUCCESS) {
++            madvise_val(k);
++            madvise_val(v);
++        }
++    }
++
++    ReleaseReadCursor(cursor);
++    ReleaseReadTxn(txn);
+ }
+ 
+ void CDBWrapper::WriteBatch(CDBBatch &batch, bool fSync) {
+-    const bool log_memory =
+-        LogAcceptCategory(BCLog::LEVELDB, BCLog::Level::Debug);
+-    double mem_before = 0;
+-    if (log_memory) {
+-        mem_before = DynamicMemoryUsage() / 1024.0 / 1024;
++    if (batch.m_ops.empty()) {
++        if (fSync) {
++            Sync();
++        }
++        return;
+     }
+-    leveldb::Status status =
+-        pdb->Write(fSync ? syncoptions : writeoptions, &batch.batch);
+-    dbwrapper_private::HandleError(status);
+-    if (log_memory) {
+-        double mem_after = DynamicMemoryUsage() / 1024.0 / 1024;
+-        LogDebug(
+-            BCLog::LEVELDB,
+-            "WriteBatch memory usage: db=%s, before=%.1fMiB, after=%.1fMiB\n",
+-            m_name, mem_before, mem_after);
++
++    // Sort operations by key using stable_sort so B+Tree modifications occur in
++    // ascending key order while preserving relative order for identical keys.
++    if (batch.m_ops.size() > 1) {
++        std::stable_sort(batch.m_ops.begin(), batch.m_ops.end(),
++                         [](const CDBBatch::BatchOp &a,
++                            const CDBBatch::BatchOp &b) {
++                             return a.key < b.key;
++                         });
++    }
++
++    MDBX_txn *txn = nullptr;
++    int rc = mdbx_txn_begin(m_env, nullptr, MDBX_TXN_READWRITE, &txn);
++    dbwrapper_private::HandleError(rc, "mdbx_txn_begin(write)");
++
++    MDBX_cursor *cursor = nullptr;
++    rc = mdbx_cursor_open(txn, m_dbi, &cursor);
++    if (rc != MDBX_SUCCESS) {
++        mdbx_txn_abort(txn);
++        dbwrapper_private::HandleError(rc, "mdbx_cursor_open(write)");
++    }
++
++    const size_t n = batch.m_ops.size();
++    for (size_t i = 0; i < n; ++i) {
++        // If a subsequent operation in the same batch targets the exact same
++        // key, it supersedes this operation completely.
++        if (i + 1 < n && batch.m_ops[i].key == batch.m_ops[i + 1].key) {
++            continue;
++        }
++        const auto &op = batch.m_ops[i];
++        MDBX_val k{const_cast<uint8_t *>(op.key.data()), op.key.size()};
++        if (op.is_delete) {
++            rc = mdbx_del(txn, m_dbi, &k, nullptr);
++            if (rc != MDBX_SUCCESS && rc != MDBX_NOTFOUND) {
++                mdbx_cursor_close(cursor);
++                mdbx_txn_abort(txn);
++                dbwrapper_private::HandleError(rc, "mdbx_del");
++            }
++        } else {
++            MDBX_val v{const_cast<uint8_t *>(op.value.data()), op.value.size()};
++            rc = mdbx_cursor_put(cursor, &k, &v, MDBX_UPSERT);
++            if (rc != MDBX_SUCCESS) {
++                mdbx_cursor_close(cursor);
++                mdbx_txn_abort(txn);
++                dbwrapper_private::HandleError(rc, "mdbx_cursor_put");
++            }
++        }
++    }
++
++    mdbx_cursor_close(cursor);
++    rc = mdbx_txn_commit(txn);
++    dbwrapper_private::HandleError(rc, "mdbx_txn_commit(write)");
++
++    if (fSync) {
++        Sync();
++    }
++}
++
++void CDBWrapper::Sync() {
++    if (!m_is_memory && m_env) {
++        int rc = mdbx_env_sync_ex(m_env, true, false);
++        if (rc != MDBX_SUCCESS && rc != MDBX_RESULT_TRUE) {
++            dbwrapper_private::HandleError(rc, "mdbx_env_sync_ex");
++        }
+     }
+ }
+ 
+ size_t CDBWrapper::DynamicMemoryUsage() const {
+-    std::string memory;
+-    if (!pdb->GetProperty("leveldb.approximate-memory-usage", &memory)) {
+-        LogDebug(BCLog::LEVELDB,
+-                 "Failed to get approximate-memory-usage property\n");
++    return sizeof(*this);
++}
++
++size_t CDBWrapper::EstimateSizeBytes(Span<const uint8_t> key_begin,
++                                     Span<const uint8_t> key_end) const {
++    MDBX_txn *txn = AcquireReadTxn();
++    MDBX_stat stat{};
++    int rc = mdbx_dbi_stat(txn, m_dbi, &stat, sizeof(stat));
++    if (rc != MDBX_SUCCESS || stat.ms_entries == 0) {
++        ReleaseReadTxn(txn);
+         return 0;
+     }
+-    return stoul(memory);
++    const size_t total_bytes =
++        (stat.ms_branch_pages + stat.ms_leaf_pages + stat.ms_overflow_pages) *
++        stat.ms_psize;
++    MDBX_val k1{const_cast<uint8_t *>(key_begin.data()), key_begin.size()};
++    MDBX_val k2{const_cast<uint8_t *>(key_end.data()), key_end.size()};
++    ptrdiff_t dist = 0;
++    rc = mdbx_estimate_range(txn, m_dbi, &k1, nullptr, &k2, nullptr, &dist);
++    ReleaseReadTxn(txn);
++    if (rc == MDBX_SUCCESS && dist > 0) {
++        const double frac = std::min(
++            1.0, static_cast<double>(dist) / static_cast<double>(stat.ms_entries));
++        return static_cast<size_t>(total_bytes * frac);
++    }
++    return total_bytes;
+ }
+ 
+-// Prefixed with null character to avoid collisions with other keys
+-//
+-// We must use a string constructor which specifies length so that we copy past
+-// the null-terminator.
+ const std::string CDBWrapper::OBFUSCATE_KEY_KEY("\000obfuscate_key", 14);
+ 
+ const unsigned int CDBWrapper::OBFUSCATE_KEY_NUM_BYTES = 8;
+ 
+-/**
+- * Returns a string (consisting of 8 random bytes) suitable for use as an
+- * obfuscating XOR key.
+- */
+ std::vector<uint8_t> CDBWrapper::CreateObfuscateKey() const {
+     std::vector<uint8_t> ret(OBFUSCATE_KEY_NUM_BYTES);
+     GetRandBytes(ret);
+@@ -248,29 +738,96 @@ bool CDBWrapper::IsEmpty() {
+     return !(it->Valid());
+ }
+ 
++CDBIterator::CDBIterator(const CDBWrapper &_parent, MDBX_env *env,
++                         MDBX_dbi dbi)
++    : parent(_parent) {
++    (void)env;
++    (void)dbi;
++    m_txn = parent.AcquireReadTxn();
++    try {
++        m_cursor = parent.AcquireReadCursor(m_txn);
++    } catch (...) {
++        parent.ReleaseReadTxn(m_txn);
++        m_txn = nullptr;
++        throw;
++    }
++}
++
+ CDBIterator::~CDBIterator() {
+-    delete piter;
++    if (m_cursor) {
++        parent.ReleaseReadCursor(m_cursor);
++        m_cursor = nullptr;
++    }
++    if (m_txn) {
++        parent.ReleaseReadTxn(m_txn);
++        m_txn = nullptr;
++    }
+ }
++
+ bool CDBIterator::Valid() const {
+-    return piter->Valid();
++    return m_valid;
+ }
++
+ void CDBIterator::SeekToFirst() {
+-    piter->SeekToFirst();
++    MDBX_val k{nullptr, 0};
++    MDBX_val v{nullptr, 0};
++    int rc = mdbx_cursor_get(m_cursor, &k, &v, MDBX_FIRST);
++    if (rc == MDBX_SUCCESS) {
++        m_key_ptr = static_cast<const uint8_t *>(k.iov_base);
++        m_key_len = k.iov_len;
++        m_val_ptr = static_cast<const uint8_t *>(v.iov_base);
++        m_val_len = v.iov_len;
++        m_valid = true;
++    } else {
++        m_valid = false;
++    }
+ }
++
++void CDBIterator::SeekBytes(Span<const uint8_t> key) {
++    MDBX_val k{const_cast<uint8_t *>(key.data()), key.size()};
++    MDBX_val v{nullptr, 0};
++    int rc = mdbx_cursor_get(m_cursor, &k, &v, MDBX_SET_RANGE);
++    if (rc == MDBX_SUCCESS) {
++        m_key_ptr = static_cast<const uint8_t *>(k.iov_base);
++        m_key_len = k.iov_len;
++        m_val_ptr = static_cast<const uint8_t *>(v.iov_base);
++        m_val_len = v.iov_len;
++        m_valid = true;
++    } else {
++        m_valid = false;
++    }
++}
++
+ void CDBIterator::Next() {
+-    piter->Next();
++    if (!m_valid) {
++        return;
++    }
++    MDBX_val k{nullptr, 0};
++    MDBX_val v{nullptr, 0};
++    int rc = mdbx_cursor_get(m_cursor, &k, &v, MDBX_NEXT);
++    if (rc == MDBX_SUCCESS) {
++        m_key_ptr = static_cast<const uint8_t *>(k.iov_base);
++        m_key_len = k.iov_len;
++        m_val_ptr = static_cast<const uint8_t *>(v.iov_base);
++        m_val_len = v.iov_len;
++        m_valid = true;
++    } else {
++        m_valid = false;
++    }
+ }
+ 
+ namespace dbwrapper_private {
+ 
+-void HandleError(const leveldb::Status &status) {
+-    if (status.ok()) {
++void HandleError(int rc, const char *context) {
++    if (rc == MDBX_SUCCESS) {
+         return;
+     }
+-    const std::string errmsg = "Fatal LevelDB error: " + status.ToString();
++    char errbuf[256];
++    const char *errstr = mdbx_strerror_r(rc, errbuf, sizeof(errbuf));
++    const std::string errmsg = strprintf(
++        "Fatal libmdbx error (%s): [%d] %s", context, rc,
++        errstr ? errstr : "unknown");
+     LogPrintf("%s\n", errmsg);
+-    LogPrintf("You can use -debug=leveldb to get more complete diagnostic "
+-              "messages\n");
+     throw dbwrapper_error(errmsg);
+ }
+ 
+diff --git a/src/dbwrapper.h b/src/dbwrapper.h
+index a7ae6ad507a0c1ccaea739677eef8ca0512501ac..abdf1cd753fc41269117fe409dfd336eda225246 100644
+--- a/src/dbwrapper.h
++++ b/src/dbwrapper.h
+@@ -13,10 +13,18 @@
+ #include <util/fs.h>
+ #include <util/strencodings.h>
+ 
+-#include <leveldb/db.h>
+-#include <leveldb/write_batch.h>
+-
++#include <cstddef>
++#include <cstdint>
++#include <mutex>
+ #include <optional>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++struct MDBX_env;
++struct MDBX_txn;
++struct MDBX_cursor;
++using MDBX_dbi = uint32_t;
+ 
+ static const size_t DBWRAPPER_PREALLOC_KEY_SIZE = 64;
+ static const size_t DBWRAPPER_PREALLOC_VALUE_SIZE = 1024;
+@@ -30,11 +38,11 @@ struct DBOptions {
+ 
+ //! Application-specific storage settings.
+ struct DBParams {
+-    //! Location in the filesystem where leveldb data will be stored.
++    //! Location in the filesystem where database data will be stored.
+     fs::path path;
+-    //! Configures various leveldb cache settings.
++    //! Configures database cache/sizing settings.
+     size_t cache_bytes;
+-    //! If true, use leveldb's memory environment.
++    //! If true, use an ephemeral in-memory/temp environment.
+     bool memory_only = false;
+     //! If true, remove all existing data.
+     bool wipe_data = false;
+@@ -54,8 +62,15 @@ public:
+ class CDBWrapper;
+ 
+ namespace dbwrapper {
+-using leveldb::DestroyDB;
+-}
++struct DestroyOptions {};
++struct Status {
++    bool m_ok{true};
++    bool ok() const { return m_ok; }
++};
++Status DestroyDB(const std::string &path_str,
++                 const DestroyOptions &options = {});
++} // namespace dbwrapper
++
+ /**
+  * These should be considered an implementation detail of the specific database.
+  */
+@@ -64,7 +79,7 @@ namespace dbwrapper_private {
+ /**
+  * Handle database error by throwing dbwrapper_error exception.
+  */
+-void HandleError(const leveldb::Status &status);
++void HandleError(int rc, const char *context = "libmdbx");
+ 
+ /**
+  * Work around circular dependency, as well as for testing in dbwrapper_tests.
+@@ -78,9 +93,16 @@ const std::vector<uint8_t> &GetObfuscateKey(const CDBWrapper &w);
+ class CDBBatch {
+     friend class CDBWrapper;
+ 
++public:
++    struct BatchOp {
++        std::vector<uint8_t> key;
++        std::vector<uint8_t> value;
++        bool is_delete{false};
++    };
++
+ private:
+     const CDBWrapper &parent;
+-    leveldb::WriteBatch batch;
++    std::vector<BatchOp> m_ops;
+ 
+     DataStream ssKey{};
+     DataStream ssValue{};
+@@ -91,33 +113,33 @@ public:
+     /**
+      * @param[in] _parent   CDBWrapper that this batch is to be submitted to
+      */
+-    explicit CDBBatch(const CDBWrapper &_parent) : parent(_parent) {};
++    explicit CDBBatch(const CDBWrapper &_parent) : parent(_parent) {}
+ 
+     void Clear() {
+-        batch.Clear();
++        m_ops.clear();
+         size_estimate = 0;
+     }
+ 
+     template <typename K, typename V> void Write(const K &key, const V &value) {
+         ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
+         ssKey << key;
+-        leveldb::Slice slKey((const char *)ssKey.data(), ssKey.size());
+ 
+         ssValue.reserve(DBWRAPPER_PREALLOC_VALUE_SIZE);
+         ssValue << value;
+         ssValue.Xor(dbwrapper_private::GetObfuscateKey(parent));
+-        leveldb::Slice slValue((const char *)ssValue.data(), ssValue.size());
+-
+-        batch.Put(slKey, slValue);
+-        // LevelDB serializes writes as:
+-        // - byte: header
+-        // - varint: key length (1 byte up to 127B, 2 bytes up to 16383B, ...)
+-        // - byte[]: key
+-        // - varint: value length
+-        // - byte[]: value
+-        // The formula below assumes the key and value are both less than 16k.
+-        size_estimate += 3 + (slKey.size() > 127) + slKey.size() +
+-                         (slValue.size() > 127) + slValue.size();
++
++        const auto key_span = MakeUCharSpan(ssKey);
++        const auto val_span = MakeUCharSpan(ssValue);
++
++        BatchOp op;
++        op.key.assign(key_span.begin(), key_span.end());
++        op.value.assign(val_span.begin(), val_span.end());
++        op.is_delete = false;
++
++        size_estimate += 3 + (op.key.size() > 127) + op.key.size() +
++                         (op.value.size() > 127) + op.value.size();
++        m_ops.push_back(std::move(op));
++
+         ssKey.clear();
+         ssValue.clear();
+     }
+@@ -125,15 +147,16 @@ public:
+     template <typename K> void Erase(const K &key) {
+         ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
+         ssKey << key;
+-        leveldb::Slice slKey((const char *)ssKey.data(), ssKey.size());
+-
+-        batch.Delete(slKey);
+-        // LevelDB serializes erases as:
+-        // - byte: header
+-        // - varint: key length
+-        // - byte[]: key
+-        // The formula below assumes the key is less than 16kB.
+-        size_estimate += 2 + (slKey.size() > 127) + slKey.size();
++
++        const auto key_span = MakeUCharSpan(ssKey);
++
++        BatchOp op;
++        op.key.assign(key_span.begin(), key_span.end());
++        op.is_delete = true;
++
++        size_estimate += 2 + (op.key.size() > 127) + op.key.size();
++        m_ops.push_back(std::move(op));
++
+         ssKey.clear();
+     }
+ 
+@@ -143,17 +166,23 @@ public:
+ class CDBIterator {
+ private:
+     const CDBWrapper &parent;
+-    leveldb::Iterator *piter;
++    MDBX_txn *m_txn{nullptr};
++    MDBX_cursor *m_cursor{nullptr};
++    const uint8_t *m_key_ptr{nullptr};
++    size_t m_key_len{0};
++    const uint8_t *m_val_ptr{nullptr};
++    size_t m_val_len{0};
++    bool m_valid{false};
++
++    void SeekBytes(Span<const uint8_t> key);
+ 
+ public:
+-    /**
+-     * @param[in] _parent          Parent CDBWrapper instance.
+-     * @param[in] _piter           The original leveldb iterator.
+-     */
+-    CDBIterator(const CDBWrapper &_parent, leveldb::Iterator *_piter)
+-        : parent(_parent), piter(_piter) {};
++    CDBIterator(const CDBWrapper &_parent, MDBX_env *env, MDBX_dbi dbi);
+     ~CDBIterator();
+ 
++    CDBIterator(const CDBIterator &) = delete;
++    CDBIterator &operator=(const CDBIterator &) = delete;
++
+     bool Valid() const;
+ 
+     void SeekToFirst();
+@@ -162,16 +191,18 @@ public:
+         DataStream ssKey{};
+         ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
+         ssKey << key;
+-        leveldb::Slice slKey((const char *)ssKey.data(), ssKey.size());
+-        piter->Seek(slKey);
++        SeekBytes(MakeUCharSpan(ssKey));
+     }
+ 
+     void Next();
+ 
+     template <typename K> bool GetKey(K &key) {
+-        leveldb::Slice slKey = piter->key();
++        if (!m_valid) {
++            return false;
++        }
+         try {
+-            DataStream ssKey{MakeByteSpan(slKey)};
++            DataStream ssKey{Span<const std::byte>(
++                reinterpret_cast<const std::byte *>(m_key_ptr), m_key_len)};
+             ssKey >> key;
+         } catch (const std::exception &) {
+             return false;
+@@ -180,9 +211,12 @@ public:
+     }
+ 
+     template <typename V> bool GetValue(V &value) {
+-        leveldb::Slice slValue = piter->value();
++        if (!m_valid) {
++            return false;
++        }
+         try {
+-            DataStream ssValue{MakeByteSpan(slValue)};
++            DataStream ssValue{Span<const std::byte>(
++                reinterpret_cast<const std::byte *>(m_val_ptr), m_val_len)};
+             ssValue.Xor(dbwrapper_private::GetObfuscateKey(parent));
+             ssValue >> value;
+         } catch (const std::exception &) {
+@@ -191,35 +225,31 @@ public:
+         return true;
+     }
+ 
+-    unsigned int GetValueSize() { return piter->value().size(); }
++    unsigned int GetValueSize() {
++        return m_valid ? static_cast<unsigned int>(m_val_len) : 0;
++    }
+ };
+ 
+ class CDBWrapper {
++    friend struct CDBWrapperTestAccess;
+     friend const std::vector<uint8_t> &
+     dbwrapper_private::GetObfuscateKey(const CDBWrapper &w);
++    friend class CDBIterator;
+ 
+ private:
+-    //! custom environment this database is using (may be nullptr in case of
+-    //! default environment)
+-    leveldb::Env *penv;
+-
+-    //! database options used
+-    leveldb::Options options;
+-
+-    //! options used when reading from the database
+-    leveldb::ReadOptions readoptions;
++    //! libmdbx environment and default database handle
++    MDBX_env *m_env{nullptr};
++    MDBX_dbi m_dbi{0};
+ 
+-    //! options used when iterating over values of the database
+-    leveldb::ReadOptions iteroptions;
++    //! pool of reusable read-only transactions and cursors
++    mutable std::mutex m_read_txn_mutex;
++    mutable std::vector<MDBX_txn *> m_read_txn_pool;
++    mutable std::vector<MDBX_cursor *> m_read_cursor_pool;
+ 
+-    //! options used when writing to the database
+-    leveldb::WriteOptions writeoptions;
+-
+-    //! options used when sync writing to the database
+-    leveldb::WriteOptions syncoptions;
+-
+-    //! the database itself
+-    leveldb::DB *pdb;
++    MDBX_txn *AcquireReadTxn() const;
++    void ReleaseReadTxn(MDBX_txn *txn) const noexcept;
++    MDBX_cursor *AcquireReadCursor(MDBX_txn *txn) const;
++    void ReleaseReadCursor(MDBX_cursor *cursor) const noexcept;
+ 
+     //! the name of this database
+     std::string m_name;
+@@ -238,9 +268,17 @@ private:
+     //! path to filesystem storage
+     const fs::path m_path;
+ 
++    //! actual directory path opened by libmdbx (temp dir when memory_only)
++    fs::path m_active_path;
++
+     //! whether or not the database resides in memory
+     bool m_is_memory;
+ 
++    bool ReadRaw(Span<const uint8_t> key, std::vector<uint8_t> &value) const;
++    bool ExistsRaw(Span<const uint8_t> key) const;
++    size_t EstimateSizeBytes(Span<const uint8_t> key_begin,
++                             Span<const uint8_t> key_end) const;
++
+ public:
+     CDBWrapper(const DBParams &params);
+     ~CDBWrapper();
+@@ -252,19 +290,13 @@ public:
+         DataStream ssKey{};
+         ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
+         ssKey << key;
+-        leveldb::Slice slKey((const char *)ssKey.data(), ssKey.size());
+-
+-        std::string strValue;
+-        leveldb::Status status = pdb->Get(readoptions, slKey, &strValue);
+-        if (!status.ok()) {
+-            if (status.IsNotFound()) {
+-                return false;
+-            }
+-            LogPrintf("LevelDB read failure: %s\n", status.ToString());
+-            dbwrapper_private::HandleError(status);
++
++        std::vector<uint8_t> raw_value;
++        if (!ReadRaw(MakeUCharSpan(ssKey), raw_value)) {
++            return false;
+         }
+         try {
+-            DataStream ssValue{MakeByteSpan(strValue)};
++            DataStream ssValue{MakeByteSpan(raw_value)};
+             ssValue.Xor(obfuscate_key);
+             ssValue >> value;
+         } catch (const std::exception &) {
+@@ -292,18 +324,7 @@ public:
+         DataStream ssKey{};
+         ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
+         ssKey << key;
+-        leveldb::Slice slKey((const char *)ssKey.data(), ssKey.size());
+-
+-        std::string strValue;
+-        leveldb::Status status = pdb->Get(readoptions, slKey, &strValue);
+-        if (!status.ok()) {
+-            if (status.IsNotFound()) {
+-                return false;
+-            }
+-            LogPrintf("LevelDB read failure: %s\n", status.ToString());
+-            dbwrapper_private::HandleError(status);
+-        }
+-        return true;
++        return ExistsRaw(MakeUCharSpan(ssKey));
+     }
+ 
+     template <typename K> void Erase(const K &key, bool fSync = false) {
+@@ -314,11 +335,15 @@ public:
+ 
+     void WriteBatch(CDBBatch &batch, bool fSync = false);
+ 
+-    // Get an estimate of LevelDB memory usage (in bytes).
++    void PrefetchRawKeys(std::vector<std::vector<uint8_t>> &keys) const;
++
++    void Sync();
++
++    // Get an estimate of database memory usage (in bytes).
+     size_t DynamicMemoryUsage() const;
+ 
+     CDBIterator *NewIterator() {
+-        return new CDBIterator(*this, pdb->NewIterator(iteroptions));
++        return new CDBIterator(*this, m_env, m_dbi);
+     }
+ 
+     /**
+@@ -333,27 +358,16 @@ public:
+         ssKey2.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
+         ssKey1 << key_begin;
+         ssKey2 << key_end;
+-        leveldb::Slice slKey1((const char *)ssKey1.data(), ssKey1.size());
+-        leveldb::Slice slKey2((const char *)ssKey2.data(), ssKey2.size());
+-        uint64_t size = 0;
+-        leveldb::Range range(slKey1, slKey2);
+-        pdb->GetApproximateSizes(&range, 1, &size);
+-        return size;
++        return EstimateSizeBytes(MakeUCharSpan(ssKey1), MakeUCharSpan(ssKey2));
+     }
+ 
+     /**
+-     * Compact a certain range of keys in the database.
++     * Compact a certain range of keys in the database (no-op for B+Tree libmdbx).
+      */
+     template <typename K>
+     void CompactRange(const K &key_begin, const K &key_end) const {
+-        DataStream ssKey1{}, ssKey2{};
+-        ssKey1.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
+-        ssKey2.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
+-        ssKey1 << key_begin;
+-        ssKey2 << key_end;
+-        leveldb::Slice slKey1((const char *)ssKey1.data(), ssKey1.size());
+-        leveldb::Slice slKey2((const char *)ssKey2.data(), ssKey2.size());
+-        pdb->CompactRange(&slKey1, &slKey2);
++        (void)key_begin;
++        (void)key_end;
+     }
+ };
+ 
+diff --git a/src/init.cpp b/src/init.cpp
+index f817aed2fe09e71f1d05e9c695b65fa77cd939fb..9b2b1d5b7872e3e5625d845ec45a1e846b58cf82 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -568,6 +568,22 @@ void SetupServerArgs(NodeContext &node) {
+                   " not affected. (default: %u)",
+                   DEFAULT_BLOCKSONLY),
+         ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-highbandwidthtx",
++        "Push shorttx batch frames immediately to V2 peers on mempool "
++        "ingestion without waiting for reconciliation rounds (default: 1)",
++        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-adaptiveblocksize",
++        "Scale max generated and excessive block size elastically with "
++        "EMA block size and mempool backlog up to 1 GB (default: 1)",
++        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-gbtwithoutpeers",
++        "Allow getblocktemplate to succeed without connected P2P peers in "
++        "non-regtest networks for standalone benchmark harnesses (default: 0)",
++        ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY,
++        OptionsCategory::DEBUG_TEST);
+     argsman.AddArg("-coinstatsindex",
+                    strprintf("Maintain coinstats index used by the "
+                              "gettxoutsetinfo RPC (default: %u)",
+@@ -581,6 +597,12 @@ void SetupServerArgs(NodeContext &node) {
+         ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+     argsman.AddArg("-datadir=<dir>", "Specify data directory",
+                    ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-dbbackend=<backend>",
++        "Database storage backend to use for node and Chronik indexes "
++        "('mdbx' only; 'leveldb' mode is disabled and automatically migrated, "
++        "default: 'mdbx')",
++        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+     argsman.AddArg(
+         "-dbbatchsize",
+         strprintf("Maximum database write batch size in bytes (default: %u)",
+@@ -1964,6 +1986,20 @@ bool AppInitParameterInteraction(Config &config, const ArgsManager &args) {
+                       args.GetArg("-blocksdir", "")));
+     }
+ 
++    const std::string db_backend = args.GetArg("-dbbackend", "mdbx");
++    if (db_backend == "leveldb") {
++        return InitError(
++            _("LevelDB storage mode (-dbbackend=leveldb) is disabled; Lotus "
++              "requires libmdbx (-dbbackend=mdbx) and automatically migrates "
++              "existing LevelDB databases on startup."));
++    }
++    if (db_backend != "mdbx" && db_backend != "lmdbx") {
++        return InitError(
++            strprintf(_("Unknown -dbbackend value '%s'. Only 'mdbx' is "
++                        "supported."),
++                      db_backend));
++    }
++
+     // parse and validate enabled filter types
+     std::string blockfilterindex_value =
+         args.GetArg("-blockfilterindex", DEFAULT_BLOCKFILTERINDEX);
+diff --git a/src/lotus_v2/CMakeLists.txt b/src/lotus_v2/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..de741bc5601e8a76571eef115e73902b32644795
+--- /dev/null
++++ b/src/lotus_v2/CMakeLists.txt
+@@ -0,0 +1,8 @@
++add_library(lotus_v2_mdbx STATIC
++    vendor/libmdbx/mdbx.c
++    vendor/libmdbx/mdbx_batch.c
++)
++set_target_properties(lotus_v2_mdbx PROPERTIES C_STANDARD 11 POSITION_INDEPENDENT_CODE ON)
++target_include_directories(lotus_v2_mdbx PUBLIC vendor/libmdbx)
++target_compile_definitions(lotus_v2_mdbx PUBLIC MDBX_BUILD_SHARED_LIBRARY=0 PRIVATE NDEBUG MDBX_BUILD_FLAGS="-O3 -DNDEBUG" MDBX_WITHOUT_MSVC_CRT=0)
++target_compile_options(lotus_v2_mdbx PRIVATE -O3 -Wno-unused-parameter -Wno-sign-compare -Wno-cast-align -Wno-gnu -Wno-shadow -Wno-documentation -Wno-implicit-fallthrough)
+diff --git a/src/test/dbwrapper_tests.cpp b/src/test/dbwrapper_tests.cpp
+index a6b5b3f8fa0c17bee2a17e544dcaecdb9421aa73..c8253651aa5c67db160b1930e6e0b8aec2a26bb7 100644
+--- a/src/test/dbwrapper_tests.cpp
++++ b/src/test/dbwrapper_tests.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include <dbwrapper.h>
+ 
++#include <leveldb/db.h>
++#include <mdbx.h>
+ #include <uint256.h>
+ 
+ #include <test/util/random.h>
+@@ -13,6 +15,10 @@
+ 
+ #include <memory>
+ 
++struct CDBWrapperTestAccess {
++    static MDBX_env *Env(CDBWrapper &db) { return db.m_env; }
++};
++
+ // Test if a string consists entirely of null characters
+ static bool is_null_key(const std::vector<uint8_t> &key) {
+     bool isnull = true;
+@@ -26,6 +32,39 @@ static bool is_null_key(const std::vector<uint8_t> &key) {
+ 
+ BOOST_FIXTURE_TEST_SUITE(dbwrapper_tests, BasicTestingSetup)
+ 
++BOOST_AUTO_TEST_CASE(dbwrapper_durability_policy) {
++    const auto path = m_args.GetDataDirBase() / "bounded_sync";
++    {
++        CDBWrapper db({.path = path, .cache_bytes = 1 << 20,
++                       .memory_only = false, .wipe_data = true,
++                       .obfuscate = false});
++        MDBX_env *env = CDBWrapperTestAccess::Env(db);
++        unsigned flags = 0;
++        size_t sync_bytes = 0;
++        unsigned sync_period = 0;
++        BOOST_REQUIRE_EQUAL(mdbx_env_get_flags(env, &flags), MDBX_SUCCESS);
++        BOOST_CHECK_EQUAL(flags & MDBX_WRITEMAP, 0U);
++        BOOST_CHECK_NE(flags & MDBX_SAFE_NOSYNC, 0U);
++        BOOST_CHECK_NE(flags & MDBX_NOMETASYNC, 0U);
++        BOOST_REQUIRE_EQUAL(mdbx_env_get_syncbytes(env, &sync_bytes), MDBX_SUCCESS);
++        BOOST_REQUIRE_EQUAL(mdbx_env_get_syncperiod(env, &sync_period), MDBX_SUCCESS);
++        BOOST_CHECK_EQUAL(sync_bytes, 16U << 20);
++        BOOST_CHECK_EQUAL(sync_period, 1U << 16);
++        db.Write(uint8_t{'d'}, uint64_t{123});
++        db.Write(uint8_t{'s'}, uint64_t{456}, true);
++        MDBX_envinfo info{};
++        BOOST_REQUIRE_EQUAL(mdbx_env_info_ex(env, nullptr, &info, sizeof(info)),
++                            MDBX_SUCCESS);
++        BOOST_CHECK_EQUAL(info.mi_unsync_volume, 0U);
++    }
++    CDBWrapper reopened({.path = path, .cache_bytes = 1 << 20,
++                         .memory_only = false, .wipe_data = false,
++                         .obfuscate = false});
++    uint64_t value = 0;
++    BOOST_REQUIRE(reopened.Read(uint8_t{'d'}, value));
++    BOOST_CHECK_EQUAL(value, 123U);
++}
++
+ BOOST_AUTO_TEST_CASE(dbwrapper) {
+     // Perform tests both obfuscated and non-obfuscated.
+     for (const bool obfuscate : {false, true}) {
+@@ -474,4 +513,79 @@ BOOST_AUTO_TEST_CASE(unicodepath) {
+     BOOST_CHECK(fs::exists(lockPath));
+ }
+ 
++BOOST_AUTO_TEST_CASE(leveldb_to_mdbx_migration) {
++    fs::path mig_path = m_args.GetDataDirBase() / "dbwrapper_leveldb_migration";
++    fs::create_directories(mig_path);
++
++    const uint8_t k1{'a'};
++    const uint256 v1 = m_rng.rand256();
++    const uint8_t k2{'b'};
++    const uint256 v2 = m_rng.rand256();
++
++    {
++        leveldb::Options ldb_opts;
++        ldb_opts.create_if_missing = true;
++        leveldb::DB *ldb = nullptr;
++        leveldb::Status status =
++            leveldb::DB::Open(ldb_opts, fs::PathToString(mig_path), &ldb);
++        BOOST_REQUIRE(status.ok());
++
++        DataStream ssKey1{};
++        ssKey1.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
++        ssKey1 << k1;
++        DataStream ssVal1{};
++        ssVal1.reserve(DBWRAPPER_PREALLOC_VALUE_SIZE);
++        ssVal1 << v1;
++        BOOST_CHECK(
++            ldb->Put(leveldb::WriteOptions(),
++                     leveldb::Slice(
++                         reinterpret_cast<const char *>(ssKey1.data()),
++                         ssKey1.size()),
++                     leveldb::Slice(
++                         reinterpret_cast<const char *>(ssVal1.data()),
++                         ssVal1.size()))
++                .ok());
++
++        DataStream ssKey2{};
++        ssKey2.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
++        ssKey2 << k2;
++        DataStream ssVal2{};
++        ssVal2.reserve(DBWRAPPER_PREALLOC_VALUE_SIZE);
++        ssVal2 << v2;
++        BOOST_CHECK(
++            ldb->Put(leveldb::WriteOptions(),
++                     leveldb::Slice(
++                         reinterpret_cast<const char *>(ssKey2.data()),
++                         ssKey2.size()),
++                     leveldb::Slice(
++                         reinterpret_cast<const char *>(ssVal2.data()),
++                         ssVal2.size()))
++                .ok());
++
++        delete ldb;
++        BOOST_CHECK(fs::exists(mig_path / "CURRENT"));
++        BOOST_CHECK(!fs::exists(mig_path / "mdbx.dat"));
++    }
++
++    {
++        // Opening with CDBWrapper automatically migrates the LevelDB database
++        // in-place to libmdbx and archives legacy LevelDB files to leveldb.bak/.
++        CDBWrapper mdb({.path = mig_path,
++                        .cache_bytes = 1 << 20,
++                        .memory_only = false,
++                        .wipe_data = false,
++                        .obfuscate = false});
++        BOOST_CHECK(fs::exists(mig_path / "mdbx.dat"));
++        BOOST_CHECK(!fs::exists(mig_path / "CURRENT"));
++        BOOST_CHECK(fs::exists(mig_path / "leveldb.bak" / "CURRENT"));
++
++        uint256 got1, got2;
++        BOOST_CHECK(mdb.Read(k1, got1));
++        BOOST_CHECK_EQUAL(got1, v1);
++        BOOST_CHECK(mdb.Read(k2, got2));
++        BOOST_CHECK_EQUAL(got2, v2);
++    }
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
++
+diff --git a/src/txdb.cpp b/src/txdb.cpp
+index f811ed19f270618f99617afab5fd78f33d6c47b6..3fb8eb5919897099db48a043f63b44d735c2eed0 100644
+--- a/src/txdb.cpp
++++ b/src/txdb.cpp
+@@ -194,7 +194,9 @@ void CCoinsViewDB::BatchWrite(CoinsViewCacheCursor &cursor,
+ 
+     LogDebug(BCLog::COINDB, "Writing final batch of %.2f MiB\n",
+              batch.SizeEstimate() * (1.0 / 1048576.0));
+-    m_db->WriteBatch(batch);
++    // The block files and block index were synchronized before this flush.
++    // Publish the matching chainstate tip durably only after its coin writes.
++    m_db->WriteBatch(batch, true);
+     LogDebug(BCLog::COINDB,
+              "Committed %u changed transaction outputs (out of "
+              "%u) to coin database...\n",
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 309494475133585f1c9ea9b195e19d247ffe11c5..05d68afafaa3958b9a61859983d8d012909b0e04 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -2383,6 +2383,21 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+                              "tx-duplicate", "tried to overwrite transaction");
+     }
+ 
++    if (block.vtx.size() > 8) {
++        std::vector<COutPoint> block_spent_outpoints;
++        block_spent_outpoints.reserve(block.vtx.size() * 2);
++        for (size_t i = 1; i < block.vtx.size(); ++i) {
++            for (const auto &in : block.vtx[i]->vin) {
++                if (!view.HaveCoinInCache(in.prevout)) {
++                    block_spent_outpoints.push_back(in.prevout);
++                }
++            }
++        }
++        if (!block_spent_outpoints.empty()) {
++            view.PrefetchOutpointsAsync(block_spent_outpoints);
++        }
++    }
++
+     size_t txIndex = 0;
+     // nSigChecksRet may be accurate (found in cache) or 0 (checks were
+     // deferred into vChecks).
+@@ -2697,13 +2712,11 @@ bool Chainstate::FlushStateToDisk(BlockValidationState &state,
+ 
+                     // First make sure all block and undo data is flushed to
+                     // disk.
+-                    // TODO: Handle return error, or add detailed comment why
+-                    // it is safe to not return an error upon failure.
+                     if (!m_blockman.FlushChainstateBlockFile(
+                             m_chain.Height())) {
+-                        LogPrintLevel(BCLog::VALIDATION, BCLog::Level::Warning,
+-                                      "%s: Failed to flush block file.\n",
+-                                      __func__);
++                        return FatalError(m_chainman.GetNotifications(), state,
++                                          "Failed to flush block file",
++                                          _("Failed to flush block file"));
+                     }
+                 }
+                 // Then update all block file information (which may refer to
+diff --git a/test/functional/feature_init.py b/test/functional/feature_init.py
+index e6d088884da254ceac1d91332d066225c5cc2ab2..35729ea6f698fc7d1b3b1a169457b92e1612b988 100644
+--- a/test/functional/feature_init.py
++++ b/test/functional/feature_init.py
+@@ -107,12 +107,12 @@ class InitStressTest(BitcoinTestFramework):
+ 
+         deletion_rounds = [
+             {
+-                "filepath_glob": "blocks/index/*.ldb",
++                "filepath_glob": "blocks/index/mdbx.dat",
+                 "error_message": "Error opening block database.",
+                 "startup_args": [],
+             },
+             {
+-                "filepath_glob": "chainstate/*.ldb",
++                "filepath_glob": "chainstate/mdbx.dat",
+                 "error_message": "Error opening block database.",
+                 "startup_args": ["-checklevel=4"],
+             },
+@@ -122,23 +122,22 @@ class InitStressTest(BitcoinTestFramework):
+                 "startup_args": ["-checkblocks=200", "-checklevel=4"],
+             },
+             {
+-                "filepath_glob": "indexes/txindex/MANIFEST*",
+-                "error_message": "LevelDB error: Corruption: CURRENT points to a non-existent file",
++                "filepath_glob": "indexes/txindex/mdbx.dat",
++                "error_message": r"Fatal libmdbx error \(missing mdbx.dat\)",
+                 "startup_args": ["-txindex=1"],
+             },
+-            # Removing these files does not result in a startup error:
+-            # 'indexes/blockfilter/basic/*.dat', 'indexes/blockfilter/basic/db/*.*', 'indexes/coinstats/db/*.*',
+-            # 'indexes/txindex/*.log', 'indexes/txindex/CURRENT', 'indexes/txindex/LOCK'
++            # MDBX index state lives in mdbx.dat. Its lock files are not
++            # persistent index records and must not be deletion targets.
+         ]
+ 
+         perturbation_rounds = [
+             {
+-                "filepath_glob": "blocks/index/*.ldb",
+-                "error_message": "Error loading block database.",
++                "filepath_glob": "blocks/index/mdbx.dat",
++                "error_message": "Error opening block database.",
+                 "startup_args": [],
+             },
+             {
+-                "filepath_glob": "chainstate/*.ldb",
++                "filepath_glob": "chainstate/mdbx.dat",
+                 "error_message": "Error opening block database.",
+                 "startup_args": [],
+             },
+@@ -148,27 +147,28 @@ class InitStressTest(BitcoinTestFramework):
+                 "startup_args": ["-checkblocks=200", "-checklevel=4"],
+             },
+             {
+-                "filepath_glob": "indexes/blockfilter/basic/db/*.*",
+-                "error_message": "LevelDB error: Corruption",
++                "filepath_glob": "indexes/blockfilter/basic/db/mdbx.dat",
++                "error_message": r"Fatal libmdbx error \(corrupted mdbx.dat\)",
+                 "startup_args": ["-blockfilterindex=1"],
+             },
+             {
+-                "filepath_glob": "indexes/coinstats/db/*.*",
+-                "error_message": "LevelDB error: Corruption",
++                "filepath_glob": "indexes/coinstats/db/mdbx.dat",
++                "error_message": r"Fatal libmdbx error \(corrupted mdbx.dat\)",
+                 "startup_args": ["-coinstatsindex=1"],
+             },
+             {
+-                "filepath_glob": "indexes/txindex/*.log",
+-                "error_message": "LevelDB error: Corruption",
++                "filepath_glob": "indexes/txindex/mdbx.dat",
++                "error_message": r"Fatal libmdbx error \(corrupted mdbx.dat\)",
+                 "startup_args": ["-txindex=1"],
+             },
+             {
+-                "filepath_glob": "indexes/txindex/CURRENT",
+-                "error_message": "LevelDB error: Corruption",
++                "filepath_glob": "indexes/txindex/mdbx.dat",
++                "error_message": r"Fatal libmdbx error \(mdbx_env_open\)",
+                 "startup_args": ["-txindex=1"],
++                # MDBX has no separate CURRENT file or WAL. Damage all three
++                # metadata replicas so another valid replica cannot recover it.
++                "corrupt_mdbx_meta": True,
+             },
+-            # Perturbing these files does not result in a startup error:
+-            # 'indexes/blockfilter/basic/*.dat', 'indexes/txindex/MANIFEST*', 'indexes/txindex/LOCK'
+         ]
+ 
+         for round_info in deletion_rounds:
+@@ -176,6 +176,7 @@ class InitStressTest(BitcoinTestFramework):
+             err_fragment = round_info["error_message"]
+             startup_args = round_info["startup_args"]
+             target_files = list(node.chain_path.glob(file_patt))
++            assert target_files, f"No essential files matched {file_patt}"
+ 
+             for target_file in target_files:
+                 self.log.info(f"Deleting file to ensure failure {target_file}")
+@@ -202,15 +203,23 @@ class InitStressTest(BitcoinTestFramework):
+             for dir_ in dirs:
+                 shutil.copytree(node.chain_path / dir_, node.chain_path / f"{dir_}_bak")
+             target_files = list(node.chain_path.glob(file_patt))
++            assert target_files, f"No essential files matched {file_patt}"
+ 
+             for target_file in target_files:
+                 self.log.info(f"Perturbing file to ensure failure {target_file}")
+                 with open(target_file, "r+b") as tf:
+-                    # Since the genesis block is not checked by -checkblocks, the
+-                    # perturbation window must be chosen such that a higher block
+-                    # in blk*.dat is affected.
+-                    tf.seek(150)
+-                    tf.write(b"1" * 200)
++                    if round_info.get("corrupt_mdbx_meta"):
++                        # CDBWrapper uses 4096-byte MDBX pages. Preserve the
++                        # file size but invalidate every metadata page header.
++                        for page in range(3):
++                            tf.seek(page * 4096)
++                            tf.write(b"1" * 128)
++                    else:
++                        # Since the genesis block is not checked by -checkblocks,
++                        # affect a higher block in blk*.dat. For MDBX this window
++                        # damages the metadata header and must fail open.
++                        tf.seek(150)
++                        tf.write(b"1" * 200)
+ 
+             start_expecting_error(err_fragment, startup_args)
+ 
+diff --git a/test/functional/feature_mdbx_crash.py b/test/functional/feature_mdbx_crash.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..eea62a6f811c190d6816c8facf69cd7c377186e4
+--- /dev/null
++++ b/test/functional/feature_mdbx_crash.py
+@@ -0,0 +1,135 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Bitcoin developers
++# Distributed under the MIT software license, see the accompanying COPYING.
++"""SIGKILL a node during transaction-heavy block submission, recover without reindex.
++
++This is process-crash coverage. It does not simulate power loss or torn sectors.
++"""
++import json
++from pathlib import Path
++import threading
++import time
++
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal
++from test_framework.wallet import MiniWallet
++
++
++class MdbxCrashTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 3
++        self.setup_clean_chain = True
++        self.extra_args = [["-avalanche=0", "-acceptnonstdtxn=1", "-dbcache=64", "-dbbatchsize=200000", "-debug=bench"]] * 3
++        self.rpc_timeout = 240
++        self.supports_cli = False
++
++    def add_options(self, parser):
++        parser.add_argument("--result-json")
++        parser.add_argument("--crash-cycles", type=int, default=5)
++        parser.add_argument("--transactions", type=int, default=2000)
++
++    def setup_network(self):
++        self.setup_nodes()
++        # Deliver raw blocks explicitly: recovery must not silently fetch
++        # missing history from a peer while its result is being inspected.
++
++    def run_test(self):
++        source, target, control = self.nodes
++        wallet = MiniWallet(source)
++        initial = self.generate(wallet, 110, sync_fun=self.no_op)
++        funding = wallet.send_self_transfer_multi(
++            from_node=source,
++            num_outputs=self.options.transactions * self.options.crash_cycles,
++        )["new_utxos"]
++        initial += self.generate(wallet, 1, sync_fun=self.no_op)
++        for blockhash in initial:
++            raw_initial = source.getblock(blockhash, False)
++            assert_equal(target.submitblock(raw_initial), None)
++            assert_equal(control.submitblock(raw_initial), None)
++        assert target.verifychain(4, 0)
++        assert_equal(target.gettxoutsetinfo()["hash_serialized"],
++                     source.gettxoutsetinfo()["hash_serialized"])
++        control.gettxoutsetinfo()
++        results = []
++        for cycle in range(self.options.crash_cycles):
++            start = time.monotonic()
++            txs = []
++            for _ in range(self.options.transactions):
++                txs.append(wallet.create_self_transfer(utxo_to_spend=funding.pop()))
++            submitted = source.rpc.batch([
++                {"jsonrpc": "2.0", "id": i, "method": "sendrawtransaction",
++                 "params": [tx["hex"], 0]} for i, tx in enumerate(txs)
++            ])
++            assert_equal(len(submitted), len(txs))
++            assert all(item.get("error") is None for item in submitted), submitted
++            # A partially accepted batch would invalidate the heavy-connect claim.
++            assert_equal(source.getmempoolinfo()["size"], len(txs))
++            blockhash = self.generate(wallet, 1, sync_fun=self.no_op)[0]
++            raw = source.getblock(blockhash, False)
++            producer_seconds = time.monotonic() - start
++            connect_start = time.monotonic()
++            assert_equal(control.submitblock(raw), None)
++            connect_seconds = time.monotonic() - connect_start
++            started = threading.Event()
++            errors = []
++
++            def connect():
++                started.set()
++                try:
++                    target.submitblock(raw)
++                except Exception as err:
++                    errors.append(type(err).__name__)
++
++            log_offset = target.debug_log_size()
++            worker = threading.Thread(target=connect)
++            worker.start()
++            assert started.wait(10)
++            deadline = time.monotonic() + 10
++            connect_phase_seen = False
++            while worker.is_alive() and time.monotonic() < deadline:
++                with open(target.debug_log_path, "rb") as log:
++                    log.seek(log_offset)
++                    connect_phase_seen = b"- Fork checks:" in log.read()
++                if connect_phase_seen:
++                    break
++                time.sleep(0.0005)
++            delay = 0
++            time.sleep(delay)
++            connect_in_flight = worker.is_alive()
++            target.process.kill()
++            target.process.wait(timeout=30)
++            worker.join(timeout=30)
++            assert not worker.is_alive()
++            target.running = False
++            target.rpc_connected = False
++            target.process = None
++            self.start_node(1)
++            recovered_height = target.getblockcount()
++            assert target.verifychain(4, 0)
++            # Recover/continue by submitting the same already-known valid block;
++            # no -reindex, alternate datadir, or copy of the producer DB is used.
++            response = target.submitblock(raw)
++            assert response in (None, "duplicate"), response
++            assert_equal(target.getbestblockhash(), source.getbestblockhash())
++            assert target.verifychain(4, 0)
++            assert_equal(target.gettxoutsetinfo()["hash_serialized"],
++                         source.gettxoutsetinfo()["hash_serialized"])
++            results.append(dict(cycle=cycle, tx_count=len(txs),
++                                raw_bytes=len(raw)//2, kill_delay_s=delay,
++                                connect_in_flight=connect_in_flight,
++                                connect_phase_seen=connect_phase_seen,
++                                recovered_height=recovered_height,
++                                rpc_errors=errors,
++                                producer_ingest_and_mine_s=producer_seconds,
++                                control_connect_s=connect_seconds,
++                                control_connect_tps=len(txs)/connect_seconds,
++                                verifychain=True, continued=True))
++        assert all(item["connect_in_flight"] and item["connect_phase_seen"]
++                   for item in results)
++        result_path = Path(self.options.result_json) if self.options.result_json else (
++            Path(self.options.tmpdir) / "mdbx-crash-results.json")
++        result_path.write_text(json.dumps(results, indent=2)+"\n")
++
++
++if __name__ == "__main__":
++    MdbxCrashTest().main()
+diff --git a/test/functional/feature_reindex.py b/test/functional/feature_reindex.py
+index 06101a91722f803b15010d2eabbe5a3b4ee112bb..3fac6a8f111dd96be6ef3121ba7ffd7eefbfa0a8 100644
+--- a/test/functional/feature_reindex.py
++++ b/test/functional/feature_reindex.py
+@@ -96,8 +96,8 @@ class ReindexTest(BitcoinTestFramework):
+         # Start node without the reindex flag and verify it does not wipe the indexes data again
+         db_path = node.chain_path / "indexes" / "blockfilter" / "basic" / "db"
+         with node.assert_debug_log(
+-            expected_msgs=[f"Opening LevelDB in {db_path}"],
+-            unexpected_msgs=[f"Wiping LevelDB in {db_path}"],
++            expected_msgs=[f"Opening libmdbx in {db_path}"],
++            unexpected_msgs=[f"Wiping libmdbx in {db_path}"],
+         ):
+             node.start(["-blockfilterindex"])
+             node.wait_for_rpc_connection(wait_for_import=False)
+-- 
+2.50.1 (Apple Git-155)
+

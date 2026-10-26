@@ -1,0 +1,1148 @@
+From e03ddf00ed2d5dc46c0f76ae17795518b5109b7b Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Tue, 20 Oct 2026 09:54:20 -0700
+Subject: [PATCH] node: own the mining pool through the RPC service lifecycle
+
+Publish a configured manager in NodeContext during AppInitMain when RPC and the runtime miningpool option are enabled. Remove process-global pool ownership and request-time global option reads; RPC/HTTP handlers retain their own node's manager.
+
+Interrupt new work and drain accepted job/share operations before node dependencies are torn down. Preserve mutex-protected share deduplication and block-submission claims outside cs_main; reject Reset during active operations. Add isolation, runtime switch, concurrency, drain, HTTP routing and restart controls. The default window remains 1000 shares and state remains intentionally in memory.
+---
+ doc/mining-pool.md                       |  26 ++
+ src/httprpc.cpp                          |  50 ++--
+ src/init.cpp                             |  15 +-
+ src/node/context.cpp                     |   7 +-
+ src/node/context.h                       |   1 +
+ src/node/mining_pool.cpp                 | 124 +++++----
+ src/node/mining_pool.h                   |  41 ++-
+ src/rpc/mining.cpp                       |  45 ++--
+ src/test/mining_pool_tests.cpp           | 312 ++++++++++++++++++++++-
+ test/functional/mining_pool_lifecycle.py |  92 +++++++
+ 10 files changed, 600 insertions(+), 113 deletions(-)
+ create mode 100644 doc/mining-pool.md
+ create mode 100644 test/functional/mining_pool_lifecycle.py
+
+diff --git a/doc/mining-pool.md b/doc/mining-pool.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..2bc01d6d67ab9faacb2679c2e29f1307a654f758
+--- /dev/null
++++ b/doc/mining-pool.md
+@@ -0,0 +1,26 @@
++# Built-in mining pool
++
++The pool is compiled into the daemon and starts during node initialization when
++RPC service is enabled (`-server=1`). It is enabled by default in that mode;
++`miningpool=0` in the configuration file or `-miningpool=0` disables it. A
++P2P-only node does not create a pool. The existing RPC listener access controls
++and public-listener route restrictions also apply to the pool HTTP routes;
++this change does not add public access or additional authentication.
++
++Each node owns a separate pool manager. RPC and HTTP handlers retain that node's
++manager throughout each request, including long polling. Shutdown rejects new
++job/share work, cancels RPC waits, drains handlers and active pool operations,
++then releases chainstate. A manager cannot be restarted after interruption;
++node startup creates a new one.
++
++The default PPLNS window is **1000 shares**, configurable with
++`-poolpplnswindow`. Pool jobs, workers, accepted-share history, and counters are
++in memory and reset on restart. Persistent pool state is deferred.
++
++Pool state and configuration are protected by the manager mutex. Share nonce
++deduplication, PPLNS accounting and the block-submission claim happen under that
++mutex. Block validation runs after releasing it; shutdown waits for validation
++to finish before releasing node dependencies. Statistics return copies rather
++than references to mutable worker/job state. Startup and final shutdown are
++serialized by the node lifecycle; concurrently invoking startup twice is not a
++supported API. Test-only Reset requires no active job/share operation.
+diff --git a/src/httprpc.cpp b/src/httprpc.cpp
+index 528463738ecba328d4b51c5c6dae9f0a83d7d878..82d54f4fe343af93c2058e14e505cfa904b66c83 100644
+--- a/src/httprpc.cpp
++++ b/src/httprpc.cpp
+@@ -729,11 +729,16 @@ static boost::asio::awaitable<bool> HandlePoolJobsHTTPAsync(
+ 
+     try {
+         node::NodeContext &node = EnsureAnyNodeContext(context);
+-        auto &pool = node.mining_pool ? *node.mining_pool
+-                                      : node::GetGlobalMiningPool();
+-        if (!pool.IsEnabled(node.args)) {
++        auto pool = node::GetMiningPool(node);
++        const bool disabled =
++            node.args &&
++            !node.args->GetBoolArg(
++                "-miningpool", lotus::v2::node::DEFAULT_MINING_POOL_ENABLED);
++        if (disabled || !pool || !pool->IsEnabled()) {
+             req->WriteReply(HTTP_SERVICE_UNAVAILABLE,
+-                            "{\"error\":\"mining-pool-disabled\"}\n");
++                            disabled
++                                ? "{\"error\":\"mining-pool-disabled\"}\n"
++                                : "{\"error\":\"mining-pool-unavailable\"}\n");
+             co_return false;
+         }
+ 
+@@ -777,7 +782,7 @@ static boost::asio::awaitable<bool> HandlePoolJobsHTTPAsync(
+         }
+ 
+         const UniValue job_json =
+-            pool.GetMiningJobJSON(config, node, worker_id);
++            pool->GetMiningJobJSON(config, node, worker_id);
+ 
+         bool use_sse = false;
+         const auto accept_hdr = req->GetHeader("Accept");
+@@ -835,11 +840,16 @@ static boost::asio::awaitable<bool> HandlePoolSubmitHTTPAsync(
+ 
+     try {
+         node::NodeContext &node = EnsureAnyNodeContext(context);
+-        auto &pool = node.mining_pool ? *node.mining_pool
+-                                      : node::GetGlobalMiningPool();
+-        if (!pool.IsEnabled(node.args)) {
++        auto pool = node::GetMiningPool(node);
++        const bool disabled =
++            node.args &&
++            !node.args->GetBoolArg(
++                "-miningpool", lotus::v2::node::DEFAULT_MINING_POOL_ENABLED);
++        if (disabled || !pool || !pool->IsEnabled()) {
+             req->WriteReply(HTTP_SERVICE_UNAVAILABLE,
+-                            "{\"error\":\"mining-pool-disabled\"}\n");
++                            disabled
++                                ? "{\"error\":\"mining-pool-disabled\"}\n"
++                                : "{\"error\":\"mining-pool-unavailable\"}\n");
+             co_return false;
+         }
+ 
+@@ -882,8 +892,8 @@ static boost::asio::awaitable<bool> HandlePoolSubmitHTTPAsync(
+             ntime_opt = parsed_time;
+         }
+ 
+-        const auto res = pool.SubmitShare(config, node, job_id, worker_id,
+-                                          ntime_opt, nonce);
++        const auto res = pool->SubmitShare(config, node, job_id, worker_id,
++                                           ntime_opt, nonce);
+         req->WriteHeader("Content-Type", "application/json");
+         req->WriteReply(HTTP_OK, res.ToUniValue().write() + "\n");
+         co_return true;
+@@ -912,8 +922,18 @@ static boost::asio::awaitable<bool> HandlePoolStatsHTTPAsync(
+ 
+     try {
+         node::NodeContext &node = EnsureAnyNodeContext(context);
+-        auto &pool = node.mining_pool ? *node.mining_pool
+-                                      : node::GetGlobalMiningPool();
++        auto pool = node::GetMiningPool(node);
++        const bool disabled =
++            node.args &&
++            !node.args->GetBoolArg(
++                "-miningpool", lotus::v2::node::DEFAULT_MINING_POOL_ENABLED);
++        if (disabled || !pool || !pool->IsEnabled()) {
++            req->WriteReply(HTTP_SERVICE_UNAVAILABLE,
++                            disabled
++                                ? "{\"error\":\"mining-pool-disabled\"}\n"
++                                : "{\"error\":\"mining-pool-unavailable\"}\n");
++            co_return false;
++        }
+ 
+         const auto qparams = ParseURIQueryParams(req->GetURI());
+         std::string worker_id;
+@@ -925,10 +945,10 @@ static boost::asio::awaitable<bool> HandlePoolStatsHTTPAsync(
+ 
+         req->WriteHeader("Content-Type", "application/json");
+         if (!worker_id.empty()) {
+-            const UniValue stats = pool.GetWorkerStatsJSON(worker_id);
++            const UniValue stats = pool->GetWorkerStatsJSON(worker_id);
+             req->WriteReply(HTTP_OK, stats.write() + "\n");
+         } else {
+-            const UniValue info = pool.GetPoolInfoJSON();
++            const UniValue info = pool->GetPoolInfoJSON();
+             req->WriteReply(HTTP_OK, info.write() + "\n");
+         }
+         co_return true;
+diff --git a/src/init.cpp b/src/init.cpp
+index 934cf6dc2b8bf6c51cf98efb2416ee645a55c194..5424755cdd8506bd320a1656170b40e2f5e6df0e 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -224,6 +224,7 @@ static void ShutdownNotify(const ArgsManager &args) {
+ #endif
+ 
+ void Interrupt(NodeContext &node) {
++    node::InterruptMiningPool(node);
+ #if HAVE_SYSTEM
+     ShutdownNotify(*node.args);
+ #endif
+@@ -273,6 +274,7 @@ void Shutdown(NodeContext &node) {
+     StopREST();
+     StopRPC();
+     StopHTTPServer();
++    node::StopMiningPool(node);
+     // After the HTTP server: no scrape is in progress. Recording continues
+     // harmlessly into the (still allocated) metrics until exit.
+     StopHTTPMetrics();
+@@ -1660,11 +1662,11 @@ void SetupServerArgs(NodeContext &node) {
+                    "Override block version to test forking scenarios",
+                    ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY,
+                    OptionsCategory::BLOCK_CREATION);
+-    argsman.AddArg(
+-        "-miningpool=<0|1>",
+-        strprintf("Enable built-in HTTP/SSE mining pool engine (default: %d)",
+-                  lotus::v2::node::DEFAULT_MINING_POOL_ENABLED),
+-        ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
++    argsman.AddArg("-miningpool=<0|1>",
++                   strprintf("Enable built-in HTTP/SSE mining pool engine when "
++                             "RPC is enabled (default: %d)",
++                             lotus::v2::node::DEFAULT_MINING_POOL_ENABLED),
++                   ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
+     argsman.AddArg(
+         "-pooladdress=<addr>",
+         "Fallback Lotus address or script hex for built-in mining pool "
+@@ -2527,8 +2529,6 @@ bool AppInitParameterInteraction(Config &config, const ArgsManager &args) {
+                       db_backend));
+     }
+ 
+-    node::GetGlobalMiningPool().Configure(args, config);
+-
+     // parse and validate enabled filter types
+     std::string blockfilterindex_value =
+         args.GetArg("-blockfilterindex", DEFAULT_BLOCKFILTERINDEX);
+@@ -2956,6 +2956,7 @@ bool AppInitMain(Config &config, RPCServer &rpcServer,
+      * be ready later).  Warmup mode will be completed when initialisation is
+      * finished.
+      */
++    node::StartMiningPool(node, config);
+     if (args.GetBoolArg("-server", false)) {
+         uiInterface.InitMessage_connect(SetRPCWarmupStatus);
+         if (!AppInitServers(config, httpRPCRequestProcessor, node)) {
+diff --git a/src/node/context.cpp b/src/node/context.cpp
+index 21aa0932f0407673b08a48dff15ca88f3b9ff35f..51ccb8832f171b9c0e756bde8f85c9541960a381 100644
+--- a/src/node/context.cpp
++++ b/src/node/context.cpp
+@@ -20,7 +20,8 @@
+ 
+ namespace node {
+ NodeContext::NodeContext()
+-    : snapshot_publisher(GetGlobalSnapshotPublisherPtr()),
+-      mining_pool(GetGlobalMiningPoolPtr()) {}
+-NodeContext::~NodeContext() = default;
++    : snapshot_publisher(GetGlobalSnapshotPublisherPtr()) {}
++NodeContext::~NodeContext() {
++    StopMiningPool(*this);
++}
+ } // namespace node
+diff --git a/src/node/context.h b/src/node/context.h
+index 6ced37e0725df23611f780155f0d823d67ff5375..01e61c5ae9e2ad316baa46817257b513242fa856 100644
+--- a/src/node/context.h
++++ b/src/node/context.h
+@@ -84,6 +84,7 @@ struct NodeContext {
+     std::thread background_init_thread;
+ 
+     std::unique_ptr<avalanche::Processor> avalanche;
++    // Atomic publication; each handler retains a strong reference until return.
+     std::shared_ptr<MiningPoolManager> mining_pool;
+ 
+     //! Declare default constructor and destructor that are not inline, so code
+diff --git a/src/node/mining_pool.cpp b/src/node/mining_pool.cpp
+index 631733cdfc761babdf504145a76fdd64c2e1e8af..20ff48eda635d8401b89b162a78d4ac4422f9c3c 100644
+--- a/src/node/mining_pool.cpp
++++ b/src/node/mining_pool.cpp
+@@ -79,6 +79,14 @@ MiningPoolManager::MiningPoolManager() = default;
+ void MiningPoolManager::Configure(const ArgsManager &args,
+                                   const Config &config) {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    if (m_stopping) {
++        throw std::runtime_error("Built-in mining pool is stopping");
++    }
++    m_staking_rewards = args.GetBoolArg(
++        "-avalanchestakingrewards",
++        config.GetChainParams().GetConsensus().enableStakingRewards);
++    m_initial_share_target =
++        GetInitialShareTarget(config.GetChainParams().GetConsensus());
+     m_enabled = args.GetBoolArg("-miningpool", DEFAULT_MINING_POOL_ENABLED);
+     m_pool_address_arg = args.GetArg("-pooladdress", "");
+     const int64_t window = args.GetIntArg(
+@@ -95,6 +103,10 @@ void MiningPoolManager::Configure(const ArgsManager &args,
+ 
+ void MiningPoolManager::Reset() {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    if (m_active_operations != 0) {
++        throw std::logic_error(
++            "Cannot reset mining pool with active operations");
++    }
+     m_next_job_id = 1;
+     m_next_nonce_prefix = 1;
+     for (auto &job : m_jobs) {
+@@ -108,15 +120,34 @@ void MiningPoolManager::Reset() {
+     m_total_work = 0.0;
+ }
+ 
+-bool MiningPoolManager::IsEnabled(const ArgsManager *args) const {
+-    if (args && args->IsArgSet("-miningpool")) {
+-        return args->GetBoolArg("-miningpool", DEFAULT_MINING_POOL_ENABLED);
+-    }
+-    if (gArgs.IsArgSet("-miningpool")) {
+-        return gArgs.GetBoolArg("-miningpool", DEFAULT_MINING_POOL_ENABLED);
++MiningPoolManager::Operation::Operation(MiningPoolManager &pool)
++    : m_pool(pool) {
++    std::lock_guard<std::mutex> lock(m_pool.m_mutex);
++    if (!m_pool.m_configured || !m_pool.m_enabled || m_pool.m_stopping) {
++        throw std::runtime_error("Built-in mining pool is unavailable");
+     }
++    ++m_pool.m_active_operations;
++}
++
++MiningPoolManager::Operation::~Operation() {
++    std::lock_guard<std::mutex> lock(m_pool.m_mutex);
++    if (--m_pool.m_active_operations == 0) m_pool.m_drained.notify_all();
++}
++
++bool MiningPoolManager::IsEnabled() const {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    return m_configured && m_enabled && !m_stopping;
++}
++
++void MiningPoolManager::Interrupt() {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    return m_enabled;
++    m_stopping = true;
++}
++
++void MiningPoolManager::Stop() {
++    std::unique_lock<std::mutex> lock(m_mutex);
++    m_stopping = true;
++    m_drained.wait(lock, [this] { return m_active_operations == 0; });
+ }
+ 
+ void MiningPoolManager::SetTargetSpacingSec(int64_t spacing_sec) {
+@@ -146,9 +177,6 @@ CScript MiningPoolManager::GetFallbackPayoutScriptLocked(
+         return m_fallback_payout_script;
+     }
+     std::string addr = m_pool_address_arg;
+-    if (addr.empty() && gArgs.IsArgSet("-pooladdress")) {
+-        addr = gArgs.GetArg("-pooladdress", "");
+-    }
+     if (!addr.empty()) {
+         CTxDestination dest =
+             DecodeDestination(addr, config.GetChainParams());
+@@ -264,13 +292,8 @@ PoolWorker &MiningPoolManager::GetOrCreateWorkerLocked(
+ 
+ void MiningPoolManager::UpdateVarDiffLocked(PoolWorker &worker, int64_t now_ms,
+                                             const Consensus::Params &params) {
+-    const int64_t target_spacing_sec =
+-        gArgs.IsArgSet("-pooltargetspacing")
+-            ? std::max<int64_t>(
+-                  1, gArgs.GetIntArg("-pooltargetspacing",
+-                                     DEFAULT_POOL_TARGET_SPACING_SEC))
+-            : m_target_spacing_sec;
+-    const int64_t target_ms = std::max<int64_t>(100, target_spacing_sec * 1000);
++    const int64_t target_ms =
++        std::max<int64_t>(100, m_target_spacing_sec * 1000);
+ 
+     if (worker.last_share_time_ms <= 0) {
+         worker.last_share_time_ms = now_ms;
+@@ -329,7 +352,7 @@ void MiningPoolManager::UpdateVarDiffLocked(PoolWorker &worker, int64_t now_ms,
+ }
+ 
+ double MiningPoolManager::EstimateWorkerHashrateLocked(
+-    const PoolWorker &worker, const Consensus::Params &params) const {
++    const PoolWorker &worker) const {
+     if (worker.accepted_shares == 0) {
+         return 0.0;
+     }
+@@ -366,6 +389,7 @@ UniValue MiningPoolManager::GetMiningJobJSON(const Config &config,
+                                              const std::string &worker_id,
+                                              PoolJob *out_job,
+                                              PoolWorker *out_worker) {
++    Operation operation(*this);
+     ChainstateManager *chainman_ptr = node.chainman.get();
+     if (!chainman_ptr) {
+         throw std::runtime_error("ChainstateManager not initialized");
+@@ -410,11 +434,6 @@ UniValue MiningPoolManager::GetMiningJobJSON(const Config &config,
+     }
+ 
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    if (gArgs.IsArgSet("-poolpplnswindow")) {
+-        m_pplns_window_size = static_cast<size_t>(std::max<int64_t>(
+-            1, gArgs.GetIntArg("-poolpplnswindow",
+-                               static_cast<int64_t>(DEFAULT_POOL_PPLNS_WINDOW))));
+-    }
+     PoolWorker &worker = GetOrCreateWorkerLocked(worker_id, config);
+     const CScript fallback_script = GetFallbackPayoutScriptLocked(config);
+ 
+@@ -427,9 +446,7 @@ UniValue MiningPoolManager::GetMiningJobJSON(const Config &config,
+ 
+     std::vector<CScript> stakingRewardsPayoutScripts;
+     Amount stakingRewardsAmount = Amount::zero();
+-    if (node.avalanche &&
+-        gArgs.GetBoolArg("-avalanchestakingrewards",
+-                         consensusParams.enableStakingRewards)) {
++    if (node.avalanche && m_staking_rewards) {
+         if (node.avalanche->getStakingRewardWinners(
+                 tmpl.prev_block_hash, stakingRewardsPayoutScripts) &&
+             !stakingRewardsPayoutScripts.empty()) {
+@@ -631,6 +648,7 @@ ShareSubmissionResult MiningPoolManager::SubmitShare(
+     const Config &config, ::node::NodeContext &node, uint64_t job_id,
+     const std::string &worker_id, std::optional<uint64_t> nTime,
+     uint64_t nNonce) {
++    Operation operation(*this);
+     ShareSubmissionResult result;
+     const Consensus::Params &consensusParams =
+         config.GetChainParams().GetConsensus();
+@@ -818,20 +836,15 @@ ShareSubmissionResult MiningPoolManager::SubmitShare(
+ 
+ UniValue MiningPoolManager::GetPoolInfoJSON() const {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    const Consensus::Params &consensusParams =
+-        GetConfig().GetChainParams().GetConsensus();
+ 
+     double pool_hashrate = 0.0;
+     for (const auto &[_, worker] : m_workers) {
+-        pool_hashrate += EstimateWorkerHashrateLocked(worker, consensusParams);
++        pool_hashrate += EstimateWorkerHashrateLocked(worker);
+     }
+ 
+-    const bool enabled =
+-        gArgs.IsArgSet("-miningpool")
+-            ? gArgs.GetBoolArg("-miningpool", DEFAULT_MINING_POOL_ENABLED)
+-            : m_enabled;
+     UniValue obj(UniValue::VOBJ);
+-    obj.pushKV("enabled", enabled);
++    obj.pushKV("enabled", m_configured && m_enabled && !m_stopping);
++    obj.pushKV("active_operations", static_cast<uint64_t>(m_active_operations));
+     obj.pushKV("active_workers", static_cast<uint64_t>(m_workers.size()));
+     obj.pushKV("pool_hashrate", pool_hashrate);
+     obj.pushKV("blocks_found", m_blocks_found);
+@@ -849,12 +862,10 @@ UniValue MiningPoolManager::GetPoolInfoJSON() const {
+ UniValue MiningPoolManager::GetWorkerStatsJSON(
+     const std::string &worker_id) const {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    const Consensus::Params &consensusParams =
+-        GetConfig().GetChainParams().GetConsensus();
+ 
+     double pool_hashrate = 0.0;
+     for (const auto &[_, w] : m_workers) {
+-        pool_hashrate += EstimateWorkerHashrateLocked(w, consensusParams);
++        pool_hashrate += EstimateWorkerHashrateLocked(w);
+     }
+ 
+     UniValue obj(UniValue::VOBJ);
+@@ -870,8 +881,7 @@ UniValue MiningPoolManager::GetWorkerStatsJSON(
+         const bool is_sub = (key.rfind("sub:", 0) == 0);
+         obj.pushKV("worker_id", key);
+         obj.pushKV("nonce_prefix", uint64_t(0));
+-        obj.pushKV("share_target",
+-                   GetInitialShareTarget(consensusParams).GetHex());
++        obj.pushKV("share_target", m_initial_share_target.GetHex());
+         obj.pushKV("accepted_shares", uint64_t(0));
+         obj.pushKV("rejected_shares", uint64_t(0));
+         obj.pushKV("worker_blocks_found", uint64_t(0));
+@@ -885,8 +895,7 @@ UniValue MiningPoolManager::GetWorkerStatsJSON(
+     }
+ 
+     const PoolWorker &w = it->second;
+-    const double est_hashrate =
+-        EstimateWorkerHashrateLocked(w, consensusParams);
++    const double est_hashrate = EstimateWorkerHashrateLocked(w);
+     const double pplns_weight = ComputeWorkerPPLNSWeightLocked(w.worker_id);
+     const bool unlocked =
+         w.is_newsletter_subscriber &&
+@@ -908,13 +917,34 @@ UniValue MiningPoolManager::GetWorkerStatsJSON(
+     return obj;
+ }
+ 
+-std::shared_ptr<MiningPoolManager> GetGlobalMiningPoolPtr() {
+-    static auto g_pool = std::make_shared<MiningPoolManager>();
+-    return g_pool;
++} // namespace lotus::v2::node
++
++namespace node {
++std::shared_ptr<MiningPoolManager> GetMiningPool(const NodeContext &node) {
++    return std::atomic_load(&node.mining_pool);
++}
++
++void StartMiningPool(NodeContext &node, const Config &config) {
++    // GUI/P2P-only nodes do not run the pool. RPC warmup prevents requests
++    // reaching the service until startup has completed.
++    if (!node.args || !node.args->GetBoolArg("-server", false) ||
++        !node.args->GetBoolArg("-miningpool",
++                               lotus::v2::node::DEFAULT_MINING_POOL_ENABLED))
++        return;
++    if (node::GetMiningPool(node))
++        throw std::logic_error("Mining pool already started");
++    auto pool = std::make_shared<MiningPoolManager>();
++    pool->Configure(*node.args, config);
++    std::atomic_store(&node.mining_pool, std::move(pool));
+ }
+ 
+-MiningPoolManager &GetGlobalMiningPool() {
+-    return *GetGlobalMiningPoolPtr();
++void InterruptMiningPool(NodeContext &node) {
++    if (auto pool = node::GetMiningPool(node)) pool->Interrupt();
+ }
+ 
+-} // namespace lotus::v2::node
++void StopMiningPool(NodeContext &node) {
++    if (auto pool = std::atomic_exchange(&node.mining_pool,
++                                         std::shared_ptr<MiningPoolManager>{}))
++        pool->Stop();
++}
++} // namespace node
+diff --git a/src/node/mining_pool.h b/src/node/mining_pool.h
+index f414d0d6d5f028a187387e2af46bcb2bead630ba..1541aa4820fa7c542ca5cb64139990b2e306960a 100644
+--- a/src/node/mining_pool.h
++++ b/src/node/mining_pool.h
+@@ -17,6 +17,7 @@
+ 
+ #include <array>
+ #include <atomic>
++#include <condition_variable>
+ #include <cstdint>
+ #include <deque>
+ #include <memory>
+@@ -126,7 +127,12 @@ public:
+     void Reset();
+ 
+     /** Return whether the built-in mining pool is enabled. */
+-    bool IsEnabled(const ArgsManager *args = nullptr) const;
++    bool IsEnabled() const;
++
++    /** Reject new node-dependent work, then drain accepted work before
++     * teardown. */
++    void Interrupt();
++    void Stop();
+ 
+     /** Register or retrieve a worker and build a current V2 mining job. */
+     UniValue GetMiningJobJSON(const Config &config, ::node::NodeContext &node,
+@@ -163,7 +169,24 @@ public:
+     void SetPPLNSWindowSize(size_t window_size);
+ 
+ private:
++    // A request retains its NodeContext dependencies until its operation ends.
++    // Never wait for operations or acquire cs_main while holding m_mutex.
++    class Operation {
++    public:
++        explicit Operation(MiningPoolManager &pool);
++        ~Operation();
++        Operation(const Operation &) = delete;
++        Operation &operator=(const Operation &) = delete;
++
++    private:
++        MiningPoolManager &m_pool;
++    };
+     mutable std::mutex m_mutex;
++    std::condition_variable m_drained;
++    size_t m_active_operations{0};
++    bool m_stopping{false};
++    bool m_staking_rewards{false};
++    uint256 m_initial_share_target;
+     bool m_configured{false};
+     bool m_enabled{DEFAULT_MINING_POOL_ENABLED};
+     std::string m_pool_address_arg;
+@@ -193,21 +216,21 @@ private:
+                                          const uint256 &pow_limit);
+     void UpdateVarDiffLocked(PoolWorker &worker, int64_t now_ms,
+                              const Consensus::Params &params);
+-    double EstimateWorkerHashrateLocked(const PoolWorker &worker,
+-                                        const Consensus::Params &params) const;
++    double EstimateWorkerHashrateLocked(const PoolWorker &worker) const;
+     double ComputeWorkerPPLNSWeightLocked(const std::string &worker_id) const;
+ };
+ 
+-/** Global singleton accessor mirrored in NodeContext::mining_pool. */
+-std::shared_ptr<MiningPoolManager> GetGlobalMiningPoolPtr();
+-MiningPoolManager &GetGlobalMiningPool();
+-
+ } // namespace lotus::v2::node
+ 
+ namespace node {
+-using lotus::v2::node::GetGlobalMiningPool;
+-using lotus::v2::node::GetGlobalMiningPoolPtr;
+ using lotus::v2::node::MiningPoolManager;
++
++/** Startup/shutdown run serially; publication and handler acquisition are
++ * atomic. */
++std::shared_ptr<MiningPoolManager> GetMiningPool(const NodeContext &node);
++void StartMiningPool(NodeContext &node, const Config &config);
++void InterruptMiningPool(NodeContext &node);
++void StopMiningPool(NodeContext &node);
+ } // namespace node
+ 
+ #endif // BITCOIN_NODE_MINING_POOL_H
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index 0b3687e53fff022b70d6e526bad3985b1708d91c..e21a66537a81ddaf3415c4885d752181b5737dde 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -2471,6 +2471,21 @@ static bool ParsePoolUint64Param(const UniValue &val, uint64_t &out) {
+     return true;
+ }
+ 
++static std::shared_ptr<node::MiningPoolManager>
++EnsureMiningPool(NodeContext &node) {
++    if (node.args &&
++        !node.args->GetBoolArg("-miningpool",
++                               lotus::v2::node::DEFAULT_MINING_POOL_ENABLED)) {
++        throw JSONRPCError(RPC_MISC_ERROR, "Built-in mining pool is disabled");
++    }
++    auto pool = node::GetMiningPool(node);
++    if (!pool || !pool->IsEnabled()) {
++        throw JSONRPCError(RPC_MISC_ERROR,
++                           "Built-in mining pool is unavailable");
++    }
++    return pool;
++}
++
+ static RPCHelpMan getminingjob() {
+     return RPCHelpMan{
+         "getminingjob",
+@@ -2490,12 +2505,7 @@ static RPCHelpMan getminingjob() {
+            boost::asio::any_io_executor executor)
+             -> boost::asio::awaitable<UniValue> {
+             NodeContext &node = EnsureAnyNodeContext(request.context);
+-            auto &pool = node.mining_pool ? *node.mining_pool
+-                                          : node::GetGlobalMiningPool();
+-            if (!pool.IsEnabled(node.args)) {
+-                throw JSONRPCError(RPC_MISC_ERROR,
+-                                   "Built-in mining pool is disabled");
+-            }
++            auto pool = EnsureMiningPool(node);
+             const std::string worker_id =
+                 request.params[0].isNull() ? "default"
+                                            : request.params[0].get_str();
+@@ -2524,7 +2534,7 @@ static RPCHelpMan getminingjob() {
+                     });
+             }
+ 
+-            co_return pool.GetMiningJobJSON(config, node, worker_id);
++            co_return pool->GetMiningJobJSON(config, node, worker_id);
+         },
+     };
+ }
+@@ -2553,12 +2563,7 @@ static RPCHelpMan submitminingshare() {
+         [&](const RPCHelpMan &self, const Config &config,
+             const JSONRPCRequest &request) -> UniValue {
+             NodeContext &node = EnsureAnyNodeContext(request.context);
+-            auto &pool = node.mining_pool ? *node.mining_pool
+-                                          : node::GetGlobalMiningPool();
+-            if (!pool.IsEnabled(node.args)) {
+-                throw JSONRPCError(RPC_MISC_ERROR,
+-                                   "Built-in mining pool is disabled");
+-            }
++            auto pool = EnsureMiningPool(node);
+ 
+             uint64_t job_id = 0;
+             if (!ParsePoolUint64Param(request.params[0], job_id)) {
+@@ -2578,8 +2583,8 @@ static RPCHelpMan submitminingshare() {
+                 ntime_opt = parsed_time;
+             }
+ 
+-            const auto res = pool.SubmitShare(config, node, job_id, worker_id,
+-                                              ntime_opt, nonce);
++            const auto res = pool->SubmitShare(config, node, job_id, worker_id,
++                                               ntime_opt, nonce);
+             return res.ToUniValue();
+         },
+     };
+@@ -2597,9 +2602,8 @@ static RPCHelpMan getpoolinfo() {
+         [&](const RPCHelpMan &self, const Config &config,
+             const JSONRPCRequest &request) -> UniValue {
+             NodeContext &node = EnsureAnyNodeContext(request.context);
+-            auto &pool = node.mining_pool ? *node.mining_pool
+-                                          : node::GetGlobalMiningPool();
+-            return pool.GetPoolInfoJSON();
++            auto pool = EnsureMiningPool(node);
++            return pool->GetPoolInfoJSON();
+         },
+     };
+ }
+@@ -2619,9 +2623,8 @@ static RPCHelpMan getpoolworker() {
+         [&](const RPCHelpMan &self, const Config &config,
+             const JSONRPCRequest &request) -> UniValue {
+             NodeContext &node = EnsureAnyNodeContext(request.context);
+-            auto &pool = node.mining_pool ? *node.mining_pool
+-                                          : node::GetGlobalMiningPool();
+-            return pool.GetWorkerStatsJSON(request.params[0].get_str());
++            auto pool = EnsureMiningPool(node);
++            return pool->GetWorkerStatsJSON(request.params[0].get_str());
+         },
+     };
+ }
+diff --git a/src/test/mining_pool_tests.cpp b/src/test/mining_pool_tests.cpp
+index b4b20ec3affdaeb27c024d1a936d7b28515cd6c2..be863308dbf11b951baf4a82eaed8ca418c6a916 100644
+--- a/src/test/mining_pool_tests.cpp
++++ b/src/test/mining_pool_tests.cpp
+@@ -8,6 +8,7 @@
+ #include <arith_uint256.h>
+ #include <chain.h>
+ #include <chainparams.h>
++#include <common/args.h>
+ #include <config.h>
+ #include <consensus/amount.h>
+ #include <core_io.h>
+@@ -15,9 +16,11 @@
+ #include <key_io.h>
+ #include <lotus_v2/header.h>
+ #include <lotus_v2/output.h>
++#include <node/context.h>
+ #include <node/snapshot.h>
+ #include <pow/pow.h>
+ #include <primitives/block.h>
++#include <rpc/protocol.h>
+ #include <rpc/server.h>
+ #include <script/standard.h>
+ #include <streams.h>
+@@ -30,9 +33,13 @@
+ 
+ #include <boost/test/unit_test.hpp>
+ 
++#include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
++#include <future>
+ #include <string>
++#include <thread>
+ 
+ namespace {
+ 
+@@ -114,12 +121,21 @@ uint64_t FindHighHashNonce(CBlockHeader header, uint32_t nonce_prefix,
+ 
+ } // namespace
+ 
+-BOOST_FIXTURE_TEST_SUITE(mining_pool_tests, TestChain100Setup)
++struct MiningPoolTestSetup : TestChain100Setup {
++    MiningPoolTestSetup() {
++        auto pool = std::make_shared<node::MiningPoolManager>();
++        pool->Configure(*m_node.args, GetConfig());
++        std::atomic_store(&m_node.mining_pool, std::move(pool));
++    }
++    ~MiningPoolTestSetup() { node::StopMiningPool(m_node); }
++};
++
++BOOST_FIXTURE_TEST_SUITE(mining_pool_tests, MiningPoolTestSetup)
+ 
+ BOOST_AUTO_TEST_CASE(job_generation_nonce_prefix_and_vardiff) {
+     const Config &config = GetConfig();
+-    auto &pool = m_node.mining_pool ? *m_node.mining_pool
+-                                    : node::GetGlobalMiningPool();
++    auto pool_ptr = node::GetMiningPool(m_node);
++    auto &pool = *pool_ptr;
+     pool.Reset();
+     pool.Configure(*m_node.args, config);
+ 
+@@ -218,8 +234,8 @@ BOOST_AUTO_TEST_CASE(job_generation_nonce_prefix_and_vardiff) {
+ 
+ BOOST_AUTO_TEST_CASE(share_validation_accept_duplicate_and_high_hash) {
+     const Config &config = GetConfig();
+-    auto &pool = m_node.mining_pool ? *m_node.mining_pool
+-                                    : node::GetGlobalMiningPool();
++    auto pool_ptr = node::GetMiningPool(m_node);
++    auto &pool = *pool_ptr;
+     pool.Reset();
+     pool.Configure(*m_node.args, config);
+ 
+@@ -304,8 +320,8 @@ BOOST_AUTO_TEST_CASE(share_validation_accept_duplicate_and_high_hash) {
+ // rather than fabricating a transaction that bypasses pool payout assembly.
+ BOOST_AUTO_TEST_CASE(coinbase_outputs_survive_wire_round_trip) {
+     const Config &config = GetConfig();
+-    auto &pool = m_node.mining_pool ? *m_node.mining_pool
+-                                    : node::GetGlobalMiningPool();
++    auto pool_ptr = node::GetMiningPool(m_node);
++    auto &pool = *pool_ptr;
+     pool.Reset();
+     const CTxDestination recipient = PKHash(coinbaseKey.GetPubKey());
+     const CScript payout = GetScriptForDestination(recipient);
+@@ -338,8 +354,8 @@ BOOST_AUTO_TEST_CASE(coinbase_outputs_survive_wire_round_trip) {
+ 
+ BOOST_AUTO_TEST_CASE(newsletter_subscriber_worker_credits_and_routing) {
+     const Config &config = GetConfig();
+-    auto &pool = m_node.mining_pool ? *m_node.mining_pool
+-                                    : node::GetGlobalMiningPool();
++    auto pool_ptr = node::GetMiningPool(m_node);
++    auto &pool = *pool_ptr;
+     pool.Reset();
+ 
+     // Configure -pooladdress to a known pool operator destination
+@@ -406,8 +422,8 @@ BOOST_AUTO_TEST_CASE(pplns_multi_worker_coinbase_splitting_and_block_discovery)
+     const Config &config = GetConfig();
+     const Consensus::Params &consensusParams =
+         config.GetChainParams().GetConsensus();
+-    auto &pool = m_node.mining_pool ? *m_node.mining_pool
+-                                    : node::GetGlobalMiningPool();
++    auto pool_ptr = node::GetMiningPool(m_node);
++    auto &pool = *pool_ptr;
+     pool.Reset();
+     pool.Configure(*m_node.args, config);
+ 
+@@ -543,4 +559,278 @@ BOOST_AUTO_TEST_CASE(pplns_multi_worker_coinbase_splitting_and_block_discovery)
+         pool_info.find_value("pplns_window_shares").getInt<uint64_t>(), 5U);
+ }
+ 
++// Startup publication is per node. Neither an RPC-disabled nor an explicitly
++// pool-disabled node instantiates the service; restarting creates fresh state.
++BOOST_AUTO_TEST_CASE(node_owned_runtime_activation_and_isolation) {
++    const Config &config = GetConfig();
++    ArgsManager args_a, args_b;
++    node::NodeContext a, b;
++    a.args = &args_a;
++    b.args = &args_b;
++    node::StartMiningPool(a, config);
++    BOOST_CHECK(!node::GetMiningPool(a));
++    args_a.ForceSetArg("-server", "1");
++    args_a.ForceSetArg("-miningpool", "0");
++    node::StartMiningPool(a, config);
++    BOOST_CHECK(!node::GetMiningPool(a));
++
++    JSONRPCRequest request;
++    request.context = &a;
++    request.strMethod = "getpoolinfo";
++    request.params = UniValue(UniValue::VARR);
++    BOOST_CHECK_EXCEPTION(
++        tableRPC.execute(config, request), UniValue, [](const UniValue &error) {
++            return error.find_value("code").getInt<int>() == RPC_MISC_ERROR &&
++                   error.find_value("message").get_str() ==
++                       "Built-in mining pool is disabled";
++        });
++    args_a.ForceSetArg("-miningpool", "1");
++    BOOST_CHECK_EXCEPTION(tableRPC.execute(config, request), UniValue,
++                          [](const UniValue &error) {
++                              return error.find_value("message").get_str() ==
++                                     "Built-in mining pool is unavailable";
++                          });
++    args_b.ForceSetArg("-server", "1");
++    args_b.ForceSetArg("-poolpplnswindow", "17");
++    node::StartMiningPool(a, config);
++    node::StartMiningPool(b,
++                          config); // Default on, without explicit -miningpool.
++    auto pa = node::GetMiningPool(a), pb = node::GetMiningPool(b);
++    BOOST_REQUIRE(pa);
++    BOOST_REQUIRE(pb);
++    BOOST_CHECK(pa != pb);
++    pa->SetWorkerShareTarget("isolated", uint256S("1234"), config);
++    pa->SetPPLNSWindowSize(9);
++    BOOST_CHECK_EQUAL(
++        pa->GetPoolInfoJSON().find_value("active_workers").getInt<int>(), 1);
++    BOOST_CHECK_EQUAL(
++        pb->GetPoolInfoJSON().find_value("active_workers").getInt<int>(), 0);
++    BOOST_CHECK_EQUAL(
++        pb->GetPoolInfoJSON().find_value("pplns_window_max").getInt<int>(), 17);
++    BOOST_CHECK_EQUAL(tableRPC.execute(config, request)
++                          .find_value("pplns_window_max")
++                          .getInt<int>(),
++                      9);
++    BOOST_CHECK_THROW(node::StartMiningPool(a, config), std::logic_error);
++    node::InterruptMiningPool(a);
++    BOOST_CHECK(!pa->IsEnabled());
++    BOOST_CHECK(pb->IsEnabled());
++    node::StopMiningPool(a);
++    node::StopMiningPool(a); // Partial startup/shutdown is idempotent.
++    BOOST_CHECK(!node::GetMiningPool(a));
++    node::StartMiningPool(a, config);
++    BOOST_CHECK(node::GetMiningPool(a) != pa);
++    BOOST_CHECK_EQUAL(node::GetMiningPool(a)
++                          ->GetPoolInfoJSON()
++                          .find_value("active_workers")
++                          .getInt<int>(),
++                      0);
++    BOOST_CHECK_EQUAL(node::GetMiningPool(a)
++                          ->GetPoolInfoJSON()
++                          .find_value("pplns_window_max")
++                          .getInt<int>(),
++                      1000);
++}
++
++BOOST_AUTO_TEST_CASE(concurrent_jobs_shares_configuration_and_stats) {
++    const Config &config = GetConfig();
++    auto pool = node::GetMiningPool(m_node);
++    const auto job = pool->GetMiningJobJSON(config, m_node, "concurrent");
++    CBlockHeader header;
++    BOOST_REQUIRE(
++        DecodeHexBlockHeader(header, job.find_value("header_hex").get_str()));
++    const auto share_target =
++        uint256S(job.find_value("share_target").get_str());
++    const auto net_target =
++        uint256S(job.find_value("network_target").get_str());
++    const auto nonce = FindShareNonce(
++        header, job.find_value("nonce_prefix").getInt<uint32_t>(), share_target,
++        net_target, true);
++    const auto job_id = job.find_value("job_id_num").getInt<uint64_t>();
++    std::atomic<bool> go{false};
++    std::atomic<int> accepted{0}, duplicate{0}, errors{0};
++    std::vector<std::thread> threads;
++    for (int i = 0; i < 8; ++i) {
++        threads.emplace_back([&] {
++            while (!go.load())
++                std::this_thread::yield();
++            try {
++                auto result = pool->SubmitShare(
++                    config, m_node, job_id, "concurrent", std::nullopt, nonce);
++                if (result.accepted)
++                    ++accepted;
++                else if (result.reason == "duplicate-share")
++                    ++duplicate;
++                else
++                    ++errors;
++            } catch (...) {
++                ++errors;
++            }
++        });
++    }
++    threads.emplace_back([&] {
++        while (!go.load())
++            std::this_thread::yield();
++        try {
++            for (int i = 0; i < 20; ++i) {
++                pool->GetMiningJobJSON(config, m_node, "concurrent");
++                pool->GetWorkerStatsJSON("concurrent");
++                pool->GetPoolInfoJSON();
++            }
++        } catch (...) {
++            ++errors;
++        }
++    });
++    threads.emplace_back([&] {
++        while (!go.load())
++            std::this_thread::yield();
++        try {
++            ArgsManager local;
++            local.ForceSetArg("-poolpplnswindow", "1000");
++            for (int i = 0; i < 20; ++i) {
++                pool->Configure(local, config);
++                pool->SetTargetSpacingSec(5);
++                pool->SetPPLNSWindowSize(1000);
++            }
++        } catch (...) {
++            ++errors;
++        }
++    });
++    go = true;
++    for (auto &thread : threads)
++        thread.join();
++    BOOST_CHECK_EQUAL(errors.load(), 0);
++    BOOST_CHECK_EQUAL(accepted.load(), 1);
++    BOOST_CHECK_EQUAL(duplicate.load(), 7);
++    BOOST_CHECK_EQUAL(pool->GetPoolInfoJSON()
++                          .find_value("total_accepted_shares")
++                          .getInt<int>(),
++                      1);
++    BOOST_CHECK_EQUAL(
++        pool->GetPoolInfoJSON().find_value("pplns_window_shares").getInt<int>(),
++        1);
++    {
++        LOCK(cs_main);
++        BOOST_CHECK_EQUAL(m_node.chainman->ActiveHeight(),
++                          100); // Share is deliberately not a block.
++    }
++}
++
++BOOST_AUTO_TEST_CASE(concurrent_block_candidates_claim_submission_once) {
++    const Config &config = GetConfig();
++    auto pool = node::GetMiningPool(m_node);
++    const auto job = pool->GetMiningJobJSON(config, m_node, "block-claim");
++    CBlockHeader header;
++    BOOST_REQUIRE(
++        DecodeHexBlockHeader(header, job.find_value("header_hex").get_str()));
++    const auto share_target =
++        uint256S(job.find_value("share_target").get_str());
++    const auto net_target =
++        uint256S(job.find_value("network_target").get_str());
++    const auto prefix = job.find_value("nonce_prefix").getInt<uint32_t>();
++    const auto first_nonce =
++        FindShareNonce(header, prefix, share_target, net_target, false);
++    const auto second_nonce =
++        FindShareNonce(header, prefix, share_target, net_target, false,
++                       (first_nonce & 0xFFFFFFFFFFULL) + 1);
++    const auto job_id = job.find_value("job_id_num").getInt<uint64_t>();
++    std::future<lotus::v2::node::ShareSubmissionResult> first, second;
++    {
++        LOCK(cs_main);
++        first = std::async(std::launch::async, [&] {
++            return pool->SubmitShare(config, m_node, job_id, "block-claim",
++                                     std::nullopt, first_nonce);
++        });
++        second = std::async(std::launch::async, [&] {
++            return pool->SubmitShare(config, m_node, job_id, "block-claim",
++                                     std::nullopt, second_nonce);
++        });
++        const auto deadline =
++            std::chrono::steady_clock::now() + std::chrono::seconds(5);
++        while ((pool->GetPoolInfoJSON()
++                        .find_value("total_accepted_shares")
++                        .getInt<int>() < 2 ||
++                pool->GetPoolInfoJSON()
++                        .find_value("active_operations")
++                        .getInt<int>() != 1) &&
++               std::chrono::steady_clock::now() < deadline) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(1));
++        }
++        BOOST_CHECK_EQUAL(pool->GetPoolInfoJSON()
++                              .find_value("total_accepted_shares")
++                              .getInt<int>(),
++                          2);
++        // Both shares are accounted for, but only the claimed block waits on
++        // cs_main.
++        BOOST_CHECK_EQUAL(pool->GetPoolInfoJSON()
++                              .find_value("active_operations")
++                              .getInt<int>(),
++                          1);
++        BOOST_CHECK_EQUAL(
++            pool->GetPoolInfoJSON().find_value("blocks_found").getInt<int>(),
++            0);
++    }
++    const auto a = first.get(), b = second.get();
++    BOOST_CHECK(a.accepted);
++    BOOST_CHECK(b.accepted);
++    BOOST_CHECK_EQUAL(int(a.block_found) + int(b.block_found), 1);
++    BOOST_CHECK_EQUAL(
++        pool->GetPoolInfoJSON().find_value("blocks_found").getInt<int>(), 1);
++    BOOST_CHECK_EQUAL(
++        pool->GetPoolInfoJSON().find_value("pplns_window_shares").getInt<int>(),
++        2);
++    {
++        LOCK(cs_main);
++        BOOST_CHECK_EQUAL(m_node.chainman->ActiveHeight(), 101);
++        BOOST_CHECK_EQUAL(m_node.chainman->ActiveTip()->GetBlockHash(),
++                          a.block_found ? a.block_hash : b.block_hash);
++    }
++}
++
++// Hold cs_main so a real job request remains in flight. Stop must wait for it,
++// while new requests are rejected, without acquiring cs_main under the pool
++// lock.
++BOOST_AUTO_TEST_CASE(shutdown_drains_node_dependent_work) {
++    const Config &config = GetConfig();
++    auto pool = node::GetMiningPool(m_node);
++    std::future<UniValue> job;
++    std::future<void> stop;
++    {
++        LOCK(cs_main);
++        job = std::async(std::launch::async, [&] {
++            return pool->GetMiningJobJSON(config, m_node, "draining");
++        });
++        const auto deadline =
++            std::chrono::steady_clock::now() + std::chrono::seconds(5);
++        while (pool->GetPoolInfoJSON()
++                       .find_value("active_operations")
++                       .getInt<int>() == 0 &&
++               std::chrono::steady_clock::now() < deadline) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(1));
++        }
++        BOOST_CHECK_EQUAL(pool->GetPoolInfoJSON()
++                              .find_value("active_operations")
++                              .getInt<int>(),
++                          1);
++        BOOST_CHECK_THROW(pool->Reset(), std::logic_error);
++        node::InterruptMiningPool(m_node);
++        stop = std::async(std::launch::async,
++                          [&] { node::StopMiningPool(m_node); });
++        BOOST_CHECK(stop.wait_for(std::chrono::milliseconds(50)) ==
++                    std::future_status::timeout);
++        BOOST_CHECK_THROW(pool->GetMiningJobJSON(config, m_node, "late"),
++                          std::runtime_error);
++    }
++    BOOST_CHECK(!job.get().isNull());
++    stop.get();
++    BOOST_CHECK(!node::GetMiningPool(m_node));
++    BOOST_CHECK(!pool->IsEnabled());
++    BOOST_CHECK_EQUAL(
++        pool->GetPoolInfoJSON().find_value("active_operations").getInt<int>(),
++        0);
++    BOOST_CHECK_THROW(
++        pool->SubmitShare(config, m_node, 1, "late", std::nullopt, 0),
++        std::runtime_error);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/test/functional/mining_pool_lifecycle.py b/test/functional/mining_pool_lifecycle.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a29d41d4a693c26a62ac04a864e75a31c0fe9038
+--- /dev/null
++++ b/test/functional/mining_pool_lifecycle.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Node-owned pool runtime options, private routing and restart state."""
++
++import base64
++import http.client
++import json
++import urllib.parse
++
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal, assert_raises_rpc_error, p2p_port
++
++
++class MiningPoolLifecycleTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 2
++        self.setup_clean_chain = True
++
++    def setup_network(self):
++        self.public_port = p2p_port(40)
++        self.add_nodes(2, [[f"-publicbind=127.0.0.1:{self.public_port}"], []])
++        with open(self.nodes[1].bitcoinconf, "a", encoding="utf-8") as config:
++            config.write("\nminingpool=0\n")
++        self.start_nodes()
++
++    def request(self, node, method, path, body=None, *, public=False):
++        url = urllib.parse.urlparse(node.url)
++        auth = base64.b64encode(f"{url.username}:{url.password}".encode()).decode()
++        connection = http.client.HTTPConnection(
++            url.hostname, self.public_port if public else url.port, timeout=15
++        )
++        connection.request(
++            method,
++            path,
++            body,
++            {"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
++        )
++        reply = connection.getresponse()
++        status, payload = reply.status, reply.read()
++        connection.close()
++        return status, payload
++
++    def run_test(self):
++        a, b = self.nodes
++        assert_equal(a.getpoolinfo()["enabled"], True)  # Default with RPC enabled.
++        assert_equal(a.getpoolinfo()["pplns_window_max"], 1000)  # Shares, not blocks.
++        calls = [
++            ("getpoolinfo", []),
++            ("getpoolworker", ["disabled"]),
++            ("getminingjob", ["disabled"]),
++            ("submitminingshare", ["1", "disabled", 0]),
++        ]
++        for name, args in calls:
++            assert_raises_rpc_error(
++                -1, "mining pool is disabled", getattr(b, name), *args
++            )
++        for method, route, body in [
++            ("GET", "/pool/jobs", None),
++            ("POST", "/pool/submit", "{}"),
++            ("GET", "/pool/stats", None),
++        ]:
++            status, payload = self.request(b, method, route, body)
++            assert_equal(status, 503)
++            assert_equal(json.loads(payload)["error"], "mining-pool-disabled")
++            status, _ = self.request(a, method, route, body, public=True)
++            assert_equal(
++                status, 404
++            )  # Existing public-listener policy, even with auth.
++
++        a.getminingjob("node-a")
++        assert_equal(a.getpoolinfo()["active_workers"], 1)
++        status, payload = self.request(a, "GET", "/pool/stats")
++        assert_equal(status, 200)
++        assert_equal(json.loads(payload)["active_workers"], 1)
++        self.restart_node(1, ["-miningpool=1"])  # CLI overrides config opt-out.
++        assert_equal(b.getpoolinfo()["enabled"], True)
++        assert_equal(b.getpoolinfo()["active_workers"], 0)
++        b.getminingjob("node-b")
++        assert_equal(a.getpoolinfo()["active_workers"], 1)
++        self.restart_node(0, [f"-publicbind=127.0.0.1:{self.public_port}"])
++        assert_equal(
++            a.getpoolinfo()["active_workers"], 0
++        )  # Intentional in-memory reset.
++        assert_equal(b.getpoolinfo()["active_workers"], 1)
++        self.restart_node(1)  # Configuration opt-out takes effect again.
++        assert_raises_rpc_error(-1, "mining pool is disabled", b.getpoolinfo)
++
++
++if __name__ == "__main__":
++    MiningPoolLifecycleTest().main()
+-- 
+2.50.1 (Apple Git-155)
+

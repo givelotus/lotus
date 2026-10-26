@@ -1,0 +1,207 @@
+From 9eee7662d0b0062c3dfd8af45107311e65101759 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:58:40 -0700
+Subject: [PATCH] chronik: offload ChronikValidationInterface callbacks to
+ dedicated worker thread
+
+Add a dedicated background worker thread and bounded FIFO task queue to ChronikValidationInterface so Chronik indexing events execute in strict FIFO order off the shared ValidationSignals scheduler thread.
+
+Original-Commit: fcea86012096e7f339ec3ed4f3d6790cb628334b
+Original-Patch: ecash/049
+Split-Concern: whole
+
+Historical compilation prerequisites are tracked separately in daemon/patch-audit;
+this provenance-preserving split does not imply standalone build validation.
+---
+ .../chronik_validationinterface.cpp           | 109 +++++++++++++++---
+ 1 file changed, 96 insertions(+), 13 deletions(-)
+
+diff --git a/chronik/chronik-cpp/chronik_validationinterface.cpp b/chronik/chronik-cpp/chronik_validationinterface.cpp
+index 15f183d4811b0f730aaa888142089ea6e8824db8..0d1ca1f49ce766c443401a71367c9a683fd4bac2 100644
+--- a/chronik/chronik-cpp/chronik_validationinterface.cpp
++++ b/chronik/chronik-cpp/chronik_validationinterface.cpp
+@@ -12,6 +12,12 @@
+ #include <txmempool.h>
+ #include <validationinterface.h>
+ 
++#include <condition_variable>
++#include <deque>
++#include <functional>
++#include <mutex>
++#include <thread>
++
+ namespace chronik {
+ 
+ /**
+@@ -21,7 +27,10 @@ class ChronikValidationInterface final : public CValidationInterface {
+ public:
+     ChronikValidationInterface(const node::NodeContext &node,
+                                rust::Box<chronik_bridge::Chronik> chronik_box)
+-        : m_node(node), m_chronik(std::move(chronik_box)) {}
++        : m_chronik(std::move(chronik_box)), m_node(node),
++          m_worker_thread([this] { WorkerLoop(); }) {}
++
++    ~ChronikValidationInterface() { StopWorker(); }
+ 
+     void Register() {
+         m_node.validation_signals->RegisterValidationInterface(this);
+@@ -33,7 +42,20 @@ public:
+ 
+     void InterruptChronik() { m_chronik->interrupt(); }
+ 
++    void StopWorker() {
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            m_stopping = true;
++        }
++        m_cv.notify_all();
++        m_cv_space.notify_all();
++        if (m_worker_thread.joinable()) {
++            m_worker_thread.join();
++        }
++    }
++
+     bool StopChronik() {
++        StopWorker();
+         try {
+             m_chronik->stop();
+         } catch (const std::exception &e) {
+@@ -44,8 +66,52 @@ public:
+     }
+ 
+ private:
++    static constexpr size_t MAX_QUEUE_SIZE = 65536;
++
+     rust::Box<chronik_bridge::Chronik> m_chronik;
+     const node::NodeContext &m_node;
++    std::deque<std::function<void()>> m_queue;
++    std::mutex m_mutex;
++    std::condition_variable m_cv;
++    std::condition_variable m_cv_space;
++    bool m_stopping{false};
++    std::thread m_worker_thread;
++
++    void WorkerLoop() {
++        while (true) {
++            std::function<void()> task;
++            {
++                std::unique_lock<std::mutex> lock(m_mutex);
++                m_cv.wait(lock, [this] {
++                    return m_stopping || !m_queue.empty();
++                });
++                if (m_queue.empty()) {
++                    if (m_stopping) {
++                        break;
++                    }
++                    continue;
++                }
++                task = std::move(m_queue.front());
++                m_queue.pop_front();
++                m_cv_space.notify_one();
++            }
++            task();
++        }
++    }
++
++    void Enqueue(std::function<void()> task) {
++        {
++            std::unique_lock<std::mutex> lock(m_mutex);
++            m_cv_space.wait(lock, [this] {
++                return m_stopping || m_queue.size() < MAX_QUEUE_SIZE;
++            });
++            if (m_stopping) {
++                return;
++            }
++            m_queue.push_back(std::move(task));
++        }
++        m_cv.notify_one();
++    }
+ 
+     using CValidationInterface::TransactionAddedToMempool;
+ 
+@@ -59,7 +125,11 @@ private:
+                 entry_time != 0
+                     ? entry_time
+                     : m_node.mempool->info(ptx->GetId()).m_time.count();
+-            m_chronik->handle_tx_added_to_mempool(*ptx, *spent_coins, tx_time);
++            Enqueue([this, ptx, spent_coins = std::move(spent_coins),
++                     tx_time]() {
++                m_chronik->handle_tx_added_to_mempool(*ptx, *spent_coins,
++                                                      tx_time);
++            });
+         } else {
+             LogPrintf("Chronik: transaction %s added to mempool but spent "
+                       "coins are not available\n",
+@@ -67,11 +137,13 @@ private:
+         }
+     }
+ 
+-    void TransactionRemovedFromMempool(const CTransactionRef &ptx,
+-                                       MemPoolRemovalReason reason,
+-                                       uint64_t mempool_sequence) override {
+-        m_chronik->handle_tx_removed_from_mempool(
+-            chronik::util::HashToArray(ptx->GetId()));
++    void TransactionRemovedFromMempool(
++        const CTransactionRef &ptx, MemPoolRemovalReason /* reason */,
++        uint64_t /* mempool_sequence */) override {
++        const auto txid = chronik::util::HashToArray(ptx->GetId());
++        Enqueue([this, txid]() {
++            m_chronik->handle_tx_removed_from_mempool(txid);
++        });
+     }
+ 
+     void BlockConnected(ChainstateRole role,
+@@ -86,33 +158,44 @@ private:
+ 
+         // We can safely pass T& here as Rust guarantees us that no references
+         // can be kept after the below function call completed.
+-        m_chronik->handle_block_connected(*block, *pindex);
++        Enqueue([this, block, pindex]() {
++            m_chronik->handle_block_connected(*block, *pindex);
++        });
+     }
+ 
+     void BlockDisconnected(const std::shared_ptr<const CBlock> &block,
+                            const CBlockIndex *pindex) override {
+         // See BlockConnected for safety
+-        m_chronik->handle_block_disconnected(*block, *pindex);
++        Enqueue([this, block, pindex]() {
++            m_chronik->handle_block_disconnected(*block, *pindex);
++        });
+     }
+ 
+     void BlockFinalized(const CBlockIndex *pindex) override {
+-        m_chronik->handle_block_finalized(*pindex);
++        Enqueue([this, pindex]() {
++            m_chronik->handle_block_finalized(*pindex);
++        });
+     }
+ 
+     void BlockInvalidated(const CBlockIndex *pindex,
+                           const std::shared_ptr<const CBlock> &block) override {
+-        m_chronik->handle_block_invalidated(*block, *pindex);
++        Enqueue([this, block, pindex]() {
++            m_chronik->handle_block_invalidated(*block, *pindex);
++        });
+     }
+ 
+     void TransactionFinalized(const CTransactionRef &tx) override {
+-        m_chronik->handle_tx_finalized(chronik::util::HashToArray(tx->GetId()));
++        const auto txid = chronik::util::HashToArray(tx->GetId());
++        Enqueue([this, txid]() { m_chronik->handle_tx_finalized(txid); });
+     }
+ 
+     void TransactionInvalidated(
+         const CTransactionRef &tx,
+         std::shared_ptr<const std::vector<Coin>> spent_coins) override {
+         if (spent_coins) {
+-            m_chronik->handle_tx_invalidated(*tx, *spent_coins);
++            Enqueue([this, tx, spent_coins = std::move(spent_coins)]() {
++                m_chronik->handle_tx_invalidated(*tx, *spent_coins);
++            });
+         } else {
+             LogPrintf("Chronik: transaction %s invalidated but spent coins are "
+                       "not available\n",
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,564 @@
+From 770bc57b9f2532cf6442aa7d05860583db7c3875 Mon Sep 17 00:00:00 2001
+From: Canonical endpoint audit <audit@localhost>
+Date: Sun, 18 Oct 2026 21:22:25 -0700
+Subject: [PATCH] net: defer reconciliation by bounded byte and work budgets
+
+---
+ src/net/recon_cost_budget.h            |  43 ++++++
+ src/net/v2_protocol_handler.cpp        | 181 +++++++++++++++++++------
+ src/net/v2_protocol_handler.h          |  35 +++++
+ src/net_processing.cpp                 |   1 +
+ src/rpc/net.cpp                        |  16 +++
+ src/test/CMakeLists.txt                |   1 +
+ src/test/merklix_cost_budget_tests.cpp |  33 +++++
+ test/functional/p2p_merklix_limits.py  |  48 +++++++
+ 8 files changed, 314 insertions(+), 44 deletions(-)
+ create mode 100644 src/net/recon_cost_budget.h
+ create mode 100644 src/test/merklix_cost_budget_tests.cpp
+ create mode 100644 test/functional/p2p_merklix_limits.py
+
+diff --git a/src/net/recon_cost_budget.h b/src/net/recon_cost_budget.h
+new file mode 100644
+index 0000000000..2f636ed5e1
+--- /dev/null
++++ b/src/net/recon_cost_budget.h
+@@ -0,0 +1,43 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++#ifndef BITCOIN_NET_RECON_COST_BUDGET_H
++#define BITCOIN_NET_RECON_COST_BUDGET_H
++
++#include <algorithm>
++#include <chrono>
++#include <cstddef>
++
++namespace lotus::v2::net {
++/** Separate byte budgets prevent transaction payload from starving sketches.
++ * Work units charge the number of transaction/cell visits before dispatch.
++ * This class never allocates and does not grant credit on clock reversal.
++ */
++class ReconCostBudget {
++    double m_sketch{256 * 1024};
++    double m_payload{4 * 1024 * 1024};
++    double m_work{1024 * 1024};
++    std::chrono::microseconds m_last{};
++    bool m_started{false};
++public:
++    static constexpr size_t SKETCH_BURST = 256 * 1024;
++    static constexpr size_t PAYLOAD_BURST = 4 * 1024 * 1024;
++    static constexpr size_t WORK_BURST = 1024 * 1024;
++
++    bool Consume(size_t bytes, size_t work, bool payload,
++                 std::chrono::microseconds now) {
++        if (!m_started) { m_last = now; m_started = true; }
++        const double seconds = std::max(0.0, (now - m_last).count() / 1e6);
++        m_last = std::max(m_last, now);
++        m_sketch = std::min<double>(SKETCH_BURST, m_sketch + seconds * SKETCH_BURST);
++        m_payload = std::min<double>(PAYLOAD_BURST, m_payload + seconds * PAYLOAD_BURST);
++        m_work = std::min<double>(WORK_BURST, m_work + seconds * WORK_BURST);
++        double &tokens = payload ? m_payload : m_sketch;
++        if (bytes > tokens || work > m_work) return false;
++        tokens -= bytes;
++        m_work -= work;
++        return true;
++    }
++};
++} // namespace lotus::v2::net
++#endif
+diff --git a/src/net/v2_protocol_handler.cpp b/src/net/v2_protocol_handler.cpp
+index a49fe2f1d7..3d87162c23 100644
+--- a/src/net/v2_protocol_handler.cpp
++++ b/src/net/v2_protocol_handler.cpp
+@@ -251,25 +251,15 @@ bool V2PeerProtocolHandler::TryHandleMessage(
+         HandleSealedHeader(pfrom, vRecv);
+         return true;
+     }
+-    if (msg_type == NetMsgType::MERKLIXSYNC) {
+-        HandleMerklixSync(pfrom, vRecv, time_received);
+-        return true;
+-    }
+-    if (msg_type == NetMsgType::GETMERKLIXBUCK ||
+-        msg_type == NetMsgType::LEGACY_GETMERKLIXBUCK) {
+-        HandleGetMerklixBuck(pfrom, vRecv, time_received);
+-        return true;
+-    }
+-    if (msg_type == NetMsgType::MERKLIXBUCK) {
+-        HandleMerklixBuck(pfrom, vRecv, time_received);
+-        return true;
+-    }
+-    if (msg_type == NetMsgType::GETSHORTTX) {
+-        HandleGetShortTx(pfrom, vRecv, time_received);
+-        return true;
+-    }
+-    if (msg_type == NetMsgType::SHORTTX) {
+-        HandleShortTx(pfrom, vRecv, time_received);
++    const bool recon = msg_type == NetMsgType::MERKLIXSYNC ||
++        msg_type == NetMsgType::GETMERKLIXBUCK ||
++        msg_type == NetMsgType::LEGACY_GETMERKLIXBUCK ||
++        msg_type == NetMsgType::MERKLIXBUCK ||
++        msg_type == NetMsgType::GETSHORTTX || msg_type == NetMsgType::SHORTTX;
++    if (recon) {
++        if (AdmitReconMessage(pfrom, msg_type, vRecv, time_received)) {
++            DispatchReconMessage(pfrom, msg_type, vRecv, time_received);
++        }
+         return true;
+     }
+     if (msg_type == NetMsgType::GETUTXOROOTS) {
+@@ -299,6 +289,95 @@ bool V2PeerProtocolHandler::TryHandleMessage(
+     return false;
+ }
+ 
++bool V2PeerProtocolHandler::DispatchReconMessage(
++    CNode &pfrom, const std::string &msg_type, DataStream &vRecv,
++    std::chrono::microseconds time_received) {
++    if (msg_type == NetMsgType::MERKLIXSYNC) {
++        HandleMerklixSync(pfrom, vRecv, time_received);
++        return true;
++    }
++    if (msg_type == NetMsgType::GETMERKLIXBUCK ||
++        msg_type == NetMsgType::LEGACY_GETMERKLIXBUCK) {
++        HandleGetMerklixBuck(pfrom, vRecv, time_received);
++        return true;
++    }
++    if (msg_type == NetMsgType::MERKLIXBUCK) {
++        HandleMerklixBuck(pfrom, vRecv, time_received);
++        return true;
++    }
++    if (msg_type == NetMsgType::GETSHORTTX) {
++        HandleGetShortTx(pfrom, vRecv, time_received);
++        return true;
++    }
++    if (msg_type == NetMsgType::SHORTTX) {
++        HandleShortTx(pfrom, vRecv, time_received);
++        return true;
++    }
++    return false;
++}
++
++bool V2PeerProtocolHandler::AdmitReconMessage(
++    CNode &peer, const std::string &type, DataStream &stream,
++    std::chrono::microseconds now) {
++    const bool payload = type == NetMsgType::SHORTTX;
++    // Charge scans independently of wire bytes: tiny requests can otherwise
++    // repeatedly trigger an expensive full-set walk. R3 replaces these walks.
++    const size_t visits = std::max<size_t>(1, m_mempool.size());
++    const size_t work = stream.size() / 26 +
++        (type == NetMsgType::GETMERKLIXBUCK ||
++         type == NetMsgType::LEGACY_GETMERKLIXBUCK ? 16 * visits : visits);
++    LOCK(m_mutex);
++    auto &queue = m_recon_queues[peer.GetId()];
++    if (stream.size() > (payload ? ReconCostBudget::PAYLOAD_BURST :
++                         ReconCostBudget::SKETCH_BURST) ||
++        work > ReconCostBudget::WORK_BURST) {
++        ++m_stats.recon_queue_rejected;
++        peer.fDisconnect = true;
++        return false;
++    }
++    if (queue.messages.empty() && queue.budget.Consume(stream.size(), work, payload, now)) {
++        return true;
++    }
++    // Bound both count and storage across all peers; no unbounded promise to
++    // retain a flood. A peer exceeding the queue receives TCP backoff/teardown.
++    if (queue.messages.size() >= 256 || queue.bytes + stream.size() > 2 * 1024 * 1024 ||
++        m_recon_queued_bytes + stream.size() > 16 * 1024 * 1024) {
++        ++m_stats.recon_queue_rejected;
++        peer.fDisconnect = true;
++        return false;
++    }
++    queue.messages.push_back({type, SerializeData(stream.begin(), stream.end()), work, payload});
++    queue.bytes += stream.size();
++    m_recon_queued_bytes += stream.size();
++    ++m_stats.rate_limited_messages;
++    ++m_stats.recon_deferred;
++    return false;
++}
++
++void V2PeerProtocolHandler::DrainReconMessages(
++    CNode &peer, std::chrono::microseconds now) {
++    // Bound one message-handler pass even if a long idle period replenished
++    // the bucket. Preserve ordering and charge queued work before dispatch.
++    for (size_t message = 0; message < 32 && !peer.fDisconnect; ++message) {
++        std::optional<DeferredReconMessage> next;
++        {
++            LOCK(m_mutex);
++            auto found = m_recon_queues.find(peer.GetId());
++            if (found == m_recon_queues.end() || found->second.messages.empty()) return;
++            auto &queue = found->second;
++            auto &front = queue.messages.front();
++            if (!queue.budget.Consume(front.bytes.size(), front.work, front.payload, now)) return;
++            queue.bytes -= front.bytes.size();
++            m_recon_queued_bytes -= front.bytes.size();
++            next = std::move(front);
++            queue.messages.pop_front();
++            ++m_stats.recon_drained;
++        }
++        DataStream stream{Span{next->bytes}};
++        DispatchReconMessage(peer, next->type, stream, now);
++    }
++}
++
+ bool V2PeerProtocolHandler::CheckPeerRateLimit(
+     NodeId peer_id, std::chrono::microseconds time_received) {
+     LOCK(m_mutex);
+@@ -1140,6 +1219,11 @@ void V2PeerProtocolHandler::RemovePeer(NodeId peer_id) {
+     m_peer_nodes.erase(peer_id);
+     m_peer_services.erase(peer_id);
+     m_sync_announcements.erase(peer_id);
++    m_expected_buckets.erase(peer_id);
++    if (auto it = m_recon_queues.find(peer_id); it != m_recon_queues.end()) {
++        m_recon_queued_bytes -= it->second.bytes;
++        m_recon_queues.erase(it);
++    }
+     if (m_swarm.state == FastSyncSwarmState::FETCHING_ROOTS ||
+         m_swarm.state == FastSyncSwarmState::FETCHING_SHARDS ||
+         m_swarm.state == FastSyncSwarmState::PIVOT_ACTIVE_PEELING) {
+@@ -1184,12 +1268,29 @@ V2PeerProtocolHandler::GetLastPeerKnownBlock(NodeId peer_id) const {
+     return it->second;
+ }
+ 
+-void V2PeerProtocolHandler::HandleMerklixSync(
+-    CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received) {
+-    if (!CheckPeerRateLimit(pfrom.GetId(), time_received)) {
+-        return;
++void V2PeerProtocolHandler::SendBucketRequest(
++    CNode &peer, const MerklixBucketRequest &req) {
++    {
++        LOCK(m_mutex);
++        auto &pending = m_expected_buckets[peer.GetId()];
++        const uint8_t depth = req.depth_bits == 0 ? 4 : req.depth_bits;
++        auto next = pending;
++        for (uint8_t bucket = 0; bucket < 16; ++bucket) {
++            if (!(req.bucket_mask & (1U << bucket))) continue;
++            const uint8_t child_depth = depth == 16 ? 16 : depth + 4;
++            const uint16_t prefix = depth == 16 ? req.parent_prefix :
++                static_cast<uint16_t>((req.parent_prefix << 4) | bucket);
++            next.emplace(req.scope, req.context_id, req.salt_k0, req.salt_k1,
++                            child_depth, prefix);
++            if (next.size() > 1024) return;
++        }
++        pending = std::move(next);
+     }
++    m_connman.PushMessage(&peer, NetMsg::Make(NetMsgType::GETMERKLIXBUCK, req));
++}
+ 
++void V2PeerProtocolHandler::HandleMerklixSync(
++    CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received) {
+     MerklixSyncSummary summary;
+     try {
+         vRecv >> summary;
+@@ -1247,17 +1348,12 @@ void V2PeerProtocolHandler::HandleMerklixSync(
+         buck_req.bucket_mask = diff.mismatched_bucket_mask;
+         buck_req.depth_bits = 4;
+         buck_req.parent_prefix = 0;
+-        m_connman.PushMessage(
+-            &pfrom, NetMsg::Make(NetMsgType::GETMERKLIXBUCK, buck_req));
++        SendBucketRequest(pfrom, buck_req);
+     }
+ }
+ 
+ void V2PeerProtocolHandler::HandleGetMerklixBuck(
+     CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received) {
+-    if (!CheckPeerRateLimit(pfrom.GetId(), time_received)) {
+-        return;
+-    }
+-
+     MerklixBucketRequest req;
+     try {
+         vRecv >> req;
+@@ -1328,10 +1424,6 @@ void V2PeerProtocolHandler::HandleGetMerklixBuck(
+ 
+ void V2PeerProtocolHandler::HandleMerklixBuck(
+     CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received) {
+-    if (!CheckPeerRateLimit(pfrom.GetId(), time_received)) {
+-        return;
+-    }
+-
+     MerklixSubBucketSummary sub;
+     try {
+         vRecv >> sub;
+@@ -1369,6 +1461,17 @@ void V2PeerProtocolHandler::HandleMerklixBuck(
+         ++m_stats.merklixbuck_received;
+     }
+ 
++    {
++        LOCK(m_mutex);
++        const auto found = m_expected_buckets.find(pfrom.GetId());
++        const ExpectedBucket expected{sub.scope, sub.context_id, sub.salt_k0,
++                                      sub.salt_k1, depth_bits, sub.parent_prefix};
++        if (found == m_expected_buckets.end() || !found->second.erase(expected)) {
++            ++m_stats.unsolicited_merklixbuck;
++            return;
++        }
++    }
++
+     const MerklixSubBucketDiffResult diff = DiffSubBucketSummary(sub);
+     if (!diff.missing_short_ids.empty()) {
+         RecordPendingShortTxRequest(pfrom.GetId(), scope, sub.context_id,
+@@ -1407,19 +1510,13 @@ void V2PeerProtocolHandler::HandleMerklixBuck(
+             bisected_req.bucket_mask = unresolved_mask;
+             bisected_req.depth_bits = depth_bits;
+             bisected_req.parent_prefix = effective_parent_prefix;
+-            m_connman.PushMessage(
+-                &pfrom,
+-                NetMsg::Make(NetMsgType::GETMERKLIXBUCK, bisected_req));
++            SendBucketRequest(pfrom, bisected_req);
+         }
+     }
+ }
+ 
+ void V2PeerProtocolHandler::HandleGetShortTx(
+     CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received) {
+-    if (!CheckPeerRateLimit(pfrom.GetId(), time_received)) {
+-        return;
+-    }
+-
+     ShortTxRequest req;
+     try {
+         vRecv >> req;
+@@ -1467,10 +1564,6 @@ void V2PeerProtocolHandler::HandleGetShortTx(
+ 
+ void V2PeerProtocolHandler::HandleShortTx(
+     CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received) {
+-    if (!CheckPeerRateLimit(pfrom.GetId(), time_received)) {
+-        return;
+-    }
+-
+     ShortTxResponse resp;
+     try {
+         vRecv >> resp;
+diff --git a/src/net/v2_protocol_handler.h b/src/net/v2_protocol_handler.h
+index 17d3b402c8..98ae0cbc49 100644
+--- a/src/net/v2_protocol_handler.h
++++ b/src/net/v2_protocol_handler.h
+@@ -13,6 +13,7 @@
+ #include <primitives/transaction.h>
+ #include <protocol.h>
+ #include <serialize.h>
++#include <net/recon_cost_budget.h>
+ #include <streams.h>
+ #include <sync.h>
+ #include <uint256.h>
+@@ -25,6 +26,8 @@
+ #include <memory>
+ #include <optional>
+ #include <string>
++#include <set>
++#include <tuple>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
+@@ -339,6 +342,10 @@ struct V2ProtocolHandlerStats {
+     uint64_t unsolicited_shorttx_dropped{0};
+     uint64_t rate_limited_messages{0};
+     uint64_t malformed_messages{0};
++    uint64_t recon_deferred{0};
++    uint64_t recon_drained{0};
++    uint64_t recon_queue_rejected{0};
++    uint64_t unsolicited_merklixbuck{0};
+     uint64_t getutxoroots_received{0};
+     uint64_t utxoroots_received{0};
+     uint64_t getutxoshard_received{0};
+@@ -511,6 +518,9 @@ public:
+                        std::chrono::milliseconds cadence = std::chrono::milliseconds{100})
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
++    void DrainReconMessages(CNode &peer, std::chrono::microseconds now)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
+     void SetPeerServices(NodeId peer_id, ServiceFlags services)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+     ServiceFlags GetPeerServices(NodeId peer_id) const
+@@ -796,6 +806,31 @@ private:
+     std::unordered_set<NodeId>
+         m_high_bandwidth_shorttx_peers GUARDED_BY(m_mutex);
+ 
++    using ExpectedBucket = std::tuple<uint8_t, uint256, uint64_t, uint64_t, uint8_t, uint16_t>;
++    std::unordered_map<NodeId, std::set<ExpectedBucket>> m_expected_buckets GUARDED_BY(m_mutex);
++    void SendBucketRequest(CNode &peer, const MerklixBucketRequest &request)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    struct DeferredReconMessage {
++        std::string type;
++        SerializeData bytes;
++        size_t work;
++        bool payload;
++    };
++    struct ReconQueue {
++        ReconCostBudget budget;
++        std::deque<DeferredReconMessage> messages;
++        size_t bytes{0};
++    };
++    std::unordered_map<NodeId, ReconQueue> m_recon_queues GUARDED_BY(m_mutex);
++    size_t m_recon_queued_bytes GUARDED_BY(m_mutex){0};
++    bool AdmitReconMessage(CNode &peer, const std::string &type,
++                           DataStream &stream, std::chrono::microseconds now)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    bool DispatchReconMessage(CNode &peer, const std::string &type,
++                              DataStream &stream, std::chrono::microseconds now)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
+     struct PeerRateState {
+         std::chrono::microseconds window_start{0};
+         size_t count{0};
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index f8cc297778..9dc51a6468 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -9415,6 +9415,7 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+ 
+     const auto current_time{GetTime<std::chrono::microseconds>()};
+     m_v2_protocol_handler.CheckFastSyncTimeouts(pto->GetId(), current_time);
++    m_v2_protocol_handler.DrainReconMessages(*pto, current_time);
+     if (gArgs.GetBoolArg("-merklixreconciliation", true)) {
+         const auto cadence = m_avalanche
+             ? m_avalanche->getAdaptiveEpochController().getSettlingWindow()
+diff --git a/src/rpc/net.cpp b/src/rpc/net.cpp
+index 0888581d4f..967207aaba 100644
+--- a/src/rpc/net.cpp
++++ b/src/rpc/net.cpp
+@@ -12,6 +12,7 @@
+ #include <config.h>
+ #include <net_permissions.h>
+ #include <net_processing.h>
++#include <net/v2_protocol_handler.h>
+ #include <net_types.h> // For banmap_t
+ #include <netbase.h>
+ #include <node/context.h>
+@@ -815,6 +816,12 @@ static RPCHelpMan getnetworkinfo() {
+                  "the number of inbound connections"},
+                 {RPCResult::Type::NUM, "connections_out",
+                  "the number of outbound connections"},
++                {RPCResult::Type::OBJ, "merklix", "Reconciliation work and queue counters", {
++                    {RPCResult::Type::NUM, "rate_limited", "Messages deferred by cost budget"},
++                    {RPCResult::Type::NUM, "deferred", "Messages queued for later processing"},
++                    {RPCResult::Type::NUM, "drained", "Queued messages processed"},
++                    {RPCResult::Type::NUM, "rejected", "Oversized messages or floods rejected with peer teardown"},
++                }},
+                 {RPCResult::Type::BOOL, "networkactive",
+                  "whether p2p networking is enabled"},
+                 {RPCResult::Type::ARR,
+@@ -873,6 +880,15 @@ static RPCHelpMan getnetworkinfo() {
+             }
+             if (node.peerman) {
+                 obj.pushKV("localrelay", !node.peerman->IgnoresIncomingTxs());
++                if (auto *handler = node.peerman->GetV2ProtocolHandler()) {
++                    const auto stats = handler->GetStats();
++                    UniValue recon(UniValue::VOBJ);
++                    recon.pushKV("rate_limited", stats.rate_limited_messages);
++                    recon.pushKV("deferred", stats.recon_deferred);
++                    recon.pushKV("drained", stats.recon_drained);
++                    recon.pushKV("rejected", stats.recon_queue_rejected);
++                    obj.pushKV("merklix", recon);
++                }
+             }
+             obj.pushKV("timeoffset", GetTimeOffset());
+             if (node.connman) {
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index f8ac142015..89b25e1331 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -280,6 +280,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		validation_flush_tests.cpp
+ 		validation_tests.cpp
+ 		validationinterface_tests.cpp
++		merklix_cost_budget_tests.cpp
+ 		merklix_wire_tests.cpp
+ 		v2_protocol_handler_tests.cpp
+ 		blockindex_comparator_tests.cpp
+diff --git a/src/test/merklix_cost_budget_tests.cpp b/src/test/merklix_cost_budget_tests.cpp
+new file mode 100644
+index 0000000000..87f52bec70
+--- /dev/null
++++ b/src/test/merklix_cost_budget_tests.cpp
+@@ -0,0 +1,33 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++#ifdef MERKLIX_STANDALONE_TEST_MAIN
++#define BOOST_TEST_MODULE merklix_cost_budget_tests
++#include <boost/test/included/unit_test.hpp>
++#else
++#include <boost/test/unit_test.hpp>
++#endif
++#include <net/recon_cost_budget.h>
++using namespace std::chrono_literals;
++using lotus::v2::net::ReconCostBudget;
++BOOST_AUTO_TEST_SUITE(merklix_cost_budget_tests)
++BOOST_AUTO_TEST_CASE(legitimate_peak_and_flood_recovery) {
++    ReconCostBudget budget;
++    // 16 first replies, then at most 256 depth-12 summaries and their
++    // followups for a 5,000-difference round, remain below the sketch burst.
++    for (int message = 0; message < 300; ++message)
++        BOOST_REQUIRE(budget.Consume(600, 2000, false, 1s));
++    BOOST_CHECK(!budget.Consume(ReconCostBudget::SKETCH_BURST, 1, false, 1s));
++    // Independent payload capacity remains available after sketch depletion.
++    BOOST_CHECK(budget.Consume(2 * 1024 * 1024, 1, true, 1s));
++    BOOST_CHECK(budget.Consume(600, 2000, false, 2s));
++    BOOST_CHECK(!budget.Consume(ReconCostBudget::PAYLOAD_BURST + 1, 1, true, 3s));
++}
++BOOST_AUTO_TEST_CASE(work_budget_and_clock_reversal) {
++    ReconCostBudget budget;
++    BOOST_REQUIRE(budget.Consume(1, ReconCostBudget::WORK_BURST, false, 5s));
++    BOOST_CHECK(!budget.Consume(1, 1, false, 4s));
++    BOOST_CHECK(!budget.Consume(1, 1, true, 5s));
++    BOOST_CHECK(budget.Consume(1, ReconCostBudget::WORK_BURST, true, 6s));
++}
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/test/functional/p2p_merklix_limits.py b/test/functional/p2p_merklix_limits.py
+new file mode 100644
+index 0000000000..c3667565d8
+--- /dev/null
++++ b/test/functional/p2p_merklix_limits.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Cost-limited sketches defer bounded traffic and disconnect a sustained flood."""
++from test_framework.p2p import P2PInterface
++from test_framework.test_framework import BitcoinTestFramework
++
++
++class RawSync:
++    msgtype = b"merklixsync"
++
++    def serialize(self):
++        # Invalid scope is intentional: admission must bound attacker work
++        # before decoding, and normal malformed handling must remain intact.
++        return b"\0" * 273
++
++
++class MerklixLimitsTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 1
++        self.setup_clean_chain = True
++        self.extra_args = [["-avalanche=0"]]
++
++    def run_test(self):
++        node = self.nodes[0]
++        peer = node.add_p2p_connection(P2PInterface())
++        for _ in range(1100):
++            peer.send_without_ping(RawSync())
++        self.wait_until(lambda: node.getnetworkinfo()["merklix"]["deferred"] > 0)
++        self.wait_until(lambda: node.getnetworkinfo()["merklix"]["drained"] > 0)
++        assert peer.is_connected
++        for _ in range(5000):
++            try:
++                peer.send_without_ping(RawSync())
++            except OSError:
++                # Expected only in the malicious flood phase; the assertions
++                # below require actual peer teardown and rejection accounting.
++                break
++        self.wait_until(lambda: not peer.is_connected)
++        assert node.getnetworkinfo()["merklix"]["rejected"] > 0
++        # Teardown releases queued bytes; a fresh peer still completes a ping.
++        fresh = node.add_p2p_connection(P2PInterface())
++        fresh.sync_with_ping()
++
++
++if __name__ == "__main__":
++    MerklixLimitsTest().main()
+-- 
+2.50.1 (Apple Git-155)
+

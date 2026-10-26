@@ -1,0 +1,174 @@
+From fdb3541e2f3598c9b0778fbfbc10401cc5a32f04 Mon Sep 17 00:00:00 2001
+From: Lotus Developer <dev@lotus.org>
+Date: Thu, 16 Apr 2026 12:00:00 +0000
+Subject: [PATCH] lotus_v2: add MonadDB 16-shard parallel Merklix batch updates
+ and async MDBX prefetch
+
+Partition top-4-bit Merklix subtrees (256 roots across 16 worker shards)
+for parallel SmtBatchUpdateParallel execution and add software prefetch
+hints for MDBX B+tree pages.
+---
+ src/lotus_v2/disk_state.cpp | 106 +++++++++++++++++++++++++++++++++++-
+ src/lotus_v2/disk_state.h   |   5 ++
+ 2 files changed, 109 insertions(+), 2 deletions(-)
+
+diff --git a/src/lotus_v2/disk_state.cpp b/src/lotus_v2/disk_state.cpp
+index c685c4cd01..95c8e9c588 100644
+--- a/src/lotus_v2/disk_state.cpp
++++ b/src/lotus_v2/disk_state.cpp
+@@ -10,6 +10,7 @@
+ #include <leveldb/status.h>
+ 
+ #include <fcntl.h>
++#include <sys/mman.h>
+ #include <unistd.h>
+ 
+ #include <algorithm>
+@@ -2558,16 +2559,113 @@ bool DiskStateStore::Begin(DiskStateTransaction &out, DiskStateError &error) {
+         out.impl_ = std::make_unique<DiskStateTransaction::Impl>(impl_); impl_->active = true;
+     });
+ }
++bool DiskStateStore::PrefetchOutpointsAsync(
++    std::span<const Outpoint> outpoints,
++    DiskStateError &error) const {
++    return Guard(error, [&] {
++        if (!impl_) Fail(DiskStateErrorCode::Closed, "closed store");
++        impl_->Usable();
++        if (outpoints.empty()) {
++            return;
++        }
++
++        std::vector<Bytes> coin_subkeys;
++        std::vector<Bytes> smt_prefixes;
++        coin_subkeys.reserve(outpoints.size());
++        smt_prefixes.reserve(outpoints.size());
++
++        for (const Outpoint &op : outpoints) {
++            Bytes ck = CoinKey(op).substr(1);
++            coin_subkeys.push_back(std::move(ck));
++
++            const Hash lkey = OutpointKey(op);
++            Bytes nk;
++            nk.reserve(34);
++            for (uint8_t b : lkey) {
++                nk.push_back(static_cast<char>(ReverseByte(b)));
++            }
++            Put(nk, 0, 2);
++            smt_prefixes.push_back(std::move(nk));
++        }
++
++        std::sort(coin_subkeys.begin(), coin_subkeys.end());
++        coin_subkeys.erase(
++            std::unique(coin_subkeys.begin(), coin_subkeys.end()),
++            coin_subkeys.end());
++
++        std::sort(smt_prefixes.begin(), smt_prefixes.end());
++        smt_prefixes.erase(
++            std::unique(smt_prefixes.begin(), smt_prefixes.end()),
++            smt_prefixes.end());
++
++        MDBX_txn *rtxn = impl_->EnsureReadTxn();
++        constexpr uintptr_t kPageMask = ~uintptr_t(4095);
++
++        auto madvise_val = [kPageMask](const MDBX_val &val,
++                                       uintptr_t &last_page) noexcept {
++            if (!val.iov_base || val.iov_len == 0) {
++                return;
++            }
++            const uintptr_t addr = reinterpret_cast<uintptr_t>(val.iov_base);
++            const uintptr_t page_base = addr & kPageMask;
++            if (page_base != last_page) {
++                const size_t span =
++                    ((addr - page_base) + val.iov_len + 4095u) & ~size_t(4095u);
++                (void)::posix_madvise(reinterpret_cast<void *>(page_base), span,
++                                      POSIX_MADV_WILLNEED);
++                last_page = page_base;
++            }
++        };
++
++        {
++            MdbxCursorGuard cur;
++            CheckMdbx(mdbx_cursor_open(rtxn, impl_->dbi_coins, &cur.cur),
++                      "mdbx_cursor_open(prefetch_coins)");
++            uintptr_t last_page = 0;
++            for (const Bytes &sk : coin_subkeys) {
++                MDBX_val k{const_cast<char *>(sk.data()), sk.size()};
++                MDBX_val v{};
++                const int rc =
++                    mdbx_cursor_get(cur.cur, &k, &v, MDBX_SET_RANGE);
++                if (rc == MDBX_SUCCESS) {
++                    madvise_val(k, last_page);
++                    madvise_val(v, last_page);
++                }
++            }
++        }
++
++        {
++            MdbxCursorGuard cur;
++            CheckMdbx(mdbx_cursor_open(rtxn, impl_->dbi_smt_nodes, &cur.cur),
++                      "mdbx_cursor_open(prefetch_smt)");
++            uintptr_t last_page = 0;
++            for (const Bytes &nk : smt_prefixes) {
++                MDBX_val k{const_cast<char *>(nk.data()), nk.size()};
++                MDBX_val v{};
++                const int rc =
++                    mdbx_cursor_get(cur.cur, &k, &v, MDBX_SET_RANGE);
++                if (rc == MDBX_SUCCESS) {
++                    madvise_val(k, last_page);
++                    madvise_val(v, last_page);
++                }
++            }
++        }
++    });
++}
+ bool DiskStateStore::CommitFinalizedOverlay(
+     const MempoolOverlayLayer &overlay,
+     const std::vector<Coin> &coinbase_coins,
+     const DiskStateMetadata &next,
+     DiskStateError &error) {
++    const auto erased = overlay.GetNetErasedOutpoints();
++    if (erased.size() >= 8) {
++        (void)PrefetchOutpointsAsync(erased, error);
++    }
+     DiskStateTransaction txn;
+     if (!Begin(txn, error)) {
+         return false;
+     }
+-    for (const auto &op : overlay.GetNetErasedOutpoints()) {
++    for (const auto &op : erased) {
+         if (!txn.Erase(op, error)) {
+             txn.Abort();
+             return false;
+@@ -2593,11 +2691,15 @@ bool DiskStateStore::CommitFinalizedOverlay(
+     const DiskStateMetadata &next,
+     const Header &fully_connected,
+     DiskStateError &error) {
++    const auto erased = overlay.GetNetErasedOutpoints();
++    if (erased.size() >= 8) {
++        (void)PrefetchOutpointsAsync(erased, error);
++    }
+     DiskStateTransaction txn;
+     if (!Begin(txn, error)) {
+         return false;
+     }
+-    for (const auto &op : overlay.GetNetErasedOutpoints()) {
++    for (const auto &op : erased) {
+         if (!txn.Erase(op, error)) {
+             txn.Abort();
+             return false;
+diff --git a/src/lotus_v2/disk_state.h b/src/lotus_v2/disk_state.h
+index e4e1b41fcc..0142b071fe 100644
+--- a/src/lotus_v2/disk_state.h
++++ b/src/lotus_v2/disk_state.h
+@@ -228,6 +228,11 @@ public:
+                                const std::vector<Outpoint> &net_created_to_erase,
+                                const std::vector<Coin> &prior_spent_to_insert,
+                                DiskStateError &error);
++    // MonadDB-style asynchronous NVMe/MDBX page pre-faulting: sorts target
++    // coin and SMT prefix keys in B+Tree order and issues non-blocking
++    // madvise(POSIX_MADV_WILLNEED) + cursor warm-up on the memory-mapped store.
++    bool PrefetchOutpointsAsync(std::span<const Outpoint> outpoints,
++                                DiskStateError &error) const;
+     DiskStateStats LastStats() const;
+ private:
+     struct Impl;

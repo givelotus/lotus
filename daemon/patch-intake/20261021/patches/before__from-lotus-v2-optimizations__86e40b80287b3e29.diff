@@ -1,0 +1,144 @@
+diff --git a/src/node/snapshot.cpp b/src/node/snapshot.cpp
+index 0dcc9557dc..db82fa504a 100644
+--- a/src/node/snapshot.cpp
++++ b/src/node/snapshot.cpp
+@@ -32,6 +32,14 @@
+ namespace node {
+ namespace {
+ 
++struct ChainPublicationScope {
++    unsigned depth{0};
++    ChainstateManager *chainman{nullptr};
++    const CTxMemPool *mempool{nullptr};
++    bool dirty{false};
++};
++thread_local ChainPublicationScope g_chain_publication;
++
+ double ComputeDifficultyFromBits(uint32_t nBits) {
+     int nShift = (nBits >> 24) & 0xff;
+     double dDiff = double(0x0000ffff) / double(nBits & 0x00ffffff);
+@@ -233,6 +241,11 @@ void ChainAndMempoolSnapshot::EnsureMempoolVectors() const {
+     mempool_vectors_ready = true;
+ }
+ 
++// Before-proof instrumentation: no-op scopes preserve the original immediate
++// publication behavior while compiling the new regression at its exact owner.
++ScopedChainSnapshotDefer::ScopedChainSnapshotDefer(ChainstateManager &, const CTxMemPool *) {}
++ScopedChainSnapshotDefer::~ScopedChainSnapshotDefer() = default;
++
+ SnapshotPublisher::SnapshotPublisher()
+     : m_current(std::make_shared<const ChainAndMempoolSnapshot>()) {}
+ 
+@@ -255,6 +268,11 @@ void PublishChainTipSnapshot(ChainstateManager &chainman,
+                              const CTxMemPool *mempool)
+     NO_THREAD_SAFETY_ANALYSIS {
+     AssertLockHeld(::cs_main);
++    if (g_chain_publication.depth && g_chain_publication.chainman == &chainman) {
++        assert(g_chain_publication.mempool == mempool);
++        g_chain_publication.dirty = true;
++        return;
++    }
+     SnapshotPublisher &publisher = GetGlobalSnapshotPublisher();
+     auto prev = publisher.Load();
+     auto next = CloneChainStateOnly(prev.get());
+@@ -373,6 +391,10 @@ void PublishChainTipSnapshot(ChainstateManager &chainman,
+ void PublishMempoolSnapshot(const CTxMemPool &mempool)
+     NO_THREAD_SAFETY_ANALYSIS {
+     AssertLockHeld(mempool.cs);
++    if (g_chain_publication.depth && g_chain_publication.mempool == &mempool) {
++        g_chain_publication.dirty = true;
++        return;
++    }
+     if (mempool.DeferSnapshotIfActive()) {
+         return;
+     }
+diff --git a/src/node/snapshot.h b/src/node/snapshot.h
+index a0280f0026..82445fd5fc 100644
+--- a/src/node/snapshot.h
++++ b/src/node/snapshot.h
+@@ -210,6 +210,17 @@ public:
+     uint64_t PublicationCount() const noexcept { return m_publications.load(); }
+ };
+ 
++/** Keep readers on the last coherent generation while chain activation or
++ * unwinding temporarily clears/rebuilds the mempool. Construct and destroy
++ * under cs_main and the pool lock; the outer scope publishes their final state. */
++class ScopedChainSnapshotDefer {
++public:
++    ScopedChainSnapshotDefer(ChainstateManager &chainman, const CTxMemPool *mempool);
++    ~ScopedChainSnapshotDefer();
++    ScopedChainSnapshotDefer(const ScopedChainSnapshotDefer &) = delete;
++    ScopedChainSnapshotDefer &operator=(const ScopedChainSnapshotDefer &) = delete;
++};
++
+ /** Return the process-wide SnapshotPublisher shared by NodeContext and validation/mempool hooks. */
+ std::shared_ptr<SnapshotPublisher> GetGlobalSnapshotPublisherPtr();
+ SnapshotPublisher &GetGlobalSnapshotPublisher();
+diff --git a/src/test/snapshot_rcu_tests.cpp b/src/test/snapshot_rcu_tests.cpp
+index 56bb16b398..824481a72e 100644
+--- a/src/test/snapshot_rcu_tests.cpp
++++ b/src/test/snapshot_rcu_tests.cpp
+@@ -321,4 +321,41 @@ BOOST_AUTO_TEST_CASE(lazy_snapshot_materialization_avoids_chain_and_mempool_lock
+     BOOST_CHECK_EQUAL(reader.get(), 1U);
+ }
+ 
++BOOST_AUTO_TEST_CASE(chain_and_mempool_rebuild_publish_only_completed_state) {
++    auto &pool = *m_node.mempool;
++    auto &chainman = *m_node.chainman;
++    auto &publisher = node::GetGlobalSnapshotPublisher();
++    CScript script = GetScriptForRawPubKey(coinbaseKey.GetPubKey());
++    CreateValidMempoolTransaction(m_coinbase_txns[0], 0, 1, coinbaseKey,
++                                 script, 50 * COIN - 2000 * SATOSHI, true);
++    LOCK2(cs_main, pool.cs);
++    node::PublishChainTipSnapshot(chainman, &pool);
++    const auto before = publisher.Load();
++    BOOST_REQUIRE(before);
++    BOOST_CHECK_EQUAL(before->mempool_size, 1U);
++    const auto publications = publisher.PublicationCount();
++    {
++        node::ScopedChainSnapshotDefer outer(chainman, &pool);
++        pool.clear();
++        node::PublishChainTipSnapshot(chainman, &pool);
++        BOOST_CHECK_EQUAL(publisher.Load().get(), before.get());
++        {
++            node::ScopedChainSnapshotDefer inner(chainman, &pool);
++            pool.SetLoadTried(true);
++            node::PublishChainTipSnapshot(chainman, &pool);
++        }
++        BOOST_CHECK_EQUAL(publisher.Load().get(), before.get());
++        BOOST_CHECK_EQUAL(publisher.PublicationCount(), publications);
++    }
++    const auto after = publisher.Load();
++    BOOST_REQUIRE(after);
++    BOOST_CHECK_NE(after.get(), before.get());
++    BOOST_CHECK_EQUAL(publisher.PublicationCount(), publications + 1);
++    BOOST_CHECK_EQUAL(after->best_block_hash, chainman.ActiveTip()->GetBlockHash());
++    BOOST_CHECK_EQUAL(after->mempool_size, 0U);
++    BOOST_CHECK(after->mempool_loaded);
++    before->EnsureMempoolVectors();
++    BOOST_CHECK_EQUAL(before->mempool_entries.size(), 1U);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 873644421d..a8e14e8347 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -3399,6 +3399,8 @@ bool Chainstate::ActivateBestChainStep(
+         AssertLockHeld(m_mempool->cs);
+     }
+ 
++    node::ScopedChainSnapshotDefer snapshot_defer(m_chainman, m_mempool);
++
+     const CBlockIndex *pindexOldTip = m_chain.Tip();
+     const CBlockIndex *pindexFork = m_chain.FindFork(pindexMostWork);
+ 
+@@ -3907,6 +3909,8 @@ bool Chainstate::UnwindBlock(BlockValidationState &state, CBlockIndex *pindex,
+         // in between
+         LOCK(MempoolMutex());
+ 
++        node::ScopedChainSnapshotDefer snapshot_defer(m_chainman, m_mempool);
++
+         constexpr int maxDisconnectPoolBlocks = 10;
+         bool ret = false;
+         DisconnectedBlockTransactions disconnectpool;

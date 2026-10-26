@@ -1,0 +1,841 @@
+From 31f7ff9d1c624be2a914071386ad45b3d45e9dd1 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 20:07:01 -0700
+Subject: [PATCH] net: add a TLS byte layer for WebSocketSock (OpenSSL on the
+ socket, kTLS)
+
+asio's ssl_stream keeps the TLS session in its own memory BIOs, so it
+cannot be handed to CConnman. TlsByteLayer instead drives an OpenSSL
+session bound to the socket itself (SSL_set_fd), non-blocking, under
+WebSocketSock's framing:
+
+- SSL_ERROR_WANT_READ/WANT_WRITE map to EAGAIN; the event a blocked write
+  waits for (RECV for e.g. a TLS 1.3 KeyUpdate) is reported through
+  PendingEvents(), and SSL_pending() through HasBufferedRecv().
+- close_notify reads as EOF; destruction sends one non-blocking
+  close_notify after the WebSocket Close.
+
+New tls_util module shared with the HTTP server: TLS 1.2+ contexts for
+caller-owned non-blocking sockets (partial writes, moving write buffers,
+no compression or renegotiation, SSL_OP_ENABLE_KTLS where available, so
+on Linux OpenSSL can offload records to the kernel), PEM loading,
+self-signed certificate generation (moved from httpserver.cpp, unchanged
+output), SPKI and certificate fingerprints.
+
+Tests: a real handshake over a socketpair, then round trips of up to 3 MB
+both ways with and without compression, a TLS 1.3 KeyUpdate mid-stream,
+orderly close (Close + close_notify reads as EOF) and SPKI fingerprints.
+Not used by the node yet.
+---
+ src/CMakeLists.txt               |   2 +
+ src/httpserver.cpp               | 112 +------------
+ src/net_websocket_tls.cpp        |  82 ++++++++++
+ src/net_websocket_tls.h          |  45 ++++++
+ src/test/net_websocket_tests.cpp | 114 +++++++++++++
+ src/tls_util.cpp                 | 264 +++++++++++++++++++++++++++++++
+ src/tls_util.h                   |  79 +++++++++
+ 7 files changed, 593 insertions(+), 105 deletions(-)
+ create mode 100644 src/net_websocket_tls.cpp
+ create mode 100644 src/net_websocket_tls.h
+ create mode 100644 src/tls_util.cpp
+ create mode 100644 src/tls_util.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 5682c7fd9e9914228e78db6c933b86067f64b85e..72274d434ec1ca3f6899a8886ca6ec9f6faf0c7e 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -659,6 +659,7 @@ add_library(server
+ 	net_websocket.cpp
+ 	net_websocket_codec.cpp
+ 	net_websocket_sock.cpp
++	net_websocket_tls.cpp
+ 	node/abort.cpp
+ 	node/blockfitter.cpp
+ 	node/blockmanager_args.cpp
+@@ -714,6 +715,7 @@ add_library(server
+ 	shutdown.cpp
+ 	streams.cpp
+ 	timedata.cpp
++	tls_util.cpp
+ 	torcontrol.cpp
+ 	txdb.cpp
+ 	txmempool.cpp
+diff --git a/src/httpserver.cpp b/src/httpserver.cpp
+index 183e32bf045cb9271c1683c7e3909f56335ceaa5..db2064d03cd557f530423f890fe2aec769a71f16 100644
+--- a/src/httpserver.cpp
++++ b/src/httpserver.cpp
+@@ -19,6 +19,7 @@
+ #include <rpc/protocol.h> // For HTTP status codes
+ #include <shutdown.h>
+ #include <sync.h>
++#include <tls_util.h>
+ #include <util/check.h>
+ #include <util/fs.h>
+ #include <util/sock.h>
+@@ -1206,20 +1207,8 @@ static asio::awaitable<void> ServeHTTP(Stream &stream,
+ }
+ 
+ static std::string ClientCertFingerprint(SSL *ssl) {
+-#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+-    X509 *cert = SSL_get1_peer_certificate(ssl);
+-#else
+-    X509 *cert = SSL_get_peer_certificate(ssl);
+-#endif
+-    if (!cert) {
+-        return {};
+-    }
+-    unsigned char md[EVP_MAX_MD_SIZE];
+-    unsigned int len{0};
+-    std::string hex;
+-    if (X509_digest(cert, EVP_sha256(), md, &len) == 1) {
+-        hex = HexStr(Span<const unsigned char>{md, len});
+-    }
++    X509 *cert{tls::PeerCertificate(ssl)};
++    std::string hex{tls::CertSha256Hex(cert)};
+     X509_free(cert);
+     return hex;
+ }
+@@ -1451,103 +1440,16 @@ static void libevent_log_cb(int severity, const char *msg) {
+     LogPrintLevel(BCLog::LIBEVENT, level, "%s\n", msg);
+ }
+ 
+-namespace {
+-struct EVPPKeyDeleter {
+-    void operator()(EVP_PKEY *p) const { EVP_PKEY_free(p); }
+-};
+-struct EVPPKeyCtxDeleter {
+-    void operator()(EVP_PKEY_CTX *p) const { EVP_PKEY_CTX_free(p); }
+-};
+-struct X509Deleter {
+-    void operator()(X509 *p) const { X509_free(p); }
+-};
+-struct BNDeleter {
+-    void operator()(BIGNUM *p) const { BN_free(p); }
+-};
+-} // namespace
+-
+-static bool AddX509Extension(X509 *cert, int nid, const char *value) {
+-    X509V3_CTX ctx;
+-    X509V3_set_ctx_nodb(&ctx);
+-    X509V3_set_ctx(&ctx, cert, cert, nullptr, nullptr, 0);
+-    X509_EXTENSION *ext =
+-        X509V3_EXT_conf_nid(nullptr, &ctx, nid, const_cast<char *>(value));
+-    if (!ext) {
+-        return false;
+-    }
+-    const bool ok{X509_add_ext(cert, ext, -1) == 1};
+-    X509_EXTENSION_free(ext);
+-    return ok;
+-}
+-
+ /**
+  * Generate a self-signed EC P-256 certificate valid for 10 years and write it
+  * and its key (mode 0600) as PEM files.
+  */
+ static bool GenerateSelfSignedCertificate(const fs::path &cert_path,
+                                           const fs::path &key_path) {
+-    std::unique_ptr<EVP_PKEY_CTX, EVPPKeyCtxDeleter> pctx{
+-        EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr)};
+-    EVP_PKEY *raw_key{nullptr};
+-    if (!pctx || EVP_PKEY_keygen_init(pctx.get()) != 1 ||
+-        EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx.get(),
+-                                               NID_X9_62_prime256v1) != 1 ||
+-        EVP_PKEY_CTX_set_ec_param_enc(pctx.get(), OPENSSL_EC_NAMED_CURVE) !=
+-            1 ||
+-        EVP_PKEY_keygen(pctx.get(), &raw_key) != 1) {
+-        return false;
+-    }
+-    std::unique_ptr<EVP_PKEY, EVPPKeyDeleter> key{raw_key};
+-
+-    std::unique_ptr<X509, X509Deleter> cert{X509_new()};
+-    std::unique_ptr<BIGNUM, BNDeleter> serial{BN_new()};
+-    if (!cert || !serial || X509_set_version(cert.get(), 2) != 1 ||
+-        BN_rand(serial.get(), 127, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY) != 1 ||
+-        !BN_to_ASN1_INTEGER(serial.get(),
+-                            X509_get_serialNumber(cert.get())) ||
+-        !X509_gmtime_adj(X509_getm_notBefore(cert.get()), -3600) ||
+-        !X509_gmtime_adj(X509_getm_notAfter(cert.get()),
+-                         10L * 365 * 24 * 3600) ||
+-        X509_set_pubkey(cert.get(), key.get()) != 1) {
+-        return false;
+-    }
+-    std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> name{
+-        X509_NAME_new(), &X509_NAME_free};
+-    if (!name ||
+-        X509_NAME_add_entry_by_txt(
+-            name.get(), "CN", MBSTRING_ASC,
+-            reinterpret_cast<const unsigned char *>("bitcoind node"), -1, -1,
+-            0) != 1 ||
+-        X509_set_subject_name(cert.get(), name.get()) != 1 ||
+-        X509_set_issuer_name(cert.get(), name.get()) != 1 ||
+-        !AddX509Extension(cert.get(), NID_basic_constraints,
+-                          "critical,CA:FALSE") ||
+-        !AddX509Extension(cert.get(), NID_subject_alt_name,
+-                          "DNS:localhost,IP:127.0.0.1,IP:::1") ||
+-        X509_sign(cert.get(), key.get(), EVP_sha256()) == 0) {
+-        return false;
+-    }
+-
+-    FILE *key_file = fsbridge::fopen(key_path, "wb");
+-    if (!key_file) {
+-        return false;
+-    }
+-#ifndef WIN32
+-    fchmod(fileno(key_file), S_IRUSR | S_IWUSR);
+-#endif
+-    const bool key_ok{PEM_write_PrivateKey(key_file, key.get(), nullptr,
+-                                           nullptr, 0, nullptr, nullptr) == 1};
+-    const bool key_closed{fclose(key_file) == 0};
+-    if (!key_ok || !key_closed) {
+-        return false;
+-    }
+-    FILE *cert_file = fsbridge::fopen(cert_path, "wb");
+-    if (!cert_file) {
+-        return false;
+-    }
+-    const bool cert_ok{PEM_write_X509(cert_file, cert.get()) == 1};
+-    const bool cert_closed{fclose(cert_file) == 0};
+-    return cert_ok && cert_closed;
++    const auto pem{tls::GenerateSelfSigned(
++        "bitcoind node", {"localhost"}, {"127.0.0.1", "::1"},
++        std::chrono::hours{24 * 365 * 10})};
++    return pem && tls::WritePemFiles(*pem, cert_path, key_path);
+ }
+ 
+ /** Set up g_ssl_ctx from -tlscert/-tlskey or the datadir certificate */
+diff --git a/src/net_websocket_tls.cpp b/src/net_websocket_tls.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a55db9b4d23b83ed5f1197acb255196e6d59a579
+--- /dev/null
++++ b/src/net_websocket_tls.cpp
+@@ -0,0 +1,82 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <net_websocket_tls.h>
++
++#include <logging.h>
++
++#include <openssl/err.h>
++
++#include <cerrno>
++#include <climits>
++
++TlsByteLayer::TlsByteLayer(tls::SslPtr ssl) : m_ssl{std::move(ssl)} {}
++
++ssize_t TlsByteLayer::Translate(int ret, Sock::Event *wait) {
++    if (ret > 0) {
++        return ret;
++    }
++    const int err{SSL_get_error(m_ssl.get(), ret)};
++    switch (err) {
++        case SSL_ERROR_WANT_READ:
++            if (wait) {
++                *wait = Sock::RECV;
++            }
++            errno = EAGAIN;
++            return -1;
++        case SSL_ERROR_WANT_WRITE:
++            if (wait) {
++                *wait = Sock::SEND;
++            }
++            errno = EAGAIN;
++            return -1;
++        case SSL_ERROR_ZERO_RETURN:
++            // Orderly TLS close_notify.
++            return 0;
++        case SSL_ERROR_SYSCALL:
++            if (errno == 0) {
++                errno = ECONNRESET;
++            }
++            return -1;
++        default:
++            LogDebug(BCLog::NET, "WebSocket TLS error: %s\n",
++                     tls::ErrorString());
++            errno = ECONNRESET;
++            return -1;
++    }
++}
++
++ssize_t TlsByteLayer::Read(SOCKET fd, uint8_t *buf, size_t len) {
++    ERR_clear_error();
++    const int n{SSL_read(m_ssl.get(), buf, int(std::min<size_t>(len, INT_MAX)))};
++    return Translate(n, nullptr);
++}
++
++ssize_t TlsByteLayer::Write(SOCKET fd, const uint8_t *buf, size_t len) {
++    // OpenSSL requires a retried write to repeat the same length.
++    len = m_retry_len != 0 ? std::min(len, m_retry_len)
++                           : std::min<size_t>(len, INT_MAX);
++    ERR_clear_error();
++    const int n{SSL_write(m_ssl.get(), buf, int(len))};
++    Sock::Event wait{Sock::SEND};
++    const ssize_t r{Translate(n, &wait)};
++    const bool again{r < 0 && errno == EAGAIN};
++    m_retry_len = again ? len : 0;
++    // A write can need to read first (e.g. a TLS 1.3 KeyUpdate exchange).
++    m_write_waits_for = again ? wait : Sock::SEND;
++    return r;
++}
++
++bool TlsByteLayer::HasBuffered() const {
++    return SSL_pending(m_ssl.get()) > 0;
++}
++
++void TlsByteLayer::Shutdown(SOCKET fd) {
++    if (!m_shutdown) {
++        m_shutdown = true;
++        ERR_clear_error();
++        // One non-blocking attempt to send close_notify.
++        (void)SSL_shutdown(m_ssl.get());
++    }
++}
+diff --git a/src/net_websocket_tls.h b/src/net_websocket_tls.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..054d7b904fcb221747815cf5463e8a6597d9383a
+--- /dev/null
++++ b/src/net_websocket_tls.h
+@@ -0,0 +1,45 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_NET_WEBSOCKET_TLS_H
++#define BITCOIN_NET_WEBSOCKET_TLS_H
++
++#include <net_websocket_sock.h>
++#include <tls_util.h>
++
++/**
++ * TLS beneath WebSocketSock: an OpenSSL session bound to the socket itself
++ * (SSL_set_fd), driven non-blocking. With kernel TLS available (Linux,
++ * SSL_OP_ENABLE_KTLS), OpenSSL offloads record encryption to the kernel
++ * behind the same calls.
++ *
++ * The handshake has completed before the layer is constructed.
++ */
++class TlsByteLayer final : public WebSocketByteLayer {
++public:
++    explicit TlsByteLayer(tls::SslPtr ssl);
++
++    ssize_t Read(SOCKET fd, uint8_t *buf, size_t len) override;
++    ssize_t Write(SOCKET fd, const uint8_t *buf, size_t len) override;
++    bool HasBuffered() const override;
++    Sock::Event WriteWaitsFor() const override { return m_write_waits_for; }
++    void Shutdown(SOCKET fd) override;
++    bool IsTLS() const override { return true; }
++
++    SSL *Native() const { return m_ssl.get(); }
++
++private:
++    //! Map an OpenSSL result to the recv/send convention; `wait` receives
++    //! the OS event a WANT_READ/WANT_WRITE needs.
++    ssize_t Translate(int ret, Sock::Event *wait);
++
++    const tls::SslPtr m_ssl;
++    Sock::Event m_write_waits_for{Sock::SEND};
++    //! Length of a write OpenSSL must see again (0: none pending). The
++    //! caller's buffer only grows at the end, so the bytes are unchanged.
++    size_t m_retry_len{0};
++    bool m_shutdown{false};
++};
++
++#endif // BITCOIN_NET_WEBSOCKET_TLS_H
+diff --git a/src/test/net_websocket_tests.cpp b/src/test/net_websocket_tests.cpp
+index 9d00f8c0b0e17bb75337f90eb19a09a408c56de9..ff9daabaaed77b23ed7df6c37121f5f721d95e5c 100644
+--- a/src/test/net_websocket_tests.cpp
++++ b/src/test/net_websocket_tests.cpp
+@@ -6,6 +6,8 @@
+ #include <protocol.h>
+ #include <net_websocket_codec.h>
+ #include <net_websocket_sock.h>
++#include <net_websocket_tls.h>
++#include <tls_util.h>
+ 
+ #include <random.h>
+ #include <util/sock.h>
+@@ -20,6 +22,7 @@
+ #include <memory>
+ #include <vector>
+ 
++#include <fcntl.h>
+ #include <poll.h>
+ #include <sys/socket.h>
+ 
+@@ -324,6 +327,117 @@ BOOST_AUTO_TEST_CASE(codec_complete_frame_detection) {
+     }
+ }
+ 
++namespace {
++/** A client/server WebSocketSock pair over TLS on a socketpair */
++struct TlsPair {
++    std::unique_ptr<WebSocketSock> client, server;
++    SSL *client_ssl{nullptr}, *server_ssl{nullptr};
++    std::vector<unsigned char> server_spki;
++    explicit TlsPair(C compression) {
++        const auto pem{tls::GenerateSelfSigned("test", {"localhost"}, {},
++                                               std::chrono::hours{1})};
++        BOOST_REQUIRE(pem);
++        auto server_ctx{tls::NewContext(/*server=*/true)};
++        auto client_ctx{tls::NewContext(/*server=*/false)};
++        BOOST_REQUIRE(server_ctx && client_ctx);
++        BOOST_REQUIRE(tls::UseCertificatePem(server_ctx.get(), pem->cert_pem,
++                                             pem->key_pem));
++        int sv[2];
++        BOOST_REQUIRE_EQUAL(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
++        BigBuffers(sv);
++        for (int fd : sv) {
++            fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
++        }
++        tls::SslPtr c{SSL_new(client_ctx.get())}, srv{SSL_new(server_ctx.get())};
++        SSL_set_fd(c.get(), sv[0]);
++        SSL_set_fd(srv.get(), sv[1]);
++        SSL_set_connect_state(c.get());
++        SSL_set_accept_state(srv.get());
++        bool c_done{false}, s_done{false};
++        for (int i = 0; i < 1000 && !(c_done && s_done); ++i) {
++            c_done = c_done || SSL_do_handshake(c.get()) == 1;
++            s_done = s_done || SSL_do_handshake(srv.get()) == 1;
++        }
++        BOOST_REQUIRE(c_done && s_done);
++        X509 *peer{tls::PeerCertificate(c.get())};
++        server_spki = tls::SpkiSha256(peer);
++        X509_free(peer);
++        client_ssl = c.get();
++        server_ssl = srv.get();
++        client = std::make_unique<WebSocketSock>(
++            SOCKET(sv[0]), Role::CLIENT, Info(compression),
++            std::make_unique<TlsByteLayer>(std::move(c)));
++        server = std::make_unique<WebSocketSock>(
++            SOCKET(sv[1]), Role::SERVER, Info(compression),
++            std::make_unique<TlsByteLayer>(std::move(srv)));
++    }
++};
++} // namespace
++
++BOOST_AUTO_TEST_CASE(tls_roundtrip_all_modes_and_sizes) {
++    FastRandomContext rng{/*fDeterministic=*/true};
++    for (const C mode : {C::NONE, C::ZSTD_DICT}) {
++        TlsPair p{mode};
++        for (const size_t size : {1, 126, 65536, 3000000}) {
++            std::vector<uint8_t> payload{rng.randbytes<uint8_t>(size)};
++            BOOST_CHECK_EQUAL(p.client->Send(payload.data(), size, 0),
++                              ssize_t(size));
++            BOOST_CHECK(ReceiveAll(*p.client, *p.server, size) == payload);
++            BOOST_CHECK_EQUAL(p.server->Send(payload.data(), size, 0),
++                              ssize_t(size));
++            BOOST_CHECK(ReceiveAll(*p.server, *p.client, size) == payload);
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(tls_key_update_mid_stream) {
++    TlsPair p{C::NONE};
++    const std::vector<uint8_t> a(1000, 1), b(2000, 2);
++    BOOST_CHECK_EQUAL(p.client->Send(a.data(), a.size(), 0), 1000);
++    BOOST_CHECK(ReceiveAll(*p.client, *p.server, a.size()) == a);
++    // The client rotates its keys and asks the server to do the same; data
++    // keeps flowing both ways.
++    if (SSL_version(p.client_ssl) == TLS1_3_VERSION) {
++        BOOST_REQUIRE_EQUAL(
++            SSL_key_update(p.client_ssl, SSL_KEY_UPDATE_REQUESTED), 1);
++    }
++    BOOST_CHECK_EQUAL(p.client->Send(b.data(), b.size(), 0), 2000);
++    BOOST_CHECK(ReceiveAll(*p.client, *p.server, b.size()) == b);
++    BOOST_CHECK_EQUAL(p.server->Send(a.data(), a.size(), 0), 1000);
++    BOOST_CHECK(ReceiveAll(*p.server, *p.client, a.size()) == a);
++}
++
++BOOST_AUTO_TEST_CASE(tls_orderly_close) {
++    TlsPair p{C::ZSTD_DICT};
++    const std::vector<uint8_t> a(500, 3);
++    BOOST_CHECK_EQUAL(p.client->Send(a.data(), a.size(), 0), 500);
++    BOOST_CHECK(ReceiveAll(*p.client, *p.server, a.size()) == a);
++    // Destroying the client sends a WebSocket Close and TLS close_notify.
++    p.client.reset();
++    uint8_t buf[16];
++    ssize_t n{-1};
++    for (int i = 0; i < 400 && n < 0; ++i) {
++        n = p.server->Recv(buf, sizeof(buf), 0);
++        if (n < 0) {
++            BOOST_REQUIRE_EQUAL(errno, EAGAIN);
++            Sock::Event occurred;
++            (void)p.server->Wait(std::chrono::milliseconds{5}, Sock::RECV,
++                                 &occurred);
++        }
++    }
++    BOOST_CHECK_EQUAL(n, 0);
++}
++
++BOOST_AUTO_TEST_CASE(tls_spki_fingerprint) {
++    TlsPair p{C::NONE};
++    BOOST_CHECK_EQUAL(p.server_spki.size(), 32U);
++    X509 *own{SSL_get_certificate(p.server_ssl)};
++    BOOST_CHECK(tls::SpkiSha256(own) == p.server_spki);
++    // A new certificate for a different key has a different SPKI hash.
++    TlsPair other{C::NONE};
++    BOOST_CHECK(other.server_spki != p.server_spki);
++}
++
+ namespace {
+ struct RestoreBlockLimit {
+     Config &config{const_cast<Config &>(GetConfig())};
+diff --git a/src/tls_util.cpp b/src/tls_util.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e865048f3687b77377c1f5aa4fc27362fbe8e436
+--- /dev/null
++++ b/src/tls_util.cpp
+@@ -0,0 +1,264 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <tls_util.h>
++
++#include <util/strencodings.h>
++#include <util/string.h>
++
++#include <openssl/bio.h>
++#include <openssl/bn.h>
++#include <openssl/err.h>
++#include <openssl/evp.h>
++#include <openssl/pem.h>
++#include <openssl/x509.h>
++#include <openssl/x509v3.h>
++
++#include <cstdio>
++
++#ifndef WIN32
++#include <sys/stat.h>
++#endif
++
++namespace tls {
++namespace {
++struct EVPPKeyDeleter {
++    void operator()(EVP_PKEY *p) const { EVP_PKEY_free(p); }
++};
++struct EVPPKeyCtxDeleter {
++    void operator()(EVP_PKEY_CTX *p) const { EVP_PKEY_CTX_free(p); }
++};
++struct X509Deleter {
++    void operator()(X509 *p) const { X509_free(p); }
++};
++struct BNDeleter {
++    void operator()(BIGNUM *p) const { BN_free(p); }
++};
++struct BIODeleter {
++    void operator()(BIO *p) const { BIO_free(p); }
++};
++
++bool AddX509Extension(X509 *cert, int nid, const std::string &value) {
++    X509V3_CTX ctx;
++    X509V3_set_ctx_nodb(&ctx);
++    X509V3_set_ctx(&ctx, cert, cert, nullptr, nullptr, 0);
++    X509_EXTENSION *ext = X509V3_EXT_conf_nid(nullptr, &ctx, nid,
++                                              const_cast<char *>(value.c_str()));
++    if (!ext) {
++        return false;
++    }
++    const bool ok{X509_add_ext(cert, ext, -1) == 1};
++    X509_EXTENSION_free(ext);
++    return ok;
++}
++
++std::string BioToString(BIO *bio) {
++    char *data{nullptr};
++    const long len{BIO_get_mem_data(bio, &data)};
++    return len > 0 ? std::string(data, len) : std::string{};
++}
++} // namespace
++
++SslCtxPtr NewContext(bool server) {
++    SslCtxPtr ctx{
++        SSL_CTX_new(server ? TLS_server_method() : TLS_client_method())};
++    if (!ctx) {
++        return ctx;
++    }
++    SSL_CTX_set_min_proto_version(ctx.get(), TLS1_2_VERSION);
++    SSL_CTX_set_mode(ctx.get(), SSL_MODE_ENABLE_PARTIAL_WRITE |
++                                    SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
++    uint64_t options{SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION};
++#ifdef SSL_OP_ENABLE_KTLS
++    options |= SSL_OP_ENABLE_KTLS;
++#endif
++    SSL_CTX_set_options(ctx.get(), options);
++    return ctx;
++}
++
++bool UseCertificatePem(SSL_CTX *ctx, const std::string &cert_chain_pem,
++                       const std::string &key_pem) {
++    std::unique_ptr<BIO, BIODeleter> cert_bio{
++        BIO_new_mem_buf(cert_chain_pem.data(), int(cert_chain_pem.size()))};
++    std::unique_ptr<BIO, BIODeleter> key_bio{
++        BIO_new_mem_buf(key_pem.data(), int(key_pem.size()))};
++    if (!cert_bio || !key_bio) {
++        return false;
++    }
++    std::unique_ptr<X509, X509Deleter> cert{
++        PEM_read_bio_X509(cert_bio.get(), nullptr, nullptr, nullptr)};
++    std::unique_ptr<EVP_PKEY, EVPPKeyDeleter> key{
++        PEM_read_bio_PrivateKey(key_bio.get(), nullptr, nullptr, nullptr)};
++    if (!cert || !key || SSL_CTX_use_certificate(ctx, cert.get()) != 1 ||
++        SSL_CTX_use_PrivateKey(ctx, key.get()) != 1) {
++        return false;
++    }
++    // Remaining certificates in the chain.
++    while (X509 *extra =
++               PEM_read_bio_X509(cert_bio.get(), nullptr, nullptr, nullptr)) {
++        if (SSL_CTX_add0_chain_cert(ctx, extra) != 1) {
++            X509_free(extra);
++            return false;
++        }
++    }
++    ERR_clear_error(); // End of the PEM chain.
++    return SSL_CTX_check_private_key(ctx) == 1;
++}
++
++bool UseCertificateFiles(SSL_CTX *ctx, const fs::path &cert_chain,
++                         const fs::path &key) {
++    return SSL_CTX_use_certificate_chain_file(
++               ctx, fs::PathToString(cert_chain).c_str()) == 1 &&
++           SSL_CTX_use_PrivateKey_file(ctx, fs::PathToString(key).c_str(),
++                                       SSL_FILETYPE_PEM) == 1 &&
++           SSL_CTX_check_private_key(ctx) == 1;
++}
++
++std::optional<SelfSigned>
++GenerateSelfSigned(const std::string &common_name,
++                   const std::vector<std::string> &dns_names,
++                   const std::vector<std::string> &ip_addresses,
++                   std::chrono::seconds validity) {
++    std::unique_ptr<EVP_PKEY_CTX, EVPPKeyCtxDeleter> pctx{
++        EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr)};
++    EVP_PKEY *raw_key{nullptr};
++    if (!pctx || EVP_PKEY_keygen_init(pctx.get()) != 1 ||
++        EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx.get(),
++                                               NID_X9_62_prime256v1) != 1 ||
++        EVP_PKEY_CTX_set_ec_param_enc(pctx.get(), OPENSSL_EC_NAMED_CURVE) !=
++            1 ||
++        EVP_PKEY_keygen(pctx.get(), &raw_key) != 1) {
++        return std::nullopt;
++    }
++    std::unique_ptr<EVP_PKEY, EVPPKeyDeleter> key{raw_key};
++
++    std::unique_ptr<X509, X509Deleter> cert{X509_new()};
++    std::unique_ptr<BIGNUM, BNDeleter> serial{BN_new()};
++    if (!cert || !serial || X509_set_version(cert.get(), 2) != 1 ||
++        BN_rand(serial.get(), 127, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY) != 1 ||
++        !BN_to_ASN1_INTEGER(serial.get(),
++                            X509_get_serialNumber(cert.get())) ||
++        !X509_gmtime_adj(X509_getm_notBefore(cert.get()), -3600) ||
++        !X509_gmtime_adj(X509_getm_notAfter(cert.get()),
++                         static_cast<long>(validity.count())) ||
++        X509_set_pubkey(cert.get(), key.get()) != 1) {
++        return std::nullopt;
++    }
++    std::unique_ptr<X509_NAME, decltype(&X509_NAME_free)> name{
++        X509_NAME_new(), &X509_NAME_free};
++    std::vector<std::string> sans;
++    for (const auto &dns : dns_names) {
++        sans.push_back("DNS:" + dns);
++    }
++    for (const auto &ip : ip_addresses) {
++        sans.push_back("IP:" + ip);
++    }
++    if (!name ||
++        X509_NAME_add_entry_by_txt(
++            name.get(), "CN", MBSTRING_ASC,
++            reinterpret_cast<const unsigned char *>(common_name.c_str()), -1,
++            -1, 0) != 1 ||
++        X509_set_subject_name(cert.get(), name.get()) != 1 ||
++        X509_set_issuer_name(cert.get(), name.get()) != 1 ||
++        !AddX509Extension(cert.get(), NID_basic_constraints,
++                          "critical,CA:FALSE") ||
++        (!sans.empty() &&
++         !AddX509Extension(cert.get(), NID_subject_alt_name,
++                           util::Join(sans, ","))) ||
++        X509_sign(cert.get(), key.get(), EVP_sha256()) == 0) {
++        return std::nullopt;
++    }
++
++    std::unique_ptr<BIO, BIODeleter> key_bio{BIO_new(BIO_s_mem())};
++    std::unique_ptr<BIO, BIODeleter> cert_bio{BIO_new(BIO_s_mem())};
++    if (!key_bio || !cert_bio ||
++        PEM_write_bio_PrivateKey(key_bio.get(), key.get(), nullptr, nullptr, 0,
++                                 nullptr, nullptr) != 1 ||
++        PEM_write_bio_X509(cert_bio.get(), cert.get()) != 1) {
++        return std::nullopt;
++    }
++    return SelfSigned{BioToString(cert_bio.get()), BioToString(key_bio.get())};
++}
++
++bool WritePemFiles(const SelfSigned &pem, const fs::path &cert_path,
++                   const fs::path &key_path) {
++    FILE *key_file = fsbridge::fopen(key_path, "wb");
++    if (!key_file) {
++        return false;
++    }
++#ifndef WIN32
++    fchmod(fileno(key_file), S_IRUSR | S_IWUSR);
++#endif
++    const bool key_ok{fwrite(pem.key_pem.data(), 1, pem.key_pem.size(),
++                             key_file) == pem.key_pem.size()};
++    const bool key_closed{fclose(key_file) == 0};
++    if (!key_ok || !key_closed) {
++        return false;
++    }
++    FILE *cert_file = fsbridge::fopen(cert_path, "wb");
++    if (!cert_file) {
++        return false;
++    }
++    const bool cert_ok{fwrite(pem.cert_pem.data(), 1, pem.cert_pem.size(),
++                              cert_file) == pem.cert_pem.size()};
++    const bool cert_closed{fclose(cert_file) == 0};
++    return cert_ok && cert_closed;
++}
++
++std::vector<unsigned char> SpkiSha256(X509 *cert) {
++    if (!cert) {
++        return {};
++    }
++    unsigned char *der{nullptr};
++    const int len{i2d_X509_PUBKEY(X509_get_X509_PUBKEY(cert), &der)};
++    if (len <= 0) {
++        return {};
++    }
++    std::vector<unsigned char> md(EVP_MAX_MD_SIZE);
++    unsigned int md_len{0};
++    const bool ok{EVP_Digest(der, len, md.data(), &md_len, EVP_sha256(),
++                             nullptr) == 1};
++    OPENSSL_free(der);
++    if (!ok) {
++        return {};
++    }
++    md.resize(md_len);
++    return md;
++}
++
++std::string CertSha256Hex(X509 *cert) {
++    if (!cert) {
++        return {};
++    }
++    unsigned char md[EVP_MAX_MD_SIZE];
++    unsigned int len{0};
++    if (X509_digest(cert, EVP_sha256(), md, &len) != 1) {
++        return {};
++    }
++    return HexStr(Span<const unsigned char>{md, len});
++}
++
++X509 *PeerCertificate(const SSL *ssl) {
++#if OPENSSL_VERSION_NUMBER >= 0x30000000L
++    return SSL_get1_peer_certificate(ssl);
++#else
++    return SSL_get_peer_certificate(ssl);
++#endif
++}
++
++std::string ErrorString() {
++    std::string out;
++    unsigned long err;
++    char buf[256];
++    while ((err = ERR_get_error()) != 0) {
++        ERR_error_string_n(err, buf, sizeof(buf));
++        if (!out.empty()) {
++            out += "; ";
++        }
++        out += buf;
++    }
++    return out;
++}
++
++} // namespace tls
+diff --git a/src/tls_util.h b/src/tls_util.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..09e12735c3bd579d2f6a24508a660e52a960a97c
+--- /dev/null
++++ b/src/tls_util.h
+@@ -0,0 +1,79 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_TLS_UTIL_H
++#define BITCOIN_TLS_UTIL_H
++
++#include <util/fs.h>
++
++#include <openssl/ssl.h>
++
++#include <chrono>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++/** OpenSSL helpers shared by the HTTP server and P2P WebSocket transport */
++namespace tls {
++
++struct SslCtxDeleter {
++    void operator()(SSL_CTX *p) const { SSL_CTX_free(p); }
++};
++struct SslDeleter {
++    void operator()(SSL *p) const { SSL_free(p); }
++};
++using SslCtxPtr = std::unique_ptr<SSL_CTX, SslCtxDeleter>;
++using SslPtr = std::unique_ptr<SSL, SslDeleter>;
++
++/**
++ * A new TLS 1.2+ context for non-blocking use on sockets owned by the
++ * caller: partial writes and moving write buffers are allowed (as
++ * WebSocketSock requires), and kernel TLS is enabled where OpenSSL and the
++ * kernel support it.
++ */
++SslCtxPtr NewContext(bool server);
++
++/** Load a PEM certificate chain and private key into `ctx` */
++bool UseCertificatePem(SSL_CTX *ctx, const std::string &cert_chain_pem,
++                       const std::string &key_pem);
++
++/** Load PEM files (certificate chain and key) into `ctx` */
++bool UseCertificateFiles(SSL_CTX *ctx, const fs::path &cert_chain,
++                         const fs::path &key);
++
++struct SelfSigned {
++    std::string cert_pem;
++    std::string key_pem;
++};
++
++/**
++ * Generate a self-signed EC P-256 certificate (CA:FALSE) with the given
++ * subject CN, DNS and IP subject alternative names and validity.
++ */
++std::optional<SelfSigned>
++GenerateSelfSigned(const std::string &common_name,
++                   const std::vector<std::string> &dns_names,
++                   const std::vector<std::string> &ip_addresses,
++                   std::chrono::seconds validity);
++
++/** Write a key (mode 0600) and certificate as PEM files */
++bool WritePemFiles(const SelfSigned &pem, const fs::path &cert_path,
++                   const fs::path &key_path);
++
++/** SHA-256 of a certificate's DER SubjectPublicKeyInfo (empty on error) */
++std::vector<unsigned char> SpkiSha256(X509 *cert);
++
++/** SHA-256 of the whole DER certificate, hex (empty if no certificate) */
++std::string CertSha256Hex(X509 *cert);
++
++/** The peer's certificate, or nullptr (caller frees with X509_free) */
++X509 *PeerCertificate(const SSL *ssl);
++
++/** OpenSSL's queued error strings, for logging */
++std::string ErrorString();
++
++} // namespace tls
++
++#endif // BITCOIN_TLS_UTIL_H
+-- 
+2.50.1 (Apple Git-155)
+

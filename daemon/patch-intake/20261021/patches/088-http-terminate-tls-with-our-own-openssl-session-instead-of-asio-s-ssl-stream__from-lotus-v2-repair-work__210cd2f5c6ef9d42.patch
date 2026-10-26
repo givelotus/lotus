@@ -1,0 +1,649 @@
+From 8326b1a96a3e2bfa862e9f421c38f8cff1f298d7 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 20:32:56 -0700
+Subject: [PATCH] http: terminate TLS with our own OpenSSL session instead of
+ asio's ssl_stream
+
+asio's ssl::stream keeps the TLS session in its own memory BIOs, so an
+upgraded connection cannot be handed elsewhere with its session. The HTTP
+server now owns the TLS session itself; Beast still does all HTTP and
+WebSocket parsing and serialization on top:
+
+- TLS is detected from the first byte (0x16) peeked with MSG_PEEK, so no
+  bytes are consumed; an SSL is created from the tls_util context and bound
+  to the socket with SSL_set_fd.
+- OsslStream is an asio AsyncStream (and non-blocking SyncWriteStream) over
+  that SSL: WANT_READ/WANT_WRITE wait with async_wait, immediate results
+  are re-posted (never completed inline from initiation), multi-buffer
+  writes (HTTP header + body) are gathered into one SSL_write so a reply is
+  one TLS record and syscall, and a write OpenSSL asked to retry is retried
+  with the same length. Beast WebSocket teardown is provided for it.
+- WriteResponse's non-blocking write fast path now covers TLS too.
+- Until the TLS handshake completes, a deadline (-rpcservertimeout) shuts
+  the socket down, so silent or stalled clients are dropped.
+- -tlscert/-tlskey/-tlsephemeral and -tlsmutual behave as before;
+  boost/asio/ssl is no longer used by the server.
+
+Measured on loopback (16 RPC threads): small RPCs over TLS 45-67k req/s
+at c=16/64 (plain 60-72k) and equal c=1 latency; 3.35 MB getblock replies
+over TLS within noise of plain. A unit test covers handshake, reads,
+gathered writes through would_block and async retry, and close_notify.
+
+diff --git a/src/http_tls_stream.h b/src/http_tls_stream.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..cfd8e615ca5be6cec5faf233d20b96af8cc44a56
+--- /dev/null
++++ b/src/http_tls_stream.h
+@@ -0,0 +1,259 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_HTTP_TLS_STREAM_H
++#define BITCOIN_HTTP_TLS_STREAM_H
++
++#include <tls_util.h>
++
++#include <boost/asio/async_result.hpp>
++#include <boost/asio/compose.hpp>
++#include <boost/asio/error.hpp>
++#include <boost/asio/post.hpp>
++#include <boost/beast/core/buffers_range.hpp>
++#include <boost/beast/core/role.hpp>
++#include <boost/beast/core/tcp_stream.hpp>
++
++#include <openssl/err.h>
++#include <openssl/ssl.h>
++
++#include <boost/asio/buffer.hpp>
++
++#include <climits>
++#include <vector>
++#include <utility>
++
++/**
++ * An asio AsyncStream (for Beast HTTP and WebSocket) over an OpenSSL session
++ * bound directly to the TCP socket with SSL_set_fd, instead of asio's
++ * ssl::stream (which keeps TLS state in its own memory BIOs). Owning the
++ * SSL* this way lets the HTTP server hand an upgraded /p2p/ws connection,
++ * TLS session and all, to CConnman (see ReleaseSsl()).
++ *
++ * SSL_ERROR_WANT_READ/WANT_WRITE wait for socket readiness with
++ * async_wait. Operations that complete immediately are re-posted, never
++ * completed inline.
++ */
++class OsslStream {
++public:
++    using next_layer_type = boost::beast::tcp_stream;
++    using executor_type = next_layer_type::executor_type;
++
++    OsslStream(next_layer_type &next, tls::SslPtr ssl)
++        : m_next{next}, m_ssl{std::move(ssl)} {}
++
++    executor_type get_executor() { return m_next.get_executor(); }
++    next_layer_type &next_layer() { return m_next; }
++    const next_layer_type &next_layer() const { return m_next; }
++    SSL *native_handle() const { return m_ssl.get(); }
++
++    /** Give up the session (with the stream no longer used) */
++    tls::SslPtr ReleaseSsl() { return std::move(m_ssl); }
++
++    template <typename MutableBuffers, typename Token>
++    auto async_read_some(const MutableBuffers &buffers, Token &&token) {
++        // Reading into no buffer space succeeds with 0 bytes.
++        const bool empty{boost::asio::buffer_size(buffers) == 0};
++        return Run<std::size_t>(
++            [this, buffers]() {
++                for (const auto &b : boost::beast::buffers_range_ref(buffers)) {
++                    if (b.size() > 0) {
++                        return SSL_read(m_ssl.get(), b.data(),
++                                        int(std::min<std::size_t>(b.size(),
++                                                                  INT_MAX)));
++                    }
++                }
++                return 0;
++            },
++            std::forward<Token>(token), /*zero_is_eof=*/true, empty);
++    }
++
++    template <typename ConstBuffers, typename Token>
++    auto async_write_some(const ConstBuffers &buffers, Token &&token) {
++        const bool empty{boost::asio::buffer_size(buffers) == 0};
++        return Run<std::size_t>(
++            [this, buffers]() { return WriteGathered(buffers); },
++            std::forward<Token>(token), /*zero_is_eof=*/false, empty);
++    }
++
++    /**
++     * Non-blocking synchronous write (Beast SyncWriteStream): what fits now,
++     * or error::would_block. Lets callers skip the scheduler when the socket
++     * has room, as on plain TCP.
++     */
++    template <typename ConstBuffers>
++    std::size_t write_some(const ConstBuffers &buffers) {
++        boost::system::error_code ec;
++        const std::size_t n{write_some(buffers, ec)};
++        if (ec) {
++            throw boost::system::system_error{ec};
++        }
++        return n;
++    }
++
++    template <typename ConstBuffers>
++    std::size_t write_some(const ConstBuffers &buffers,
++                           boost::system::error_code &ec) {
++        ec = {};
++        if (boost::asio::buffer_size(buffers) == 0) {
++            return 0;
++        }
++        ERR_clear_error();
++        const int n{WriteGathered(buffers)};
++        if (n > 0) {
++            return std::size_t(n);
++        }
++        const int err{SSL_get_error(m_ssl.get(), n)};
++        ec = err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE
++                 ? make_error_code(boost::asio::error::would_block)
++                 : make_error_code(boost::asio::error::connection_reset);
++        return 0;
++    }
++
++    /** Server-side TLS handshake */
++    template <typename Token> auto async_handshake(Token &&token) {
++        SSL_set_accept_state(m_ssl.get());
++        return Run<int>([this]() { return SSL_do_handshake(m_ssl.get()); },
++                        std::forward<Token>(token), /*zero_is_eof=*/false);
++    }
++
++    /** Send close_notify once (not waiting for the peer's) */
++    void shutdown(boost::system::error_code &ec) {
++        ec = {};
++        if (m_ssl) {
++            ERR_clear_error();
++            (void)SSL_shutdown(m_ssl.get());
++        }
++    }
++
++private:
++    //! Largest write coalesced into one TLS record batch
++    static constexpr std::size_t MAX_GATHER = 64 * 1024;
++
++    /**
++     * SSL_write the start of `buffers`, coalescing a multi-buffer sequence
++     * (e.g. HTTP header + body) so it becomes one TLS record and syscall.
++     * A write OpenSSL asked to retry is retried with exactly the same length.
++     */
++    template <typename ConstBuffers>
++    int WriteGathered(const ConstBuffers &buffers) {
++        const std::size_t total{boost::asio::buffer_size(buffers)};
++        std::size_t len{std::min<std::size_t>(total, INT_MAX)};
++        const auto first{*boost::asio::buffer_sequence_begin(buffers)};
++        const void *data{first.data()};
++        if (first.size() < len) {
++            // More than one buffer: gather (bounded) into one write.
++            len = std::min(len, MAX_GATHER);
++            if (m_retry_len != 0) {
++                len = m_retry_len;
++            }
++            m_gather.resize(len);
++            boost::asio::buffer_copy(boost::asio::buffer(m_gather), buffers);
++            data = m_gather.data();
++        } else if (m_retry_len != 0) {
++            len = m_retry_len;
++        }
++        const int n{SSL_write(m_ssl.get(), data, int(len))};
++        if (n > 0) {
++            m_retry_len = 0;
++        } else {
++            const int err{SSL_get_error(m_ssl.get(), n)};
++            m_retry_len = (err == SSL_ERROR_WANT_READ ||
++                           err == SSL_ERROR_WANT_WRITE)
++                              ? len
++                              : 0;
++        }
++        return n;
++    }
++
++    /**
++     * Run `attempt` (an OpenSSL call returning >0 on success) until it
++     * succeeds or fails, waiting for socket readiness as OpenSSL asks.
++     * Completion signature: void(error_code, Result).
++     */
++    template <typename Result, typename Attempt, typename Token>
++    auto Run(Attempt attempt, Token &&token, bool zero_is_eof,
++             bool empty = false) {
++        enum class State { START, WAITED, DONE };
++        return boost::asio::async_compose<Token, void(boost::system::error_code,
++                                                      Result)>(
++            [this, attempt, zero_is_eof, empty, state = State::START,
++             result_ec = boost::system::error_code{}, result = Result{}](
++                auto &self, boost::system::error_code ec = {}) mutable {
++                if (state == State::DONE) {
++                    return self.complete(result_ec, result);
++                }
++                if (state == State::WAITED && ec) {
++                    return self.complete(ec, Result{});
++                }
++                const bool initiating{state == State::START};
++                if (!m_ssl) {
++                    result_ec = boost::asio::error::bad_descriptor;
++                    state = State::DONE;
++                    boost::asio::post(m_next.get_executor(), std::move(self));
++                    return;
++                }
++                ERR_clear_error();
++                const int n{empty ? 0 : attempt()};
++                if (empty) {
++                    result = Result{};
++                } else if (n > 0) {
++                    result = Result(n);
++                } else {
++                    const int err{SSL_get_error(m_ssl.get(), n)};
++                    if (err == SSL_ERROR_WANT_READ ||
++                        err == SSL_ERROR_WANT_WRITE) {
++                        state = State::WAITED;
++                        m_next.socket().async_wait(
++                            err == SSL_ERROR_WANT_READ
++                                ? boost::asio::socket_base::wait_read
++                                : boost::asio::socket_base::wait_write,
++                            std::move(self));
++                        return;
++                    }
++                    if (err == SSL_ERROR_ZERO_RETURN ||
++                        (zero_is_eof && err == SSL_ERROR_SYSCALL && n == 0)) {
++                        result_ec = boost::asio::error::eof;
++                    } else {
++                        result_ec = boost::asio::error::connection_reset;
++                    }
++                }
++                if (!initiating) {
++                    // Resumed by async_wait: already on a fresh stack.
++                    return self.complete(result_ec, result);
++                }
++                // Never complete inline from the initiating call.
++                state = State::DONE;
++                boost::asio::post(m_next.get_executor(), std::move(self));
++            },
++            token, m_next);
++    }
++
++    next_layer_type &m_next;
++    tls::SslPtr m_ssl;
++    std::vector<unsigned char> m_gather;
++    //! Length of a write OpenSSL must see again (0: none pending)
++    std::size_t m_retry_len{0};
++};
++
++/** Beast WebSocket teardown for OsslStream: close_notify, then TCP */
++inline void teardown(boost::beast::role_type, OsslStream &stream,
++                     boost::system::error_code &ec) {
++    stream.shutdown(ec);
++    stream.next_layer().socket().shutdown(
++        boost::asio::ip::tcp::socket::shutdown_both, ec);
++    ec = {};
++}
++
++template <typename TeardownHandler>
++void async_teardown(boost::beast::role_type role, OsslStream &stream,
++                    TeardownHandler &&handler) {
++    boost::system::error_code ec;
++    teardown(role, stream, ec);
++    boost::asio::post(stream.get_executor(),
++                      [h = std::forward<TeardownHandler>(handler),
++                       ec]() mutable { h(ec); });
++}
++
++#endif // BITCOIN_HTTP_TLS_STREAM_H
+diff --git a/src/httpserver.cpp b/src/httpserver.cpp
+index db2064d03cd557f530423f890fe2aec769a71f16..07279f7fa8501dcd2344e689ffbb514b537ba93e 100644
+--- a/src/httpserver.cpp
++++ b/src/httpserver.cpp
+@@ -19,6 +19,7 @@
+ #include <rpc/protocol.h> // For HTTP status codes
+ #include <shutdown.h>
+ #include <sync.h>
++#include <http_tls_stream.h>
+ #include <tls_util.h>
+ #include <util/check.h>
+ #include <util/fs.h>
+@@ -40,15 +41,12 @@
+ #include <boost/asio/ip/tcp.hpp>
+ #include <boost/asio/ip/v6_only.hpp>
+ #include <boost/asio/post.hpp>
+-#include <boost/asio/ssl.hpp>
+ #include <boost/asio/steady_timer.hpp>
+ #include <boost/asio/strand.hpp>
+ #include <boost/asio/use_awaitable.hpp>
+ #include <boost/beast/core.hpp>
+ #include <boost/beast/http.hpp>
+-#include <boost/beast/ssl.hpp>
+ #include <boost/beast/websocket.hpp>
+-#include <boost/beast/websocket/ssl.hpp>
+ 
+ #include <openssl/bn.h>
+ #include <openssl/evp.h>
+@@ -90,7 +88,6 @@
+ namespace beast = boost::beast;
+ namespace http = beast::http;
+ namespace asio = boost::asio;
+-namespace ssl = asio::ssl;
+ namespace websocket = beast::websocket;
+ using tcp = asio::ip::tcp;
+ using namespace boost::asio::experimental::awaitable_operators;
+@@ -310,7 +307,7 @@ struct HTTPListener {
+ };
+ static std::vector<HTTPListener> g_acceptors;
+ //! TLS context for connections detected as TLS, if TLS is enabled
+-static std::unique_ptr<ssl::context> g_ssl_ctx;
++static tls::SslCtxPtr g_ssl_ctx;
+ //! The configuration handlers are invoked with
+ static Config *g_config{nullptr};
+ //! Maximum accepted request body size
+@@ -687,8 +684,8 @@ DispatchRequest(BeastRequest &&beast_req, const HTTPConnectionInfo &conn) {
+ }
+ 
+ /**
+- * Write a response. On plain TCP, first write directly while the socket
+- * accepts data: a reply that fits in the socket buffer (most of them) then
++ * Write a response. On plain TCP and TLS, first write directly while the
++ * socket accepts data: a reply that fits in the socket buffer (most of them) then
+  * costs one writev and no trip through the I/O scheduler. Whatever does not
+  * fit is written asynchronously, continuing the same serializer.
+  */
+@@ -696,12 +693,19 @@ template <typename Stream>
+ static asio::awaitable<boost::system::error_code>
+ WriteResponse(Stream &stream, BeastResponse &res) {
+     http::serializer<false, http::string_body> sr{res};
+-    if constexpr (std::is_same_v<Stream, beast::tcp_stream>) {
+-        auto &socket{stream.socket()};
++    if constexpr (std::is_same_v<Stream, beast::tcp_stream> ||
++                  std::is_same_v<Stream, OsslStream>) {
+         boost::system::error_code ec;
+-        socket.non_blocking(true, ec);
+-        while (!ec && !sr.is_done()) {
+-            http::write_some(socket, sr, ec);
++        const auto try_write = [&](auto &sync_stream) {
++            while (!ec && !sr.is_done()) {
++                http::write_some(sync_stream, sr, ec);
++            }
++        };
++        if constexpr (std::is_same_v<Stream, beast::tcp_stream>) {
++            stream.socket().non_blocking(true, ec);
++            try_write(stream.socket());
++        } else {
++            try_write(stream);
+         }
+         if (ec != asio::error::would_block) {
+             co_return ec;
+@@ -1112,8 +1116,7 @@ static asio::awaitable<void> ServeHTTP(Stream &stream,
+             if (hdr_ec == http::error::end_of_stream ||
+                 hdr_ec == asio::error::eof || hdr_ec == beast::error::timeout ||
+                 hdr_ec == asio::error::operation_aborted ||
+-                hdr_ec == asio::error::connection_reset ||
+-                hdr_ec == ssl::error::stream_truncated) {
++                hdr_ec == asio::error::connection_reset) {
+                 co_return;
+             }
+             // Malformed or oversized request line/headers (libevent also
+@@ -1238,37 +1241,58 @@ static asio::awaitable<void> HandleConnection(tcp::socket socket,
+     try {
+         beast::tcp_stream stream{std::move(socket)};
+         beast::flat_buffer buffer;
+-        stream.expires_after(g_server_timeout);
+-        auto [detect_ec, is_tls] = co_await beast::async_detect_ssl(
+-            stream, buffer, asio::as_tuple(asio::use_awaitable));
+-        if (detect_ec) {
+-            // Client went away before sending anything.
+-        } else if (!is_tls) {
++        auto &sock{stream.socket()};
++        boost::system::error_code ec;
++        sock.non_blocking(true, ec);
++
++        // Until the TLS handshake (if any) is done, a deadline shuts the
++        // socket down, which completes any pending wait with an error.
++        asio::steady_timer deadline{sock.get_executor(), g_server_timeout};
++        deadline.async_wait([fd = sock.native_handle()](
++                                const boost::system::error_code &wec) {
++            if (!wec) {
++                ::shutdown(fd, SHUT_RDWR);
++            }
++        });
++
++        // Classify the connection by its first byte, without consuming it:
++        // 0x16 starts a TLS handshake record.
++        auto [wait_ec] = co_await sock.async_wait(
++            tcp::socket::wait_read, asio::as_tuple(asio::use_awaitable));
++        uint8_t first{0};
++        const ssize_t peeked{
++            wait_ec ? -1
++                    : ::recv(sock.native_handle(),
++                             reinterpret_cast<char *>(&first), 1, MSG_PEEK)};
++        if (peeked <= 0) {
++            // Client went away (or timed out) before sending anything.
++        } else if (first != 0x16) {
++            deadline.cancel();
+             co_await ServeHTTP(stream, buffer, conn);
+-            boost::system::error_code ec;
+-            stream.socket().shutdown(tcp::socket::shutdown_send, ec);
++            sock.shutdown(tcp::socket::shutdown_send, ec);
+         } else if (!g_ssl_ctx) {
+             LogDebug(BCLog::HTTP,
+                      "TLS connection from %s rejected: TLS is disabled\n",
+                      conn.peer.ToStringAddrPort());
+         } else {
+-            beast::ssl_stream<beast::tcp_stream> tls_stream{std::move(stream),
+-                                                            *g_ssl_ctx};
+-            auto [hs_ec, used] = co_await tls_stream.async_handshake(
+-                ssl::stream_base::server, buffer.data(),
+-                asio::as_tuple(asio::use_awaitable));
+-            if (hs_ec) {
+-                LogDebug(BCLog::HTTP, "TLS handshake with %s failed: %s\n",
+-                         conn.peer.ToStringAddrPort(), hs_ec.message());
+-            } else {
+-                buffer.consume(used);
+-                conn.is_tls = true;
+-                conn.client_cert_fingerprint_hex =
+-                    ClientCertFingerprint(tls_stream.native_handle());
+-                co_await ServeHTTP(tls_stream, buffer, conn);
+-                tls_stream.next_layer().expires_after(std::chrono::seconds{5});
+-                co_await tls_stream.async_shutdown(
++            tls::SslPtr ssl{SSL_new(g_ssl_ctx.get())};
++            if (ssl && SSL_set_fd(ssl.get(), int(sock.native_handle())) == 1) {
++                OsslStream tls_stream{stream, std::move(ssl)};
++                auto [hs_ec, hs] = co_await tls_stream.async_handshake(
+                     asio::as_tuple(asio::use_awaitable));
++                deadline.cancel();
++                if (hs_ec) {
++                    LogDebug(BCLog::HTTP,
++                             "TLS handshake with %s failed: %s\n",
++                             conn.peer.ToStringAddrPort(), tls::ErrorString());
++                } else {
++                    conn.is_tls = true;
++                    conn.client_cert_fingerprint_hex =
++                        ClientCertFingerprint(tls_stream.native_handle());
++                    co_await ServeHTTP(tls_stream, buffer, conn);
++                    tls_stream.shutdown(ec);
++                    sock.shutdown(tcp::socket::shutdown_send, ec);
++                }
+             }
+         }
+     } catch (const std::exception &e) {
+@@ -1479,27 +1503,18 @@ static bool InitTLS() {
+         return true;
+     }
+ 
+-    auto ctx{std::make_unique<ssl::context>(ssl::context::tls_server)};
+-    try {
+-        ctx->set_options(ssl::context::default_workarounds |
+-                         ssl::context::no_sslv2 | ssl::context::no_sslv3 |
+-                         ssl::context::no_tlsv1 | ssl::context::no_tlsv1_1 |
+-                         ssl::context::single_dh_use);
+-        ctx->use_certificate_chain_file(fs::PathToString(cert_path));
+-        ctx->use_private_key_file(fs::PathToString(key_path),
+-                                  ssl::context::pem);
+-    } catch (const boost::system::system_error &e) {
++    auto ctx{tls::NewContext(/*server=*/true)};
++    if (!ctx || !tls::UseCertificateFiles(ctx.get(), cert_path, key_path)) {
+         LogPrintf("Error: unable to load TLS certificate %s / key %s: %s\n",
+                   fs::PathToString(cert_path), fs::PathToString(key_path),
+-                  e.what());
++                  tls::ErrorString());
+         return false;
+     }
+     if (gArgs.GetBoolArg("-tlsmutual", DEFAULT_HTTP_TLS_MUTUAL)) {
+         // Ask for a client certificate, accept any (including self-signed
+         // node certificates); the fingerprint is exposed per request.
+-        ctx->set_verify_mode(ssl::verify_peer);
+-        ctx->set_verify_callback(
+-            [](bool, ssl::verify_context &) { return true; });
++        SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_PEER,
++                           [](int, X509_STORE_CTX *) { return 1; });
+     }
+     g_ssl_ctx = std::move(ctx);
+     LogPrintf("TLS enabled on the RPC port using %s\n",
+diff --git a/src/test/httpserver_tests.cpp b/src/test/httpserver_tests.cpp
+index 3cbf1c87245d65990f94b173769973d4cd6fa2fb..b10ec538b63df959b2ddf9cc49da2b537f76cb5c 100644
+--- a/src/test/httpserver_tests.cpp
++++ b/src/test/httpserver_tests.cpp
+@@ -2,15 +2,31 @@
+ // Distributed under the MIT software license, see the accompanying
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
++#include <http_tls_stream.h>
+ #include <httpserver.h>
++#include <tls_util.h>
+ #include <test/util/setup_common.h>
+ 
+ #include <netaddress.h>
+ 
+ #include <boost/test/unit_test.hpp>
+ 
++#include <boost/asio/as_tuple.hpp>
++#include <boost/asio/co_spawn.hpp>
++#include <boost/asio/detached.hpp>
++#include <boost/asio/io_context.hpp>
++#include <boost/asio/ip/tcp.hpp>
++#include <boost/asio/use_awaitable.hpp>
++#include <boost/asio/use_future.hpp>
++#include <boost/beast/core/buffers_suffix.hpp>
++
++#include <array>
++
++#include <openssl/ssl.h>
+ #include <zstd.h>
+ 
++#include <thread>
++
+ BOOST_FIXTURE_TEST_SUITE(httpserver_tests, BasicTestingSetup)
+ 
+ BOOST_AUTO_TEST_CASE(test_query_parameters) {
+@@ -120,4 +136,109 @@ BOOST_AUTO_TEST_CASE(test_zstd_request_body) {
+     BOOST_REQUIRE(bad);
+     BOOST_CHECK_EQUAL(bad->ReadBody(), "");
+ }
++BOOST_AUTO_TEST_CASE(ossl_stream_reads_gathers_and_retries) {
++    namespace asio = boost::asio;
++    using tcp = asio::ip::tcp;
++    const auto pem{tls::GenerateSelfSigned("t", {"localhost"}, {},
++                                           std::chrono::hours{1})};
++    BOOST_REQUIRE(pem);
++    auto server_ctx{tls::NewContext(/*server=*/true)};
++    auto client_ctx{tls::NewContext(/*server=*/false)};
++    BOOST_REQUIRE(
++        tls::UseCertificatePem(server_ctx.get(), pem->cert_pem, pem->key_pem));
++
++    asio::io_context io;
++    tcp::acceptor acceptor{io, {asio::ip::make_address("127.0.0.1"), 0}};
++    tcp::socket client{io};
++    client.connect(acceptor.local_endpoint());
++    boost::beast::tcp_stream server{acceptor.accept()};
++    server.socket().non_blocking(true);
++    // Small kernel buffers so writes fill them quickly.
++    server.socket().set_option(asio::socket_base::send_buffer_size(16384));
++
++    // Blocking OpenSSL client on its own thread.
++    tls::SslPtr cssl{SSL_new(client_ctx.get())};
++    SSL_set_fd(cssl.get(), int(client.native_handle()));
++    std::string received;
++    const std::string request(100, 'q');
++    const size_t expected{3 * 1024 * 1024 + 11};
++    std::thread client_thread{[&] {
++        BOOST_REQUIRE_EQUAL(SSL_connect(cssl.get()), 1);
++        BOOST_REQUIRE_EQUAL(SSL_write(cssl.get(), request.data(), 100), 100);
++        char buf[65536];
++        while (received.size() < expected) {
++            const int n{SSL_read(cssl.get(), buf, sizeof(buf))};
++            BOOST_REQUIRE(n > 0);
++            received.append(buf, n);
++        }
++        // The server's close_notify reads as an orderly end.
++        BOOST_CHECK_LE(SSL_read(cssl.get(), buf, sizeof(buf)), 0);
++        BOOST_CHECK_EQUAL(SSL_get_error(cssl.get(), 0), SSL_ERROR_ZERO_RETURN);
++    }};
++
++    tls::SslPtr sssl{SSL_new(server_ctx.get())};
++    SSL_set_fd(sssl.get(), int(server.socket().native_handle()));
++    OsslStream stream{server, std::move(sssl)};
++    const std::string head{"head:"}, body(3 * 1024 * 1024 + 6, 'b');
++    auto result{asio::co_spawn(
++        io,
++        [&]() -> asio::awaitable<bool> {
++            auto [hec, h] = co_await stream.async_handshake(
++                asio::as_tuple(asio::use_awaitable));
++            if (hec) {
++                co_return false;
++            }
++            std::string got(100, '\0');
++            size_t off{0};
++            while (off < got.size()) {
++                auto [ec, n] = co_await stream.async_read_some(
++                    asio::buffer(got.data() + off, got.size() - off),
++                    asio::as_tuple(asio::use_awaitable));
++                if (ec) {
++                    co_return false;
++                }
++                off += n;
++            }
++            if (got != request) {
++                co_return false;
++            }
++            // Non-blocking writes of a two-buffer sequence until the socket
++            // is full; the rest asynchronously from the same position
++            // (which must repeat the exact retried length).
++            const std::array<asio::const_buffer, 2> seq{asio::buffer(head),
++                                                        asio::buffer(body)};
++            size_t sent{0};
++            bool blocked{false};
++            const size_t total{head.size() + body.size()};
++            while (sent < total) {
++                auto rest{boost::beast::buffers_suffix<decltype(seq)>{seq}};
++                rest.consume(sent);
++                boost::system::error_code ec;
++                const size_t n{stream.write_some(rest, ec)};
++                if (ec == asio::error::would_block) {
++                    blocked = true;
++                    auto [aec, an] = co_await stream.async_write_some(
++                        rest, asio::as_tuple(asio::use_awaitable));
++                    if (aec) {
++                        co_return false;
++                    }
++                    sent += an;
++                } else if (ec) {
++                    co_return false;
++                } else {
++                    sent += n;
++                }
++            }
++            boost::system::error_code ec;
++            stream.shutdown(ec);
++            co_return blocked;
++        },
++        asio::use_future)};
++    io.run();
++    client_thread.join();
++    BOOST_CHECK(result.get());
++    BOOST_CHECK_EQUAL(received.size(), expected);
++    BOOST_CHECK(received == head + body);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()

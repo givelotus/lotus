@@ -1,0 +1,215 @@
+From 14f6325e97ce601fba14c515fe1b9aa68d326d88 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@gmail.com>
+Date: Mon, 19 Oct 2026 20:59:14 -0700
+Subject: [PATCH] rpc: verify synchronous broadcast scripts outside the chain
+ lock
+
+Concurrent sendrawtransaction clients previously serialized script checks
+under cs_main even when peer admission used unlocked verification.
+
+For synchronous broadcasts with -parallelmempool enabled, resolve inputs
+with the same deferred PreChecks used by staged peer admission, copy the
+spent outputs, release the locks and verify scripts on the calling RPC
+thread. Advisory cache entries are uncached before unlocking. The original
+locked BroadcastTransaction critical section still checks chain/mempool
+presence, admits with current policy and fee bounds, marks unbroadcast
+transactions and fences validation-interface callbacks before returning.
+Only matching spent outputs, transaction ID and flags reuse script results.
+
+Synchronous callers already promise they hold no chain/mempool/wallet
+locks. Asynchronous callers retain their existing lock contract and
+ordinary admission. -parallelmempool=0 selects the original serial path;
+-parallelmempoolthreads controls P2P workers, while independent RPC request
+threads do their own script work. Update option help to explain both paths.
+
+Validation: assembled Chronik-enabled Release daemon/test/benchmark build
+and 62 directly related native cases pass, including spent-output/flag
+mismatch, cheap reject gating and validation-interface callback fencing.
+Focused functional and RPC flood results are recorded in the delivery
+README; full functional coverage and Linux validation remain separate.
+
+How to reproduce:
+    CARGO_BUILD_JOBS=2 ninja -C build -j2 bitcoind test_bitcoin
+    build/src/test/test_bitcoin \
+        --run_test=mempool_admission_tests,validationinterface_tests
+    contrib/bench/mempool-admission/ab.py \
+        --bitcoind new=build/src/bitcoind \
+        --config serial=new:-parallelmempool=0 \
+        --config parallel=new:-parallelmempool=1 \
+        --fixture FX --workdir AB-RPC --mode rpc --peers 8 --rounds 5
+The driver prints medians/min-max for complete floods and retains failed
+attempts, exact transaction coverage, node/fixture/tool hashes and settings.
+---
+ src/init.cpp                         | 16 +++++++-------
+ src/node/transaction.cpp             | 17 +++++++++++++--
+ src/test/mempool_admission_tests.cpp |  9 +++++++-
+ src/validation.cpp                   | 31 ++++++++++++++++++++++++++++
+ src/validation.h                     |  9 ++++++++
+ 5 files changed, 72 insertions(+), 10 deletions(-)
+
+diff --git a/src/init.cpp b/src/init.cpp
+index 22fc71f3e9faa5790ca24f5ac986c8b156ab6c3d..84d139f490a30a47e0da5303c816bd0c87313596 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -780,17 +780,19 @@ void SetupServerArgs(NodeContext &node) {
+         "-parallelmempool",
+         strprintf("Admit transactions received from peers on a separate "
+                   "thread, verifying their scripts on several threads "
+-                  "without holding the chain lock; 0 admits them on the "
+-                  "message handler thread (default: %u)",
++                  "without holding the chain lock. Synchronous RPC "
++                  "broadcasts also verify scripts outside that lock; 0 "
++                  "selects locked serial admission (default: %u)",
+                   node::DEFAULT_PARALLEL_MEMPOOL),
+         ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+     argsman.AddArg(
+         "-parallelmempoolthreads=<n>",
+-        strprintf("Threads verifying transaction scripts for -parallelmempool, "
+-                  "including the admission thread (0 = one per core, up to "
+-                  "%d; default: %d)",
+-                  node::MAX_PARALLEL_MEMPOOL_THREADS,
+-                  node::DEFAULT_PARALLEL_MEMPOOL_THREADS),
++        strprintf(
++            "P2P threads verifying transaction scripts for -parallelmempool, "
++            "including the admission thread (0 = one per core, up to "
++            "%d; default: %d)",
++            node::MAX_PARALLEL_MEMPOOL_THREADS,
++            node::DEFAULT_PARALLEL_MEMPOOL_THREADS),
+         ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+     argsman.AddArg("-mempoolexpiry=<n>",
+                    strprintf("Do not keep transactions in the mempool longer "
+diff --git a/src/node/transaction.cpp b/src/node/transaction.cpp
+index 65d0370b16aeab17a13c762e0b85a6c53d7045af..52ca239c2a362f670bbb7819a4e1d50f301cac25 100644
+--- a/src/node/transaction.cpp
++++ b/src/node/transaction.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <node/transaction.h>
+ 
++#include <common/args.h>
+ #include <config.h>
+ #include <consensus/validation.h>
+ #include <index/txindex.h>
+@@ -12,6 +13,7 @@
+ #include <net_processing.h>
+ #include <node/blockstorage.h>
+ #include <node/context.h>
++#include <node/txadmission.h>
+ #include <node/types.h>
+ #include <primitives/blockhash.h>
+ #include <primitives/txid.h>
+@@ -51,6 +53,16 @@ TransactionError BroadcastTransaction(const NodeContext &node,
+     std::promise<void> promise;
+     TxId txid = tx->GetId();
+     bool callback_set = false;
++    const MempoolAdmissionLimits limits{max_tx_fee, rpc_fee_hysteresis};
++    std::optional<PrecomputedAdmissionChecks> precomputed;
++    if (wait_callback && node.args &&
++        node.args->GetBoolArg("-parallelmempool", DEFAULT_PARALLEL_MEMPOOL)) {
++        // Synchronous callers guarantee they hold no chain/mempool/wallet
++        // locks. RPC clients can therefore verify concurrently. The existing
++        // critical section below decides every verdict,
++        // fee bound, broadcast marker and notification in the same order.
++        precomputed = PrecomputeMempoolAdmission(*node.chainman, tx, limits);
++    }
+ 
+     {
+         LOCK(cs_main);
+@@ -71,9 +83,10 @@ TransactionError BroadcastTransaction(const NodeContext &node,
+         if (!node.mempool->exists(txid)) {
+             // Transaction is not already in the mempool.
+             // Validate caller fee bounds before insertion in this one ATMP pass.
+-            const MempoolAdmissionLimits limits{max_tx_fee, rpc_fee_hysteresis};
+             const MempoolAcceptResult result =
+-                node.chainman->ProcessTransaction(tx, /*test_accept=*/false, limits);
++                node.chainman->ProcessTransaction(
++                    tx, /*test_accept=*/false, limits,
++                    precomputed ? &*precomputed : nullptr);
+             if (result.m_result_type !=
+                 MempoolAcceptResult::ResultType::VALID) {
+                 if (result.m_state.GetRejectReason() == "max-fee-exceeded") {
+diff --git a/src/test/mempool_admission_tests.cpp b/src/test/mempool_admission_tests.cpp
+index 8374594473e83f69316ed2770e8d0a4aca5dde50..1397aae8fcc19a2f9a51f0dea572ed98cca51d76 100644
+--- a/src/test/mempool_admission_tests.cpp
++++ b/src/test/mempool_admission_tests.cpp
+@@ -374,7 +374,14 @@ BOOST_AUTO_TEST_CASE(staged_cheap_rejects_do_not_run_unlocked_scripts) {
+         BOOST_CHECK_EQUAL(stats.precomputed, 0U);
+         CheckSameResult(serial, *staged[0]);
+     }
+-
++    const auto tx = SignedSpend(wallet, {wallet.outputs[2]}, 1, true);
++    MempoolAdmissionLimits limits;
++    limits.max_fee = 1 * SATOSHI;
++    const auto checks =
++        PrecomputeMempoolAdmission(*m_node.chainman, tx, limits);
++    BOOST_CHECK(!checks.standard.ran);
++    // Advisory work cannot insert or skip the caller's authoritative fee check.
++    BOOST_CHECK(!m_node.mempool->exists(tx->GetId()));
+ }
+ 
+ BOOST_AUTO_TEST_CASE(staged_double_spend_race_first_in_order_wins) {
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 0529dfe4b3a245f463307fd62f1759f29b932252..3de4c0901866d544e0505e2b0a19d6966f554a15 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -2735,6 +2735,37 @@ MemPoolAccept::PrepareStaged(const std::vector<CTransactionRef> &txs,
+     return verify;
+ }
+ 
++PrecomputedAdmissionChecks
++PrecomputeMempoolAdmission(ChainstateManager &chainman,
++                           const CTransactionRef &tx,
++                           const MempoolAdmissionLimits &limits) {
++    AssertLockNotHeld(cs_main);
++    std::vector<PrecomputedAdmissionChecks> checks(1);
++    std::vector<std::vector<COutPoint>> fetched(1);
++    bool verify = false;
++    uint32_t flags = 0;
++    {
++        LOCK(cs_main);
++        auto &chainstate = chainman.ActiveChainstate();
++        if (auto *pool = chainstate.GetMempool()) {
++            flags = GetMempoolScriptFlags(chainstate);
++            verify =
++                MemPoolAccept(*pool, chainstate)
++                    .PrepareStaged({tx}, checks, fetched, flags, limits)[0];
++            // No admission owns these cache entries yet. Retain only copied
++            // outputs across the unlocked phase, including for invalid work.
++            for (const auto &outpoint : fetched[0]) {
++                chainstate.CoinsTip().Uncache(outpoint);
++            }
++        }
++    }
++    if (verify) {
++        ComputeAdmissionChecks(*tx, flags, chainman.m_validation_cache,
++                               checks[0]);
++    }
++    return std::move(checks[0]);
++}
++
+ std::vector<std::optional<MempoolAcceptResult>> AcceptToMemoryPoolStaged(
+     ChainstateManager &chainman, const std::vector<CTransactionRef> &txs,
+     const StagedAdmissionOptions &options, StagedAdmissionStats *stats) {
+diff --git a/src/validation.h b/src/validation.h
+index 1bbd7e551e4bfc441c70a582979af9b93948c25f..7832589987f94d3d1c5663bcc6cf5a50a070300b 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -495,6 +495,15 @@ struct StagedAdmissionOptions {
+     std::function<void()> test_between_phases;
+ };
+ 
++/**
++ * Snapshot and verify one transaction for a caller that will admit it later
++ * under cs_main. Cheap checks are advisory; admission repeats them and only
++ * reuses scripts when spent outputs and flags still match. No insertion.
++ */
++PrecomputedAdmissionChecks PrecomputeMempoolAdmission(
++    ChainstateManager &chainman, const CTransactionRef &tx,
++    const MempoolAdmissionLimits &limits) LOCKS_EXCLUDED(cs_main);
++
+ /** Where one AcceptToMemoryPoolStaged call spent its time. */
+ struct StagedAdmissionStats {
+     /** Transactions whose checks ran in the unlocked phase. */
+-- 
+2.50.1 (Apple Git-155)
+

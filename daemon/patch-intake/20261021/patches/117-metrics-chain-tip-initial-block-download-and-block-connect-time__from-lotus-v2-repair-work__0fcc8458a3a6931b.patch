@@ -1,0 +1,251 @@
+From e85b87f0972ae0039ec373e060c4249a6f77f174 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 02:01:14 -0700
+Subject: [PATCH] metrics: chain tip, initial block download and block connect
+ time
+
+The tip's height and block timestamp live under cs_main; they are
+mirrored into gauges where the tip changes (Chainstate::UpdateTip, for
+the active chainstate) and once at startup, with the lock already held,
+so scraping reads atomics only. The tip's age is computed when scraped
+(and is negative while the tip's timestamp is ahead of the clock, as
+with quickly mined regtest blocks). Initial block download is 1 until
+the existing IBD latch flips.
+
+ConnectBlock's duration goes to a histogram through the validating
+thread's event ring: one extra clock read, only when metrics are on.
+
+(cherry picked from commit d60614a59c1e2eec9d1cc5fa962800d6c6afd9b6)
+
+N3-Source-Commit: d60614a59c1e2eec9d1cc5fa962800d6c6afd9b6
+N3-Source-Export: 0009
+---
+ src/CMakeLists.txt                        |  2 ++
+ src/init.cpp                              |  7 ++++++
+ src/node/metrics.cpp                      | 30 +++++++++++++++++++++++
+ src/node/metrics.h                        | 15 ++++++++++++
+ src/validation.cpp                        |  9 +++++++
+ test/functional/interface_http_metrics.py | 25 +++++++++++++++++++
+ 6 files changed, 88 insertions(+)
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 1b2dd6da1daaa2909f7a0d5abea18c4a94493e0a..65c82d317edb25115bf0f6c5040dfde29f36af27 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -946,6 +946,8 @@ if(BUILD_CHAINSTATE)
+ 		util/syserror.cpp
+ 		util/threadinterrupt.cpp
+ 		util/threadnames.cpp
++		metrics/metrics.cpp
++		node/metrics.cpp
+ 		util/time.cpp
+ 		util/tokenpipe.cpp
+ 		validation.cpp
+diff --git a/src/init.cpp b/src/init.cpp
+index 9ca56f21287cea9e72f172958411a4a6600c3b04..2920fe14aae600cfdce034222ecb7ef22a31263f 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -3343,6 +3343,13 @@ bool AppInitMain(Config &config, RPCServer &rpcServer,
+         LOCK(cs_main);
+         LogPrintf("block tree size = %u\n", chainman.BlockIndex().size());
+         chain_active_height = chainman.ActiveChain().Height();
++        if (const CBlockIndex *tip{chainman.ActiveChain().Tip()}) {
++            node::SetTipMetrics(tip->nHeight, tip->GetBlockTime());
++        }
++        if (auto *metrics{node::GetNodeMetrics()}) {
++            metrics->initial_block_download.Set(
++                chainman.IsInitialBlockDownload() ? 1 : 0);
++        }
+         if (tip_info) {
+             tip_info->block_height = chain_active_height;
+             tip_info->block_time =
+diff --git a/src/node/metrics.cpp b/src/node/metrics.cpp
+index 6e1cb806c36d65c100424862c405e100afabc3d8..4065bd527d33e0eb39134f765f03fcd22daefa86 100644
+--- a/src/node/metrics.cpp
++++ b/src/node/metrics.cpp
+@@ -5,6 +5,7 @@
+ #include <node/metrics.h>
+ 
+ #include <protocol.h>
++#include <util/time.h>
+ 
+ #include <algorithm>
+ #include <array>
+@@ -64,6 +65,10 @@ namespace {
+     using metrics::LabelDim;
+     namespace L = metric_labels;
+ 
++    //! Seconds; from an empty regtest block (~0.2 ms) to a large one (minutes)
++    const std::vector<double> BLOCK_CONNECT_BUCKETS{
++        0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
++        0.1,    0.25,    0.5,    1,     2.5,    5,     10,   30,    60};
+     //! Seconds; HTTP and RPC requests (long polls can take minutes)
+     const std::vector<double> REQUEST_BUCKETS{
+         0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+@@ -125,6 +130,22 @@ NodeMetrics::NodeMetrics()
+           "Connected P2P WebSocket peers, by compression and TLS.",
+           std::vector<LabelDim>{{"compression", L::WebSocketCompressions()},
+                                 {"tls", {"false", "true"}}})},
++      tip_height{Add<Gauge>(registry, "lotus_chain_tip_height",
++                            "Height of the active chain tip.")},
++      tip_timestamp{
++          Add<Gauge>(registry, "lotus_chain_tip_timestamp_seconds",
++                     "Block timestamp of the active chain tip (Unix time).")},
++      tip_age{Add<Gauge>(registry, "lotus_chain_tip_age_seconds",
++                         "Seconds since the active chain tip's block "
++                         "timestamp, at scrape time.")},
++      initial_block_download{
++          Add<Gauge>(registry, "lotus_initial_block_download",
++                     "1 while in initial block download, else 0.")},
++      block_connect_seconds{Add<EventHistogram>(
++          registry, "lotus_block_connect_seconds",
++          "Time to connect a block to the chain tip (ConnectBlock: "
++          "validating it and updating the UTXO view).",
++          BLOCK_CONNECT_BUCKETS, /*divisor=*/1e9)},
+       http_requests{Add<Counter>(
+           registry, "lotus_http_requests_total",
+           "HTTP requests answered (not WebSocket sessions), by endpoint and "
+@@ -141,6 +162,15 @@ NodeMetrics::NodeMetrics()
+           Add<Counter>(registry, "lotus_http_tls_handshakes_total",
+                        "TLS handshakes on the HTTP listeners, by result.",
+                        std::vector<LabelDim>{{"result", {"ok", "failed"}}})} {
++    initial_block_download.Set(1);
++    registry.AddCollector([this] {
++        const double tip{tip_timestamp.Value()};
++        if (tip > 0) {
++            tip_age.Set(double(TicksSinceEpoch<std::chrono::seconds>(
++                            NodeClock::now())) -
++                        tip);
++        }
++    });
+ }
+ 
+ size_t NodeMetrics::PeerSeries(bool inbound, bool websocket,
+diff --git a/src/node/metrics.h b/src/node/metrics.h
+index e1fa89f78253ed10a65d1ab13de6a142e7e50fe9..97c89dbfe5d932234d10257dafd7755bc6dca668 100644
+--- a/src/node/metrics.h
++++ b/src/node/metrics.h
+@@ -66,6 +66,13 @@ struct NodeMetrics {
+     //! WebSocket peers, by compression x tls (0 = plain, 1 = TLS)
+     metrics::Gauge &websocket_peers;
+ 
++    // Chain
++    metrics::Gauge &tip_height;
++    metrics::Gauge &tip_timestamp;
++    metrics::Gauge &tip_age;
++    metrics::Gauge &initial_block_download;
++    metrics::EventHistogram &block_connect_seconds;
++
+     // HTTP and RPC
+     metrics::Counter &http_requests;
+     metrics::EventHistogram &http_request_seconds;
+@@ -97,6 +104,14 @@ void StopNodeMetrics();
+ /** Label index of a P2P message type ("other" for unknown types) */
+ size_t MetricMsgTypeIndex(std::string_view msg_type) noexcept;
+ 
++/** Set the chain tip gauges (call with cs_main held, where the tip changes) */
++inline void SetTipMetrics(int height, int64_t block_time) noexcept {
++    if (auto *m{GetNodeMetrics()}) {
++        m->tip_height.Set(double(height));
++        m->tip_timestamp.Set(double(block_time));
++    }
++}
++
+ } // namespace node
+ 
+ #endif // BITCOIN_NODE_METRICS_H
+diff --git a/src/validation.cpp b/src/validation.cpp
+index c8494e669a0d43328b3a3a5a3626d438a4c35977..232cfae9c24f12de4615e493dec90c1c4671b0ba 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -37,6 +37,7 @@
+ #include <lotus_v2/signing.h>
+ #include <minerfund.h>
+ #include <node/blockstorage.h>
++#include <node/metrics.h>
+ #include <node/snapshot.h>
+ #include <node/utxo_snapshot.h>
+ #include <policy/block/minerfund.h>
+@@ -2506,6 +2507,9 @@ bool ChainstateManager::IsInitialBlockDownload() const {
+     }
+     LogPrintf("Leaving InitialBlockDownload (latching to false)\n");
+     m_cached_finished_ibd.store(true, std::memory_order_relaxed);
++    if (auto *metrics{node::GetNodeMetrics()}) {
++        metrics->initial_block_download.Set(0);
++    }
+     return false;
+ }
+ 
+@@ -3995,6 +3999,7 @@ void Chainstate::UpdateTip(const CBlockIndex *pindexNew) {
+         g_best_block = pindexNew;
+         g_best_block_cv.notify_all();
+     }
++    node::SetTipMetrics(pindexNew->nHeight, pindexNew->GetBlockTime());
+ 
+     node::PublishChainTipSnapshot(m_chainman, m_mempool);
+ 
+@@ -4157,6 +4162,10 @@ bool Chainstate::ConnectTip(BlockValidationState &state,
+         bool rv = ConnectBlock(blockConnecting, state, pindexNew, view,
+                                BlockValidationOptions(m_chainman.GetConfig()),
+                                &blockFees);
++        if (auto *metrics{node::GetNodeMetrics()}; metrics && rv) {
++            metrics->block_connect_seconds.RecordDuration(SteadyClock::now() -
++                                                          time_2);
++        }
+         if (m_chainman.m_options.signals) {
+             m_chainman.m_options.signals->BlockChecked(blockConnecting, state);
+         }
+diff --git a/test/functional/interface_http_metrics.py b/test/functional/interface_http_metrics.py
+index 0788f434b7624e6ddbf0c3c3bc0b3575507c96f0..7502df28a096934949b01b716c0cb198807926ec 100755
+--- a/test/functional/interface_http_metrics.py
++++ b/test/functional/interface_http_metrics.py
+@@ -13,6 +13,7 @@ import time
+ 
+ from test_framework.test_framework import BitcoinTestFramework
+ from test_framework.util import assert_equal, p2p_port, rpc_port
++from test_framework.wallet import MiniWallet
+ 
+ PUBLIC_PORT_INDEX = 41
+ NAME = r"[a-zA-Z_:][a-zA-Z0-9_:]*"
+@@ -124,7 +125,12 @@ class HTTPMetricsTest(BitcoinTestFramework):
+         node = self.nodes[0]
+         self.log.info("The exposition is well formed")
+         samples = self.scrape()
++        # The genesis block was connected at startup.
++        connected = samples[("lotus_block_connect_seconds_count", ())]
++        assert_equal(connected, 1)
+         assert_equal(samples[("lotus_metrics_dropped_samples_total", ())], 0)
++        assert_equal(samples[("lotus_chain_tip_height", ())], 0)
++        assert_equal(samples[("lotus_initial_block_download", ())], 1)
+ 
+         self.log.info("Peers: node1 over WebSocket, node1 over TCP")
+         self.wait_until(
+@@ -151,6 +157,25 @@ class HTTPMetricsTest(BitcoinTestFramework):
+         assert self.total(samples, "lotus_p2p_sent_bytes_total") > 0
+         assert ("lotus_p2p_received_bytes_total", (("type", "other"),)) in samples
+ 
++        self.log.info("Chain and mempool values change")
++        wallet = MiniWallet(node)
++        self.generate(wallet, 101)
++        self.wait_until(
++            lambda: self.scrape()[("lotus_block_connect_seconds_count", ())]
++            == connected + 101
++        )
++        self.wait_until(
++            lambda: self.scrape()[("lotus_initial_block_download", ())] == 0
++        )
++        samples = self.scrape()
++        assert_equal(samples[("lotus_chain_tip_height", ())], 101)
++        tip_time = node.getblockheader(node.getbestblockhash())["time"]
++        assert_equal(samples[("lotus_chain_tip_timestamp_seconds", ())], tip_time)
++        # Computed at scrape time; negative if the tip's timestamp is ahead
++        # of the clock (quickly mined regtest blocks).
++        age = samples[("lotus_chain_tip_age_seconds", ())]
++        assert abs(age - (time.time() - tip_time)) < 30, age
++        assert samples[("lotus_block_connect_seconds_sum", ())] > 0
+ 
+         self.log.info("HTTP and RPC requests")
+         node.getblockcount()
+-- 
+2.50.1 (Apple Git-155)
+

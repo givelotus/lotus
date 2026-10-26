@@ -1,0 +1,134 @@
+From c1939423cd074b5cef339712100445529e2d3a42 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Wed, 14 Oct 2026 11:52:07 -0700
+Subject: [PATCH] miner: prioritize newly ready transactions by modified fee
+ rate
+
+BCHN already releases direct dependencies once and does not need the
+historical transitive-package algorithm. However, its FIFO backlog follows
+child entry order rather than fee priority. When several high-fee children
+are skipped before a common lower-fee parent, selecting that parent makes
+them ready together. Under constrained block capacity, the earlier-added
+lower-fee child can consume the space that the higher-fee sibling needs.
+
+Use a priority queue for the newly ready backlog, reusing BCHN's existing
+virtual-size modified-fee comparator and topological tie break. Keep the
+existing ordered mempool cursor, direct-parent counters, timeout, ABLA
+resource limits, finality checks, failure heuristic and no-CPFP policy.
+Correct the stale ancestor-feerate description.
+
+A native regression leaves one byte spare for the parent and one sibling.
+It fails two membership assertions on abd433abe and passes with this
+change. All existing miner tests also pass. A heap adds logarithmic queue
+work; this patch makes no performance speedup claim over current BCHN's
+already nonquadratic dependency traversal.
+
+Acceptance base: abd433abe04f74780744b9eac06731f3690ce68a
+---
+ src/miner.cpp            | 15 ++++++++----
+ src/test/miner_tests.cpp | 49 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 60 insertions(+), 4 deletions(-)
+
+diff --git a/src/miner.cpp b/src/miner.cpp
+index 190338d29..6d3877eef 100644
+--- a/src/miner.cpp
++++ b/src/miner.cpp
+@@ -41,8 +41,8 @@
+ 
+ // Unconfirmed transactions in the memory pool often depend on other
+ // transactions in the memory pool. When we select transactions from the
+-// pool, we select by highest fee rate of a transaction combined with all
+-// its ancestors.
++// pool, we select eligible transactions by their individual modified fee
++// rates. Parents must be selected before their children; this is not CPFP.
+ 
+ uint64_t nLastBlockTx = 0;
+ uint64_t nLastBlockSize = 0;
+@@ -363,7 +363,14 @@ void BlockAssembler::addTxs(int64_t nLimitTimePoint) {
+ 
+     // Transactions that may or may not have been skipped due to parent not
+     // being present in the block, but where a parent has now been added.
+-    std::queue<CTxMemPool::txiter> backlog;
++    // The child link set is topological, not fee ordered. Once several
++    // skipped children become ready together, consider the highest-fee one
++    // first, particularly when only one child fits the remaining capacity.
++    auto lowerFeePriority = [](const CTxMemPool::txiter &a, const CTxMemPool::txiter &b) {
++        return CompareTxMemPoolEntryByModifiedFeeRate{}(*b, *a);
++    };
++    std::priority_queue<CTxMemPool::txiter, std::vector<CTxMemPool::txiter>,
++                        decltype(lowerFeePriority)> backlog(lowerFeePriority);
+ 
+     CTxMemPool::txiter iter;
+     auto mi = mempool.mapTx.get<modified_feerate>().begin();
+@@ -372,7 +379,7 @@ void BlockAssembler::addTxs(int64_t nLimitTimePoint) {
+         // Get a new or old transaction in mapTx to evaluate.
+         bool isFromBacklog = false;
+         if (!backlog.empty()) {
+-            iter = backlog.front();
++            iter = backlog.top();
+             backlog.pop();
+             isFromBacklog = true;
+         } else {
+diff --git a/src/test/miner_tests.cpp b/src/test/miner_tests.cpp
+index b02641335..589930590 100644
+--- a/src/test/miner_tests.cpp
++++ b/src/test/miner_tests.cpp
+@@ -705,6 +705,55 @@ BOOST_AUTO_TEST_CASE(BlockAssembler_construction) {
+     }
+ }
+ 
++// Newly ready siblings must compete by fee, not by insertion order.
++BOOST_AUTO_TEST_CASE(ReadySiblingsRespectFeePriority) {
++    GlobalConfig config;
++    LOCK2(cs_main, g_mempool.cs);
++    g_mempool.clear();
++    TestMemPoolEntryHelper entry;
++    CMutableTransaction parent;
++    parent.vin.resize(1);
++    parent.vin[0].prevout = COutPoint(TxId(uint256S("01")), 0);
++    parent.vin[0].scriptSig = CScript() << OP_1;
++    parent.vout.resize(2);
++    for (auto &out : parent.vout) {
++        out.nValue = 100000 * SATOSHI;
++        out.scriptPubKey = CScript() << OP_TRUE;
++    }
++    const auto parentRef = MakeTransactionRef(parent);
++    g_mempool.addUnchecked(entry.Fee(1000 * SATOSHI).FromTx(parent));
++    CMutableTransaction child;
++    child.vin.resize(1);
++    child.vin[0].prevout = COutPoint(parentRef->GetId(), 0);
++    child.vin[0].scriptSig = CScript() << OP_1;
++    child.vout.resize(1);
++    child.vout[0].scriptPubKey = CScript() << OP_TRUE;
++    child.vout[0].nValue = 90000 * SATOSHI;
++    const auto lowRef = MakeTransactionRef(child);
++    g_mempool.addUnchecked(entry.Fee(10000 * SATOSHI).FromTx(child));
++    child.vin[0].prevout = COutPoint(parentRef->GetId(), 1);
++    child.vout[0].nValue = 50000 * SATOSHI;
++    const auto highRef = MakeTransactionRef(child);
++    g_mempool.addUnchecked(entry.Fee(50000 * SATOSHI).FromTx(child));
++
++    BlockAssembler::Options options;
++    options.blockMinFeeRate = blockMinFeeRate;
++    // One byte spare after the parent and either child; both children cannot fit.
++    options.nMaxGeneratedBlockSize = 1000 + GetSerializeSize(*parentRef, PROTOCOL_VERSION)
++        + GetSerializeSize(*highRef, PROTOCOL_VERSION) + 1;
++    const auto block = BlockAssembler(config, g_mempool, options)
++        .CreateNewBlock(CScript() << OP_TRUE, 0., false);
++    BOOST_REQUIRE_EQUAL(block->block.vtx.size(), 3U);
++    const auto contains = [&](const TxId &id) {
++        return std::any_of(block->block.vtx.begin(), block->block.vtx.end(),
++                           [&](const auto &tx) { return tx->GetId() == id; });
++    };
++    BOOST_CHECK(contains(parentRef->GetId()));
++    BOOST_CHECK(contains(highRef->GetId()));
++    BOOST_CHECK(!contains(lowRef->GetId()));
++    g_mempool.clear();
++}
++
+ BOOST_AUTO_TEST_CASE(TestCBlockTemplateEntry) {
+     CTransactionRef txRef = MakeTransactionRef();
+     CBlockTemplateEntry txEntry(txRef, 1 * SATOSHI, 10);
+-- 
+2.50.1 (Apple Git-155)
+

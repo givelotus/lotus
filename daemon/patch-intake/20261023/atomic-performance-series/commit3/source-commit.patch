@@ -1,0 +1,207 @@
+From cc6148400673ef5aa797f19f1fc1da0bd3386fc0 Mon Sep 17 00:00:00 2001
+From: Canonical patch progression <213740+schancel@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 18:35:07 -0700
+Subject: [PATCH] [NATIVE] Reuse persistent workers for transaction subtree
+ roots
+
+---
+ src/lotus_v2/commitment.cpp | 67 ++++++++++++++++++++++++++++-----
+ src/test/lotus_v2_tests.cpp | 74 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 131 insertions(+), 10 deletions(-)
+
+diff --git a/src/lotus_v2/commitment.cpp b/src/lotus_v2/commitment.cpp
+index 08c2c3a66f..45d2634661 100644
+--- a/src/lotus_v2/commitment.cpp
++++ b/src/lotus_v2/commitment.cpp
+@@ -2,12 +2,13 @@
+ 
+ #include "tagged_hash.h"
+ 
++#include <util/parallel_range.h>
++
+ #include <algorithm>
+ #include <limits>
+ #include <stdexcept>
+ #include <vector>
+ 
+-#include <future>
+ 
+ namespace lotus::v2 {
+ namespace {
+@@ -84,17 +85,63 @@ Hash TransactionSubtreeA(std::span<const TxIdentityPair *> entries,
+         });
+     const auto left = entries.first(static_cast<size_t>(split - entries.begin()));
+     const auto right = entries.subspan(left.size());
+-    if (depth < 4 && entries.size() >= 64 && !left.empty() && !right.empty()) {
+-        auto left_future = std::async(std::launch::async, [left, depth]() {
+-            return TransactionSubtreeA(left, depth + 1);
+-        });
+-        const Hash right_hash = TransactionSubtreeA(right, depth + 1);
+-        return TxNodeAtDepth(depth, left_future.get(), right_hash);
+-    }
+     return TxNodeAtDepth(depth, TransactionSubtreeA(left, depth + 1),
+                          TransactionSubtreeA(right, depth + 1));
+ }
+ 
++Hash ParallelTransactionSubtreeA(std::span<const TxIdentityPair *> entries) {
++    if (entries.size() < 64) return TransactionSubtreeA(entries, 0);
++
++    // Heap indices 1..31 describe the first four radix levels. Partition in
++    // tree order: TxKeyBit consumes the low bit first, not numeric nibble order.
++    std::array<std::span<const TxIdentityPair *>, 32> prefixes{};
++    std::array<Hash, 32> roots{};
++    prefixes[1] = entries;
++    for (unsigned depth = 0; depth < 4; ++depth) {
++        for (size_t node = size_t{1} << depth;
++             node < (size_t{1} << (depth + 1)); ++node) {
++            const auto prefix = prefixes[node];
++            if (prefix.size() <= 1) continue;
++            const auto split = std::partition(prefix.begin(), prefix.end(),
++                [depth](const TxIdentityPair *entry) {
++                    return !TxKeyBit(entry->tx_id, depth);
++                });
++            prefixes[2 * node] = prefix.first(split - prefix.begin());
++            prefixes[2 * node + 1] = prefix.subspan(prefixes[2 * node].size());
++        }
++    }
++    std::array<size_t, 16> occupied{};
++    size_t count = 0;
++    for (size_t node = 16; node < 32; ++node) {
++        if (prefixes[node].empty()) {
++            roots[node] = EmptyTxRoot();
++        } else {
++            occupied[count++] = node;
++        }
++    }
++    // Calls synchronously drain their disjoint pointer spans before folding.
++    // Contended submissions run inline; recursive subtrees never submit work.
++    static util::ParallelRangeExecutor executor;
++    executor.Run(count, 1, [&](size_t begin, size_t end) {
++        for (size_t i = begin; i < end; ++i) {
++            const size_t node = occupied[i];
++            roots[node] = TransactionSubtreeA(prefixes[node], 4);
++        }
++    });
++    for (unsigned depth = 4; depth-- > 0;) {
++        for (size_t node = size_t{1} << depth;
++             node < (size_t{1} << (depth + 1)); ++node) {
++            const auto prefix = prefixes[node];
++            // Empty and singleton prefixes stop at their original depth. An
++            // unconditional four-level fold would change path compression.
++            roots[node] = prefix.empty() ? EmptyTxRoot()
++                : prefix.size() == 1 ? TxLeaf(*prefix[0])
++                : TxNodeAtDepth(depth, roots[2 * node], roots[2 * node + 1]);
++        }
++    }
++    return roots[1];
++}
++
+ Hash TransactionIdentity(HashDomain domain, const ChainId &chain_id,
+                          const TxHeaderCore &header_core, const Hash &input_root,
+                          const Hash &output_root) {
+@@ -282,7 +329,7 @@ bool TransactionRoot(std::span<const TxIdentityPair> transactions, Hash &out) {
+     for (size_t i = 1; i < transactions.size(); ++i) {
+         entries.push_back(&transactions[i]);
+     }
+-    const Hash subtree_a = TransactionSubtreeA(entries, 0);
++    const Hash subtree_a = ParallelTransactionSubtreeA(entries);
+     out = TransactionRootFromSubtreeA(transactions[0], subtree_a);
+     return true;
+ }
+@@ -304,7 +351,7 @@ Hash TransactionSubtreeARoot(
+             throw std::invalid_argument("duplicate transaction identifier in subtree");
+         }
+     }
+-    return TransactionSubtreeA(entries, 0);
++    return ParallelTransactionSubtreeA(entries);
+ }
+ 
+ Hash TransactionRootFromSubtreeA(const TxIdentityPair &coinbase_tx,
+diff --git a/src/test/lotus_v2_tests.cpp b/src/test/lotus_v2_tests.cpp
+index f1f3c78083..e6368a4080 100644
+--- a/src/test/lotus_v2_tests.cpp
++++ b/src/test/lotus_v2_tests.cpp
+@@ -212,6 +212,80 @@ static void SimdBlake3Hash(const uint8_t *input, size_t input_len,
+ 
+ BOOST_FIXTURE_TEST_SUITE(lotus_v2_tests, BasicTestingSetup)
+ 
++BOOST_AUTO_TEST_CASE(transaction_subtree_a_prefix_boundaries) {
++    using namespace lotus::v2;
++    for (size_t count : {0U, 1U, 2U, 63U, 64U, 65U, 128U}) {
++        // All prefixes, one occupied prefix, singleton at depth 1, and keys
++        // sharing 248 bits (including a split at the final key bit).
++        for (unsigned shape = 0; shape < 4; ++shape) {
++            BOOST_TEST_CONTEXT("count=" << count << " shape=" << shape) {
++                std::vector<TxIdentityPair> entries(count);
++                TxOverlayArena arena;
++                uint32_t root = TxOverlayArena::kNullIdx;
++                for (size_t i = 0; i < count; ++i) {
++                    auto &entry = entries[i];
++                    entry.tx_hash[0] = static_cast<uint8_t>(i + 17);
++                    if (shape == 0) {
++                        entry.tx_id[0] = static_cast<uint8_t>(i);
++                    } else if (shape == 1) {
++                        entry.tx_id[1] = static_cast<uint8_t>(i);
++                    } else if (shape == 2) {
++                        entry.tx_id[0] = i == 0 ? 1 : 0;
++                        entry.tx_id[1] = static_cast<uint8_t>(i);
++                    } else {
++                        // Bit reversal includes both 0 and 128 even at count 2.
++                        uint8_t reversed = 0;
++                        for (unsigned bit = 0; bit < 8; ++bit) {
++                            reversed |= ((i >> bit) & 1) << (7 - bit);
++                        }
++                        entry.tx_id[31] = reversed;
++                    }
++                    root = arena.InsertTxLeaf(root, entry.tx_id, entry.tx_hash);
++                }
++                const lotus::v2::Hash expected = arena.SubtreeARoot(root);
++                BOOST_CHECK(TransactionSubtreeARoot(entries) == expected);
++                std::reverse(entries.begin(), entries.end());
++                BOOST_CHECK(BuildTxSubtreeA(entries) == expected);
++                TxIdentityPair coinbase{};
++                coinbase.tx_id.fill(0xff);
++                const lotus::v2::Hash full_expected =
++                    TransactionRootFromSubtreeA(coinbase, expected);
++                entries.insert(entries.begin(), coinbase);
++                lotus::v2::Hash actual{};
++                BOOST_REQUIRE(TransactionRoot(entries, actual));
++                BOOST_CHECK(actual == full_expected);
++            }
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(transaction_subtree_a_duplicate_keys) {
++    using namespace lotus::v2;
++    for (size_t count : {2U, 63U, 64U, 65U}) {
++        std::vector<TxIdentityPair> entries(count);
++        for (size_t i = 0; i < count; ++i) {
++            entries[i].tx_id[0] = static_cast<uint8_t>(i);
++            entries[i].tx_hash[0] = static_cast<uint8_t>(i);
++        }
++        entries.back().tx_id = entries.front().tx_id;
++        BOOST_CHECK_THROW(TransactionSubtreeARoot(entries), std::invalid_argument);
++        BOOST_CHECK_THROW(BuildTxSubtreeA(entries), std::invalid_argument);
++        lotus::v2::Hash out{};
++        BOOST_CHECK(!TransactionRoot(entries, out));
++    }
++    // Rejecting a duplicate must leave subsequent executor use healthy.
++    std::vector<TxIdentityPair> valid(65);
++    for (size_t i = 0; i < valid.size(); ++i) {
++        valid[i].tx_id[0] = static_cast<uint8_t>(i);
++    }
++    const lotus::v2::Hash expected = TransactionSubtreeARoot(valid);
++    auto concurrent = std::async(std::launch::async, [&] {
++        return TransactionSubtreeARoot(valid);
++    });
++    BOOST_CHECK(TransactionSubtreeARoot(valid) == expected);
++    BOOST_CHECK(concurrent.get() == expected);
++}
++
+ BOOST_AUTO_TEST_CASE(end_to_end_bulk_preconsensus_and_overlay_commit) {
+     // 1. Initialize DiskStateStore at Genesis + Block 1 with 20 spendable UTXOs
+     const fs::path db_dir = m_args.GetDataDirNet() / "v2_e2e_overlay_db";
+-- 
+2.50.1 (Apple Git-155)
+

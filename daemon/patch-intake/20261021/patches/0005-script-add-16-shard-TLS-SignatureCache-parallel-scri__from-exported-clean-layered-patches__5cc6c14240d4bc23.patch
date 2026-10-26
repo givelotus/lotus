@@ -1,0 +1,1977 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sat, 17 Oct 2026 20:27:43 -0700
+Subject: [PATCH] script: add 16-shard TLS SignatureCache, parallel script
+ workers, and batch Schnorr verification
+
+Introduce a 16-shard cuckoo SignatureCache with thread-local lookaside caching,
+parallel script verification worker threads (ParallelScriptWorkerPool), and
+multi-scalar batch Schnorr verification (BatchSigCollector via
+secp256k1_schnorrsig_verify_batch and secp256k1_schnorr_verify_batch) with
+binary-search bisection fallback.
+---
+ src/CMakeLists.txt                            |   4 +-
+ src/bench/verify_script.cpp                   |  72 +++
+ src/lotus_v2/CMakeLists.txt                   |  21 +
+ src/lotus_v2/signing.cpp                      | 476 ++++++++++++++++++
+ src/lotus_v2/signing.h                        |  93 ++++
+ src/lotus_v2/tagged_hash.cpp                  |  75 +++
+ src/lotus_v2/tagged_hash.h                    |  41 ++
+ src/script/sigcache.cpp                       | 132 ++++-
+ src/script/sigcache.h                         |  29 +-
+ src/secp256k1/include/secp256k1_schnorr.h     |   9 +
+ src/secp256k1/include/secp256k1_schnorrsig.h  |  23 +
+ src/secp256k1/src/modules/schnorr/main_impl.h | 118 +++++
+ .../src/modules/schnorrsig/main_impl.h        | 108 ++++
+ src/test/sigcache_tests.cpp                   |  48 ++
+ src/validation.cpp                            | 358 +++++++++++--
+ src/validation.h                              |  11 +-
+ 16 files changed, 1562 insertions(+), 56 deletions(-)
+ create mode 100644 src/lotus_v2/signing.cpp
+ create mode 100644 src/lotus_v2/signing.h
+ create mode 100644 src/lotus_v2/tagged_hash.cpp
+ create mode 100644 src/lotus_v2/tagged_hash.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index cd17ec8244..0ff98e09fe 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -558,7 +558,7 @@ add_library(common
+ 	${NETWORK_SOURCES}
+ )
+ 
+-target_link_libraries(common bitcoinconsensus util secp256k1 script)
++target_link_libraries(common bitcoinconsensus util secp256k1 script lotus_v2_header)
+ 
+ # script library
+ add_library(script
+@@ -974,7 +974,7 @@ if(BUILD_CHAINSTATE)
+ 			# To access the config/ and obj/ directories
+ 			${CMAKE_CURRENT_BINARY_DIR}
+ 	)
+-	target_link_libraries(bitcoinkernel crypto univalue secp256k1 lotus_v2_mdbx leveldb)
++	target_link_libraries(bitcoinkernel crypto univalue secp256k1 lotus_v2_header lotus_v2_mdbx leveldb)
+ 	link_boost_headers_only(bitcoinkernel headers)
+ 
+ 	if(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
+diff --git a/src/bench/verify_script.cpp b/src/bench/verify_script.cpp
+index 30c91154d8..ec88aa9937 100644
+--- a/src/bench/verify_script.cpp
++++ b/src/bench/verify_script.cpp
+@@ -3,18 +3,24 @@
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
+ #include <bench/bench.h>
++#include <hash.h>
+ #include <key.h>
++#include <lotus_v2/signing.h>
+ #if defined(HAVE_CONSENSUS_LIB)
+ #include <script/bitcoinconsensus.h>
+ #endif
+ #include <script/interpreter.h>
+ #include <script/script.h>
+ #include <script/script_error.h>
++#include <script/sigcache.h>
+ #include <script/standard.h>
+ #include <streams.h>
++#include <test/util/setup_common.h>
+ #include <test/util/transaction_utils.h>
++#include <tinyformat.h>
+ 
+ #include <array>
++#include <cstring>
+ 
+ static void VerifyNestedIfScript(benchmark::Bench &bench) {
+     std::vector<std::vector<uint8_t>> stack;
+@@ -38,4 +44,70 @@ static void VerifyNestedIfScript(benchmark::Bench &bench) {
+     });
+ }
+ 
++static void VerifySchnorrIndividual64(benchmark::Bench &bench) {
++    BasicTestingSetup test_setup;
++    constexpr size_t N = 64;
++    std::vector<CPubKey> pubkeys(N);
++    std::vector<uint256> msgs(N);
++    std::vector<std::vector<uint8_t>> sigs(N);
++    for (size_t i = 0; i < N; ++i) {
++        CKey k;
++        k.MakeNewKey(true);
++        pubkeys[i] = k.GetPubKey();
++        msgs[i] = Hash(strprintf("bench schnorr msg %zu", i));
++        bool ok = k.SignSchnorr(msgs[i], sigs[i]);
++        assert(ok);
++    }
++    bench.batch(N).unit("sig").run([&] {
++        for (size_t i = 0; i < N; ++i) {
++            bool ok = pubkeys[i].VerifySchnorr(msgs[i], sigs[i]);
++            assert(ok);
++        }
++    });
++}
++
++static void VerifySchnorrBatch64(benchmark::Bench &bench) {
++    BasicTestingSetup test_setup;
++    constexpr size_t N = 64;
++    lotus::v2::BatchSigCollector collector;
++    for (size_t i = 0; i < N; ++i) {
++        CKey k;
++        k.MakeNewKey(true);
++        CPubKey pk = k.GetPubKey();
++        uint256 msg = Hash(strprintf("bench schnorr msg %zu", i));
++        std::vector<uint8_t> sig;
++        bool ok = k.SignSchnorr(msg, sig);
++        assert(ok);
++        collector.AddLegacySchnorr(
++            std::span<const uint8_t>(pk.data(), pk.size()),
++            std::span<const uint8_t>(sig.data(), sig.size()), msg.begin());
++    }
++    bench.batch(N).unit("sig").run([&] {
++        bool ok = collector.VerifyAll();
++        assert(ok);
++    });
++}
++
++static void SigCacheTlsHit(benchmark::Bench &bench) {
++    BasicTestingSetup test_setup;
++    SignatureCache sigcache{DEFAULT_SIGNATURE_CACHE_BYTES};
++    CKey k;
++    k.MakeNewKey(true);
++    CPubKey pk = k.GetPubKey();
++    uint256 msg = Hash(std::string("tls sigcache bench"));
++    std::vector<uint8_t> sig;
++    bool ok = k.SignSchnorr(msg, sig);
++    assert(ok);
++    uint256 entry;
++    sigcache.ComputeEntry(entry, msg, sig, pk);
++    sigcache.Set(entry);
++    bench.unit("lookup").run([&] {
++        bool hit = sigcache.Get(entry, /*erase=*/false);
++        assert(hit);
++    });
++}
++
+ BENCHMARK(VerifyNestedIfScript);
++BENCHMARK(VerifySchnorrIndividual64);
++BENCHMARK(VerifySchnorrBatch64);
++BENCHMARK(SigCacheTlsHit);
+diff --git a/src/lotus_v2/CMakeLists.txt b/src/lotus_v2/CMakeLists.txt
+index de741bc560..e3633e7d24 100644
+--- a/src/lotus_v2/CMakeLists.txt
++++ b/src/lotus_v2/CMakeLists.txt
+@@ -1,3 +1,24 @@
++if(NOT TARGET Boost::headers)
++    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.30)
++        cmake_policy(SET CMP0167 OLD)
++    endif()
++    find_package(Boost 1.64 REQUIRED)
++endif()
++
++add_library(lotus_v2_header STATIC
++    tagged_hash.cpp
++    signing.cpp
++)
++target_include_directories(lotus_v2_header PUBLIC
++    "${CMAKE_CURRENT_SOURCE_DIR}"
++    ..
++)
++target_link_libraries(lotus_v2_header PUBLIC
++    secp256k1
++    crypto
++    Boost::headers
++)
++
+ add_library(lotus_v2_mdbx STATIC
+     vendor/libmdbx/mdbx.c
+     vendor/libmdbx/mdbx_batch.c
+diff --git a/src/lotus_v2/signing.cpp b/src/lotus_v2/signing.cpp
+new file mode 100644
+index 0000000000..306557a45d
+--- /dev/null
++++ b/src/lotus_v2/signing.cpp
+@@ -0,0 +1,476 @@
++// Copyright (c) 2026 The Lotus developers
++#include "signing.h"
++
++#include <crypto/sha256.h>
++#include <secp256k1.h>
++#include <secp256k1_extrakeys.h>
++#include <secp256k1_schnorr.h>
++#include <secp256k1_schnorrsig.h>
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstring>
++#include <functional>
++#include <mutex>
++#include <thread>
++
++namespace lotus::v2 {
++namespace {
++bool VerifyBatchSlice(std::span<const BatchSigItem> slice) {
++    if (slice.empty()) return true;
++    if (slice.size() == 1) {
++        return secp256k1_schnorrsig_verify(
++                   secp256k1_context_static, slice[0].sig.data(),
++                   slice[0].msg.data(), slice[0].msg.size(),
++                   reinterpret_cast<const secp256k1_xonly_pubkey *>(
++                       slice[0].parsed_pubkey.data())) == 1;
++    }
++    const size_t n = slice.size();
++    std::vector<const unsigned char *> sigs(n);
++    std::vector<const unsigned char *> msgs(n);
++    std::vector<const secp256k1_xonly_pubkey *> pubkeys(n);
++
++    static std::atomic<uint64_t> batch_nonce{1};
++    const uint64_t nonce_val =
++        batch_nonce.fetch_add(1, std::memory_order_relaxed);
++    const uint64_t clock_val = static_cast<uint64_t>(
++        std::chrono::steady_clock::now().time_since_epoch().count());
++    const uintptr_t addr_val = reinterpret_cast<uintptr_t>(slice.data());
++
++    CSHA256 hasher;
++    constexpr char domain[] = "Lotus/v2/schnorr-batch-randomizer";
++    hasher.Write(reinterpret_cast<const uint8_t *>(domain), sizeof(domain));
++    hasher.Write(reinterpret_cast<const uint8_t *>(&nonce_val),
++                 sizeof(nonce_val));
++    hasher.Write(reinterpret_cast<const uint8_t *>(&clock_val),
++                 sizeof(clock_val));
++    hasher.Write(reinterpret_cast<const uint8_t *>(&addr_val),
++                 sizeof(addr_val));
++
++    for (size_t i = 0; i < n; ++i) {
++        sigs[i] = slice[i].sig.data();
++        msgs[i] = slice[i].msg.data();
++        pubkeys[i] = reinterpret_cast<const secp256k1_xonly_pubkey *>(
++            slice[i].parsed_pubkey.data());
++        hasher.Write(slice[i].pubkey.data(), slice[i].pubkey.size());
++        hasher.Write(slice[i].sig.data(), slice[i].sig.size());
++        hasher.Write(slice[i].msg.data(), slice[i].msg.size());
++    }
++
++    uint8_t seed[CSHA256::OUTPUT_SIZE];
++    hasher.Finalize(seed);
++
++    CSHA256 expand_base;
++    expand_base.Write(seed, CSHA256::OUTPUT_SIZE);
++    expand_base.Write(seed, CSHA256::OUTPUT_SIZE);
++
++    std::vector<unsigned char> rand32(32 * n, 0);
++    for (size_t i = 1; i < n; ++i) {
++        const uint64_t ctr = static_cast<uint64_t>(i);
++        CSHA256 h = expand_base;
++        h.Write(reinterpret_cast<const uint8_t *>(&ctr), sizeof(ctr));
++        h.Finalize(rand32.data() + 32 * i);
++    }
++
++    return secp256k1_schnorrsig_verify_batch(
++               secp256k1_context_static, sigs.data(), msgs.data(),
++               pubkeys.data(), rand32.data(), n) == 1;
++}
++
++bool VerifyLegacyBatchSlice(std::span<const LegacyBatchSigItem> slice) {
++    if (slice.empty()) return true;
++    if (slice.size() == 1) {
++        return secp256k1_schnorr_verify(
++                   secp256k1_context_static, slice[0].sig.data(),
++                   slice[0].msg.data(),
++                   reinterpret_cast<const secp256k1_pubkey *>(
++                       slice[0].parsed_pubkey.data())) == 1;
++    }
++    const size_t n = slice.size();
++    std::vector<const unsigned char *> sigs(n);
++    std::vector<const unsigned char *> msgs(n);
++    std::vector<const secp256k1_pubkey *> pubkeys(n);
++
++    static std::atomic<uint64_t> batch_nonce{1};
++    const uint64_t nonce_val =
++        batch_nonce.fetch_add(1, std::memory_order_relaxed);
++    const uint64_t clock_val = static_cast<uint64_t>(
++        std::chrono::steady_clock::now().time_since_epoch().count());
++    const uintptr_t addr_val = reinterpret_cast<uintptr_t>(slice.data());
++
++    CSHA256 hasher;
++    constexpr char domain[] = "Lotus/v2/legacy-schnorr-batch-randomizer";
++    hasher.Write(reinterpret_cast<const uint8_t *>(domain), sizeof(domain));
++    hasher.Write(reinterpret_cast<const uint8_t *>(&nonce_val),
++                 sizeof(nonce_val));
++    hasher.Write(reinterpret_cast<const uint8_t *>(&clock_val),
++                 sizeof(clock_val));
++    hasher.Write(reinterpret_cast<const uint8_t *>(&addr_val),
++                 sizeof(addr_val));
++
++    for (size_t i = 0; i < n; ++i) {
++        sigs[i] = slice[i].sig.data();
++        msgs[i] = slice[i].msg.data();
++        pubkeys[i] = reinterpret_cast<const secp256k1_pubkey *>(
++            slice[i].parsed_pubkey.data());
++        hasher.Write(slice[i].parsed_pubkey.data(),
++                     slice[i].parsed_pubkey.size());
++        hasher.Write(slice[i].sig.data(), slice[i].sig.size());
++        hasher.Write(slice[i].msg.data(), slice[i].msg.size());
++    }
++
++    uint8_t seed[CSHA256::OUTPUT_SIZE];
++    hasher.Finalize(seed);
++
++    CSHA256 expand_base;
++    expand_base.Write(seed, CSHA256::OUTPUT_SIZE);
++    expand_base.Write(seed, CSHA256::OUTPUT_SIZE);
++
++    std::vector<unsigned char> rand32(32 * n, 0);
++    for (size_t i = 1; i < n; ++i) {
++        const uint64_t ctr = static_cast<uint64_t>(i);
++        CSHA256 h = expand_base;
++        h.Write(reinterpret_cast<const uint8_t *>(&ctr), sizeof(ctr));
++        h.Finalize(rand32.data() + 32 * i);
++    }
++
++    return secp256k1_schnorr_verify_batch(
++               secp256k1_context_static, sigs.data(), msgs.data(),
++               pubkeys.data(), rand32.data(), n) == 1;
++}
++
++std::optional<size_t> BisectBatchSlice(std::span<const BatchSigItem> slice,
++                                       size_t base_offset) {
++    if (slice.empty()) return std::nullopt;
++    if (VerifyBatchSlice(slice)) return std::nullopt;
++    if (slice.size() == 1) return base_offset;
++    const size_t mid = slice.size() / 2;
++    if (auto left = BisectBatchSlice(slice.subspan(0, mid), base_offset)) {
++        return left;
++    }
++    return BisectBatchSlice(slice.subspan(mid), base_offset + mid);
++}
++
++std::optional<size_t>
++BisectLegacyBatchSlice(std::span<const LegacyBatchSigItem> slice,
++                       size_t base_offset) {
++    if (slice.empty()) return std::nullopt;
++    if (VerifyLegacyBatchSlice(slice)) return std::nullopt;
++    if (slice.size() == 1) return base_offset;
++    const size_t mid = slice.size() / 2;
++    if (auto left =
++            BisectLegacyBatchSlice(slice.subspan(0, mid), base_offset)) {
++        return left;
++    }
++    return BisectLegacyBatchSlice(slice.subspan(mid), base_offset + mid);
++}
++
++class SigningWorkerPool {
++public:
++    static SigningWorkerPool &Instance() {
++        static SigningWorkerPool pool;
++        return pool;
++    }
++
++    template <typename Fn>
++    void Run(size_t num_workers, Fn &&fn) {
++        if (num_workers <= 1) {
++            fn(0);
++            return;
++        }
++        std::function<void(size_t)> task_fn(std::forward<Fn>(fn));
++        std::unique_lock<std::mutex> dispatch_lock(m_dispatch_mutex);
++        EnsureWorkers(num_workers - 1);
++        const size_t active = std::min(num_workers - 1, m_threads.size());
++        if (active == 0) {
++            dispatch_lock.unlock();
++            task_fn(0);
++            return;
++        }
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            m_task = &task_fn;
++            m_active_workers = active;
++            m_remaining.store(active, std::memory_order_release);
++            ++m_generation;
++        }
++        m_cv_start.notify_all();
++        task_fn(0);
++        {
++            std::unique_lock<std::mutex> lock(m_mutex);
++            m_cv_done.wait(lock, [this]() {
++                return m_remaining.load(std::memory_order_acquire) == 0;
++            });
++            m_task = nullptr;
++        }
++    }
++
++private:
++    SigningWorkerPool() = default;
++    ~SigningWorkerPool() {
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            m_stop = true;
++            ++m_generation;
++        }
++        m_cv_start.notify_all();
++        for (auto &t : m_threads) {
++            if (t.joinable()) {
++                t.join();
++            }
++        }
++    }
++
++    void EnsureWorkers(size_t count) {
++        while (m_threads.size() < count) {
++            const size_t worker_id = m_threads.size() + 1;
++            m_threads.emplace_back([this, worker_id]() {
++                uint64_t seen_gen = 0;
++                while (true) {
++                    const std::function<void(size_t)> *fn = nullptr;
++                    {
++                        std::unique_lock<std::mutex> lock(m_mutex);
++                        m_cv_start.wait(lock, [this, &seen_gen]() {
++                            return m_stop || m_generation != seen_gen;
++                        });
++                        if (m_stop) {
++                            return;
++                        }
++                        seen_gen = m_generation;
++                        if (worker_id <= m_active_workers) {
++                            fn = m_task;
++                        }
++                    }
++                    if (fn != nullptr) {
++                        (*fn)(worker_id);
++                        if (m_remaining.fetch_sub(
++                                1, std::memory_order_acq_rel) == 1) {
++                            std::lock_guard<std::mutex> lock(m_mutex);
++                            m_cv_done.notify_one();
++                        }
++                    }
++                }
++            });
++        }
++    }
++
++    std::mutex m_dispatch_mutex;
++    std::mutex m_mutex;
++    std::condition_variable m_cv_start;
++    std::condition_variable m_cv_done;
++    std::vector<std::thread> m_threads;
++    const std::function<void(size_t)> *m_task{nullptr};
++    size_t m_active_workers{0};
++    std::atomic<size_t> m_remaining{0};
++    uint64_t m_generation{0};
++    bool m_stop{false};
++};
++
++size_t EffectiveBatchThreads(size_t total_items, size_t requested_threads) {
++    if (total_items < 32) return 1;
++    size_t hw = requested_threads;
++    if (hw == 0) {
++        hw = std::min<size_t>(
++            std::max<size_t>(std::thread::hardware_concurrency(), 1), 16);
++    }
++    return std::min<size_t>(hw, (total_items + 15) / 16);
++}
++} // namespace
++
++bool BatchSigCollector::Add(std::span<const uint8_t> pubkey,
++                            std::span<const uint8_t> sig, const Hash &msg) {
++    if (pubkey.size() != 32 || sig.size() < 64) return false;
++    secp256k1_xonly_pubkey parsed;
++    if (!secp256k1_xonly_pubkey_parse(secp256k1_context_static, &parsed,
++                                      pubkey.data())) {
++        return false;
++    }
++    BatchSigItem item;
++    std::memcpy(item.pubkey.data(), pubkey.data(), 32);
++    std::memcpy(item.parsed_pubkey.data(), parsed.data, 64);
++    std::memcpy(item.sig.data(), sig.data(), 64);
++    item.msg = msg;
++    items_.push_back(item);
++    return true;
++}
++
++bool BatchSigCollector::AddLegacySchnorr(std::span<const uint8_t> pubkey,
++                                         std::span<const uint8_t> sig64,
++                                         const uint8_t *msg32,
++                                         const uint8_t *cache_entry32,
++                                         bool store_in_cache) {
++    if (sig64.size() != 64 || msg32 == nullptr ||
++        (pubkey.size() != 33 && pubkey.size() != 65)) {
++        return false;
++    }
++    secp256k1_pubkey parsed;
++    if (!secp256k1_ec_pubkey_parse(secp256k1_context_static, &parsed,
++                                   pubkey.data(), pubkey.size())) {
++        return false;
++    }
++    LegacyBatchSigItem item;
++    std::memcpy(item.parsed_pubkey.data(), parsed.data, 64);
++    std::memcpy(item.sig.data(), sig64.data(), 64);
++    std::memcpy(item.msg.data(), msg32, 32);
++    if (store_in_cache && cache_entry32 != nullptr) {
++        std::memcpy(item.cache_entry.data(), cache_entry32, 32);
++        item.store_in_cache = true;
++    }
++    legacy_items_.push_back(item);
++    return true;
++}
++
++void BatchSigCollector::Merge(const BatchSigCollector &other) {
++    if (!other.items_.empty()) {
++        items_.insert(items_.end(), other.items_.begin(), other.items_.end());
++    }
++    if (!other.legacy_items_.empty()) {
++        legacy_items_.insert(legacy_items_.end(), other.legacy_items_.begin(),
++                             other.legacy_items_.end());
++    }
++}
++
++void BatchSigCollector::Merge(BatchSigCollector &&other) {
++    if (!other.items_.empty()) {
++        if (items_.empty()) {
++            items_ = std::move(other.items_);
++        } else {
++            items_.insert(items_.end(), other.items_.begin(),
++                          other.items_.end());
++            other.items_.clear();
++        }
++    }
++    if (!other.legacy_items_.empty()) {
++        if (legacy_items_.empty()) {
++            legacy_items_ = std::move(other.legacy_items_);
++        } else {
++            legacy_items_.insert(legacy_items_.end(),
++                                 other.legacy_items_.begin(),
++                                 other.legacy_items_.end());
++            other.legacy_items_.clear();
++        }
++    }
++}
++
++bool BatchSigCollector::VerifyAll(size_t num_threads) const {
++    if (!items_.empty()) {
++        const size_t threads = EffectiveBatchThreads(items_.size(), num_threads);
++        const std::span<const BatchSigItem> all(items_.data(), items_.size());
++        if (threads <= 1) {
++            if (!VerifyBatchSlice(all)) return false;
++        } else {
++            std::atomic<bool> all_valid{true};
++            auto run_chunk = [&](size_t t) {
++                const size_t begin = (items_.size() * t) / threads;
++                const size_t end = (items_.size() * (t + 1)) / threads;
++                if (begin >= end || !all_valid.load(std::memory_order_relaxed))
++                    return;
++                if (!VerifyBatchSlice(all.subspan(begin, end - begin))) {
++                    all_valid.store(false, std::memory_order_relaxed);
++                }
++            };
++            SigningWorkerPool::Instance().Run(threads, run_chunk);
++            if (!all_valid.load(std::memory_order_relaxed)) return false;
++        }
++    }
++
++    if (!legacy_items_.empty()) {
++        const size_t threads =
++            EffectiveBatchThreads(legacy_items_.size(), num_threads);
++        const std::span<const LegacyBatchSigItem> all(legacy_items_.data(),
++                                                      legacy_items_.size());
++        if (threads <= 1) {
++            if (!VerifyLegacyBatchSlice(all)) return false;
++        } else {
++            std::atomic<bool> all_valid{true};
++            auto run_chunk = [&](size_t t) {
++                const size_t begin = (legacy_items_.size() * t) / threads;
++                const size_t end = (legacy_items_.size() * (t + 1)) / threads;
++                if (begin >= end || !all_valid.load(std::memory_order_relaxed))
++                    return;
++                if (!VerifyLegacyBatchSlice(all.subspan(begin, end - begin))) {
++                    all_valid.store(false, std::memory_order_relaxed);
++                }
++            };
++            SigningWorkerPool::Instance().Run(threads, run_chunk);
++            if (!all_valid.load(std::memory_order_relaxed)) return false;
++        }
++    }
++
++    return true;
++}
++
++std::optional<size_t>
++BatchSigCollector::FirstFailingIndex(size_t num_threads) const {
++    if (!items_.empty()) {
++        const size_t threads = EffectiveBatchThreads(items_.size(), num_threads);
++        const std::span<const BatchSigItem> all(items_.data(), items_.size());
++        if (threads <= 1) {
++            if (auto fail = BisectBatchSlice(all, 0)) {
++                return fail;
++            }
++        } else {
++            std::vector<uint8_t> chunk_ok(threads, 1);
++            auto check_chunk = [&](size_t t) {
++                const size_t begin = (items_.size() * t) / threads;
++                const size_t end = (items_.size() * (t + 1)) / threads;
++                if (begin < end &&
++                    !VerifyBatchSlice(all.subspan(begin, end - begin))) {
++                    chunk_ok[t] = 0;
++                }
++            };
++            SigningWorkerPool::Instance().Run(threads, check_chunk);
++            for (size_t t = 0; t < threads; ++t) {
++                if (chunk_ok[t] == 0) {
++                    const size_t begin = (items_.size() * t) / threads;
++                    const size_t end = (items_.size() * (t + 1)) / threads;
++                    if (auto fail = BisectBatchSlice(
++                            all.subspan(begin, end - begin), begin)) {
++                        return fail;
++                    }
++                }
++            }
++        }
++    }
++
++    if (!legacy_items_.empty()) {
++        const size_t base = items_.size();
++        const size_t threads =
++            EffectiveBatchThreads(legacy_items_.size(), num_threads);
++        const std::span<const LegacyBatchSigItem> all(legacy_items_.data(),
++                                                      legacy_items_.size());
++        if (threads <= 1) {
++            if (auto fail = BisectLegacyBatchSlice(all, base)) {
++                return fail;
++            }
++        } else {
++            std::vector<uint8_t> chunk_ok(threads, 1);
++            auto check_chunk = [&](size_t t) {
++                const size_t begin = (legacy_items_.size() * t) / threads;
++                const size_t end = (legacy_items_.size() * (t + 1)) / threads;
++                if (begin < end &&
++                    !VerifyLegacyBatchSlice(all.subspan(begin, end - begin))) {
++                    chunk_ok[t] = 0;
++                }
++            };
++            SigningWorkerPool::Instance().Run(threads, check_chunk);
++            for (size_t t = 0; t < threads; ++t) {
++                if (chunk_ok[t] == 0) {
++                    const size_t begin = (legacy_items_.size() * t) / threads;
++                    const size_t end = (legacy_items_.size() * (t + 1)) / threads;
++                    if (auto fail = BisectLegacyBatchSlice(
++                            all.subspan(begin, end - begin), base + begin)) {
++                        return fail;
++                    }
++                }
++            }
++        }
++    }
++
++    return std::nullopt;
++}
++
++} // namespace lotus::v2
++
+diff --git a/src/lotus_v2/signing.h b/src/lotus_v2/signing.h
+new file mode 100644
+index 0000000000..2861a22dee
+--- /dev/null
++++ b/src/lotus_v2/signing.h
+@@ -0,0 +1,93 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_SIGNING_H
++#define LOTUS_V2_SIGNING_H
++
++#include "tagged_hash.h"
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <span>
++#include <vector>
++
++namespace lotus::v2 {
++
++struct BatchSigItem {
++    std::array<uint8_t, 32> pubkey{};
++    std::array<uint8_t, 64> parsed_pubkey{};
++    std::array<uint8_t, 64> sig{};
++    Hash msg{};
++};
++
++struct LegacyBatchSigItem {
++    std::array<uint8_t, 64> parsed_pubkey{};
++    std::array<uint8_t, 64> sig{};
++    Hash msg{};
++    std::array<uint8_t, 32> cache_entry{};
++    bool store_in_cache{false};
++};
++
++// Collects BIP340 Schnorr and legacy 64-byte Schnorr (pubkey, sig64, msg32)
++// tuples during NULLFAIL script execution for deferred multi-scalar
++// multiplication batch verification (Strauss / Pippenger via
++// secp256k1_schnorrsig_verify_batch and secp256k1_schnorr_verify_batch) and
++// bisection fallback to pinpoint the exact failing signature index.
++class BatchSigCollector {
++public:
++    BatchSigCollector() = default;
++
++    // Validates that `pubkey` is a canonical 32-byte x-only secp256k1 key and
++    // `sig` has at least 64 bytes (using the 64-byte R||s prefix), then records
++    // the tuple for deferred batch verification. Returns false if `pubkey` or
++    // `sig` encoding is invalid.
++    bool Add(std::span<const uint8_t> pubkey, std::span<const uint8_t> sig,
++             const Hash &msg);
++
++    // Validates that `pubkey` is a valid 33/65-byte secp256k1 public key and
++    // `sig64` is 64 bytes, then records the tuple for deferred legacy Schnorr
++    // batch verification.
++    bool AddLegacySchnorr(std::span<const uint8_t> pubkey,
++                          std::span<const uint8_t> sig64,
++                          const uint8_t *msg32,
++                          const uint8_t *cache_entry32 = nullptr,
++                          bool store_in_cache = false);
++
++    void Reserve(size_t n) {
++        items_.reserve(n);
++        legacy_items_.reserve(n);
++    }
++    void Clear() noexcept {
++        items_.clear();
++        legacy_items_.clear();
++    }
++    bool Empty() const noexcept {
++        return items_.empty() && legacy_items_.empty();
++    }
++    size_t Size() const noexcept {
++        return items_.size() + legacy_items_.size();
++    }
++    const std::vector<BatchSigItem> &Items() const noexcept { return items_; }
++    const std::vector<LegacyBatchSigItem> &LegacyItems() const noexcept {
++        return legacy_items_;
++    }
++
++    void Merge(const BatchSigCollector &other);
++    void Merge(BatchSigCollector &&other);
++
++    // Verifies all collected signatures in batch using multi-scalar
++    // multiplication. When `num_threads == 0`, automatically partitions large
++    // batches across hardware worker threads.
++    bool VerifyAll(size_t num_threads = 0) const;
++
++    // Returns std::nullopt if all collected signatures are valid, or the
++    // 0-based index of the first invalid signature via batch bisection.
++    std::optional<size_t> FirstFailingIndex(size_t num_threads = 0) const;
++
++private:
++    std::vector<BatchSigItem> items_;
++    std::vector<LegacyBatchSigItem> legacy_items_;
++};
++
++} // namespace lotus::v2
++#endif
+diff --git a/src/lotus_v2/tagged_hash.cpp b/src/lotus_v2/tagged_hash.cpp
+new file mode 100644
+index 0000000000..bfaae698c4
+--- /dev/null
++++ b/src/lotus_v2/tagged_hash.cpp
+@@ -0,0 +1,75 @@
++#include "tagged_hash.h"
++
++#include <crypto/sha256.h>
++
++#include <array>
++#include <cstdlib>
++#include <cstring>
++#include <string_view>
++
++namespace lotus::v2 {
++namespace {
++constexpr std::string_view TagView(HashDomain domain) noexcept {
++    switch (domain) {
++    case HashDomain::HeaderBody: return "Lotus/v2/header/body";
++    case HashDomain::HeaderWork: return "Lotus/v2/header/work";
++    case HashDomain::BlockId: return "Lotus/v2/blockid";
++    case HashDomain::Branch: return "Lotus/v2/branch";
++    case HashDomain::InputCore: return "Lotus/v2/inputcore";
++    case HashDomain::InputFull: return "Lotus/v2/inputfull";
++    case HashDomain::OwnInput: return "Lotus/v2/owninput";
++    case HashDomain::Sighash: return "Lotus/v2/sighash";
++    case HashDomain::Output: return "Lotus/v2/output";
++    case HashDomain::CoinEntry: return "Lotus/v2/coinentry";
++    case HashDomain::MerkleIndex: return "Lotus/v2/merkleidx";
++    case HashDomain::TxId: return "Lotus/v2/txid";
++    case HashDomain::TxHash: return "Lotus/v2/txhash";
++    case HashDomain::TxRoot: return "Lotus/v2/txroot";
++    case HashDomain::OutpointKey: return "Lotus/v2/outpointkey";
++    case HashDomain::Utxo: return "Lotus/v2/utxo";
++    case HashDomain::State: return "Lotus/v2/state";
++    }
++    std::abort();
++}
++
++constexpr size_t kNumDomains = static_cast<size_t>(HashDomain::State) + 1;
++
++CSHA256 MakeTagMidstate(HashDomain domain) {
++    const std::string_view tag = TagView(domain);
++    uint8_t tag_hash[CSHA256::OUTPUT_SIZE];
++    CSHA256()
++        .Write(reinterpret_cast<const uint8_t *>(tag.data()), tag.size())
++        .Finalize(tag_hash);
++    CSHA256 hasher;
++    hasher.Write(tag_hash, CSHA256::OUTPUT_SIZE);
++    hasher.Write(tag_hash, CSHA256::OUTPUT_SIZE);
++    return hasher;
++}
++
++const std::array<CSHA256, kNumDomains> &GetTagMidstates() {
++    static const std::array<CSHA256, kNumDomains> kMidstates = []() {
++        std::array<CSHA256, kNumDomains> arr{};
++        for (size_t i = 0; i < kNumDomains; ++i) {
++            arr[i] = MakeTagMidstate(static_cast<HashDomain>(i));
++        }
++        return arr;
++    }();
++    return kMidstates;
++}
++} // namespace
++
++Hash TaggedHash(HashDomain domain, std::span<const uint8_t> payload) {
++    const size_t idx = static_cast<size_t>(domain);
++    if (idx >= kNumDomains) {
++        std::abort();
++    }
++    CSHA256 hasher = GetTagMidstates()[idx];
++    if (!payload.empty()) {
++        hasher.Write(payload.data(), payload.size());
++    }
++    Hash result;
++    hasher.Finalize(result.data());
++    return result;
++}
++
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/tagged_hash.h b/src/lotus_v2/tagged_hash.h
+new file mode 100644
+index 0000000000..55eacb731c
+--- /dev/null
++++ b/src/lotus_v2/tagged_hash.h
+@@ -0,0 +1,41 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_TAGGED_HASH_H
++#define LOTUS_V2_TAGGED_HASH_H
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <span>
++
++namespace lotus::v2 {
++
++using Hash = std::array<uint8_t, 32>;
++using ChainId = Hash;
++using Bytes32 = Hash;
++
++enum class HashDomain {
++    HeaderBody,
++    HeaderWork,
++    BlockId,
++    Branch,
++    InputCore,
++    InputFull,
++    OwnInput,
++    Sighash,
++    Output,
++    CoinEntry,
++    MerkleIndex,
++    TxId,
++    TxHash,
++    TxRoot,
++    OutpointKey,
++    Utxo,
++    State,
++};
++
++// Hardware-accelerated BIP-340 style tagged SHA-256:
++// SHA256(SHA256(tag) || SHA256(tag) || payload).
++Hash TaggedHash(HashDomain domain, std::span<const uint8_t> payload);
++
++} // namespace lotus::v2
++#endif
+diff --git a/src/script/sigcache.cpp b/src/script/sigcache.cpp
+index f2c834e8ff..6a1d91a658 100644
+--- a/src/script/sigcache.cpp
++++ b/src/script/sigcache.cpp
+@@ -5,18 +5,58 @@
+ 
+ #include <script/sigcache.h>
+ 
++#include <crypto/common.h>
+ #include <crypto/sha256.h>
+ #include <logging.h>
++#include <lotus_v2/signing.h>
+ #include <pubkey.h>
+ #include <random.h>
+ #include <script/interpreter.h>
+ #include <span.h>
+ #include <uint256.h>
+ 
++#include <array>
++#include <cstring>
+ #include <mutex>
+ #include <shared_mutex>
+ #include <vector>
+ 
++namespace {
++struct TlsSigCache {
++    static constexpr size_t kMask = 4095;
++    struct Slot {
++        const SignatureCache *owner{nullptr};
++        uint256 entry{};
++    };
++    std::array<Slot, kMask + 1> slots{};
++
++    static size_t Index(const uint256 &entry) noexcept {
++        return static_cast<size_t>(ReadLE64(entry.begin())) & kMask;
++    }
++
++    bool Contains(const SignatureCache *owner,
++                  const uint256 &entry) const noexcept {
++        const Slot &s = slots[Index(entry)];
++        return s.owner == owner && s.entry == entry;
++    }
++
++    void Insert(const SignatureCache *owner, const uint256 &entry) noexcept {
++        Slot &s = slots[Index(entry)];
++        s.owner = owner;
++        s.entry = entry;
++    }
++
++    void Erase(const SignatureCache *owner, const uint256 &entry) noexcept {
++        Slot &s = slots[Index(entry)];
++        if (s.owner == owner && s.entry == entry) {
++            s.owner = nullptr;
++        }
++    }
++};
++
++thread_local TlsSigCache g_tls_sigcache;
++} // namespace
++
+ SignatureCache::SignatureCache(const size_t max_size_bytes) {
+     uint256 nonce = GetRandHash();
+     // We want the nonce to be 64 bytes long to force the hasher to process
+@@ -25,11 +65,18 @@ SignatureCache::SignatureCache(const size_t max_size_bytes) {
+     m_salted_hasher.Write(nonce.begin(), 32);
+     m_salted_hasher.Write(nonce.begin(), 32);
+ 
+-    const auto [num_elems, approx_size_bytes] =
+-        setValid.setup_bytes(max_size_bytes);
++    const size_t per_shard_bytes = std::max<size_t>(1, max_size_bytes / kNumShards);
++    size_t total_elems = 0;
++    size_t total_approx_bytes = 0;
++    for (auto &shard : m_shards) {
++        const auto [num_elems, approx_size_bytes] =
++            shard.setValid.setup_bytes(per_shard_bytes);
++        total_elems += num_elems;
++        total_approx_bytes += approx_size_bytes;
++    }
+     LogPrintf("Using %zu MiB out of %zu MiB requested for signature cache, "
+               "able to store %zu elements\n",
+-              approx_size_bytes >> 20, max_size_bytes >> 20, num_elems);
++              total_approx_bytes >> 20, max_size_bytes >> 20, total_elems);
+ }
+ 
+ void SignatureCache::ComputeEntry(uint256 &entry, const uint256 &hash,
+@@ -43,13 +90,70 @@ void SignatureCache::ComputeEntry(uint256 &entry, const uint256 &hash,
+ }
+ 
+ bool SignatureCache::Get(const uint256 &entry, const bool erase) {
+-    std::shared_lock<std::shared_mutex> lock(cs_sigcache);
+-    return setValid.contains(entry, erase);
++    if (!erase && g_tls_sigcache.Contains(this, entry)) {
++        return true;
++    }
++    if (erase) {
++        g_tls_sigcache.Erase(this, entry);
++    }
++    Shard &shard =
++        m_shards[static_cast<size_t>(ReadLE64(entry.begin())) & (kNumShards - 1)];
++    if (!shard.has_entries.load(std::memory_order_acquire)) {
++        return false;
++    }
++    std::shared_lock<std::shared_mutex> lock(shard.mutex);
++    const bool found = shard.setValid.contains(entry, erase);
++    if (found && !erase) {
++        g_tls_sigcache.Insert(this, entry);
++    }
++    return found;
+ }
+ 
+ void SignatureCache::Set(const uint256 &entry) {
+-    std::unique_lock<std::shared_mutex> lock(cs_sigcache);
+-    setValid.insert(entry);
++    g_tls_sigcache.Insert(this, entry);
++    Shard &shard =
++        m_shards[static_cast<size_t>(ReadLE64(entry.begin())) & (kNumShards - 1)];
++    std::unique_lock<std::shared_mutex> lock(shard.mutex);
++    shard.setValid.insert(entry);
++    shard.has_entries.store(true, std::memory_order_release);
++}
++
++void SignatureCache::SetBatch(const lotus::v2::BatchSigCollector &collector) {
++    const auto &items = collector.LegacyItems();
++    uint32_t touched_mask = 0;
++    for (const auto &item : items) {
++        if (item.store_in_cache) {
++            const size_t s = static_cast<size_t>(ReadLE64(item.cache_entry.data())) &
++                             (kNumShards - 1);
++            touched_mask |= (uint32_t{1} << s);
++        }
++    }
++    if (touched_mask == 0) {
++        return;
++    }
++    uint256 entry;
++    for (size_t s = 0; s < kNumShards; ++s) {
++        if ((touched_mask & (uint32_t{1} << s)) == 0) {
++            continue;
++        }
++        Shard &shard = m_shards[s];
++        std::unique_lock<std::shared_mutex> lock(shard.mutex);
++        for (const auto &item : items) {
++            if (!item.store_in_cache) {
++                continue;
++            }
++            const size_t item_s =
++                static_cast<size_t>(ReadLE64(item.cache_entry.data())) &
++                (kNumShards - 1);
++            if (item_s != s) {
++                continue;
++            }
++            std::memcpy(entry.begin(), item.cache_entry.data(), 32);
++            g_tls_sigcache.Insert(this, entry);
++            shard.setValid.insert(entry);
++        }
++        shard.has_entries.store(true, std::memory_order_release);
++    }
+ }
+ 
+ template <typename F>
+@@ -80,6 +184,20 @@ bool CachingTransactionSignatureChecker::IsCached(
+ bool CachingTransactionSignatureChecker::VerifySignature(
+     const std::vector<uint8_t> &vchSig, const CPubKey &pubkey,
+     const uint256 &sighash) const {
++    if (m_sig_collector != nullptr && vchSig.size() == 64) {
++        if (!pubkey.IsValid()) {
++            return false;
++        }
++        uint256 entry;
++        m_signature_cache.ComputeEntry(entry, sighash, vchSig, pubkey);
++        if (m_signature_cache.Get(entry, !store)) {
++            return true;
++        }
++        return m_sig_collector->AddLegacySchnorr(
++            std::span<const uint8_t>(pubkey.data(), pubkey.size()),
++            std::span<const uint8_t>(vchSig.data(), vchSig.size()),
++            sighash.begin(), entry.begin(), store);
++    }
+     return RunMemoizedCheck(
+         m_signature_cache, vchSig, pubkey, sighash, store, [&] {
+             return TransactionSignatureChecker::VerifySignature(vchSig, pubkey,
+diff --git a/src/script/sigcache.h b/src/script/sigcache.h
+index b9c038e90e..d4d8d701db 100644
+--- a/src/script/sigcache.h
++++ b/src/script/sigcache.h
+@@ -20,6 +20,10 @@
+ class CPubKey;
+ class CTransaction;
+ 
++namespace lotus::v2 {
++class BatchSigCollector;
++} // namespace lotus::v2
++
+ // DoS prevention: limit cache size to 32MiB (over 1000000 entries on 64-bit
+ // systems). Due to how we count cache size, actual memory usage is slightly
+ // more (~32.25 MiB)
+@@ -32,13 +36,18 @@ static constexpr size_t DEFAULT_SIGNATURE_CACHE_BYTES{32 << 20};
+  */
+ class SignatureCache {
+ private:
++    static constexpr size_t kNumShards = 16;
+     //! Entries are SHA256(nonce || signature hash || public key || signature):
+     CSHA256 m_salted_hasher;
+     typedef CuckooCache::cache<CuckooCache::KeyOnly<uint256>,
+                                SignatureCacheHasher>
+         map_type;
+-    map_type setValid;
+-    std::shared_mutex cs_sigcache;
++    struct alignas(64) Shard {
++        std::shared_mutex mutex;
++        map_type setValid;
++        std::atomic<bool> has_entries{false};
++    };
++    std::array<Shard, kNumShards> m_shards;
+ 
+ public:
+     SignatureCache(size_t max_size_bytes);
+@@ -53,24 +62,28 @@ public:
+     bool Get(const uint256 &entry, const bool erase);
+ 
+     void Set(const uint256 &entry);
++
++    void SetBatch(const lotus::v2::BatchSigCollector &collector);
+ };
+ 
+ class CachingTransactionSignatureChecker : public TransactionSignatureChecker {
+ private:
+     bool store;
+     SignatureCache &m_signature_cache;
++    lotus::v2::BatchSigCollector *m_sig_collector{nullptr};
+ 
+     bool IsCached(const std::vector<uint8_t> &vchSig, const CPubKey &vchPubKey,
+                   const uint256 &sighash) const;
+ 
+ public:
+-    CachingTransactionSignatureChecker(const CTransaction *txToIn,
+-                                       unsigned int nInIn,
+-                                       const Amount amountIn, bool storeIn,
+-                                       SignatureCache &signature_cache,
+-                                       PrecomputedTransactionData &txdataIn)
++    CachingTransactionSignatureChecker(
++        const CTransaction *txToIn, unsigned int nInIn, const Amount amountIn,
++        bool storeIn, SignatureCache &signature_cache,
++        PrecomputedTransactionData &txdataIn,
++        lotus::v2::BatchSigCollector *sig_collector = nullptr)
+         : TransactionSignatureChecker(txToIn, nInIn, amountIn, txdataIn),
+-          store(storeIn), m_signature_cache(signature_cache) {}
++          store(storeIn), m_signature_cache(signature_cache),
++          m_sig_collector(sig_collector) {}
+ 
+     bool VerifySignature(const std::vector<uint8_t> &vchSig,
+                          const CPubKey &vchPubKey,
+diff --git a/src/secp256k1/include/secp256k1_schnorr.h b/src/secp256k1/include/secp256k1_schnorr.h
+index f0b74eafd8..486eb4b183 100644
+--- a/src/secp256k1/include/secp256k1_schnorr.h
++++ b/src/secp256k1/include/secp256k1_schnorr.h
+@@ -54,6 +54,15 @@ SECP256K1_API int secp256k1_schnorr_sign(
+   const void *ndata
+ ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4);
+ 
++SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_schnorr_verify_batch(
++  const secp256k1_context *ctx,
++  const unsigned char * const *sig64,
++  const unsigned char * const *msghash32,
++  const secp256k1_pubkey * const *pubkey,
++  const unsigned char *rand32,
++  size_t n_sigs
++) SECP256K1_ARG_NONNULL(1);
++
+ # ifdef __cplusplus
+ }
+ # endif
+diff --git a/src/secp256k1/include/secp256k1_schnorrsig.h b/src/secp256k1/include/secp256k1_schnorrsig.h
+index 72b874f246..fb3b192867 100644
+--- a/src/secp256k1/include/secp256k1_schnorrsig.h
++++ b/src/secp256k1/include/secp256k1_schnorrsig.h
+@@ -179,6 +179,29 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_schnorrsig_verify(
+     const secp256k1_xonly_pubkey *pubkey
+ ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(5);
+ 
++/** Verify a batch of BIP-340 Schnorr signatures over 32-byte messages using
++ *  randomized linear combinations and multi-scalar multiplication
++ *  (Strauss / Pippenger).
++ *
++ *  Returns: 1: all n_sigs signatures are valid
++ *           0: at least one signature is invalid (or scratch allocation failed)
++ *  Args:    ctx: pointer to a context object.
++ *  In:    sig64: array of n_sigs pointers to 64-byte signatures.
++ *         msg32: array of n_sigs pointers to 32-byte messages.
++ *        pubkey: array of n_sigs pointers to x-only public keys.
++ *        rand32: pointer to 32 * n_sigs random bytes for linear combination
++ *                weights (may be NULL when n_sigs <= 1).
++ *        n_sigs: number of signatures in the batch.
++ */
++SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_schnorrsig_verify_batch(
++    const secp256k1_context *ctx,
++    const unsigned char * const *sig64,
++    const unsigned char * const *msg32,
++    const secp256k1_xonly_pubkey * const *pubkey,
++    const unsigned char *rand32,
++    size_t n_sigs
++) SECP256K1_ARG_NONNULL(1);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/secp256k1/src/modules/schnorr/main_impl.h b/src/secp256k1/src/modules/schnorr/main_impl.h
+index 5e0e422176..0e0958ebd7 100644
+--- a/src/secp256k1/src/modules/schnorr/main_impl.h
++++ b/src/secp256k1/src/modules/schnorr/main_impl.h
+@@ -73,4 +73,122 @@ int secp256k1_schnorr_sign(
+     return !!ret & !overflow;
+ }
+ 
++typedef struct {
++    const secp256k1_context *ctx;
++    const unsigned char * const *sig64;
++    const unsigned char * const *msghash32;
++    const secp256k1_pubkey * const *pubkey;
++    const unsigned char *rand32;
++} secp256k1_schnorr_batch_data;
++
++static void secp256k1_schnorr_batch_z(secp256k1_scalar *z, const unsigned char *rand32, size_t sig_idx) {
++    if (sig_idx == 0) {
++        *z = secp256k1_scalar_one;
++    } else {
++        int overflow = 0;
++        secp256k1_scalar_set_b32(z, rand32 + 32 * sig_idx, &overflow);
++        if (overflow || secp256k1_scalar_is_zero(z)) {
++            *z = secp256k1_scalar_one;
++        }
++    }
++}
++
++static int secp256k1_schnorr_batch_ecmult_cb(secp256k1_scalar *sc, secp256k1_ge *pt, size_t idx, void *data) {
++    const secp256k1_schnorr_batch_data *bdata = (const secp256k1_schnorr_batch_data *)data;
++    const size_t sig_idx = idx >> 1;
++    secp256k1_scalar z;
++    secp256k1_schnorr_batch_z(&z, bdata->rand32, sig_idx);
++
++    if ((idx & 1) == 0) {
++        secp256k1_fe rx;
++        if (!secp256k1_fe_set_b32_limit(&rx, &bdata->sig64[sig_idx][0])) {
++            return 0;
++        }
++        if (!secp256k1_ge_set_xquad(pt, &rx)) {
++            return 0;
++        }
++        secp256k1_ge_neg(pt, pt);
++        *sc = z;
++        return 1;
++    } else {
++        if (!secp256k1_pubkey_load(bdata->ctx, pt, bdata->pubkey[sig_idx])) {
++            return 0;
++        }
++        if (secp256k1_ge_is_infinity(pt)) {
++            return 0;
++        }
++        if (!secp256k1_schnorr_compute_e(sc, &bdata->sig64[sig_idx][0], pt, bdata->msghash32[sig_idx])) {
++            return 0;
++        }
++        secp256k1_scalar_mul(sc, sc, &z);
++        secp256k1_ge_neg(pt, pt);
++        return 1;
++    }
++}
++
++int secp256k1_schnorr_verify_batch(
++    const secp256k1_context *ctx,
++    const unsigned char * const *sig64,
++    const unsigned char * const *msghash32,
++    const secp256k1_pubkey * const *pubkey,
++    const unsigned char *rand32,
++    size_t n_sigs
++) {
++    secp256k1_schnorr_batch_data bdata;
++    secp256k1_scalar g_sc;
++    secp256k1_gej rj;
++    secp256k1_scratch *scratch;
++    size_t i;
++    size_t n_points;
++    size_t scratch_size;
++    int ret;
++
++    VERIFY_CHECK(ctx != NULL);
++    if (n_sigs == 0) {
++        return 1;
++    }
++    ARG_CHECK(sig64 != NULL);
++    ARG_CHECK(msghash32 != NULL);
++    ARG_CHECK(pubkey != NULL);
++    if (n_sigs == 1) {
++        return secp256k1_schnorr_verify(ctx, sig64[0], msghash32[0], pubkey[0]);
++    }
++    ARG_CHECK(rand32 != NULL);
++
++    secp256k1_scalar_clear(&g_sc);
++    for (i = 0; i < n_sigs; i++) {
++        secp256k1_scalar s;
++        secp256k1_scalar z;
++        int overflow = 0;
++        if (sig64[i] == NULL || msghash32[i] == NULL || pubkey[i] == NULL) {
++            return 0;
++        }
++        secp256k1_scalar_set_b32(&s, &sig64[i][32], &overflow);
++        if (overflow) {
++            return 0;
++        }
++        secp256k1_schnorr_batch_z(&z, rand32, i);
++        secp256k1_scalar_mul(&s, &s, &z);
++        secp256k1_scalar_add(&g_sc, &g_sc, &s);
++    }
++
++    bdata.ctx = ctx;
++    bdata.sig64 = sig64;
++    bdata.msghash32 = msghash32;
++    bdata.pubkey = pubkey;
++    bdata.rand32 = rand32;
++
++    n_points = 2 * n_sigs;
++    if (n_points >= ECMULT_PIPPENGER_THRESHOLD) {
++        int bucket_window = secp256k1_pippenger_bucket_window(n_points);
++        scratch_size = secp256k1_pippenger_scratch_size(n_points, bucket_window) + PIPPENGER_SCRATCH_OBJECTS * 16;
++    } else {
++        scratch_size = secp256k1_strauss_scratch_size(n_points) + STRAUSS_SCRATCH_OBJECTS * 16;
++    }
++    scratch = secp256k1_scratch_create(&ctx->error_callback, scratch_size);
++    ret = secp256k1_ecmult_multi_var(&ctx->error_callback, scratch, &rj, &g_sc, secp256k1_schnorr_batch_ecmult_cb, &bdata, n_points);
++    secp256k1_scratch_destroy(&ctx->error_callback, scratch);
++    return ret && secp256k1_gej_is_infinity(&rj);
++}
++
+ #endif
+diff --git a/src/secp256k1/src/modules/schnorrsig/main_impl.h b/src/secp256k1/src/modules/schnorrsig/main_impl.h
+index 57f7eadd3c..e1ec2027bb 100644
+--- a/src/secp256k1/src/modules/schnorrsig/main_impl.h
++++ b/src/secp256k1/src/modules/schnorrsig/main_impl.h
+@@ -264,4 +264,112 @@ int secp256k1_schnorrsig_verify(const secp256k1_context* ctx, const unsigned cha
+            secp256k1_fe_equal(&rx, &r.x);
+ }
+ 
++typedef struct {
++    const secp256k1_context *ctx;
++    const unsigned char * const *sig64;
++    const unsigned char * const *msg32;
++    const secp256k1_xonly_pubkey * const *pubkey;
++    const unsigned char *rand32;
++} secp256k1_schnorrsig_batch_data;
++
++static void secp256k1_schnorrsig_batch_z(secp256k1_scalar *z, const unsigned char *rand32, size_t sig_idx) {
++    if (sig_idx == 0) {
++        *z = secp256k1_scalar_one;
++    } else {
++        int overflow = 0;
++        secp256k1_scalar_set_b32(z, rand32 + 32 * sig_idx, &overflow);
++        if (overflow || secp256k1_scalar_is_zero(z)) {
++            *z = secp256k1_scalar_one;
++        }
++    }
++}
++
++static int secp256k1_schnorrsig_batch_ecmult_cb(secp256k1_scalar *sc, secp256k1_ge *pt, size_t idx, void *data) {
++    const secp256k1_schnorrsig_batch_data *bdata = (const secp256k1_schnorrsig_batch_data *)data;
++    const size_t sig_idx = idx >> 1;
++    secp256k1_scalar z;
++    secp256k1_schnorrsig_batch_z(&z, bdata->rand32, sig_idx);
++
++    if ((idx & 1) == 0) {
++        secp256k1_fe rx;
++        if (!secp256k1_fe_set_b32_limit(&rx, &bdata->sig64[sig_idx][0])) {
++            return 0;
++        }
++        if (!secp256k1_ge_set_xo_var(pt, &rx, 0)) {
++            return 0;
++        }
++        secp256k1_ge_neg(pt, pt);
++        *sc = z;
++        return 1;
++    } else {
++        unsigned char pk_buf[32];
++        if (!secp256k1_xonly_pubkey_load(bdata->ctx, pt, bdata->pubkey[sig_idx])) {
++            return 0;
++        }
++        secp256k1_fe_get_b32(pk_buf, &pt->x);
++        secp256k1_schnorrsig_challenge(sc, &bdata->sig64[sig_idx][0], bdata->msg32[sig_idx], 32, pk_buf);
++        secp256k1_scalar_mul(sc, sc, &z);
++        secp256k1_ge_neg(pt, pt);
++        return 1;
++    }
++}
++
++int secp256k1_schnorrsig_verify_batch(const secp256k1_context* ctx, const unsigned char * const *sig64, const unsigned char * const *msg32, const secp256k1_xonly_pubkey * const *pubkey, const unsigned char *rand32, size_t n_sigs) {
++    secp256k1_schnorrsig_batch_data bdata;
++    secp256k1_scalar g_sc;
++    secp256k1_gej rj;
++    secp256k1_scratch *scratch;
++    size_t i;
++    size_t n_points;
++    size_t scratch_size;
++    int ret;
++
++    VERIFY_CHECK(ctx != NULL);
++    if (n_sigs == 0) {
++        return 1;
++    }
++    ARG_CHECK(sig64 != NULL);
++    ARG_CHECK(msg32 != NULL);
++    ARG_CHECK(pubkey != NULL);
++    if (n_sigs == 1) {
++        return secp256k1_schnorrsig_verify(ctx, sig64[0], msg32[0], 32, pubkey[0]);
++    }
++    ARG_CHECK(rand32 != NULL);
++
++    secp256k1_scalar_clear(&g_sc);
++    for (i = 0; i < n_sigs; i++) {
++        secp256k1_scalar s;
++        secp256k1_scalar z;
++        int overflow = 0;
++        if (sig64[i] == NULL || msg32[i] == NULL || pubkey[i] == NULL) {
++            return 0;
++        }
++        secp256k1_scalar_set_b32(&s, &sig64[i][32], &overflow);
++        if (overflow) {
++            return 0;
++        }
++        secp256k1_schnorrsig_batch_z(&z, rand32, i);
++        secp256k1_scalar_mul(&s, &s, &z);
++        secp256k1_scalar_add(&g_sc, &g_sc, &s);
++    }
++
++    bdata.ctx = ctx;
++    bdata.sig64 = sig64;
++    bdata.msg32 = msg32;
++    bdata.pubkey = pubkey;
++    bdata.rand32 = rand32;
++
++    n_points = 2 * n_sigs;
++    if (n_points >= ECMULT_PIPPENGER_THRESHOLD) {
++        int bucket_window = secp256k1_pippenger_bucket_window(n_points);
++        scratch_size = secp256k1_pippenger_scratch_size(n_points, bucket_window) + PIPPENGER_SCRATCH_OBJECTS * 16;
++    } else {
++        scratch_size = secp256k1_strauss_scratch_size(n_points) + STRAUSS_SCRATCH_OBJECTS * 16;
++    }
++    scratch = secp256k1_scratch_create(&ctx->error_callback, scratch_size);
++    ret = secp256k1_ecmult_multi_var(&ctx->error_callback, scratch, &rj, &g_sc, secp256k1_schnorrsig_batch_ecmult_cb, &bdata, n_points);
++    secp256k1_scratch_destroy(&ctx->error_callback, scratch);
++    return ret && secp256k1_gej_is_infinity(&rj);
++}
++
+ #endif
+diff --git a/src/test/sigcache_tests.cpp b/src/test/sigcache_tests.cpp
+index af950ac85f..51941f0cbd 100644
+--- a/src/test/sigcache_tests.cpp
++++ b/src/test/sigcache_tests.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <key.h>
+ #include <key_io.h>
++#include <lotus_v2/signing.h>
+ #include <streams.h>
+ #include <tinyformat.h>
+ #include <util/strencodings.h>
+@@ -114,4 +115,51 @@ BOOST_AUTO_TEST_CASE(sig_pubkey_hash_variations) {
+     }
+ }
+ 
++BOOST_AUTO_TEST_CASE(schnorr_batch_and_tls_sigcache) {
++    DataStream stream{ParseHex(
++        "010000000122739e70fbee987a8be1788395a2f2e6ad18ccb7ff611cd798071539"
++        "dde3c38e000000000151ffffffff010000000000000000016a00000000")};
++    CTransaction dummyTx(deserialize, stream);
++    BOOST_CHECK_EQUAL(dummyTx.GetTotalSize(), GetSerializeSize(dummyTx));
++
++    PrecomputedTransactionData txdata(dummyTx);
++    SignatureCache signature_cache{DEFAULT_SIGNATURE_CACHE_BYTES};
++    lotus::v2::BatchSigCollector collector;
++    CachingTransactionSignatureChecker batchChecker(
++        &dummyTx, 0, 0 * SATOSHI, true, signature_cache, txdata, &collector);
++
++    CKey key;
++    key.MakeNewKey(true);
++    CPubKey pubkey = key.GetPubKey();
++
++    std::vector<std::vector<uint8_t>> sigs(32);
++    std::vector<uint256> hashes(32);
++    for (int i = 0; i < 32; ++i) {
++        hashes[i] = Hash(strprintf("Schnorr batch msg %d", i));
++        BOOST_CHECK(key.SignSchnorr(hashes[i], sigs[i]));
++        BOOST_CHECK(batchChecker.VerifySignature(sigs[i], pubkey, hashes[i]));
++    }
++    BOOST_CHECK_EQUAL(collector.LegacyItems().size(), 32U);
++    BOOST_CHECK(collector.VerifyAll());
++
++    // Batch insert into signature cache and verify TLS + global cache hits.
++    signature_cache.SetBatch(collector);
++    CachingTransactionSignatureChecker checkCached(
++        &dummyTx, 0, 0 * SATOSHI, false, signature_cache, txdata);
++    TestCachingTransactionSignatureChecker testCached(checkCached);
++    for (int i = 0; i < 32; ++i) {
++        BOOST_CHECK(testCached.IsCached(sigs[i], pubkey, hashes[i]));
++    }
++
++    // Corrupting one signature in a batch must cause VerifyAll() to fail.
++    lotus::v2::BatchSigCollector bad_collector = collector;
++    std::vector<uint8_t> bad_sig = sigs[0];
++    bad_sig[10] ^= 0x01;
++    BOOST_CHECK(bad_collector.AddLegacySchnorr(
++        std::span<const uint8_t>(pubkey.data(), pubkey.size()),
++        std::span<const uint8_t>(bad_sig.data(), bad_sig.size()),
++        hashes[0].begin()));
++    BOOST_CHECK(!bad_collector.VerifyAll());
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 46ae00c11c..b0b151c1d1 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -30,6 +30,7 @@
+ #include <kernel/notifications_interface.h>
+ #include <logging.h>
+ #include <logging/timer.h>
++#include <lotus_v2/signing.h>
+ #include <minerfund.h>
+ #include <node/blockstorage.h>
+ #include <node/utxo_snapshot.h>
+@@ -68,7 +69,10 @@
+ #include <atomic>
+ #include <cassert>
+ #include <chrono>
++#include <condition_variable>
+ #include <deque>
++#include <functional>
++#include <mutex>
+ #include <numeric>
+ #include <optional>
+ #include <string>
+@@ -280,6 +284,161 @@ static bool CheckInputsFromMempoolAndCache(
+ 
+ namespace {
+ 
++struct ParallelTxScriptError {
++    TxValidationResult result{TxValidationResult::TX_CONSENSUS};
++    ScriptError script_err{ScriptError::UNKNOWN};
++    std::string reject_reason;
++    std::string debug_message;
++};
++
++std::optional<ParallelTxScriptError> VerifyTxScriptsFromResolvedCoins(
++    const CTransaction &tx, const std::vector<Coin> &resolved_inputs,
++    const uint32_t flags, bool sigCacheStore,
++    const PrecomputedTransactionData &txdata, SignatureCache &signature_cache,
++    int &nSigChecksOut, TxSigCheckLimiter &txLimitSigChecks,
++    CheckInputsLimiter *pBlockLimitSigChecks,
++    lotus::v2::BatchSigCollector *sig_collector) {
++    assert(!tx.IsCoinBase());
++    assert(resolved_inputs.size() == tx.vin.size());
++
++    int nSigChecksTotal = 0;
++    for (size_t i = 0; i < tx.vin.size(); i++) {
++        assert(!resolved_inputs[i].IsSpent());
++        const CTxOut &prev_txout = resolved_inputs[i].GetTxOut();
++
++        CScriptCheck check(prev_txout, tx, signature_cache, i, flags,
++                           sigCacheStore, txdata, &txLimitSigChecks,
++                           pBlockLimitSigChecks, sig_collector);
++        if (auto result = check(); result.has_value()) {
++            uint32_t mandatoryFlags =
++                flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS;
++            if (flags != mandatoryFlags) {
++                CScriptCheck check2(prev_txout, tx, signature_cache, i,
++                                    mandatoryFlags, sigCacheStore, txdata,
++                                    nullptr, nullptr, nullptr);
++                auto mandatory_result = check2();
++                if (!mandatory_result.has_value()) {
++                    return ParallelTxScriptError{
++                        TxValidationResult::TX_NOT_STANDARD, result->first,
++                        strprintf("non-mandatory-script-verify-flag (%s)",
++                                  ScriptErrorString(result->first)),
++                        result->second};
++                }
++                result = mandatory_result;
++            }
++            return ParallelTxScriptError{
++                TxValidationResult::TX_CONSENSUS, result->first,
++                strprintf("mandatory-script-verify-flag-failed (%s)",
++                          ScriptErrorString(result->first)),
++                result->second};
++        }
++        nSigChecksTotal += check.GetScriptExecutionMetrics().nSigChecks;
++    }
++    nSigChecksOut = nSigChecksTotal;
++    return std::nullopt;
++}
++
++class ParallelScriptWorkerPool {
++public:
++    static ParallelScriptWorkerPool &Instance() {
++        static ParallelScriptWorkerPool pool;
++        return pool;
++    }
++
++    template <typename Fn>
++    void Run(size_t num_workers, Fn &&fn) {
++        if (num_workers <= 1) {
++            fn(0);
++            return;
++        }
++        std::function<void(size_t)> task_fn(std::forward<Fn>(fn));
++        std::unique_lock<std::mutex> dispatch_lock(m_dispatch_mutex);
++        EnsureWorkers(num_workers - 1);
++        const size_t active = std::min(num_workers - 1, m_threads.size());
++        if (active == 0) {
++            dispatch_lock.unlock();
++            task_fn(0);
++            return;
++        }
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            m_task = &task_fn;
++            m_active_workers = active;
++            m_remaining.store(active, std::memory_order_release);
++            ++m_generation;
++        }
++        m_cv_start.notify_all();
++        task_fn(0);
++        {
++            std::unique_lock<std::mutex> lock(m_mutex);
++            m_cv_done.wait(lock, [this]() {
++                return m_remaining.load(std::memory_order_acquire) == 0;
++            });
++            m_task = nullptr;
++        }
++    }
++
++private:
++    ParallelScriptWorkerPool() = default;
++    ~ParallelScriptWorkerPool() {
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            m_stop = true;
++            ++m_generation;
++        }
++        m_cv_start.notify_all();
++        for (auto &t : m_threads) {
++            if (t.joinable()) {
++                t.join();
++            }
++        }
++    }
++
++    void EnsureWorkers(size_t count) {
++        while (m_threads.size() < count) {
++            const size_t worker_id = m_threads.size() + 1;
++            m_threads.emplace_back([this, worker_id]() {
++                uint64_t seen_gen = 0;
++                while (true) {
++                    const std::function<void(size_t)> *fn = nullptr;
++                    {
++                        std::unique_lock<std::mutex> lock(m_mutex);
++                        m_cv_start.wait(lock, [this, &seen_gen]() {
++                            return m_stop || m_generation != seen_gen;
++                        });
++                        if (m_stop) {
++                            return;
++                        }
++                        seen_gen = m_generation;
++                        if (worker_id <= m_active_workers) {
++                            fn = m_task;
++                        }
++                    }
++                    if (fn != nullptr) {
++                        (*fn)(worker_id);
++                        if (m_remaining.fetch_sub(
++                                1, std::memory_order_acq_rel) == 1) {
++                            std::lock_guard<std::mutex> lock(m_mutex);
++                            m_cv_done.notify_one();
++                        }
++                    }
++                }
++            });
++        }
++    }
++
++    std::mutex m_dispatch_mutex;
++    std::mutex m_mutex;
++    std::condition_variable m_cv_start;
++    std::condition_variable m_cv_done;
++    std::vector<std::thread> m_threads;
++    const std::function<void(size_t)> *m_task{nullptr};
++    size_t m_active_workers{0};
++    std::atomic<size_t> m_remaining{0};
++    uint64_t m_generation{0};
++    bool m_stop{false};
++};
++
+ class MemPoolAccept {
+ public:
+     MemPoolAccept(CTxMemPool &mempool, Chainstate &active_chainstate)
+@@ -1754,7 +1913,10 @@ std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
+     if (!VerifyScript(scriptSig, m_tx_out.scriptPubKey, nFlags,
+                       CachingTransactionSignatureChecker(
+                           ptxTo, nIn, m_tx_out.nValue, cacheStore,
+-                          *m_signature_cache, txdata),
++                          *m_signature_cache, txdata,
++                          ((nFlags & SCRIPT_VERIFY_NULLFAIL) != 0)
++                              ? m_sig_collector
++                              : nullptr),
+                       metrics, &error)) {
+         return std::make_pair(error, std::move(debug_str));
+     }
+@@ -2399,10 +2561,21 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+         }
+     }
+ 
++    struct PendingBlockTxCheck {
++        size_t tx_index;
++        ScriptCacheKey cache_key;
++    };
++    std::vector<PendingBlockTxCheck> pending_script_txs;
++    if (fScriptChecks && block.vtx.size() > 1) {
++        pending_script_txs.reserve(block.vtx.size() - 1);
++    }
++
+     size_t txIndex = 0;
+     // nSigChecksRet may be accurate (found in cache) or 0 (checks were
+-    // deferred into vChecks).
+-    int nSigChecksRet;
++    // deferred into Pass 2).
++    int nSigChecksRet = 0;
++    const bool fCacheResults = fJustCheck;
++    const bool fEnforceSigCheck = flags & SCRIPT_ENFORCE_SIGCHECKS;
+     for (const auto &ptx : block.vtx) {
+         const CTransaction &tx = *ptx;
+         const bool isCoinBase = tx.IsCoinBase();
+@@ -2453,11 +2626,6 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+             break;
+         }
+ 
+-        // Don't cache results if we're actually connecting blocks (still
+-        // consult the cache, though).
+-        bool fCacheResults = fJustCheck;
+-
+-        const bool fEnforceSigCheck = flags & SCRIPT_ENFORCE_SIGCHECKS;
+         if (!fEnforceSigCheck) {
+             // Historically, there has been transactions with a very high
+             // sigcheck count, so we need to disable this check for such
+@@ -2465,31 +2633,32 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+             nSigChecksTxLimiters[txIndex] = TxSigCheckLimiter::getDisabled();
+         }
+ 
+-        std::vector<CScriptCheck> vChecks;
+-        TxValidationState tx_state;
+-        if (fScriptChecks &&
+-            !CheckInputScripts(tx, tx_state, view, flags, fCacheResults,
+-                               fCacheResults, PrecomputedTransactionData(tx),
+-                               m_chainman.m_validation_cache, nSigChecksRet,
+-                               nSigChecksTxLimiters[txIndex],
+-                               &nSigChecksBlockLimiter, &vChecks)) {
+-            // Any transaction validation failure in ConnectBlock is a block
+-            // consensus failure
+-            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+-                          tx_state.GetRejectReason(),
+-                          tx_state.GetDebugMessage());
+-            break;
+-        }
+-
+-        if (control) {
+-            control->Add(std::move(vChecks));
++        if (fScriptChecks) {
++            ScriptCacheKey hashCacheEntry(
++                tx, flags,
++                m_chainman.m_validation_cache.ScriptExecutionCacheHasher());
++            ScriptCacheElement elem(hashCacheEntry, 0);
++            if (m_chainman.m_validation_cache.m_script_execution_cache.get(
++                    elem, /*erase=*/!fCacheResults)) {
++                nSigChecksRet = elem.nSigChecks;
++                if (!nSigChecksTxLimiters[txIndex].consume_and_check(
++                        nSigChecksRet) ||
++                    !nSigChecksBlockLimiter.consume_and_check(nSigChecksRet)) {
++                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                                  "too-many-sigchecks", "");
++                    break;
++                }
++            } else {
++                nSigChecksRet = 0;
++                pending_script_txs.push_back({txIndex, hashCacheEntry});
++            }
+         }
+ 
+         // Note: this must execute in the same iteration as CheckTxInputs (not
+-        // in a separate loop) in order to detect double spends. However,
+-        // this does not prevent double-spending by duplicated transaction
+-        // inputs in the same transaction (cf. CVE-2018-17144) -- that check is
+-        // done in CheckBlock (CheckRegularTransaction).
++        // in a separate loop) in order to detect double spends. SpendCoins
++        // also snapshots the exact spent Coin for each input into
++        // blockundo.vtxundo[txIndex].vprevout, forming the static UTXO
++        // dependency snapshot for Pass 2 parallel script verification.
+         SpendCoins(view, tx, blockundo.vtxundo.at(txIndex), pindex->nHeight);
+         txIndex++;
+     }
+@@ -2520,15 +2689,130 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+     if (blockFees) {
+         *blockFees = nFees;
+     }
+-    if (control) {
+-        auto parallel_result = control->Complete();
+-        if (parallel_result.has_value() && state.IsValid()) {
+-            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+-                          strprintf("mandatory-script-verify-flag-failed (%s)",
+-                                    ScriptErrorString(parallel_result->first)),
+-                          parallel_result->second);
++
++    // Pass 2: Static UTXO Dependency-Graph Multi-Core Parallel Script &
++    // Batch Schnorr Signature Verification using blockundo.vtxundo[txIndex].
++    if (fScriptChecks && state.IsValid() && !pending_script_txs.empty()) {
++        const size_t n_pending = pending_script_txs.size();
++        const unsigned int hw_threads =
++            std::max(1u, std::thread::hardware_concurrency());
++        const size_t num_workers =
++            (n_pending >= 2)
++                ? std::min<size_t>(n_pending, static_cast<size_t>(hw_threads))
++                : 1;
++        std::vector<std::optional<ParallelTxScriptError>> tx_errors(n_pending);
++        std::vector<int> tx_sigchecks(n_pending, 0);
++        std::vector<lotus::v2::BatchSigCollector> worker_collectors(
++            num_workers);
++        std::atomic<size_t> next_k{0};
++        std::atomic<size_t> min_failed_k{n_pending};
++
++        auto worker_fn = [&](size_t tid) {
++            lotus::v2::BatchSigCollector &local_sigs = worker_collectors[tid];
++            while (true) {
++                const size_t k = next_k.fetch_add(1, std::memory_order_relaxed);
++                if (k >= n_pending ||
++                    k > min_failed_k.load(std::memory_order_relaxed)) {
++                    break;
++                }
++                const size_t t_idx = pending_script_txs[k].tx_index;
++                const CTransaction &tx = *block.vtx[t_idx + 1];
++                const std::vector<Coin> &resolved_inputs =
++                    blockundo.vtxundo[t_idx].vprevout;
++                PrecomputedTransactionData txdata(tx);
++                auto err = VerifyTxScriptsFromResolvedCoins(
++                    tx, resolved_inputs, flags, fCacheResults, txdata,
++                    m_chainman.m_validation_cache.m_signature_cache,
++                    tx_sigchecks[k], nSigChecksTxLimiters[t_idx],
++                    &nSigChecksBlockLimiter, &local_sigs);
++                if (err.has_value()) {
++                    tx_errors[k] = std::move(err);
++                    size_t prev = min_failed_k.load(std::memory_order_relaxed);
++                    while (k < prev &&
++                           !min_failed_k.compare_exchange_weak(
++                               prev, k, std::memory_order_relaxed)) {
++                    }
++                }
++            }
++        };
++
++        ParallelScriptWorkerPool::Instance().Run(num_workers, worker_fn);
++
++        for (size_t k = 0; k < n_pending; ++k) {
++            if (tx_errors[k].has_value()) {
++                if (tx_errors[k]->script_err ==
++                    ScriptError::SIGCHECKS_LIMIT_EXCEEDED) {
++                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                                  "too-many-sigchecks",
++                                  tx_errors[k]->debug_message);
++                } else {
++                    state.Invalid(
++                        BlockValidationResult::BLOCK_CONSENSUS,
++                        strprintf("mandatory-script-verify-flag-failed (%s)",
++                                  ScriptErrorString(tx_errors[k]->script_err)),
++                        tx_errors[k]->debug_message);
++                }
++                break;
++            }
++        }
++
++        if (state.IsValid()) {
++            lotus::v2::BatchSigCollector combined_sigs;
++            for (const auto &wc : worker_collectors) {
++                combined_sigs.Merge(wc);
++            }
++            if (!combined_sigs.Empty() && !combined_sigs.VerifyAll()) {
++                for (size_t k = 0; k < n_pending; ++k) {
++                    const size_t t_idx = pending_script_txs[k].tx_index;
++                    const CTransaction &tx = *block.vtx[t_idx + 1];
++                    const std::vector<Coin> &resolved_inputs =
++                        blockundo.vtxundo[t_idx].vprevout;
++                    PrecomputedTransactionData txdata(tx);
++                    int dummy_sigchecks = 0;
++                    TxSigCheckLimiter dummy_tx_limiter =
++                        TxSigCheckLimiter::getDisabled();
++                    TxSigCheckLimiter dummy_block_limiter =
++                        TxSigCheckLimiter::getDisabled();
++                    auto err = VerifyTxScriptsFromResolvedCoins(
++                        tx, resolved_inputs, flags, /*cache_results=*/false,
++                        txdata,
++                        m_chainman.m_validation_cache.m_signature_cache,
++                        dummy_sigchecks, dummy_tx_limiter,
++                        &dummy_block_limiter, /*sig_collector=*/nullptr);
++                    if (err.has_value()) {
++                        state.Invalid(
++                            BlockValidationResult::BLOCK_CONSENSUS,
++                            strprintf(
++                                "mandatory-script-verify-flag-failed (%s)",
++                                ScriptErrorString(err->script_err)),
++                            err->debug_message);
++                        break;
++                    }
++                }
++                if (state.IsValid()) {
++                    state.Invalid(
++                        BlockValidationResult::BLOCK_CONSENSUS,
++                        strprintf("mandatory-script-verify-flag-failed (%s)",
++                                  ScriptErrorString(ScriptError::EVAL_FALSE)),
++                        "Batch signature verification failed");
++                }
++            } else if (fCacheResults) {
++                m_chainman.m_validation_cache.m_signature_cache.SetBatch(
++                    combined_sigs);
++            }
++        }
++
++        if (state.IsValid() && fCacheResults) {
++            for (size_t k = 0; k < n_pending; ++k) {
++                m_chainman.m_validation_cache.m_script_execution_cache.insert(
++                    ScriptCacheElement{pending_script_txs[k].cache_key,
++                                       tx_sigchecks[k]});
++            }
+         }
+     }
++    if (control) {
++        (void)control->Complete();
++    }
+     if (!state.IsValid()) {
+         LogInfo("Block validation error: %s\n", state.ToString());
+         return false;
+diff --git a/src/validation.h b/src/validation.h
+index 3e4f03567b..c9f255cf68 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -540,6 +540,10 @@ std::optional<LockPoints> CalculateLockPointsAtTip(CBlockIndex *tip,
+  */
+ bool CheckSequenceLocksAtTip(CBlockIndex *tip, const LockPoints &lock_points);
+ 
++namespace lotus::v2 {
++class BatchSigCollector;
++} // namespace lotus::v2
++
+ /**
+  * Closure representing one script verification.
+  * Note that this stores references to the spending transaction.
+@@ -559,6 +563,7 @@ private:
+     SignatureCache *m_signature_cache;
+     TxSigCheckLimiter *pTxLimitSigChecks;
+     CheckInputsLimiter *pBlockLimitSigChecks;
++    lotus::v2::BatchSigCollector *m_sig_collector{nullptr};
+ 
+ public:
+     CScriptCheck(const CTxOut &outIn, const CTransaction &txToIn,
+@@ -566,12 +571,14 @@ public:
+                  uint32_t nFlagsIn, bool cacheIn,
+                  const PrecomputedTransactionData &txdataIn,
+                  TxSigCheckLimiter *pTxLimitSigChecksIn = nullptr,
+-                 CheckInputsLimiter *pBlockLimitSigChecksIn = nullptr)
++                 CheckInputsLimiter *pBlockLimitSigChecksIn = nullptr,
++                 lotus::v2::BatchSigCollector *sigCollectorIn = nullptr)
+         : m_tx_out(outIn), ptxTo(&txToIn), nIn(nInIn), nFlags(nFlagsIn),
+           cacheStore(cacheIn), txdata(txdataIn),
+           m_signature_cache(&signature_cache),
+           pTxLimitSigChecks(pTxLimitSigChecksIn),
+-          pBlockLimitSigChecks(pBlockLimitSigChecksIn) {}
++          pBlockLimitSigChecks(pBlockLimitSigChecksIn),
++          m_sig_collector(sigCollectorIn) {}
+ 
+     CScriptCheck(const CScriptCheck &) = delete;
+     CScriptCheck &operator=(const CScriptCheck &) = delete;
+-- 
+2.50.1 (Apple Git-155)
+

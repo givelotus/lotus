@@ -1,0 +1,752 @@
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 3540a07660..600ef28354 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -3,6 +3,7 @@
+ // Distributed under the MIT software license, see the accompanying
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
++#include <net/relay_inventory_queue.h>
+ #include <net/txrelay_index.h>
+ #include <net/v2_protocol_handler.h>
+ #include <net_processing.h>
+@@ -510,12 +511,11 @@ struct Peer {
+          */
+         CRollingBloomFilter m_tx_inventory_known_filter
+             GUARDED_BY(m_tx_inventory_mutex){50000, 0.000001};
+-        /**
+-         * Set of transaction ids we still have to announce. We use the
+-         * mempool to sort transactions in dependency order before relay, so
+-         * this does not have to be sorted.
+-         */
+-        std::set<TxId> m_tx_inventory_to_send GUARDED_BY(m_tx_inventory_mutex);
++        /** Pending IDs ranked by cached admission incarnation. Suffix refresh
++         * and authoritative selection restore current order before emission.
++         * Body ownership is confined to bounded chunks, not backlog. */
++        txrelay::RelayInventoryQueue m_tx_inventory_to_send
++            GUARDED_BY(m_tx_inventory_mutex);
+         /**
+          * Whether the peer has requested us to send our complete mempool. Only
+          * permitted if the peer has NetPermissionFlags::Mempool.
+@@ -990,6 +990,23 @@ public:
+     void RelayProof(const avalanche::ProofId &proofid) override
+         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex);
+     void SetBestHeight(int height) override { m_best_height = height; };
++    RelayInventoryWork GetRelayInventoryWorkForTest() const override
++        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex) {
++        return m_relay_inventory_work;
++    }
++    void UnitTestSetStalledTx(NodeId peer_id, const TxId &txid,
++                              bool stalled) override
++        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex) {
++        const auto peer = Assert(GetPeerRef(peer_id));
++        auto *relay = Assert(peer->GetTxRelay());
++        LOCK(relay->m_tx_inventory_mutex);
++        if (stalled) {
++            relay->m_avalanche_stalled_txids.insert(
++                {txid, GetTime<std::chrono::seconds>()});
++        } else {
++            relay->m_avalanche_stalled_txids.erase(txid);
++        }
++    }
+     void UnitTestMisbehaving(NodeId peer_id) override
+         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex) {
+         Misbehaving(*Assert(GetPeerRef(peer_id)), "");
+@@ -1609,6 +1626,8 @@ private:
+     GlobalMutex m_relay_queue_mutex;
+     std::vector<RelayQueueEntry> m_relay_queue GUARDED_BY(m_relay_queue_mutex);
+     std::chrono::microseconds m_next_relay_drain GUARDED_BY(g_msgproc_mutex){0};
++    uint64_t m_relay_admission_cursor GUARDED_BY(g_msgproc_mutex){0};
++    RelayInventoryWork m_relay_inventory_work GUARDED_BY(g_msgproc_mutex);
+     /**
+      * Recently relayed transactions and the peers they were announced to, so
+      * that a child is announced to (at least) its parent's peers.
+@@ -1629,6 +1648,9 @@ private:
+         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex);
+     void DrainRelayQueue()
+         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_peer_mutex);
++    /** Apply only new live admissions to existing queued IDs, before selection. */
++    void RefreshRelayInventoryAdmissions()
++        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, cs_main, !m_peer_mutex);
+     /** Wake the message handler at each relay tick while inventory waits */
+     void ScheduleRelayTick(CScheduler &scheduler);
+     /**
+@@ -2150,7 +2172,7 @@ static void AddKnownTx(Peer &peer, const TxId &txid) {
+ 
+     LOCK(tx_relay->m_tx_inventory_mutex);
+     tx_relay->m_tx_inventory_known_filter.insert(txid);
+-    tx_relay->m_tx_inventory_to_send.erase(txid);
++    tx_relay->m_tx_inventory_to_send.Erase(txid);
+ }
+ 
+ static void AddKnownProof(Peer &peer, const avalanche::ProofId &proofid) {
+@@ -4284,6 +4306,8 @@ void PeerManagerImpl::DrainRelayQueue() {
+     // The nearest in-mempool parent that was relayed recently, if any.
+     std::vector<const std::vector<NodeId> *> parent_route(batch.size(),
+                                                           nullptr);
++    std::vector<std::optional<uint64_t>> admission_ranks(batch.size());
++    m_relay_inventory_work.enqueue_rank_lookups += batch.size();
+     {
+         LOCK(m_mempool.cs);
+         for (size_t i = 0; i < batch.size(); ++i) {
+@@ -4291,6 +4315,7 @@ void PeerManagerImpl::DrainRelayQueue() {
+             if (!it) {
+                 continue;
+             }
++            admission_ranks[i] = (**it)->GetEntryId();
+             for (const auto &parent : (**it)->GetMemPoolParentsConst()) {
+                 const auto route{
+                     m_relay_routes.find(parent.get()->GetTx().GetId())};
+@@ -4375,7 +4400,8 @@ void PeerManagerImpl::DrainRelayQueue() {
+         }
+         LOCK(target.relay->m_tx_inventory_mutex);
+         for (const uint32_t i : target.picks) {
+-            target.relay->m_tx_inventory_to_send.insert(batch[i].txid);
++            target.relay->m_tx_inventory_to_send.SetRank(batch[i].txid,
++                                                        admission_ranks[i]);
+         }
+     }
+ 
+@@ -4391,6 +4417,38 @@ void PeerManagerImpl::DrainRelayQueue() {
+     m_txrelay_wake.store(true, std::memory_order_relaxed);
+ }
+ 
++void PeerManagerImpl::RefreshRelayInventoryAdmissions() {
++    AssertLockHeld(g_msgproc_mutex);
++    AssertLockHeld(cs_main);
++    auto admissions = WITH_LOCK(
++        m_mempool.cs,
++        return m_mempool.ReadRelayAdmissionsAfter(m_relay_admission_cursor));
++    m_relay_inventory_work.new_admission_facts += admissions.entries.size();
++    if (!admissions.entries.empty()) {
++        // Release mempool.cs before taking peer/inventory locks: selection
++        // keeps the existing inventory -> mempool lock order. cs_main keeps
++        // admission/removal stable while applying this captured suffix.
++        LOCK(m_peer_mutex);
++        for (const auto &[id, peer] : m_peer_map) {
++            auto *relay = peer->GetTxRelay();
++            if (!relay) continue;
++            LOCK(relay->m_tx_inventory_mutex);
++            if (relay->m_tx_inventory_to_send.Empty()) continue;
++            m_relay_inventory_work.peer_suffix_checks += admissions.entries.size();
++            for (const auto &entry : admissions.entries) {
++                if (relay->m_tx_inventory_to_send.Find(entry.txid)) {
++                    relay->m_tx_inventory_to_send.SetRank(entry.txid,
++                                                         entry.entry_id);
++                }
++            }
++        }
++    }
++    // Do not advance on partial application if a queue allocation fails.
++    // This depends on serialized ID assignment AND publication; a future
++    // parallel reservation counter is not a committed publication frontier.
++    m_relay_admission_cursor = admissions.watermark;
++}
++
+ void PeerManagerImpl::MarkPeerKnownTx(NodeId peer_id, const TxId &txid) {
+     if (PeerRef peer = GetPeerRef(peer_id)) {
+         AddKnownTx(*peer, txid);
+@@ -4412,7 +4470,7 @@ void PeerManagerImpl::MarkPeerKnownTxBatch(
+                 }
+                 const TxId &txid = tx->GetId();
+                 tx_relay->m_tx_inventory_known_filter.insert(txid);
+-                tx_relay->m_tx_inventory_to_send.erase(txid);
++                tx_relay->m_tx_inventory_to_send.Erase(txid);
+             }
+         }
+     }
+@@ -6945,7 +7003,7 @@ void PeerManagerImpl::ProcessMessage(
+             // otherwise be advertised as soon as it completes, potentially
+             // leaking the time of arrival to a spy.
+             Assume(WITH_LOCK(tx_relay->m_tx_inventory_mutex,
+-                             return tx_relay->m_tx_inventory_to_send.empty() &&
++                             return tx_relay->m_tx_inventory_to_send.Empty() &&
+                                     !tx_relay->m_relay_ready));
+         }
+ 
+@@ -10716,25 +10774,6 @@ void PeerManagerImpl::MaybeSendFeefilter(
+     }
+ }
+ 
+-namespace {
+-struct RelayInventoryCandidate {
+-    std::set<TxId>::iterator inventory;
+-    std::optional<uint64_t> entry_id;
+-};
+-
+-struct CompareInvMempoolOrder {
+-    bool operator()(const RelayInventoryCandidate &a,
+-                    const RelayInventoryCandidate &b) const {
+-        // make_heap is a max-heap: existing entries precede stale inventory,
+-        // and lower admission IDs (parents before children) are sent first.
+-        if (a.entry_id.has_value() != b.entry_id.has_value()) {
+-            return !a.entry_id.has_value();
+-        }
+-        return a.entry_id && *a.entry_id > *b.entry_id;
+-    }
+-};
+-} // namespace
+-
+ bool PeerManagerImpl::RejectIncomingTxs(const CNode &peer) const {
+     // block-relay-only peers may never send txs to us
+     if (peer.IsBlockOnlyConn()) {
+@@ -11115,6 +11154,7 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+ 
+     {
+         LOCK(cs_main);
++        RefreshRelayInventoryAdmissions();
+ 
+         {
+             LOCK(peer->m_block_inv_mutex);
+@@ -11213,7 +11253,7 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+             if (fSendTrickle) {
+                 LOCK(tx_relay->m_bloom_filter_mutex);
+                 if (!tx_relay->m_relay_txs) {
+-                    tx_relay->m_tx_inventory_to_send.clear();
++                    tx_relay->m_tx_inventory_to_send.Clear();
+                 }
+             }
+ 
+@@ -11228,7 +11268,7 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+ 
+                 for (const auto &txinfo : vtxinfo) {
+                     const TxId &txid = txinfo.tx->GetId();
+-                    tx_relay->m_tx_inventory_to_send.erase(txid);
++                    tx_relay->m_tx_inventory_to_send.Erase(txid);
+                     // Don't send transactions that peers will not put into
+                     // their mempool
+                     if (txinfo.fee < filterrate.GetFee(txinfo.vsize)) {
+@@ -11251,74 +11291,84 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+ 
+             // Determine transactions to relay
+             if (fSendTrickle) {
+-                // Resolve each rank once under one coherent mempool view.
+-                // Heap comparisons must not hash txids and recursively take
+-                // the mempool lock for every comparison. cs_main (held above)
+-                // prevents admission/removal while this relay turn runs.
+-                std::vector<RelayInventoryCandidate> vInvTx;
+-                vInvTx.reserve(tx_relay->m_tx_inventory_to_send.size());
+-                {
+-                    LOCK(m_mempool.cs);
+-                    for (auto it = tx_relay->m_tx_inventory_to_send.begin();
+-                         it != tx_relay->m_tx_inventory_to_send.end(); ++it) {
+-                        const auto entry = m_mempool.mapTx.find(*it);
+-                        vInvTx.push_back({it, entry == m_mempool.mapTx.end()
+-                                                ? std::nullopt
+-                                                : std::optional<uint64_t>{
+-                                                      (*entry)->GetEntryId()}});
+-                    }
+-                }
+                 const CFeeRate filterrate{
+                     tx_relay->m_fee_filter_received.load()};
+-                // Send out the inventory in the order of admission to our
+-                // mempool, which is guaranteed to be a topological sort order.
+-                // A heap is used so that not all items need sorting if only a
+-                // few are being sent.
+-                CompareInvMempoolOrder compareInvMempoolOrder;
+-                std::make_heap(vInvTx.begin(), vInvTx.end(),
+-                               compareInvMempoolOrder);
+-                // Per-peer budget per tick (-txrelayratemax); the rest
+-                // stays queued for the next tick.
+                 const size_t tick_budget{TxRelayTickBudget()};
+                 size_t nRelayedTransactions = 0;
+                 std::vector<std::pair<TxId, CTransactionRef>> vRelayTxs;
+-                vRelayTxs.reserve(std::min(vInvTx.size(), tick_budget));
++                vRelayTxs.reserve(std::min(
++                    tx_relay->m_tx_inventory_to_send.Size(), tick_budget));
+                 LOCK(tx_relay->m_bloom_filter_mutex);
+-                while (!vInvTx.empty() && nRelayedTransactions < tick_budget) {
+-                    // Fetch the top element from the heap
+-                    std::pop_heap(vInvTx.begin(), vInvTx.end(),
+-                                  compareInvMempoolOrder);
+-                    std::set<TxId>::iterator it = vInvTx.back().inventory;
+-                    vInvTx.pop_back();
+-                    const TxId txid = *it;
+-                    // Remove it from the to-be-sent set
+-                    tx_relay->m_tx_inventory_to_send.erase(it);
+-                    // Check if not in the filter already
+-                    if (tx_relay->m_tx_inventory_known_filter.contains(txid) &&
+-                        tx_relay->m_avalanche_stalled_txids.count(txid) == 0) {
+-                        continue;
++                while (!tx_relay->m_tx_inventory_to_send.Empty() &&
++                       nRelayedTransactions < tick_budget) {
++                    // Read only a bounded top prefix, not the whole backlog.
++                    // Previously selected refs + this chunk's refs <= the
++                    // original successful-send budget, even on filtered runs.
++                    constexpr size_t MAX_SELECTION_CHUNK = 256;
++                    const auto prefix =
++                        tx_relay->m_tx_inventory_to_send.PeekPrefix(std::min(
++                            MAX_SELECTION_CHUNK,
++                            tick_budget - nRelayedTransactions));
++                    struct Prepared {
++                        std::optional<uint64_t> entry_id;
++                        CTransactionRef tx;
++                        Amount fee;
++                        size_t vsize{0};
++                    };
++                    std::vector<Prepared> prepared(prefix.size());
++                    m_relay_inventory_work.authoritative_lookups += prefix.size();
++                    ++m_relay_inventory_work.selection_chunks;
++                    {
++                        LOCK(m_mempool.cs);
++                        for (size_t i = 0; i < prefix.size(); ++i) {
++                            const auto it = m_mempool.mapTx.find(prefix[i].txid);
++                            if (it == m_mempool.mapTx.end()) continue;
++                            prepared[i].entry_id = (*it)->GetEntryId();
++                            prepared[i].tx = (*it)->GetSharedTx();
++                            prepared[i].fee = (*it)->GetFee();
++                            prepared[i].vsize = (*it)->GetTxSize();
++                        }
+                     }
+-                    // Not in the mempool anymore? don't bother sending it.
+-                    auto txinfo = m_mempool.info(txid);
+-                    if (!txinfo.tx) {
+-                        continue;
++                    bool changed = false;
++                    for (size_t i = 0; i < prefix.size(); ++i) {
++                        if (prepared[i].entry_id != prefix[i].entry_id) {
++                            tx_relay->m_tx_inventory_to_send.SetRank(
++                                prefix[i].txid, prepared[i].entry_id);
++                            changed = true;
++                        }
+                     }
+-                    // Peer told you to not send transactions at that
+-                    // feerate? Don't bother sending it.
+-                    if (txinfo.fee < filterrate.GetFee(txinfo.vsize)) {
++                    if (changed) {
++                        // Removed entries now sort after all live entries;
++                        // re-admissions use their current incarnation rank.
++                        // Discard speculative refs before retrying selection.
+                         continue;
+                     }
+-                    if (tx_relay->m_bloom_filter &&
+-                        !tx_relay->m_bloom_filter->IsRelevantAndUpdate(
+-                            *txinfo.tx)) {
+-                        continue;
++                    for (size_t i = 0; i < prefix.size(); ++i) {
++                        const TxId &txid = prefix[i].txid;
++                        const auto first = tx_relay->m_tx_inventory_to_send.Pop();
++                        assert(first && first->txid == txid);
++                        // Erase before filters, exactly like the old full-pass
++                        // selection. Only emitted transactions consume budget.
++                        if (tx_relay->m_tx_inventory_known_filter.contains(txid) &&
++                            tx_relay->m_avalanche_stalled_txids.count(txid) == 0) {
++                            continue;
++                        }
++                        auto &txinfo = prepared[i];
++                        if (!txinfo.tx) continue;
++                        if (txinfo.fee < filterrate.GetFee(txinfo.vsize)) {
++                            continue;
++                        }
++                        if (tx_relay->m_bloom_filter &&
++                            !tx_relay->m_bloom_filter->IsRelevantAndUpdate(
++                                *txinfo.tx)) {
++                            continue;
++                        }
++                        tx_relay->m_recently_announced_invs.insert(txid);
++                        vRelayTxs.emplace_back(txid, std::move(txinfo.tx));
++                        ++nRelayedTransactions;
++                        tx_relay->m_tx_inventory_known_filter.insert(txid);
++                        tx_relay->m_avalanche_stalled_txids.erase(txid);
+                     }
+-                    // Send
+-                    tx_relay->m_recently_announced_invs.insert(txid);
+-                    vRelayTxs.emplace_back(txid, std::move(txinfo.tx));
+-                    nRelayedTransactions++;
+-                    tx_relay->m_tx_inventory_known_filter.insert(txid);
+-                    tx_relay->m_avalanche_stalled_txids.erase(txid);
+                 }
+ 
+                 if (high_bandwidth_peer && vRelayTxs.size() >= 16) {
+@@ -11360,7 +11410,7 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+                     }
+                 }
+             }
+-            if (!tx_relay->m_tx_inventory_to_send.empty()) {
++            if (!tx_relay->m_tx_inventory_to_send.Empty()) {
+                 // Left over (rate cap, or not yet this peer's tick): come
+                 // back at the next tick.
+                 m_txrelay_wake.store(true, std::memory_order_relaxed);
+diff --git a/src/net_processing.h b/src/net_processing.h
+index 731e5dcc0b..e2a9c21cc4 100644
+--- a/src/net_processing.h
++++ b/src/net_processing.h
+@@ -320,6 +320,23 @@ public:
+     /** Set the best height */
+     virtual void SetBestHeight(int height) = 0;
+ 
++    /** Operation counts for deterministic relay complexity regression tests.
++     * These are message-thread-owned bookkeeping, not timing/RPC metrics. */
++    struct RelayInventoryWork {
++        uint64_t enqueue_rank_lookups{0};
++        uint64_t new_admission_facts{0};
++        uint64_t peer_suffix_checks{0};
++        uint64_t authoritative_lookups{0};
++        uint64_t selection_chunks{0};
++    };
++    virtual RelayInventoryWork GetRelayInventoryWorkForTest() const
++        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) = 0;
++
++    /** Set only the stalled marker in relay tests, without a live quorum. */
++    virtual void UnitTestSetStalledTx(NodeId peer_id, const TxId &txid,
++                                      bool stalled)
++        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) = 0;
++
+     /** Public for unit testing. */
+     virtual void UnitTestMisbehaving(const NodeId peer_id) = 0;
+ 
+diff --git a/src/test/txrelay_tests.cpp b/src/test/txrelay_tests.cpp
+index e77cad849e..d967486239 100644
+--- a/src/test/txrelay_tests.cpp
++++ b/src/test/txrelay_tests.cpp
+@@ -8,10 +8,12 @@
+ 
+ #include <config.h>
+ #include <common/args.h>
++#include <common/bloom.h>
+ #include <lotus_v2/commitment.h>
+ #include <net.h>
+ #include <net/txrelay_index.h>
+ #include <node/snapshot.h>
++#include <policy/fees.h>
+ 
+ #include <net/v2_protocol_handler.h>
+ #include <primitives/transaction.h>
+@@ -39,6 +41,8 @@
+ #include <thread>
+ #include <map>
+ #include <memory>
++#include <optional>
++#include <span>
+ #include <set>
+ #include <vector>
+ 
+@@ -116,7 +120,8 @@ struct RelayHarness {
+         connman->ClearTestNodes();
+     }
+ 
+-    CNode &AddPeer(ConnectionType type = ConnectionType::OUTBOUND_FULL_RELAY)
++    CNode &AddPeer(ConnectionType type = ConnectionType::OUTBOUND_FULL_RELAY,
++                   ServiceFlags local_services = NODE_NETWORK)
+         EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
+         const NodeId id = NodeId(500 + nodes.size());
+         CAddress addr(MakeTestIp(0x0a000001 + uint32_t(nodes.size())),
+@@ -124,7 +129,7 @@ struct RelayHarness {
+         nodes.push_back(new CNode(id, nullptr, addr, 0, 0, 0, CAddress(), "",
+                                   type, type == ConnectionType::INBOUND));
+         CNode &node = *nodes.back();
+-        connman->Handshake(node, true, NODE_NETWORK, NODE_NETWORK,
++        connman->Handshake(node, true, NODE_NETWORK, local_services,
+                            PROTOCOL_VERSION, true);
+         connman->AddTestNode(node);
+         return node;
+@@ -192,6 +197,85 @@ struct RelayHarness {
+     }
+ };
+ 
++/** Reference to the previous full-rank-per-turn behavior. Small integrated
++ * cases deliberately scan/sort the actual mempool, independently of the
++ * persistent queue and admission cursor used by production. */
++struct FullScanRelayReference {
++    std::set<TxId> pending;
++    std::set<TxId> known;
++    std::set<TxId> stalled;
++    CFeeRate fee_filter{Amount::zero()};
++    std::optional<CBloomFilter> bloom;
++
++    void Queue(const TxId &txid) {
++        if (!known.count(txid) || stalled.count(txid)) pending.insert(txid);
++    }
++    void MarkKnown(const TxId &txid) {
++        known.insert(txid);
++        pending.erase(txid);
++    }
++    bool Accept(const TxMempoolInfo &info) {
++        return info.fee >= fee_filter.GetFee(info.vsize) &&
++               (!bloom || bloom->IsRelevantAndUpdate(*info.tx));
++    }
++    std::vector<TxId> Tick(CTxMemPool &pool, size_t budget) {
++        struct Live {
++            uint64_t rank;
++            TxMempoolInfo info;
++        };
++        std::vector<Live> live;
++        std::vector<TxId> stale;
++        {
++            LOCK(pool.cs);
++            for (const auto &txid : pending) {
++                auto it = pool.GetIter(txid);
++                if (it) {
++                    live.push_back({(**it)->GetEntryId(), pool.info(txid)});
++                } else {
++                    stale.push_back(txid);
++                }
++            }
++        }
++        std::sort(live.begin(), live.end(),
++                  [](const Live &a, const Live &b) { return a.rank < b.rank; });
++        std::vector<TxId> result;
++        for (const auto &entry : live) {
++            if (result.size() == budget) break;
++            const TxId &txid = entry.info.tx->GetId();
++            pending.erase(txid);
++            if ((!known.count(txid) || stalled.count(txid)) && Accept(entry.info)) {
++                result.push_back(txid);
++                known.insert(txid);
++                stalled.erase(txid);
++            }
++        }
++        if (result.size() < budget) {
++            for (const auto &txid : stale) pending.erase(txid);
++        }
++        return result;
++    }
++    std::vector<TxId> MempoolRequest(CTxMemPool &pool) {
++        std::vector<TxId> result;
++        for (const auto &info : pool.infoAll()) {
++            const TxId &txid = info.tx->GetId();
++            pending.erase(txid);
++            if (Accept(info)) {
++                result.push_back(txid);
++                known.insert(txid);
++            }
++        }
++        return result;
++    }
++};
++
++void CheckRelayOrder(const std::vector<TxId> &actual,
++                     const std::vector<TxId> &expected) {
++    BOOST_REQUIRE_EQUAL(actual.size(), expected.size());
++    for (size_t i = 0; i < actual.size(); ++i) {
++        BOOST_CHECK(actual[i] == expected[i]);
++    }
++}
++
+ /** Mock the relay tick clock (MockableSteadyClock) for one test */
+ struct MockTick {
+     explicit MockTick(std::chrono::milliseconds start) { Set(start); }
+@@ -496,6 +580,223 @@ BOOST_AUTO_TEST_CASE(per_tick_rate_budget) {
+     BOOST_CHECK_EQUAL(total, 25U);
+ }
+ 
++BOOST_AUTO_TEST_CASE(persistent_inventory_matches_full_scan_across_mutations) {
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    MockTick clock{4'100'000ms};
++    PeerManager::Options opts;
++    opts.txrelay_rate_max = 200; // Two successful announcements per tick.
++    opts.txrelay_shortids = false;
++    opts.txrecon_interval = 0ms;
++    RelayHarness h{m_node, opts};
++    CNode &peer = h.AddPeer();
++    h.SendAll();
++    FastRandomContext rng{uint256{42}};
++    TestMemPoolEntryHelper entry;
++    std::vector<CTransactionRef> txs;
++    FullScanRelayReference reference;
++    for (size_t i = 0; i < 9; ++i) {
++        txs.push_back(MakeTx(rng));
++        if (i < 8) AddToMempool(m_node, txs.back());
++        reference.Queue(txs.back()->GetId());
++    }
++    // Last body is initially absent, but must remain eligible for promotion
++    // while preceding live bodies consume the whole successful-send budget.
++    h.peerman->RelayTransactionBatch(txs);
++    h.peerman->MarkPeerKnownTx(peer.GetId(), txs[1]->GetId());
++    reference.MarkKnown(txs[1]->GetId());
++    h.peerman->MarkPeerKnownTxBatch(peer.GetId(),
++                                   std::span<const CTransactionRef>{txs}.subspan(2, 1));
++    reference.MarkKnown(txs[2]->GetId());
++    auto tick = [&](std::chrono::milliseconds time)
++        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
++        const auto expected = reference.Tick(*m_node.mempool, 2);
++        clock.Set(time);
++        const auto sent = h.SendAll();
++        CheckRelayOrder(sent.at(peer.GetId()).inv_txids, expected);
++        BOOST_CHECK(sent.at(peer.GetId()).shorttx_txids.empty());
++        return expected;
++    };
++    CheckRelayOrder(tick(4'100'010ms), {txs[0]->GetId(), txs[3]->GetId()});
++    {
++        LOCK2(cs_main, m_node.mempool->cs);
++        m_node.mempool->removeRecursive(*txs[4], MemPoolRemovalReason::CONFLICT);
++        m_node.mempool->removeRecursive(*txs[6], MemPoolRemovalReason::CONFLICT);
++        // Same TxId, fresh admission incarnation/rank, still queued.
++        m_node.mempool->addUnchecked(entry.FromTx(txs[6]));
++    }
++    CheckRelayOrder(tick(4'100'020ms), {txs[5]->GetId(), txs[7]->GetId()});
++    AddToMempool(m_node, txs[8]);
++    const auto newest = MakeTx(rng);
++    AddToMempool(m_node, newest);
++    reference.Queue(newest->GetId());
++    h.peerman->RelayTransaction(newest->GetId());
++    CheckRelayOrder(tick(4'100'030ms), {txs[6]->GetId(), txs[8]->GetId()});
++    CheckRelayOrder(tick(4'100'040ms), {newest->GetId()});
++    BOOST_CHECK(reference.pending.empty());
++
++    // The global cursor is now ahead of txs[0]'s admission. A new peer's
++    // direct enqueue must obtain that older current rank, not wait for a
++    // suffix that will never mention it again.
++    CNode &second = h.AddPeer();
++    h.SendAll();
++    h.peerman->RelayTransaction(txs[0]->GetId());
++    clock.Set(4'100'050ms);
++    const auto old_admission = h.SendAll();
++    BOOST_CHECK(old_admission.at(peer.GetId()).inv_txids.empty());
++    CheckRelayOrder(old_admission.at(second.GetId()).inv_txids, {txs[0]->GetId()});
++
++    // Known inventory is still eligible while Avalanche-stalled. The marker
++    // is erased only after emission, so a later ordinary repeat is suppressed.
++    h.peerman->UnitTestSetStalledTx(peer.GetId(), txs[0]->GetId(), true);
++    reference.stalled.insert(txs[0]->GetId());
++    reference.Queue(txs[0]->GetId());
++    h.peerman->RelayTransaction(txs[0]->GetId());
++    CheckRelayOrder(tick(4'100'060ms), {txs[0]->GetId()});
++    BOOST_CHECK(reference.stalled.empty());
++    h.peerman->RelayTransaction(txs[0]->GetId());
++    BOOST_CHECK(tick(4'100'070ms).empty());
++}
++
++BOOST_AUTO_TEST_CASE(persistent_inventory_preserves_fee_bloom_and_bip35) {
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    MockTick clock{4'200'000ms};
++    PeerManager::Options opts;
++    opts.txrelay_rate_max = 200;
++    opts.txrelay_shortids = false;
++    opts.txrecon_interval = 0ms;
++    RelayHarness h{m_node, opts};
++    CNode &peer = h.AddPeer(ConnectionType::OUTBOUND_FULL_RELAY,
++                          ServiceFlags(NODE_NETWORK | NODE_BLOOM));
++    h.SendAll();
++    std::atomic<bool> interrupt{false};
++    const std::vector<uint8_t> marker(32, 0x7b);
++    FullScanRelayReference reference;
++    reference.fee_filter = CFeeRate(1000 * SATOSHI);
++    reference.bloom.emplace(100, 0.000000001, 42, BLOOM_UPDATE_ALL);
++    reference.bloom->insert(marker);
++    {
++        DataStream fee;
++        fee << 1000 * SATOSHI;
++        h.peerman->ProcessMessage(h.config, peer, NetMsgType::FEEFILTER,
++                                  fee, 0us, interrupt);
++        DataStream filter;
++        filter << *reference.bloom;
++        h.peerman->ProcessMessage(h.config, peer, NetMsgType::FILTERLOAD,
++                                  filter, 0us, interrupt);
++    }
++    FastRandomContext rng{uint256{43}};
++    auto marked = [&] {
++        CMutableTransaction tx{*MakeTx(rng)};
++        tx.vout[0].scriptPubKey = CScript() << marker << OP_DROP << OP_TRUE;
++        return MakeTransactionRef(tx);
++    };
++    const auto unrelated = MakeTx(rng);
++    const auto low_parent = marked();
++    const auto low_child = MakeTx(rng, {COutPoint{low_parent->GetId(), 0}});
++    const auto parent = marked();
++    const auto child = MakeTx(rng, {COutPoint{parent->GetId(), 0}});
++    std::vector<CTransactionRef> txs{unrelated, low_parent, low_child, parent, child};
++    {
++        LOCK2(cs_main, m_node.mempool->cs);
++        TestMemPoolEntryHelper entry;
++        for (const auto &tx : txs) {
++            m_node.mempool->addUnchecked(
++                entry.Fee(tx == low_parent ? Amount::zero() : 1000 * SATOSHI).FromTx(tx));
++            reference.Queue(tx->GetId());
++        }
++    }
++    h.peerman->RelayTransactionBatch(txs);
++    const auto expected = reference.Tick(*m_node.mempool, 2);
++    CheckRelayOrder(expected, {parent->GetId(), child->GetId()});
++    clock.Set(4'200'010ms);
++    CheckRelayOrder(h.SendAll().at(peer.GetId()).inv_txids, expected);
++
++    const auto late_low = marked();
++    const auto late_good = marked();
++    const auto late_unrelated = MakeTx(rng);
++    std::vector<CTransactionRef> late{late_low, late_good, late_unrelated};
++    {
++        LOCK2(cs_main, m_node.mempool->cs);
++        TestMemPoolEntryHelper entry;
++        for (const auto &tx : late) {
++            m_node.mempool->addUnchecked(
++                entry.Fee(tx == late_low ? Amount::zero() : 1000 * SATOSHI).FromTx(tx));
++            reference.Queue(tx->GetId());
++        }
++    }
++    h.peerman->RelayTransactionBatch(late);
++    DataStream request;
++    h.peerman->ProcessMessage(h.config, peer, NetMsgType::MEMPOOL,
++                              request, 0us, interrupt);
++    // BIP35 bypasses known suppression and the normal two-item budget. It
++    // also erases queued live entries before its fee/Bloom decision.
++    const auto requested = reference.MempoolRequest(*m_node.mempool);
++    BOOST_CHECK_GT(requested.size(), 2U);
++    clock.Set(4'200'020ms);
++    CheckRelayOrder(h.SendAll().at(peer.GetId()).inv_txids, requested);
++    BOOST_CHECK(reference.pending.empty());
++    DataStream clear, fee;
++    fee << Amount::zero();
++    h.peerman->ProcessMessage(h.config, peer, NetMsgType::FILTERCLEAR,
++                              clear, 0us, interrupt);
++    h.peerman->ProcessMessage(h.config, peer, NetMsgType::FEEFILTER,
++                              fee, 0us, interrupt);
++    clock.Set(4'200'030ms);
++    BOOST_CHECK(h.SendAll().at(peer.GetId()).inv_txids.empty());
++    BOOST_CHECK(!peer.fDisconnect);
++}
++
++BOOST_AUTO_TEST_CASE(persistent_inventory_unchanged_turn_has_bounded_lookup_work) {
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    MockTick clock{4'300'000ms};
++    PeerManager::Options opts;
++    opts.txrelay_rate_max = 300; // Three per peer per tick.
++    opts.txrelay_fanout_min = opts.txrelay_fanout_max = 2;
++    opts.txrelay_shortids = false;
++    opts.txrecon_interval = 0ms;
++    RelayHarness h{m_node, opts};
++    h.AddPeer();
++    h.AddPeer();
++    h.SendAll();
++    FastRandomContext rng{uint256{44}};
++    std::vector<CTransactionRef> txs;
++    {
++        LOCK2(cs_main, m_node.mempool->cs);
++        CTxMemPool::ScopedSnapshotDefer defer(*m_node.mempool);
++        TestMemPoolEntryHelper entry;
++        for (size_t i = 0; i < 2048; ++i) {
++            txs.push_back(MakeTx(rng));
++            m_node.mempool->addUnchecked(entry.FromTx(txs.back()));
++        }
++    }
++    h.peerman->RelayTransactionBatch(txs);
++    clock.Set(4'300'010ms);
++    h.SendAll();
++    const auto before = h.peerman->GetRelayInventoryWorkForTest();
++    clock.Set(4'300'020ms);
++    const auto sent = h.SendAll();
++    for (const auto &[id, messages] : sent) {
++        CheckRelayOrder(messages.inv_txids,
++                        {txs[3]->GetId(), txs[4]->GetId(), txs[5]->GetId()});
++    }
++    const auto after = h.peerman->GetRelayInventoryWorkForTest();
++    BOOST_CHECK_EQUAL(after.enqueue_rank_lookups, before.enqueue_rank_lookups);
++    BOOST_CHECK_EQUAL(after.new_admission_facts, before.new_admission_facts);
++    BOOST_CHECK_EQUAL(after.peer_suffix_checks, before.peer_suffix_checks);
++    BOOST_CHECK_EQUAL(after.authoritative_lookups - before.authoritative_lookups, 6U);
++    BOOST_CHECK_EQUAL(after.selection_chunks - before.selection_chunks, 2U);
++    const auto newest = MakeTx(rng);
++    AddToMempool(m_node, newest);
++    h.peerman->RelayTransaction(newest->GetId());
++    clock.Set(4'300'030ms);
++    h.SendAll();
++    const auto added = h.peerman->GetRelayInventoryWorkForTest();
++    BOOST_CHECK_EQUAL(added.enqueue_rank_lookups - after.enqueue_rank_lookups, 1U);
++    BOOST_CHECK_EQUAL(added.new_admission_facts - after.new_admission_facts, 1U);
++    BOOST_CHECK_EQUAL(added.peer_suffix_checks - after.peer_suffix_checks, 2U);
++    BOOST_CHECK_EQUAL(added.authoritative_lookups - after.authoritative_lookups, 6U);
++}
++
+ BOOST_AUTO_TEST_CASE(shortid_index_epochs_and_collisions) {
+     using txrelay::TxRelayIndex;
+     FastRandomContext rng{true};

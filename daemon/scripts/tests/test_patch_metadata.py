@@ -204,6 +204,35 @@ class PatchMetadataTests(unittest.TestCase):
             export_module.export(self.repo, self.base, self.manifest, destination)
         self.assertFalse(destination.exists())
 
+    def test_layered_include_manifest_replay_and_export(self):
+        ecash_dir = self.root / 'ecash'
+        ecash_dir.mkdir()
+        v2_dir = self.root / 'v2'
+        v2_dir.mkdir()
+        shutil.copy2(self.patches / self.names[0], ecash_dir / self.names[0])
+        shutil.copy2(self.patches / self.names[1], v2_dir / self.names[1])
+        (ecash_dir / 'series').write_text(self.names[0] + '\n')
+        (v2_dir / 'series').write_text('# Self-describing layered series\n@include ../ecash/series\n' + self.names[1] + '\n')
+        module.replay(self.workspace, v2_dir / 'series')
+        commits = git(self.workspace, 'rev-list', '--reverse', f'{self.base}..HEAD').decode().splitlines()
+        self.assertEqual(len(commits), 2)
+        for commit, expected in zip(commits, self.metadata):
+            self.assertEqual(git(self.workspace, 'show', '-s', '--format=%an%n%ae%n%aI%n%B%n%T', commit), expected)
+        # Export only the v2 layer commits when given the full base..HEAD range:
+        dest = self.root / 'exported-v2'
+        export_module.export(self.repo, self.base, v2_dir / 'series', dest)
+        self.assertTrue((dest / self.names[1]).is_file())
+        self.assertFalse((dest / self.names[0]).exists())
+        self.assertIn('@include ../ecash/series', (dest / 'series').read_text())
+        # Reject cyclic @include and out-of-bounds @include:
+        (ecash_dir / 'series').write_text('@include ../v2/series\n')
+        git(self.workspace, 'reset', '--hard', self.base)
+        with self.assertRaisesRegex(ValueError, 'Cyclic'):
+            module.replay(self.workspace, v2_dir / 'series')
+        (v2_dir / 'series').write_text('@include ../../outside/series\n')
+        with self.assertRaisesRegex(ValueError, 'Invalid or out-of-bounds'):
+            module.replay(self.workspace, v2_dir / 'series')
+
 
 if __name__ == '__main__':
     unittest.main()

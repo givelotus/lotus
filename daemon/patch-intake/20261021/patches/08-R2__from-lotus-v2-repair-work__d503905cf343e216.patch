@@ -1,0 +1,1520 @@
+From 34f9d5542331b80684726539f48e25c8cc7463a0 Mon Sep 17 00:00:00 2001
+From: Canonical endpoint audit <audit@localhost>
+Date: Sun, 18 Oct 2026 22:14:07 -0700
+Subject: [PATCH] net: push negotiated sketches sized by estimated
+ reconciliation difference
+
+---
+ src/init.cpp                               |   7 +
+ src/net/v2_protocol_handler.cpp            | 398 ++++++++++++++++++++-
+ src/net/v2_protocol_handler.h              |  69 +++-
+ src/net_processing.cpp                     |   1 +
+ src/protocol.cpp                           |   4 +
+ src/protocol.h                             |   3 +
+ src/rpc/net.cpp                            |   8 +
+ src/test/CMakeLists.txt                    |   1 +
+ src/test/merklix_batch_tests.cpp           |   2 +
+ src/test/merklix_sized_tests.cpp           | 302 ++++++++++++++++
+ test/functional/p2p_merklix_initiation.py  |  23 +-
+ test/functional/test_framework/messages.py | 212 +++++++++++
+ test/functional/test_framework/p2p.py      |  42 +++
+ 13 files changed, 1048 insertions(+), 24 deletions(-)
+ create mode 100644 src/test/merklix_sized_tests.cpp
+
+diff --git a/src/init.cpp b/src/init.cpp
+index de5819f81a..8fcd2ce189 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -602,6 +602,10 @@ void SetupServerArgs(NodeContext &node) {
+         "-epochminms=<n>",
+         "Minimum adaptive epoch settling window in milliseconds (1..1000, default: 100)",
+         ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-merklixsized",
++        "Negotiate initial Merklix sketches and complete short-ID lists (default: 1)",
++        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+     argsman.AddArg(
+         "-merklixbatch",
+         "Negotiate vector Merklix bucket requests and replies (default: 1)",
+@@ -3053,6 +3057,9 @@ bool AppInitMain(Config &config, RPCServer &rpcServer,
+         nLocalServices = ServiceFlags(nLocalServices | NODE_MERKLIX);
+         if (args.GetBoolArg("-merklixbatch", true)) {
+             nLocalServices = ServiceFlags(nLocalServices | NODE_MERKLIX_BATCH);
++            if (args.GetBoolArg("-merklixsized", true)) {
++                nLocalServices = ServiceFlags(nLocalServices | NODE_MERKLIX_SIZED);
++            }
+         }
+     }
+ 
+diff --git a/src/net/v2_protocol_handler.cpp b/src/net/v2_protocol_handler.cpp
+index a677a86307..6d1db38923 100644
+--- a/src/net/v2_protocol_handler.cpp
++++ b/src/net/v2_protocol_handler.cpp
+@@ -340,6 +340,7 @@ bool V2PeerProtocolHandler::TryHandleMessage(
+         return true;
+     }
+     const bool recon = msg_type == NetMsgType::MERKLIXSYNC ||
++        msg_type == NetMsgType::MERKLIXSIZED ||
+         msg_type == NetMsgType::GETMERKLIXBATCH || msg_type == NetMsgType::MERKLIXBATCH ||
+         msg_type == NetMsgType::GETMERKLIXBUCK ||
+         msg_type == NetMsgType::LEGACY_GETMERKLIXBUCK ||
+@@ -386,8 +387,18 @@ bool V2PeerProtocolHandler::TryHandleMessage(
+ bool V2PeerProtocolHandler::DispatchReconMessage(
+     CNode &pfrom, const std::string &msg_type, DataStream &vRecv,
+     std::chrono::microseconds time_received) {
++    if (msg_type == NetMsgType::MERKLIXSIZED) {
++        if (!gArgs.GetBoolArg("-merklixsized", true) || !gArgs.GetBoolArg("-merklixbatch", true) ||
++            (GetPeerServices(pfrom.GetId()) & (NODE_MERKLIX_SIZED | NODE_MERKLIX_BATCH)) !=
++            (NODE_MERKLIX_SIZED | NODE_MERKLIX_BATCH)) {
++            LOCK(m_mutex); ++m_stats.malformed_messages; return true;
++        }
++        HandleSizedSync(pfrom, vRecv, time_received);
++        return true;
++    }
+     if (msg_type == NetMsgType::GETMERKLIXBATCH || msg_type == NetMsgType::MERKLIXBATCH) {
+-        if (!(GetPeerServices(pfrom.GetId()) & NODE_MERKLIX_BATCH)) {
++        if (!gArgs.GetBoolArg("-merklixbatch", true) ||
++            !(GetPeerServices(pfrom.GetId()) & NODE_MERKLIX_BATCH)) {
+             LOCK(m_mutex);
+             ++m_stats.malformed_messages;
+             return true;
+@@ -423,20 +434,25 @@ bool V2PeerProtocolHandler::DispatchReconMessage(
+ bool V2PeerProtocolHandler::AdmitReconMessage(
+     CNode &peer, const std::string &type, DataStream &stream,
+     std::chrono::microseconds now) {
+-    if (type != NetMsgType::SHORTTX && m_mempool.size() > MAX_SCOPED_TXS) {
+-        return false; // Existing INV/getdata relay remains the fallback.
++    size_t visits;
++    {
++        LOCK(m_mempool.cs);
++        if (type != NetMsgType::SHORTTX &&
++            (m_mempool.size() > MAX_SCOPED_TXS || m_mempool.GetTotalTxSize() > MAX_SCOPED_TX_BYTES)) {
++            return false; // Existing INV/getdata relay remains the fallback.
++        }
++        visits = std::max<size_t>(1, m_mempool.size());
+     }
+     const bool payload = type == NetMsgType::SHORTTX;
+     // Charge scans independently of wire bytes: tiny requests can otherwise
+-    // repeatedly trigger an expensive full-set walk. R3 replaces these walks.
+-    size_t visits = std::max<size_t>(1, m_mempool.size());
++    // repeatedly trigger an expensive full-set walk.
+     {
+         LOCK(m_mutex);
+         for (const auto &[_, scope] : m_scoped_txs)
+             visits = std::max(visits, scope.txs.size());
+     }
+     const size_t work = stream.size() / 26 +
+-        (type == NetMsgType::GETMERKLIXBATCH || type == NetMsgType::MERKLIXBATCH ? 3 * visits :
++        (type == NetMsgType::MERKLIXSIZED || type == NetMsgType::GETMERKLIXBATCH || type == NetMsgType::MERKLIXBATCH ? 3 * visits :
+         (type == NetMsgType::GETMERKLIXBUCK ||
+          type == NetMsgType::LEGACY_GETMERKLIXBUCK ? 16 * visits : visits));
+     LOCK(m_mutex);
+@@ -448,7 +464,7 @@ bool V2PeerProtocolHandler::AdmitReconMessage(
+         peer.fDisconnect = true;
+         return false;
+     }
+-    if (queue.messages.empty() && queue.budget.Consume(stream.size(), work, payload, now)) {
++    if (!peer.fPauseSend && queue.messages.empty() && queue.budget.Consume(stream.size(), work, payload, now)) {
+         return true;
+     }
+     // Bound both count and storage across all peers; no unbounded promise to
+@@ -469,9 +485,10 @@ bool V2PeerProtocolHandler::AdmitReconMessage(
+ 
+ void V2PeerProtocolHandler::DrainReconMessages(
+     CNode &peer, std::chrono::microseconds now) {
++    if (peer.fPauseSend) return;
+     // Bound one message-handler pass even if a long idle period replenished
+     // the bucket. Preserve ordering and charge queued work before dispatch.
+-    for (size_t message = 0; message < 32 && !peer.fDisconnect; ++message) {
++    for (size_t message = 0; message < 32 && !peer.fDisconnect && !peer.fPauseSend; ++message) {
+         std::optional<DeferredReconMessage> next;
+         {
+             LOCK(m_mutex);
+@@ -890,6 +907,50 @@ void V2PeerProtocolHandler::HandleSealedHeader(CNode &pfrom,
+                              std::vector<CInv>{fallback_inv}));
+ }
+ 
++bool V2PeerProtocolHandler::AuthorizeScopedRoot(
++    ReconScope scope, const uint256 &context_id, const uint256 &root) {
++    LOCK(m_mutex);
++    const ScopeKey key{scope, context_id};
++    auto found = m_scoped_txs.find(key);
++    if (found != m_scoped_txs.end() && found->second.expected_root)
++        return *found->second.expected_root == root;
++    if (found == m_scoped_txs.end()) {
++        if (m_scoped_txs.size() >= MAX_TRACKED_RECON_SCOPES) {
++            m_scoped_cache_bytes -= m_scoped_txs.begin()->second.bytes;
++            m_scoped_txs.erase(m_scoped_txs.begin());
++        }
++        found = m_scoped_txs.try_emplace(key).first;
++        found->second.subtree_a_root = ComputeSubtreeAHash({});
++    }
++    auto &entry = found->second;
++    uint256 cached_root;
++    std::memcpy(cached_root.begin(), entry.subtree_a_root.data(), 32);
++    if (cached_root != root) {
++        m_scoped_cache_bytes -= entry.bytes;
++        entry = ScopedTxSetEntry{};
++        entry.subtree_a_root = ComputeSubtreeAHash({});
++    }
++    entry.expected_root = root;
++    // Discard requests authorized by a summary received before its immutable
++    // announcement. Repeated announcements preserve an ongoing valid transfer.
++    for (auto it = m_pending_shorttx_requests.begin(); it != m_pending_shorttx_requests.end();) {
++        if (it->first.scope == scope && it->first.context_id == context_id)
++            it = m_pending_shorttx_requests.erase(it);
++        else ++it;
++    }
++    for (auto it = m_sized_transfers.begin(); it != m_sized_transfers.end();) {
++        if (it->second.request.scope == uint8_t(scope) && it->second.request.context_id == context_id) {
++            m_sized_queued_ids -= it->second.remaining.size();
++            it = m_sized_transfers.erase(it);
++        } else ++it;
++    }
++    for (auto &[_, buckets] : m_expected_buckets)
++        std::erase_if(buckets, [&](const ExpectedBucket &bucket) {
++            return std::get<0>(bucket) == uint8_t(scope) && std::get<1>(bucket) == context_id;
++        });
++    return true;
++}
++
+ bool V2PeerProtocolHandler::SetScopedTransactions(
+     ReconScope scope, const uint256 &context_id,
+     std::vector<CTransactionRef> txs) {
+@@ -911,6 +972,7 @@ bool V2PeerProtocolHandler::SetScopedTransactions(
+     LOCK(m_mutex);
+     const ScopeKey key{scope, context_id};
+     const auto previous = m_scoped_txs.find(key);
++    if (previous != m_scoped_txs.end()) entry.expected_root = previous->second.expected_root;
+     const size_t old_bytes = previous == m_scoped_txs.end() ? 0 : previous->second.bytes;
+     if (m_scoped_cache_bytes - old_bytes + bytes > MAX_SCOPED_CACHE_BYTES) return false;
+     if (previous == m_scoped_txs.end() && m_scoped_txs.size() >= MAX_TRACKED_RECON_SCOPES) {
+@@ -1399,12 +1461,16 @@ bool V2PeerProtocolHandler::IsHighBandwidthShortTxPeer(NodeId peer_id) const {
+ 
+ bool V2PeerProtocolHandler::MaybeSendSync(
+     CNode &peer, std::chrono::microseconds now, std::chrono::milliseconds cadence) {
++    ExpireSizedTransfer(peer.GetId(), now);
+     if (!(GetPeerServices(peer.GetId()) & NODE_MERKLIX) ||
+-        !peer.fSuccessfullyConnected || peer.fDisconnect ||
++        !peer.fSuccessfullyConnected || peer.fDisconnect || peer.fPauseSend ||
+         peer.IsBlockOnlyConn() || peer.IsAddrFetchConn()) {
+         return false;
+     }
+-    if (m_mempool.size() > MAX_SCOPED_TXS) return false;
++    LOCK(m_mempool.cs);
++    if (m_mempool.size() > MAX_SCOPED_TXS || m_mempool.GetTotalTxSize() > MAX_SCOPED_TX_BYTES) return false;
++    SendNextSizedChunk(peer, now);
++    if (peer.fPauseSend) return false;
+     const auto generation = m_mempool.GetTransactionsUpdated();
+     {
+         LOCK(m_mutex);
+@@ -1448,7 +1514,48 @@ bool V2PeerProtocolHandler::MaybeSendSync(
+         state.root = summary.candidate_root;
+         state.last_sent = now;
+     }
+-    m_connman.PushMessage(&peer, NetMsg::Make(NetMsgType::MERKLIXSYNC, summary));
++    return SendSyncSummary(peer, summary);
++}
++
++bool V2PeerProtocolHandler::PushScopedSync(CNode &peer, ReconScope scope,
++                                          const uint256 &context) {
++    if (peer.fPauseSend || peer.fDisconnect ||
++        !(GetPeerServices(peer.GetId()) & NODE_MERKLIX)) return false;
++    return SendSyncSummary(peer, BuildSyncSummary(scope, context));
++}
++
++bool V2PeerProtocolHandler::SendSyncSummary(CNode &peer, const MerklixSyncSummary &summary) {
++    const auto scope = static_cast<ReconScope>(summary.scope);
++    const auto &context = summary.context_id;
++    if (gArgs.GetBoolArg("-merklixsized", true) && gArgs.GetBoolArg("-merklixbatch", true) &&
++        (GetPeerServices(peer.GetId()) & (NODE_MERKLIX_SIZED | NODE_MERKLIX_BATCH)) ==
++        (NODE_MERKLIX_SIZED | NODE_MERKLIX_BATCH)) {
++        size_t local_size = 0;
++        for (const auto &bucket : summary.buckets) local_size += bucket.count;
++        PeerReconHistory history;
++        { LOCK(m_mutex); history = m_recon_history[peer.GetId()]; }
++        const double expected = history.known ?
++            std::abs(double(local_size) - double(history.remote_size)) +
++                history.q * std::min(local_size, history.remote_size) : double(local_size);
++        MerklixSizedSync push;
++        push.summary = summary;
++        push.depth = expected <= 128 ? 8 : expected <= 2048 ? 12 : 0;
++        if (push.depth == 0) {
++            const auto txs = GetScopedTransactions(scope, context);
++            // The cached root and this complete ID list must describe exactly
++            // the same snapshot, even if admission raced the initial cache read.
++            push.summary = BuildSyncSummary(scope, context);
++            if (push.summary.candidate_root != ComputeScopedMerklixRoot(txs)) return false;
++            for (const auto &tx : txs)
++                push.short_ids.push_back(ComputeMerklixShortId(summary.salt_k0, summary.salt_k1, tx->GetId()));
++        } else {
++            const size_t parents = push.depth == 8 ? 16 : 256;
++            for (size_t prefix = 0; prefix < parents; ++prefix)
++                push.sketches.push_back(BuildSubBucketSummary(scope,
++                    context, summary.salt_k0, summary.salt_k1, uint16_t(prefix), push.depth));
++        }
++        m_connman.PushMessage(&peer, NetMsg::Make(NetMsgType::MERKLIXSIZED, push));
++    } else m_connman.PushMessage(&peer, NetMsg::Make(NetMsgType::MERKLIXSYNC, summary));
+     return true;
+ }
+ 
+@@ -1472,6 +1579,16 @@ void V2PeerProtocolHandler::RemovePeer(NodeId peer_id) {
+     m_peer_nodes.erase(peer_id);
+     m_peer_services.erase(peer_id);
+     m_sync_announcements.erase(peer_id);
++    m_recon_history.erase(peer_id);
++    m_shorttx_send_budgets.erase(peer_id);
++    if (const auto pending = m_shorttx_responses.find(peer_id); pending != m_shorttx_responses.end()) {
++        for (const auto &job : pending->second) m_shorttx_response_bytes -= job.bytes;
++        m_shorttx_responses.erase(pending);
++    }
++    if (const auto pending = m_sized_transfers.find(peer_id); pending != m_sized_transfers.end()) {
++        m_sized_queued_ids -= pending->second.remaining.size();
++        m_sized_transfers.erase(pending);
++    }
+     m_expected_buckets.erase(peer_id);
+     if (auto it = m_recon_queues.find(peer_id); it != m_recon_queues.end()) {
+         m_recon_queued_bytes -= it->second.bytes;
+@@ -1513,9 +1630,172 @@ V2PeerProtocolHandler::GetLastPeerKnownBlock(NodeId peer_id) const {
+     return it->second;
+ }
+ 
++void V2PeerProtocolHandler::ExpireSizedTransfer(NodeId peer, std::chrono::microseconds now) {
++    LOCK(m_mutex);
++    const auto found = m_sized_transfers.find(peer);
++    if (found == m_sized_transfers.end() || now < found->second.expires) return;
++    const auto &req = found->second.request;
++    m_pending_shorttx_requests.erase(PendingShortTxKey{peer, static_cast<ReconScope>(req.scope), req.context_id});
++    m_sized_queued_ids -= found->second.remaining.size();
++    m_sized_transfers.erase(found);
++}
++
++void V2PeerProtocolHandler::SendNextSizedChunk(CNode &peer, std::chrono::microseconds now) {
++    if (peer.fPauseSend || peer.fDisconnect) return;
++    struct Completion { ShortTxRequest header; uint256 root; size_t rounds; };
++    std::optional<Completion> completion;
++    ShortTxRequest request;
++    {
++        LOCK(m_mutex);
++        const auto found = m_sized_transfers.find(peer.GetId());
++        if (found == m_sized_transfers.end()) return;
++        auto &transfer = found->second;
++        const auto &header = transfer.request;
++        if (m_pending_shorttx_requests.count(PendingShortTxKey{peer.GetId(),
++                static_cast<ReconScope>(header.scope), header.context_id})) return;
++        if (transfer.remaining.empty()) {
++            completion = Completion{header, transfer.expected_root, transfer.rounds};
++            m_sized_transfers.erase(found);
++        } else {
++            request = header;
++            const size_t count = std::min(transfer.remaining.size(), ShortTxRequest::MAX_SHORT_IDS);
++            request.short_ids.reserve(count);
++            for (size_t i = 0; i < count; ++i) {
++                request.short_ids.push_back(transfer.remaining.front());
++                transfer.remaining.pop_front();
++            }
++            m_sized_queued_ids -= count;
++            transfer.expires = now + std::chrono::seconds{10};
++            ++transfer.rounds;
++        }
++    }
++    if (completion) {
++        const auto txs = GetScopedTransactions(static_cast<ReconScope>(completion->header.scope),
++                                               completion->header.context_id);
++        if (ComputeScopedMerklixRoot(txs) == completion->root) {
++            LOCK(m_mutex);
++            ++m_stats.sized_list_transfers_completed;
++            ++m_stats.sized_list_round_histogram[std::min<size_t>(16, completion->rounds)];
++        }
++        return;
++    }
++    RecordPendingShortTxRequest(peer.GetId(), static_cast<ReconScope>(request.scope),
++                                 request.context_id, request.salt_k0, request.salt_k1,
++                                 request.short_ids);
++    m_connman.PushMessage(&peer, NetMsg::Make(NetMsgType::GETSHORTTX, request));
++}
++
++void V2PeerProtocolHandler::HandleSizedSync(
++    CNode &peer, DataStream &stream, std::chrono::microseconds now) {
++    auto malformed = [&] { LOCK(m_mutex); ++m_stats.malformed_messages; };
++    MerklixSizedSync push;
++    try { stream >> push; } catch (const std::exception &) { malformed(); return; }
++    auto &summary = push.summary;
++    if (!stream.empty() || !IsValidReconScope(summary.scope) ||
++        !IsValidReconSipHashKey(static_cast<ReconScope>(summary.scope), summary.context_id,
++                                summary.salt_k0, summary.salt_k1)) { malformed(); return; }
++    size_t total = 0;
++    for (const auto &bucket : summary.buckets) total += bucket.count;
++    if (total > MAX_SCOPED_TXS ||
++        (push.depth != 0 && push.depth != 8 && push.depth != 12)) { malformed(); return; }
++    const auto scope = static_cast<ReconScope>(summary.scope);
++    {
++        LOCK(m_mutex);
++        const auto bound = m_scoped_txs.find(ScopeKey{scope, summary.context_id});
++        if (bound != m_scoped_txs.end() && bound->second.expected_root &&
++            *bound->second.expected_root != summary.candidate_root) {
++            ++m_stats.malformed_messages;
++            return;
++        }
++    }
++    const auto local = GetScopedTransactions(scope, summary.context_id);
++    const bool matched = ComputeScopedMerklixRoot(local) == summary.candidate_root;
++    {
++        LOCK(m_mutex);
++        auto &history = m_recon_history[peer.GetId()];
++        history.remote_size = total;
++        history.known = true;
++        if (matched) history.q = 0.0;
++    }
++    if (push.depth == 0) {
++        if (!push.sketches.empty() || push.short_ids.size() != total) { malformed(); return; }
++        if (matched) return;
++        std::unordered_set<uint64_t> remote_ids;
++        for (const auto id : push.short_ids)
++            if (!id || !remote_ids.insert(id).second) { malformed(); return; }
++        std::unordered_set<uint64_t> local_ids;
++        for (const auto &tx : local)
++            local_ids.insert(ComputeMerklixShortId(summary.salt_k0, summary.salt_k1, tx->GetId()));
++        if (local_ids.size() != local.size()) return; // Collision: ordinary relay fallback.
++        std::vector<uint64_t> missing;
++        size_t extra = 0;
++        for (const auto id : remote_ids) if (!local_ids.count(id)) missing.push_back(id);
++        for (const auto id : local_ids) if (!remote_ids.count(id)) ++extra;
++        {
++            LOCK(m_mutex);
++            auto &history = m_recon_history[peer.GetId()];
++            const size_t size_difference = local.size() > total ? local.size() - total : total - local.size();
++            const auto shared_size = std::min(local.size(), total);
++            history.q = shared_size ? std::clamp(
++                double(missing.size() + extra - size_difference) / shared_size, 0.0, 1.0) : 0.0;
++        }
++        if (matched || missing.empty()) return;
++        ExpireSizedTransfer(peer.GetId(), now);
++        {
++            LOCK(m_mutex);
++            if (m_sized_transfers.count(peer.GetId())) return;
++            // At most half a MiB of IDs per peer and eight MiB globally.
++            if (m_sized_queued_ids + missing.size() > 1024 * 1024) {
++                ++m_stats.recon_queue_rejected;
++                peer.fDisconnect = true;
++                return;
++            }
++            SizedTransfer transfer;
++            transfer.expected_root = summary.candidate_root;
++            transfer.request.scope = summary.scope;
++            transfer.request.context_id = summary.context_id;
++            transfer.request.salt_k0 = summary.salt_k0;
++            transfer.request.salt_k1 = summary.salt_k1;
++            std::sort(missing.begin(), missing.end());
++            transfer.remaining.assign(missing.begin(), missing.end());
++            transfer.expires = now + std::chrono::seconds{10};
++            m_sized_queued_ids += missing.size();
++            m_sized_transfers.emplace(peer.GetId(), std::move(transfer));
++        }
++        SendNextSizedChunk(peer, now);
++        return;
++    }
++    const size_t parents = push.depth == 8 ? 16 : 256;
++    if (!push.short_ids.empty() || push.sketches.size() != parents) { malformed(); return; }
++    size_t cells_count = 0;
++    for (size_t prefix = 0; prefix < parents; ++prefix) {
++        const auto &sketch = push.sketches[prefix];
++        if (sketch.scope != summary.scope || sketch.context_id != summary.context_id ||
++            sketch.salt_k0 != summary.salt_k0 || sketch.salt_k1 != summary.salt_k1 ||
++            sketch.depth_bits != push.depth || sketch.parent_prefix != prefix ||
++            !sketch.overflow_short_ids.empty()) { malformed(); return; }
++        for (const auto &cell : sketch.sub_buckets) cells_count += cell.count;
++    }
++    if (cells_count != total) { malformed(); return; }
++    if (matched) return;
++    {
++        LOCK(m_mutex);
++        auto &pending = m_expected_buckets[peer.GetId()];
++        if (pending.size() + parents > MerklixBucketBatchReply::MAX_SUMMARIES) return;
++        for (const auto &sketch : push.sketches)
++            pending.emplace(sketch.scope, sketch.context_id, sketch.salt_k0, sketch.salt_k1,
++                            sketch.depth_bits, sketch.parent_prefix);
++    }
++    MerklixBucketBatchReply batch{std::move(push.sketches)};
++    DataStream sketches;
++    sketches << batch;
++    HandleBucketBatchReply(peer, sketches, now);
++}
++
+ void V2PeerProtocolHandler::SendBucketRequests(
+     CNode &peer, const std::vector<MerklixBucketRequest> &requests) {
+-    if (!(GetPeerServices(peer.GetId()) & NODE_MERKLIX_BATCH)) {
++    if (!gArgs.GetBoolArg("-merklixbatch", true) ||
++        !(GetPeerServices(peer.GetId()) & NODE_MERKLIX_BATCH)) {
+         for (const auto &req : requests) SendBucketRequest(peer, req);
+         return;
+     }
+@@ -1671,7 +1951,8 @@ void V2PeerProtocolHandler::HandleBucketBatchReply(
+ 
+ void V2PeerProtocolHandler::SendBucketRequest(
+     CNode &peer, const MerklixBucketRequest &req) {
+-    if (GetPeerServices(peer.GetId()) & NODE_MERKLIX_BATCH) {
++    if (gArgs.GetBoolArg("-merklixbatch", true) &&
++        (GetPeerServices(peer.GetId()) & NODE_MERKLIX_BATCH)) {
+         SendBucketRequests(peer, {req});
+         return;
+     }
+@@ -1712,6 +1993,15 @@ void V2PeerProtocolHandler::HandleMerklixSync(
+     }
+ 
+     const ReconScope scope = static_cast<ReconScope>(summary.scope);
++    {
++        LOCK(m_mutex);
++        const auto bound = m_scoped_txs.find(ScopeKey{scope, summary.context_id});
++        if (bound != m_scoped_txs.end() && bound->second.expected_root &&
++            *bound->second.expected_root != summary.candidate_root) {
++            ++m_stats.malformed_messages;
++            return;
++        }
++    }
+     if ((summary.salt_k0 != 0 || summary.salt_k1 != 0) &&
+         !IsValidReconSipHashKey(scope, summary.context_id, summary.salt_k0,
+                                 summary.salt_k1)) {
+@@ -1919,6 +2209,79 @@ void V2PeerProtocolHandler::HandleMerklixBuck(
+     }
+ }
+ 
++void V2PeerProtocolHandler::QueueShortTxResponse(CNode &peer, ShortTxResponse response) {
++    OutgoingShortTx job{response.scope, response.context_id, {}, 0};
++    for (const auto &tx : response.txs) {
++        const size_t bytes = GetSerializeSize(Using<TransactionCompression>(tx));
++        if (bytes + 64 > MAX_PROTOCOL_MESSAGE_LENGTH) {
++            LOCK(m_mutex); ++m_stats.recon_queue_rejected; peer.fDisconnect = true; return;
++        }
++        job.bytes += bytes;
++        job.txs.emplace_back(tx, bytes);
++    }
++    {
++        LOCK(m_mutex);
++        auto &queue = m_shorttx_responses[peer.GetId()];
++        size_t peer_bytes = job.bytes;
++        for (const auto &pending : queue) peer_bytes += pending.bytes;
++        if (queue.size() >= 16 || peer_bytes > MAX_SCOPED_TX_BYTES ||
++            m_shorttx_response_bytes + job.bytes > MAX_SCOPED_CACHE_BYTES) {
++            ++m_stats.recon_queue_rejected;
++            peer.fDisconnect = true;
++            return;
++        }
++        m_shorttx_response_bytes += job.bytes;
++        queue.push_back(std::move(job));
++    }
++    DrainShortTxResponses(peer);
++}
++
++void V2PeerProtocolHandler::DrainShortTxResponses(CNode &peer) {
++    for (size_t frame = 0; frame < 4 && !peer.fPauseSend && !peer.fDisconnect; ++frame) {
++        ShortTxResponse response;
++        {
++            LOCK(m_mutex);
++            const auto found = m_shorttx_responses.find(peer.GetId());
++            if (found == m_shorttx_responses.end() || found->second.empty()) return;
++            auto &queue = found->second;
++            auto &job = queue.front();
++            response.scope = job.scope;
++            response.context_id = job.context;
++            size_t bytes = 64, payload_bytes = 0, count = 0;
++            for (const auto &pending : job.txs) {
++                if (count == ShortTxResponse::MAX_TXS ||
++                    (count && bytes + pending.second > 1024 * 1024)) break;
++                bytes += pending.second;
++                payload_bytes += pending.second;
++                ++count;
++            }
++            // Serving tiny repeated requests must also consume payload credit.
++            // Leave the bounded job untouched until a whole frame can be sent.
++            if (!m_shorttx_send_budgets[peer.GetId()].Consume(
++                    bytes, 0, true, GetTime<std::chrono::microseconds>())) {
++                if (!job.waiting_for_budget) {
++                    ++m_stats.rate_limited_messages;
++                    ++m_stats.recon_deferred;
++                    job.waiting_for_budget = true;
++                }
++                return;
++            }
++            if (job.waiting_for_budget) ++m_stats.recon_drained;
++            job.waiting_for_budget = false;
++            for (size_t i = 0; i < count; ++i) {
++                response.txs.push_back(job.txs.front().first);
++                job.txs.pop_front();
++            }
++            job.bytes -= payload_bytes;
++            m_shorttx_response_bytes -= payload_bytes;
++            if (job.txs.empty()) queue.pop_front();
++            if (queue.empty()) m_shorttx_responses.erase(found);
++        }
++        if (response.txs.empty()) return;
++        m_connman.PushMessage(&peer, NetMsg::Make(NetMsgType::SHORTTX, response));
++    }
++}
++
+ void V2PeerProtocolHandler::HandleGetShortTx(
+     CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received) {
+     ShortTxRequest req;
+@@ -1962,7 +2325,7 @@ void V2PeerProtocolHandler::HandleGetShortTx(
+         resp.scope = req.scope;
+         resp.context_id = req.context_id;
+         resp.txs = std::move(resolved);
+-        m_connman.PushMessage(&pfrom, NetMsg::Make(NetMsgType::SHORTTX, resp));
++        QueueShortTxResponse(pfrom, std::move(resp));
+     }
+ }
+ 
+@@ -1998,12 +2361,14 @@ void V2PeerProtocolHandler::HandleShortTx(
+         LOCK(m_mutex);
+         const PendingShortTxKey key{pfrom.GetId(), scope, resp.context_id};
+         auto it = m_pending_shorttx_requests.find(key);
+-        const bool high_bandwidth_opt_in =
++        const auto bound = m_scoped_txs.find(ScopeKey{scope, resp.context_id});
++        const bool root_bound = bound != m_scoped_txs.end() && bound->second.expected_root.has_value();
++        const bool high_bandwidth_opt_in = !root_bound && (
+             pfrom.m_bip152_highbandwidth_to.load() ||
+             pfrom.m_bip152_highbandwidth_from.load() ||
+             m_high_bandwidth_shorttx_peers.count(pfrom.GetId()) > 0 ||
+             pfrom.HasPermission(NetPermissionFlags::Relay) ||
+-            gArgs.GetBoolArg("-highbandwidthtx", false);
++            gArgs.GetBoolArg("-highbandwidthtx", false));
+ 
+         if (it != m_pending_shorttx_requests.end() &&
+             !it->second.requested_short_ids.empty()) {
+@@ -2164,6 +2529,7 @@ void V2PeerProtocolHandler::HandleShortTx(
+     }
+ 
+     m_peerman.RelayTransactionBatch(accepted_txs);
++    SendNextSizedChunk(pfrom, time_received);
+ }
+ 
+ V2ProtocolHandlerStats V2PeerProtocolHandler::GetStats() const {
+diff --git a/src/net/v2_protocol_handler.h b/src/net/v2_protocol_handler.h
+index 9148d6bb40..de469d4949 100644
+--- a/src/net/v2_protocol_handler.h
++++ b/src/net/v2_protocol_handler.h
+@@ -102,20 +102,22 @@ struct CandidateOverlayEntry {
+ };
+ 
+ /** CompactSize vectors rejected before allocating an attacker-selected count. */
+-template <size_t Limit> struct ReconVectorFormatter {
++template <size_t Limit, typename Formatter = DefaultFormatter> struct ReconVectorFormatter {
+     template <typename Stream, typename Vector> void Ser(Stream &s, const Vector &v) {
+         if (v.size() > Limit) throw std::ios_base::failure("oversized Merklix vector");
+         WriteCompactSize(s, v.size());
+-        for (const auto &item : v) ::Serialize(s, item);
++        Formatter formatter;
++        for (const auto &item : v) formatter.Ser(s, item);
+     }
+     template <typename Stream, typename Vector> void Unser(Stream &s, Vector &v) {
+         const auto count = ReadCompactSize(s);
+         if (count > Limit) throw std::ios_base::failure("oversized Merklix vector");
+         v.clear();
+         v.reserve(count);
++        Formatter formatter;
+         for (size_t i = 0; i < count; ++i) {
+             typename Vector::value_type value;
+-            ::Unserialize(s, value);
++            formatter.Unser(s, value);
+             v.push_back(std::move(value));
+         }
+     }
+@@ -245,6 +247,22 @@ struct MerklixBucketBatchReply {
+     }
+ };
+ 
++/** The capability-negotiated initial push avoids the top-level request RTT.
++ * depth=8/12 carries all cells at that depth; depth=0 carries every short ID
++ * for the complete advertised set (never a truncated list).
++ */
++struct MerklixSizedSync {
++    MerklixSyncSummary summary;
++    uint8_t depth{8};
++    std::vector<MerklixSubBucketSummary> sketches;
++    std::vector<uint64_t> short_ids;
++    SERIALIZE_METHODS(MerklixSizedSync, obj) {
++        READWRITE(obj.summary, obj.depth,
++                  Using<ReconVectorFormatter<256>>(obj.sketches),
++                  Using<ReconVectorFormatter<65536>>(obj.short_ids));
++    }
++};
++
+ /**
+  * Request for missing transactions by 64-bit salted short IDs (getshorttx).
+  */
+@@ -275,7 +293,7 @@ struct ShortTxResponse {
+ 
+     SERIALIZE_METHODS(ShortTxResponse, obj) {
+         READWRITE(obj.scope, obj.context_id,
+-                  Using<VectorFormatter<TransactionCompression>>(obj.txs));
++                  Using<ReconVectorFormatter<MAX_TXS, TransactionCompression>>(obj.txs));
+     }
+ };
+ 
+@@ -393,6 +411,8 @@ struct V2ProtocolHandlerStats {
+     uint64_t recon_drained{0};
+     uint64_t recon_queue_rejected{0};
+     uint64_t unsolicited_merklixbuck{0};
++    uint64_t sized_list_transfers_completed{0};
++    std::array<uint64_t, 17> sized_list_round_histogram{};
+     uint64_t getutxoroots_received{0};
+     uint64_t utxoroots_received{0};
+     uint64_t getutxoshard_received{0};
+@@ -582,9 +602,15 @@ public:
+                        std::chrono::milliseconds cadence = std::chrono::milliseconds{100})
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
++    void DrainShortTxResponses(CNode &peer) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+     void DrainReconMessages(CNode &peer, std::chrono::microseconds now)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
++    bool PushScopedSync(CNode &peer, ReconScope scope, const uint256 &context)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    bool SendSyncSummary(CNode &peer, const MerklixSyncSummary &summary)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
+     /**
+      * Register a candidate transaction overlay for O(1) sealedheader
+      * reconstruction keyed by the parent block hash (or block merkle root).
+@@ -618,6 +644,10 @@ public:
+      * the handler also reads directly from m_mempool when no explicit set is
+      * registered.
+      */
++    [[nodiscard]] bool AuthorizeScopedRoot(ReconScope scope, const uint256 &context_id,
++                                           const uint256 &root)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
+     [[nodiscard]] bool SetScopedTransactions(ReconScope scope, const uint256 &context_id,
+                                std::vector<CTransactionRef> txs)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+@@ -812,6 +842,21 @@ private:
+     std::optional<bool> m_serve_utxo_shards_override GUARDED_BY(m_mutex);
+     std::unordered_map<NodeId, CNode *> m_peer_nodes GUARDED_BY(m_mutex);
+     std::unordered_map<NodeId, ServiceFlags> m_peer_services GUARDED_BY(m_mutex);
++    struct PeerReconHistory {
++        size_t remote_size{0};
++        double q{0.1};
++        bool known{false};
++    };
++    std::unordered_map<NodeId, PeerReconHistory> m_recon_history GUARDED_BY(m_mutex);
++    struct SizedTransfer {
++        uint256 expected_root{};
++        ShortTxRequest request;
++        std::deque<uint64_t> remaining;
++        std::chrono::microseconds expires{};
++        size_t rounds{0};
++    };
++    std::unordered_map<NodeId, SizedTransfer> m_sized_transfers GUARDED_BY(m_mutex);
++    size_t m_sized_queued_ids GUARDED_BY(m_mutex){0};
+     struct SyncAnnouncement {
+         std::chrono::microseconds next{};
+         std::optional<uint256> root;
+@@ -839,6 +884,7 @@ private:
+         }
+     };
+     struct ScopedTxSetEntry {
++        std::optional<uint256> expected_root;
+         std::unique_ptr<ReconSyndromeIndex> syndromes;
+         size_t bytes{0};
+         std::vector<CTransactionRef> txs;
+@@ -888,6 +934,18 @@ private:
+     void SendBucketRequest(CNode &peer, const MerklixBucketRequest &request)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
++    struct OutgoingShortTx {
++        uint8_t scope;
++        uint256 context;
++        std::deque<std::pair<CTransactionRef, size_t>> txs;
++        size_t bytes{0};
++        bool waiting_for_budget{false};
++    };
++    std::unordered_map<NodeId, std::deque<OutgoingShortTx>> m_shorttx_responses GUARDED_BY(m_mutex);
++    size_t m_shorttx_response_bytes GUARDED_BY(m_mutex){0};
++    std::unordered_map<NodeId, ReconCostBudget> m_shorttx_send_budgets GUARDED_BY(m_mutex);
++    void QueueShortTxResponse(CNode &peer, ShortTxResponse response)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+     struct DeferredReconMessage {
+         std::string type;
+         SerializeData bytes;
+@@ -904,6 +962,9 @@ private:
+     bool AdmitReconMessage(CNode &peer, const std::string &type,
+                            DataStream &stream, std::chrono::microseconds now)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    void HandleSizedSync(CNode &peer, DataStream &stream, std::chrono::microseconds now);
++    void SendNextSizedChunk(CNode &peer, std::chrono::microseconds now);
++    void ExpireSizedTransfer(NodeId peer, std::chrono::microseconds now);
+     void HandleBucketBatchRequest(CNode &peer, DataStream &stream);
+     void HandleBucketBatchReply(CNode &peer, DataStream &stream, std::chrono::microseconds now);
+     bool DispatchReconMessage(CNode &peer, const std::string &type,
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index b236ac2ea2..393a659f43 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -9302,6 +9302,7 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+ 
+     const auto current_time{GetTime<std::chrono::microseconds>()};
+     m_v2_protocol_handler.CheckFastSyncTimeouts(pto->GetId(), current_time);
++    m_v2_protocol_handler.DrainShortTxResponses(*pto);
+     m_v2_protocol_handler.DrainReconMessages(*pto, current_time);
+     if (gArgs.GetBoolArg("-merklixreconciliation", true)) {
+         const auto cadence = m_avalanche
+diff --git a/src/protocol.cpp b/src/protocol.cpp
+index ba77a2c74c..0e20613333 100644
+--- a/src/protocol.cpp
++++ b/src/protocol.cpp
+@@ -68,6 +68,7 @@ const char *LEGACY_GETMERKLIXBUCK = "getmerklixbuck";
+ const char *GETMERKLIXBUCK = "getmrklbckt";
+ const char *GETMERKLIXBATCH = "getmrklbatch";
+ const char *MERKLIXBATCH = "mrklbatch";
++const char *MERKLIXSIZED = "merklixsket";
+ const char *MERKLIXBUCK = "merklixbuck";
+ const char *GETSHORTTX = "getshorttx";
+ const char *SHORTTX = "shorttx";
+@@ -117,6 +118,7 @@ static const std::string allNetMessageTypes[] = {
+     NetMsgType::GETAVAPROOFS,   NetMsgType::AVAPROOFS,
+     NetMsgType::AVAPROOFSREQ,   NetMsgType::MINEDHEADER,
+     NetMsgType::SEALEDHEADER,   NetMsgType::SEALEDBLOCK,
++    NetMsgType::MERKLIXSIZED,
+     NetMsgType::GETMERKLIXBATCH, NetMsgType::MERKLIXBATCH,
+     NetMsgType::MERKLIXSYNC,    NetMsgType::GETMERKLIXBUCK,
+     NetMsgType::MERKLIXBUCK,    NetMsgType::GETSHORTTX,
+@@ -288,6 +290,8 @@ static std::string serviceFlagToStr(const size_t bit) {
+             return "MERKLIX";
+         case NODE_MERKLIX_BATCH:
+             return "MERKLIX_BATCH";
++        case NODE_MERKLIX_SIZED:
++            return "MERKLIX_SIZED";
+         default:
+             std::ostringstream stream;
+             stream.imbue(std::locale::classic());
+diff --git a/src/protocol.h b/src/protocol.h
+index 4ddceeb06a..6e1b54ee65 100644
+--- a/src/protocol.h
++++ b/src/protocol.h
+@@ -346,6 +346,7 @@ extern const char *LEGACY_GETMERKLIXBUCK;
+ extern const char *GETMERKLIXBUCK;
+ extern const char *GETMERKLIXBATCH;
+ extern const char *MERKLIXBATCH;
++extern const char *MERKLIXSIZED;
+ 
+ /**
+  * Transmits depth-8 sub-bucket algebraic syndromes (count, s1, s3 over GF(2^64)).
+@@ -467,6 +468,8 @@ enum ServiceFlags : uint64_t {
+     NODE_MERKLIX = (1 << 26),
+     // Explicit opt-in to vector requests/replies; old encodings remain intact.
+     NODE_MERKLIX_BATCH = (1 << 27),
++    // Push initial syndromes or a complete bounded short-ID list.
++    NODE_MERKLIX_SIZED = (1 << 29),
+ };
+ 
+ /**
+diff --git a/src/rpc/net.cpp b/src/rpc/net.cpp
+index 967207aaba..1c60374caf 100644
+--- a/src/rpc/net.cpp
++++ b/src/rpc/net.cpp
+@@ -821,6 +821,10 @@ static RPCHelpMan getnetworkinfo() {
+                     {RPCResult::Type::NUM, "deferred", "Messages queued for later processing"},
+                     {RPCResult::Type::NUM, "drained", "Queued messages processed"},
+                     {RPCResult::Type::NUM, "rejected", "Oversized messages or floods rejected with peer teardown"},
++                    {RPCResult::Type::NUM, "list_transfers_completed", "Completed bounded full-ID list transfers"},
++                    {RPCResult::Type::ARR, "list_round_histogram", "Completed list transfers by GETSHORTTX request count (index0..16)", {
++                        {RPCResult::Type::NUM, "", "Number of transfers"},
++                    }},
+                 }},
+                 {RPCResult::Type::BOOL, "networkactive",
+                  "whether p2p networking is enabled"},
+@@ -887,6 +891,10 @@ static RPCHelpMan getnetworkinfo() {
+                     recon.pushKV("deferred", stats.recon_deferred);
+                     recon.pushKV("drained", stats.recon_drained);
+                     recon.pushKV("rejected", stats.recon_queue_rejected);
++                    recon.pushKV("list_transfers_completed", stats.sized_list_transfers_completed);
++                    UniValue rounds(UniValue::VARR);
++                    for (const auto count : stats.sized_list_round_histogram) rounds.push_back(count);
++                    recon.pushKV("list_round_histogram", rounds);
+                     obj.pushKV("merklix", recon);
+                 }
+             }
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 65a1a8e7e1..9b562893fe 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -276,6 +276,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		validation_flush_tests.cpp
+ 		validation_tests.cpp
+ 		validationinterface_tests.cpp
++		merklix_sized_tests.cpp
+ 		merklix_incremental_tests.cpp
+ 		merklix_batch_tests.cpp
+ 		merklix_scope_tests.cpp
+diff --git a/src/test/merklix_batch_tests.cpp b/src/test/merklix_batch_tests.cpp
+index 97ad3226b6..c4bac4f331 100644
+--- a/src/test/merklix_batch_tests.cpp
++++ b/src/test/merklix_batch_tests.cpp
+@@ -55,6 +55,8 @@ BOOST_AUTO_TEST_CASE(one_reply_and_followup_independent_of_bucket_count) {
+             }
+         }
+         peer.vSendMsg.clear();
++        peer.nSendSize = 0;
++        peer.fPauseSend = false;
+         return messages;
+     };
+     for (const unsigned buckets : {1U, 16U}) {
+diff --git a/src/test/merklix_sized_tests.cpp b/src/test/merklix_sized_tests.cpp
+new file mode 100644
+index 0000000000..902356e0d3
+--- /dev/null
++++ b/src/test/merklix_sized_tests.cpp
+@@ -0,0 +1,302 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++#include <net/v2_protocol_handler.h>
++#include <net_processing.h>
++#include <net.h>
++#include <validation.h>
++#include <coins.h>
++#include <node/protocol_version.h>
++#include <script/standard.h>
++#include <test/util/net.h>
++#include <test/util/setup_common.h>
++#include <boost/test/unit_test.hpp>
++using namespace lotus::v2::net;
++using namespace std::chrono_literals;
++BOOST_FIXTURE_TEST_SUITE(merklix_sized_tests, RegTestingSetup)
++BOOST_AUTO_TEST_CASE(ten_thousand_epoch_difference_round_trip_gate) {
++    const auto &config = m_node.chainman->GetConfig();
++    ConnmanTestMsg connman(config, 1, 2, *m_node.addrman);
++    auto peerman = PeerManager::make(connman, *m_node.addrman, nullptr,
++                                     *m_node.chainman, *m_node.mempool, nullptr, {});
++    auto *local = peerman->GetV2ProtocolHandler();
++    V2PeerProtocolHandler remote(*m_node.chainman, *m_node.mempool, connman, *peerman);
++    CNode peer(901, nullptr, CAddress(), 0, 0, 0, CAddress(), "",
++               ConnectionType::OUTBOUND_FULL_RELAY, false);
++    peer.SetCommonVersion(PROTOCOL_VERSION);
++    peer.fSuccessfullyConnected = true;
++    const auto services = ServiceFlags(NODE_MERKLIX | NODE_MERKLIX_BATCH | NODE_MERKLIX_SIZED);
++    local->SetPeerServices(peer.GetId(), services);
++    remote.SetPeerServices(peer.GetId(), services);
++    auto take = [&] {
++        V1TransportDeserializer decoder(config, peer.GetId());
++        std::vector<CNetMessage> messages;
++        LOCK(peer.cs_vSend);
++        for (const auto &chunk : peer.vSendMsg) {
++            Span<const uint8_t> bytes{chunk};
++            while (!bytes.empty()) {
++                BOOST_REQUIRE_GE(decoder.Read(config, bytes), 0);
++                if (decoder.Complete()) {
++                    bool rejected = false;
++                    messages.push_back(decoder.GetMessage(0us, rejected));
++                    BOOST_REQUIRE(!rejected);
++                }
++            }
++        }
++        peer.vSendMsg.clear();
++        peer.nSendSize = 0; // All captured transport bytes were delivered.
++        peer.fPauseSend = false;
++        return messages;
++    };
++    const CScript redeem = CScript() << std::vector<uint8_t>(48, 0x42) << OP_DROP << OP_TRUE;
++    const CScript script = GetScriptForDestination(ScriptHash(redeem));
++    std::vector<CTransactionRef> universe;
++    {
++        LOCK(cs_main);
++        auto &coins = m_node.chainman->ActiveChainstate().CoinsTip();
++        for (size_t i = 0; i < 10000; ++i) {
++            CMutableTransaction tx;
++            tx.nVersion = 2;
++            tx.vin.resize(1);
++            uint256 prev;
++            for (unsigned b = 0; b < 8; ++b) prev.begin()[b] = (i + 1) >> (8 * b);
++            tx.vin[0].prevout = COutPoint(TxId(prev), 0);
++            tx.vin[0].scriptSig = CScript() << ToByteVector(redeem);
++            tx.vout.emplace_back(1000 * SATOSHI, script);
++            coins.AddCoin(tx.vin[0].prevout, Coin(CTxOut(5000 * SATOSHI, script), 1, false), true);
++            universe.push_back(MakeTransactionRef(std::move(tx)));
++        }
++    }
++    size_t sequence = 1;
++    for (size_t difference : {10, 100, 1000, 2000, 5000}) {
++        std::vector<size_t> observed;
++        for (size_t repeat = 0; repeat < 3; ++repeat) {
++            uint256 context;
++            context.begin()[0] = sequence++;
++            const auto scope = ReconScope::EPOCH_BATCH;
++            std::vector<CTransactionRef> shared(universe.begin(), universe.end() - difference);
++            BOOST_REQUIRE(local->SetScopedTransactions(scope, context, shared));
++            BOOST_REQUIRE(remote.SetScopedTransactions(scope, context, universe));
++            const auto expected_root = ComputeScopedMerklixRoot(universe);
++            BOOST_REQUIRE(local->AuthorizeScopedRoot(scope, context, expected_root));
++            BOOST_REQUIRE(local->SetScopedTransactions(scope, context, shared));
++            // Exercise the actual scoped initiator and its cold-peer size estimate.
++            BOOST_REQUIRE(remote.PushScopedSync(peer, scope, context));
++            auto announcements = take();
++            BOOST_REQUIRE_EQUAL(announcements.size(), 1U);
++            BOOST_REQUIRE_EQUAL(announcements[0].m_type, NetMsgType::MERKLIXSIZED);
++            auto now = std::chrono::microseconds{1000000 * sequence};
++            BOOST_REQUIRE(local->TryHandleMessage(peer, announcements[0].m_type,
++                                                  announcements[0].m_recv, now));
++            size_t rounds = 0;
++            while (true) {
++                auto requests = take();
++                if (requests.empty()) break;
++                BOOST_REQUIRE_EQUAL(requests.size(), 1U);
++                BOOST_REQUIRE_EQUAL(requests[0].m_type, NetMsgType::GETSHORTTX);
++                ++rounds;
++                BOOST_REQUIRE_LE(rounds, 3U);
++                now += 100ms;
++                BOOST_REQUIRE(remote.TryHandleMessage(peer, requests[0].m_type, requests[0].m_recv, now));
++                auto replies = take();
++                BOOST_REQUIRE_EQUAL(replies.size(), 1U);
++                BOOST_REQUIRE_EQUAL(replies[0].m_type, NetMsgType::SHORTTX);
++                now += 100ms;
++                BOOST_REQUIRE(local->TryHandleMessage(peer, replies[0].m_type, replies[0].m_recv, now));
++            }
++            BOOST_REQUIRE(local->BuildSyncSummary(scope, context).candidate_root == expected_root);
++            BOOST_CHECK_EQUAL(local->GetScopedTransactions(scope, context).size(), 10000U);
++            observed.push_back(rounds);
++        }
++        std::sort(observed.begin(), observed.end());
++        BOOST_TEST_MESSAGE("difference=" << difference << " median actual request/response rounds=" << observed[1]);
++        BOOST_CHECK_LE(observed[1], difference <= 1000 ? 2U : 3U);
++    }
++    const auto stats = local->GetStats();
++    BOOST_CHECK_EQUAL(stats.sized_list_transfers_completed, 15U);
++    BOOST_CHECK_EQUAL(stats.sized_list_round_histogram[1], 12U);
++    BOOST_CHECK_EQUAL(stats.sized_list_round_histogram[2], 3U);
++}
++BOOST_AUTO_TEST_CASE(outgoing_frames_respect_bytes_backpressure_and_teardown) {
++    const auto &config = m_node.chainman->GetConfig();
++    ConnmanTestMsg connman(config, 3, 4, *m_node.addrman);
++    auto peerman = PeerManager::make(connman, *m_node.addrman, nullptr,
++                                     *m_node.chainman, *m_node.mempool, nullptr, {});
++    auto *handler = peerman->GetV2ProtocolHandler();
++    CNode peer(902, nullptr, CAddress(), 0, 0, 0, CAddress(), "",
++               ConnectionType::OUTBOUND_FULL_RELAY, false);
++    peer.SetCommonVersion(PROTOCOL_VERSION);
++    peer.fSuccessfullyConnected = true;
++    SetMockTime(GetTime() + 100);
++    std::vector<CTransactionRef> txs;
++    for (uint8_t i = 1; i <= 8; ++i) {
++        CMutableTransaction tx;
++        tx.nVersion = 2;
++        tx.vin.resize(1);
++        uint256 prev;
++        prev.begin()[0] = i;
++        tx.vin[0].prevout = COutPoint(TxId(prev), 0);
++        // Synthetic payloads test framing only, not consensus acceptance.
++        tx.vout.emplace_back(1000 * SATOSHI,
++                            CScript() << std::vector<uint8_t>(600000, 0x42) << OP_DROP);
++        txs.push_back(MakeTransactionRef(std::move(tx)));
++    }
++    uint256 context;
++    context.begin()[0] = 99;
++    BOOST_REQUIRE(handler->SetScopedTransactions(ReconScope::BLOCK_RECON, context, txs));
++    const auto [k0, k1] = DeriveReconSipHashKey(ReconScope::BLOCK_RECON, context, 0);
++    ShortTxRequest request;
++    request.scope = uint8_t(ReconScope::BLOCK_RECON);
++    request.context_id = context;
++    request.salt_k0 = k0; request.salt_k1 = k1;
++    for (const auto &tx : txs) request.short_ids.push_back(ComputeMerklixShortId(k0, k1, tx->GetId()));
++    DataStream wire;
++    wire << request;
++    BOOST_REQUIRE(handler->TryHandleMessage(peer, NetMsgType::GETSHORTTX, wire, 1s));
++    size_t frames = 0, delivered = 0;
++    for (int pass = 0; pass < 10; ++pass) {
++        V1TransportDeserializer decoder(config, peer.GetId());
++        {
++            LOCK(peer.cs_vSend);
++            for (const auto &chunk : peer.vSendMsg) {
++                Span<const uint8_t> bytes{chunk};
++                while (!bytes.empty()) {
++                    BOOST_REQUIRE_GE(decoder.Read(config, bytes), 0);
++                    if (!decoder.Complete()) continue;
++                    bool rejected = false;
++                    auto msg = decoder.GetMessage(0us, rejected);
++                    BOOST_REQUIRE(!rejected);
++                    BOOST_REQUIRE_EQUAL(msg.m_type, NetMsgType::SHORTTX);
++                    BOOST_CHECK_LE(msg.m_recv.size(), MAX_PROTOCOL_MESSAGE_LENGTH);
++                    ShortTxResponse response;
++                    msg.m_recv >> response;
++                    delivered += response.txs.size();
++                    ++frames;
++                }
++            }
++            peer.vSendMsg.clear();
++            peer.nSendSize = 0;
++            peer.fPauseSend = false;
++        }
++        handler->DrainShortTxResponses(peer);
++    }
++    // Six ~600k frames fit the 4MiB burst; a seventh must wait even
++    // when the mock receiver drains its socket immediately.
++    BOOST_CHECK_EQUAL(delivered, 6U);
++    BOOST_CHECK_EQUAL(handler->GetStats().rate_limited_messages, 1U);
++    BOOST_CHECK_EQUAL(handler->GetStats().recon_deferred, 1U);
++    SetMockTime(GetTime() + 1);
++    for (int pass = 0; pass < 4 && delivered < 8; ++pass) {
++        handler->DrainShortTxResponses(peer);
++        V1TransportDeserializer decoder(config, peer.GetId());
++        LOCK(peer.cs_vSend);
++        for (const auto &chunk : peer.vSendMsg) {
++            Span<const uint8_t> bytes{chunk};
++            while (!bytes.empty()) {
++                BOOST_REQUIRE_GE(decoder.Read(config, bytes), 0);
++                if (!decoder.Complete()) continue;
++                bool rejected = false;
++                auto msg = decoder.GetMessage(0us, rejected);
++                BOOST_REQUIRE(!rejected);
++                BOOST_REQUIRE_EQUAL(msg.m_type, NetMsgType::SHORTTX);
++                BOOST_CHECK_LE(msg.m_recv.size(), MAX_PROTOCOL_MESSAGE_LENGTH);
++                ShortTxResponse response; msg.m_recv >> response;
++                delivered += response.txs.size(); ++frames;
++            }
++        }
++        peer.vSendMsg.clear(); peer.nSendSize = 0; peer.fPauseSend = false;
++    }
++    BOOST_CHECK_EQUAL(delivered, 8U);
++    BOOST_CHECK_EQUAL(frames, 8U);
++    BOOST_CHECK_EQUAL(handler->GetStats().recon_drained, 1U);
++    const auto references = txs.front().use_count();
++    peer.fPauseSend = true;
++    DataStream paused;
++    paused << request;
++    handler->HandleGetShortTx(peer, paused, 2s);
++    BOOST_CHECK_EQUAL(txs.front().use_count(), references + 1);
++    handler->RemovePeer(peer.GetId());
++    BOOST_CHECK_EQUAL(txs.front().use_count(), references);
++    peer.fPauseSend = false;
++    handler->DrainShortTxResponses(peer);
++    LOCK(peer.cs_vSend);
++    BOOST_CHECK(peer.vSendMsg.empty());
++}
++
++BOOST_AUTO_TEST_CASE(authorized_root_clears_poison_and_rejects_alternate_summary) {
++    const auto &config = m_node.chainman->GetConfig();
++    ConnmanTestMsg connman(config, 7, 8, *m_node.addrman);
++    auto peerman = PeerManager::make(connman, *m_node.addrman, nullptr,
++                                     *m_node.chainman, *m_node.mempool, nullptr, {});
++    auto *handler = peerman->GetV2ProtocolHandler();
++    CNode peer(904, nullptr, CAddress(), 0, 0, 0, CAddress(), "",
++               ConnectionType::OUTBOUND_FULL_RELAY, false);
++    peer.SetCommonVersion(PROTOCOL_VERSION);
++    handler->SetPeerServices(peer.GetId(), ServiceFlags(NODE_MERKLIX | NODE_MERKLIX_BATCH | NODE_MERKLIX_SIZED));
++    MerklixSizedSync push;
++    push.depth = 0;
++    push.summary.scope = uint8_t(ReconScope::EPOCH_BATCH);
++    push.summary.context_id.begin()[0] = 51;
++    std::tie(push.summary.salt_k0, push.summary.salt_k1) = DeriveReconSipHashKey(
++        ReconScope::EPOCH_BATCH, push.summary.context_id, 0);
++    push.summary.candidate_root.begin()[0] = 99;
++    push.summary.buckets[0].count = 1;
++    push.short_ids = {123};
++    DataStream stale; stale << push;
++    BOOST_REQUIRE(handler->TryHandleMessage(peer, NetMsgType::MERKLIXSIZED, stale, 1s));
++    BOOST_REQUIRE(handler->HasPendingShortTxRequests(peer.GetId()));
++    uint256 expected; expected.begin()[0] = 88;
++    BOOST_REQUIRE(handler->AuthorizeScopedRoot(ReconScope::EPOCH_BATCH, push.summary.context_id, expected));
++    BOOST_CHECK(!handler->HasPendingShortTxRequests(peer.GetId()));
++    { LOCK(peer.cs_vSend); peer.vSendMsg.clear(); peer.nSendSize = 0; peer.fPauseSend = false; }
++    const auto before = handler->GetStats().malformed_messages;
++    DataStream alternate; alternate << push;
++    BOOST_REQUIRE(handler->TryHandleMessage(peer, NetMsgType::MERKLIXSIZED, alternate, 2s));
++    BOOST_CHECK(!handler->HasPendingShortTxRequests(peer.GetId()));
++    BOOST_CHECK_EQUAL(handler->GetStats().malformed_messages, before + 1);
++    BOOST_CHECK(!handler->AuthorizeScopedRoot(ReconScope::EPOCH_BATCH, push.summary.context_id, push.summary.candidate_root));
++    // Even high-bandwidth peers cannot append unsolicited transactions to an
++    // immutable announced scope. Admission is not reached for this payload.
++    peer.m_bip152_highbandwidth_to = true;
++    CMutableTransaction tx; tx.vin.emplace_back(COutPoint(TxId(expected), 0));
++    tx.vout.emplace_back(1000 * SATOSHI, CScript() << OP_TRUE);
++    ShortTxResponse response; response.scope = push.summary.scope;
++    response.context_id = push.summary.context_id;
++    response.txs = {MakeTransactionRef(std::move(tx))};
++    DataStream unsolicited; unsolicited << response;
++    const auto drops = handler->GetStats().unsolicited_shorttx_dropped;
++    BOOST_REQUIRE(handler->TryHandleMessage(peer, NetMsgType::SHORTTX, unsolicited, 3s));
++    BOOST_CHECK_EQUAL(handler->GetStats().unsolicited_shorttx_dropped, drops + 1);
++}
++
++BOOST_AUTO_TEST_CASE(stalled_list_request_expires_without_claiming_completion) {
++    const auto &config = m_node.chainman->GetConfig();
++    ConnmanTestMsg connman(config, 5, 6, *m_node.addrman);
++    auto peerman = PeerManager::make(connman, *m_node.addrman, nullptr,
++                                     *m_node.chainman, *m_node.mempool, nullptr, {});
++    auto *handler = peerman->GetV2ProtocolHandler();
++    CNode peer(903, nullptr, CAddress(), 0, 0, 0, CAddress(), "",
++               ConnectionType::OUTBOUND_FULL_RELAY, false);
++    peer.SetCommonVersion(PROTOCOL_VERSION);
++    peer.fSuccessfullyConnected = true;
++    handler->SetPeerServices(peer.GetId(), ServiceFlags(NODE_MERKLIX | NODE_MERKLIX_BATCH | NODE_MERKLIX_SIZED));
++    MerklixSizedSync push;
++    push.depth = 0;
++    push.summary.scope = uint8_t(ReconScope::EPOCH_BATCH);
++    push.summary.context_id.begin()[0] = 31;
++    std::tie(push.summary.salt_k0, push.summary.salt_k1) = DeriveReconSipHashKey(
++        ReconScope::EPOCH_BATCH, push.summary.context_id, 0);
++    push.summary.candidate_root.begin()[0] = 99;
++    push.summary.buckets[0].count = 1;
++    push.summary.buckets[0].xor_short_id = 123;
++    push.short_ids = {123};
++    DataStream initial;
++    initial << push;
++    BOOST_REQUIRE(handler->TryHandleMessage(peer, NetMsgType::MERKLIXSIZED, initial, 1s));
++    BOOST_CHECK(handler->HasPendingShortTxRequests(peer.GetId()));
++    handler->MaybeSendSync(peer, 12s);
++    BOOST_CHECK(!handler->HasPendingShortTxRequests(peer.GetId()));
++    BOOST_CHECK_EQUAL(handler->GetStats().sized_list_transfers_completed, 0U);
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/test/functional/p2p_merklix_initiation.py b/test/functional/p2p_merklix_initiation.py
+index e57286ec99..053cda56fa 100644
+--- a/test/functional/p2p_merklix_initiation.py
++++ b/test/functional/p2p_merklix_initiation.py
+@@ -21,14 +21,21 @@ class MerklixInitiationTest(BitcoinTestFramework):
+     def add_options(self, parser):
+         parser.add_argument("--legacy-control", action="store_true")
+         parser.add_argument("--legacy-wire", action="store_true")
++        parser.add_argument("--batch-wire", action="store_true")
++        parser.add_argument("--mixed-wire", action="store_true")
+ 
+     def set_test_params(self):
+         self.num_nodes = 3
+         self.setup_clean_chain = True
+         self.extra_args = [["-avalanche=0",
+                             f"-merklixreconciliation={int(not self.options.legacy_control)}",
+-                            f"-merklixbatch={int(not self.options.legacy_wire)}"]
++                            f"-merklixbatch={int(not self.options.legacy_wire)}",
++                            f"-merklixsized={int(not self.options.legacy_wire and not self.options.batch_wire)}"]
+                            for _ in range(self.num_nodes)]
++        if self.options.mixed_wire:
++            self.extra_args[0][-2:] = ["-merklixbatch=0", "-merklixsized=0"]
++            self.extra_args[1][-2:] = ["-merklixbatch=1", "-merklixsized=0"]
++            self.extra_args[2][-2:] = ["-merklixbatch=1", "-merklixsized=1"]
+ 
+     def run_test(self):
+         self.generatetodescriptor(self.nodes[0], 120, FUNDING_DESCRIPTOR)
+@@ -68,12 +75,20 @@ class MerklixInitiationTest(BitcoinTestFramework):
+         # Accepted SHORTTX transactions are deliberately relayed onward by
+         # ordinary INV as well. The disabled-capability control isolates the
+         # initiation trigger; do not require zero secondary INV traffic.
+-        assert sent.get("merklixsync", 0) > 0, sent
+-        if self.options.legacy_wire:
++        if self.options.legacy_wire or self.options.batch_wire or self.options.mixed_wire:
++            assert sent.get("merklixsync", 0) > 0, sent
++        else:
++            assert sent.get("merklixsket", 0) > 0, sent
++        if self.options.mixed_wire:
++            assert sent.get("getmrklbckt", 0) > 0, sent
++            assert sent.get("getmrklbatch", 0) > 0, sent
++            assert sent.get("mrklbatch", 0) > 0, sent
++            assert sent.get("merklixsket", 0) == 0, sent
++        elif self.options.legacy_wire:
+             assert sent.get("getmrklbckt", 0) > 0, sent
+             assert sent.get("merklixbuck", 0) > 0, sent
+             assert sent.get("getmrklbatch", 0) == 0, sent
+-        else:
++        elif self.options.batch_wire:
+             assert sent.get("getmrklbatch", 0) > 0, sent
+             assert sent.get("mrklbatch", 0) > 0, sent
+             assert sent.get("getmrklbckt", 0) == 0, sent
+diff --git a/test/functional/test_framework/messages.py b/test/functional/test_framework/messages.py
+index 76d74199f3..24d7196d9e 100644
+--- a/test/functional/test_framework/messages.py
++++ b/test/functional/test_framework/messages.py
+@@ -56,6 +56,9 @@ NODE_BLOOM = 1 << 2
+ NODE_COMPACT_FILTERS = 1 << 6
+ NODE_NETWORK_LIMITED = 1 << 10
+ NODE_AVALANCHE = 1 << 24
++NODE_MERKLIX = 1 << 26
++NODE_MERKLIX_BATCH = 1 << 27
++NODE_MERKLIX_SIZED = 1 << 29
+ 
+ MSG_UNDEFINED = 0
+ MSG_TX = 1
+@@ -2278,6 +2281,215 @@ class msg_avaproofsreq:
+         )
+ 
+ 
++# Merklix capabilities are opt-in; these command names all fit 12-byte framing.
++def _merklix_read(f, size):
++    data = f.read(size)
++    if len(data) != size:
++        raise ValueError("truncated Merklix payload")
++    return int.from_bytes(data, "little")
++
++
++def _merklix_ids_read(f, limit):
++    count = deser_compact_size(f)
++    if count > limit:
++        raise ValueError("oversized Merklix ID vector")
++    return [_merklix_read(f, 8) for _ in range(count)]
++
++
++def _merklix_ids_write(ids, limit):
++    if len(ids) > limit:
++        raise ValueError("oversized Merklix ID vector")
++    return ser_compact_size(len(ids)) + b"".join(i.to_bytes(8, "little") for i in ids)
++
++
++def _merklix_vector_read(f, cls, limit):
++    count = deser_compact_size(f)
++    if count > limit:
++        raise ValueError("oversized Merklix object vector")
++    result = []
++    for _ in range(count):
++        item = cls()
++        item.deserialize(f)
++        result.append(item)
++    return result
++
++
++def _merklix_vector_write(items, limit):
++    if len(items) > limit:
++        raise ValueError("oversized Merklix object vector")
++    return ser_compact_size(len(items)) + b"".join(i.serialize() for i in items)
++
++
++class msg_merklixsync:
++    msgtype = b"merklixsync"
++    __slots__ = ("scope", "context_id", "salt_k0", "salt_k1", "candidate_root", "buckets")
++
++    def __init__(self):
++        self.scope, self.context_id, self.salt_k0, self.salt_k1 = 1, 0, 0, 0
++        self.candidate_root = 0
++        self.buckets = [(0, 0)] * 16
++
++    def serialize(self):
++        assert len(self.buckets) == 16
++        return (bytes([self.scope]) + ser_uint256(self.context_id)
++                + self.salt_k0.to_bytes(8, "little") + self.salt_k1.to_bytes(8, "little")
++                + ser_uint256(self.candidate_root)
++                + b"".join(c.to_bytes(4, "little") + x.to_bytes(8, "little") for c, x in self.buckets))
++
++    def deserialize(self, f):
++        self.scope, self.context_id = _merklix_read(f, 1), _merklix_read(f, 32)
++        self.salt_k0, self.salt_k1 = _merklix_read(f, 8), _merklix_read(f, 8)
++        self.candidate_root = _merklix_read(f, 32)
++        self.buckets = [(_merklix_read(f, 4), _merklix_read(f, 8)) for _ in range(16)]
++
++
++class msg_getmrklbckt:
++    msgtype = b"getmrklbckt"
++    __slots__ = ("scope", "context_id", "salt_k0", "salt_k1", "bucket_mask", "depth_bits", "parent_prefix")
++
++    def __init__(self):
++        self.scope, self.context_id, self.salt_k0, self.salt_k1 = 1, 0, 0, 0
++        self.bucket_mask, self.depth_bits, self.parent_prefix = 0, 4, 0
++
++    def serialize(self):
++        return (bytes([self.scope]) + ser_uint256(self.context_id)
++                + self.salt_k0.to_bytes(8, "little") + self.salt_k1.to_bytes(8, "little")
++                + self.bucket_mask.to_bytes(2, "little") + bytes([self.depth_bits])
++                + self.parent_prefix.to_bytes(2, "little"))
++
++    def deserialize(self, f):
++        self.scope, self.context_id = _merklix_read(f, 1), _merklix_read(f, 32)
++        self.salt_k0, self.salt_k1 = _merklix_read(f, 8), _merklix_read(f, 8)
++        self.bucket_mask, self.depth_bits = _merklix_read(f, 2), _merklix_read(f, 1)
++        self.parent_prefix = _merklix_read(f, 2)
++
++
++class msg_merklixbuck:
++    msgtype = b"merklixbuck"
++    __slots__ = ("scope", "context_id", "salt_k0", "salt_k1", "parent_bucket", "depth_bits", "parent_prefix", "sub_buckets", "overflow_short_ids")
++
++    def __init__(self):
++        self.scope, self.context_id, self.salt_k0, self.salt_k1 = 1, 0, 0, 0
++        self.parent_bucket, self.depth_bits, self.parent_prefix = 0, 8, 0
++        self.sub_buckets, self.overflow_short_ids = [(0, 0, 0, 0)] * 16, []
++
++    def serialize(self):
++        assert len(self.sub_buckets) == 16
++        return (bytes([self.scope]) + ser_uint256(self.context_id)
++                + self.salt_k0.to_bytes(8, "little") + self.salt_k1.to_bytes(8, "little")
++                + bytes([self.parent_bucket, self.depth_bits]) + self.parent_prefix.to_bytes(2, "little")
++                + b"".join(c.to_bytes(2, "little") + b"".join(s.to_bytes(8, "little") for s in [s1, s3, s5])
++                           for c, s1, s3, s5 in self.sub_buckets)
++                + _merklix_ids_write(self.overflow_short_ids, 4096))
++
++    def deserialize(self, f):
++        self.scope, self.context_id = _merklix_read(f, 1), _merklix_read(f, 32)
++        self.salt_k0, self.salt_k1 = _merklix_read(f, 8), _merklix_read(f, 8)
++        self.parent_bucket, self.depth_bits = _merklix_read(f, 1), _merklix_read(f, 1)
++        self.parent_prefix = _merklix_read(f, 2)
++        self.sub_buckets = [(_merklix_read(f, 2), _merklix_read(f, 8), _merklix_read(f, 8), _merklix_read(f, 8)) for _ in range(16)]
++        self.overflow_short_ids = _merklix_ids_read(f, 4096)
++
++
++class msg_getmrklbatch:
++    msgtype = b"getmrklbatch"
++    __slots__ = ("requests",)
++
++    def __init__(self):
++        self.requests = []
++
++    def serialize(self):
++        return _merklix_vector_write(self.requests, 256)
++
++    def deserialize(self, f):
++        self.requests = _merklix_vector_read(f, msg_getmrklbckt, 256)
++
++
++class msg_mrklbatch:
++    msgtype = b"mrklbatch"
++    __slots__ = ("summaries",)
++
++    def __init__(self):
++        self.summaries = []
++
++    def serialize(self):
++        return _merklix_vector_write(self.summaries, 4096)
++
++    def deserialize(self, f):
++        self.summaries = _merklix_vector_read(f, msg_merklixbuck, 4096)
++
++
++class msg_getshorttx:
++    msgtype = b"getshorttx"
++    __slots__ = ("scope", "context_id", "salt_k0", "salt_k1", "short_ids")
++
++    def __init__(self):
++        self.scope, self.context_id, self.salt_k0, self.salt_k1 = 1, 0, 0, 0
++        self.short_ids = []
++
++    def serialize(self):
++        return (bytes([self.scope]) + ser_uint256(self.context_id)
++                + self.salt_k0.to_bytes(8, "little") + self.salt_k1.to_bytes(8, "little")
++                + _merklix_ids_write(self.short_ids, 4096))
++
++    def deserialize(self, f):
++        self.scope, self.context_id = _merklix_read(f, 1), _merklix_read(f, 32)
++        self.salt_k0, self.salt_k1 = _merklix_read(f, 8), _merklix_read(f, 8)
++        self.short_ids = _merklix_ids_read(f, 4096)
++
++
++class msg_shorttx:
++    msgtype = b"shorttx"
++    __slots__ = ("scope", "context_id", "txs")
++
++    def __init__(self):
++        self.scope, self.context_id, self.txs = 1, 0, []
++
++    def serialize(self):
++        return bytes([self.scope]) + ser_uint256(self.context_id) + _merklix_vector_write(self.txs, 4096)
++
++    def deserialize(self, f):
++        self.scope, self.context_id = _merklix_read(f, 1), _merklix_read(f, 32)
++        self.txs = _merklix_vector_read(f, CTransaction, 4096)
++
++
++class msg_merklixsket:
++    msgtype = b"merklixsket"
++    __slots__ = ("summary", "depth", "sketches", "short_ids")
++
++    def __init__(self):
++        self.summary, self.depth, self.sketches, self.short_ids = msg_merklixsync(), 8, [], []
++
++    def serialize(self):
++        return (self.summary.serialize() + bytes([self.depth])
++                + _merklix_vector_write(self.sketches, 256)
++                + _merklix_ids_write(self.short_ids, 65536))
++
++    def deserialize(self, f):
++        self.summary.deserialize(f)
++        self.depth = _merklix_read(f, 1)
++        self.sketches = _merklix_vector_read(f, msg_merklixbuck, 256)
++        self.short_ids = _merklix_ids_read(f, 65536)
++
++
++class TestMerklixMessages(unittest.TestCase):
++    def test_wire_sizes_roundtrip_and_preallocation_bounds(self):
++        classes = [msg_merklixsync, msg_getmrklbckt, msg_merklixbuck, msg_getmrklbatch,
++                   msg_mrklbatch, msg_getshorttx, msg_shorttx, msg_merklixsket]
++        for cls in classes:
++            original, parsed = cls(), cls()
++            self.assertLessEqual(len(original.msgtype), 12)
++            parsed.deserialize(BytesIO(original.serialize()))
++            self.assertEqual(parsed.serialize(), original.serialize())
++        self.assertEqual(len(msg_merklixsync().serialize()), 273)
++        self.assertEqual(len(msg_getmrklbckt().serialize()), 54)
++        self.assertEqual(len(msg_merklixbuck().serialize()), 470)
++        with self.assertRaises(ValueError):
++            msg_getmrklbatch().deserialize(BytesIO(ser_compact_size(257)))
++        with self.assertRaises(ValueError):
++            msg_mrklbatch().deserialize(BytesIO(ser_compact_size(4097)))
++
++
+ class TestFrameworkMessages(unittest.TestCase):
+     def test_ecash_batch_sha256_identifier_and_wire_round_trip(self):
+         batch = msg_avabatch(
+diff --git a/test/functional/test_framework/p2p.py b/test/functional/test_framework/p2p.py
+index 46f2511dac..c3860d6441 100644
+--- a/test/functional/test_framework/p2p.py
++++ b/test/functional/test_framework/p2p.py
+@@ -63,6 +63,15 @@ from test_framework.messages import (
+     msg_inv,
+     msg_mempool,
+     msg_merkleblock,
++    msg_merklixsync,
++    msg_getmrklbckt,
++    msg_merklixbuck,
++    msg_getmrklbatch,
++    msg_mrklbatch,
++    msg_getshorttx,
++    msg_shorttx,
++    msg_merklixsket,
++
+     msg_notfound,
+     msg_ping,
+     msg_pong,
+@@ -107,6 +116,15 @@ OVERLOADED_PEER_TX_DELAY = 2
+ GETDATA_TX_INTERVAL = 60
+ 
+ MESSAGEMAP = {
++    b"merklixsync": msg_merklixsync,
++    b"getmrklbckt": msg_getmrklbckt,
++    b"merklixbuck": msg_merklixbuck,
++    b"getmrklbatch": msg_getmrklbatch,
++    b"mrklbatch": msg_mrklbatch,
++    b"getshorttx": msg_getshorttx,
++    b"shorttx": msg_shorttx,
++    b"merklixsket": msg_merklixsket,
++
+     b"addr": msg_addr,
+     b"addrv2": msg_addrv2,
+     b"avapoll": msg_avapoll,
+@@ -536,6 +554,30 @@ class P2PInterface(P2PConnection):
+     def on_headers(self, message):
+         pass
+ 
++    def on_merklixsync(self, message):
++        pass
++
++    def on_getmrklbckt(self, message):
++        pass
++
++    def on_merklixbuck(self, message):
++        pass
++
++    def on_getmrklbatch(self, message):
++        pass
++
++    def on_mrklbatch(self, message):
++        pass
++
++    def on_getshorttx(self, message):
++        pass
++
++    def on_shorttx(self, message):
++        pass
++
++    def on_merklixsket(self, message):
++        pass
++
+     def on_mempool(self, message):
+         pass
+ 
+-- 
+2.50.1 (Apple Git-155)
+

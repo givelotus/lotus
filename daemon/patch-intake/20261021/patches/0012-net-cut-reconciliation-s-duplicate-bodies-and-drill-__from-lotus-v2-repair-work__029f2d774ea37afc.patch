@@ -1,0 +1,310 @@
+From 7cc5db46b41614363d66f68bd1800fac2af8f2f3 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 18:34:41 -0700
+Subject: [PATCH 12/12] net: cut reconciliation's duplicate bodies and
+ drill-down bytes
+
+The first cluster measurements (relay_cluster.py, 6 nodes, 20
+transactions at 10/s, 10-30 ms links, two runs) showed reconciliation
+costing far more than it should: 1,109-1,394 bytes per node per
+transaction, almost all of it merklixbuck bucket summaries, and 10 of 110
+bodies (9%) were duplicates (target: below 1%). Three causes:
+
+- Reconciliation pushed its own getshorttx, outside the transaction
+  request tracker, so a transaction found missing by reconciliation and
+  announced by a peer was fetched twice. Missing short ids now become
+  announcements from the reconciling peer (AddRelayShortIdAnnouncements),
+  so one request per transaction is in flight whatever found it.
+- The windows are cut by each node's own admission times, so the newest
+  transactions, still on their way by announcement, showed up as
+  differences every round. The summarised set now leaves out the last two
+  reconciliation intervals (500 ms by default).
+- A mismatched bucket was drilled into even when we had more than the
+  peer there (our own extras at the window edges), and a root mismatch
+  with matching buckets drilled into all 16 (the D1 rule, meant for scoped
+  sets that must converge exactly). For relay epochs only, a bucket or
+  undecodable sub-bucket is drilled into only where the peer has more than
+  we do, and the D1 fallback is skipped. A miss hidden by our own extra in
+  the same bucket is found in a later round, by this peer or another.
+
+Measured with the same cluster, two runs: reconciliation 163 bytes per
+node per transaction (all merklixsync summaries: 4 per second per node,
+so the cost per transaction falls as the rate rises), no merklixbuck,
+duplicate bodies 0 of 100 in both runs; time to every node 0.54 / 0.72 s
+worst (0.34-0.55 s before). p2p_tx_reconciliation.py (fan-out 1, half the
+peers silent) delivers everything in 2.38 s, against 0.84 s before: the
+grace period and drilling less make recovery slower in that extreme case.
+
+Tests: txrelay_tests' round-robin test now admits its transaction a
+second before the rounds (the newest 500 ms are left out). txrelay_tests,
+v2_protocol_handler_tests, p2p_tx_reconciliation, p2p_tx_relay_invshort,
+p2p_tx_relay_fanout, p2p_1p1c_network and mempool_unbroadcast pass.
+
+Not tested here: the full functional suite (run on the finished series);
+higher rates, where the window edges hold more transactions.
+---
+ src/net/txrelay_index.cpp       |  5 +++-
+ src/net/txrelay_index.h         |  8 ++++--
+ src/net/v2_protocol_handler.cpp | 43 +++++++++++++++++++++++++--------
+ src/net/v2_protocol_handler.h   |  4 +--
+ src/net_processing.cpp          | 21 +++++++++++++---
+ src/net_processing.h            |  7 ++++++
+ src/test/txrelay_tests.cpp      |  5 ++++
+ 7 files changed, 75 insertions(+), 18 deletions(-)
+
+diff --git a/src/net/txrelay_index.cpp b/src/net/txrelay_index.cpp
+index 09a4b8192d..a83d50b399 100644
+--- a/src/net/txrelay_index.cpp
++++ b/src/net/txrelay_index.cpp
+@@ -202,7 +202,7 @@ TxRelayIndex::Lookup TxRelayIndex::Find(const uint256 &epoch_id,
+     return Lookup::HAVE;
+ }
+ 
+-std::vector<TxId> TxRelayIndex::AdmittedSince(Clock since) const {
++std::vector<TxId> TxRelayIndex::AdmittedSince(Clock since, Clock until) const {
+     LOCK(m_mutex);
+     std::vector<TxId> out;
+     if (!m_current) {
+@@ -213,6 +213,9 @@ std::vector<TxId> TxRelayIndex::AdmittedSince(Clock since) const {
+         if (it->first < since) {
+             break;
+         }
++        if (it->first >= until) {
++            continue;
++        }
+         if (m_current->short_id_of.count(it->second) &&
+             seen.insert(it->second).second) {
+             out.push_back(it->second);
+diff --git a/src/net/txrelay_index.h b/src/net/txrelay_index.h
+index 79599124c8..af141abb57 100644
+--- a/src/net/txrelay_index.h
++++ b/src/net/txrelay_index.h
+@@ -120,8 +120,12 @@ public:
+                 std::vector<TxId> *out = nullptr) const
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
+-    /** Transactions admitted at or after `since`, still in the mempool */
+-    std::vector<TxId> AdmittedSince(Clock since) const
++    /**
++     * Transactions admitted at or after `since` (and before `until`), still
++     * in the mempool
++     */
++    std::vector<TxId> AdmittedSince(Clock since,
++                                    Clock until = Clock::max()) const
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+     /** Forget window entries older than `before` */
+     void PruneWindow(Clock before) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+diff --git a/src/net/v2_protocol_handler.cpp b/src/net/v2_protocol_handler.cpp
+index cb2c9eba8b..2814d9edef 100644
+--- a/src/net/v2_protocol_handler.cpp
++++ b/src/net/v2_protocol_handler.cpp
+@@ -448,8 +448,8 @@ bool V2PeerProtocolHandler::IsRelayEpoch(ReconScope scope,
+ }
+ 
+ void V2PeerProtocolHandler::FilterRelayHave(
+-    ReconScope scope, const uint256 &context_id, uint64_t k0, uint64_t k1,
+-    std::vector<uint64_t> &short_ids) const {
++    CNode &pfrom, ReconScope scope, const uint256 &context_id, uint64_t k0,
++    uint64_t k1, std::vector<uint64_t> &short_ids) const {
+     if (short_ids.empty() || !IsRelayEpoch(scope, context_id, k0, k1)) {
+         return;
+     }
+@@ -466,8 +466,14 @@ void V2PeerProtocolHandler::FilterRelayHave(
+         if (metrics) {
+             metrics->txrelay_recon_fetched.Add(0, short_ids.size());
+         }
+-        LOCK(m_mutex);
+-        m_stats.recon_relay_missing += short_ids.size();
++        {
++            LOCK(m_mutex);
++            m_stats.recon_relay_missing += short_ids.size();
++        }
++        // Fetch them like announced short ids: one request per transaction
++        // across peers, whether reconciliation or an announcement found it.
++        m_peerman.AddRelayShortIdAnnouncements(pfrom, context_id, short_ids);
++        short_ids.clear();
+     }
+ }
+ 
+@@ -983,6 +989,12 @@ MerklixSyncDiffResult V2PeerProtocolHandler::DiffSyncSummary(
+         local_bucket_sids[b].insert(sid);
+     }
+ 
++    // Relay-epoch windows are cut by each node's own admission times, so
++    // their edges differ by the propagation delay: drill only into buckets
++    // where the peer has more than we do. A miss hidden by our own extras
++    // in the same bucket is found by a later round.
++    const bool relay_epoch{
++        IsRelayEpoch(scope, remote_summary.context_id, k0, k1)};
+     for (uint8_t b = 0; b < 16; ++b) {
+         const auto &rem = remote_summary.buckets[b];
+         const auto &loc = local_buckets[b];
+@@ -993,6 +1005,9 @@ MerklixSyncDiffResult V2PeerProtocolHandler::DiffSyncSummary(
+         if (diff_xor == 0 && diff_count == 0) {
+             continue;
+         }
++        if (relay_epoch && diff_count <= 0) {
++            continue;
++        }
+ 
+         // Fast 1-tx recovery directly at depth 4 when count differs by 1:
+         if (std::abs(diff_count) == 1 && diff_xor != 0) {
+@@ -1014,7 +1029,8 @@ MerklixSyncDiffResult V2PeerProtocolHandler::DiffSyncSummary(
+ 
+     // Defect D1 (Hole 1): Never treat a scope as converged when the 256-bit
+     // candidate_root differs, even if all 16 64-bit bucket XORs/counts match.
+-    if (!result.root_matched && result.mismatched_bucket_mask == 0 &&
++    if (!relay_epoch && !result.root_matched &&
++        result.mismatched_bucket_mask == 0 &&
+         result.single_missing_short_ids.empty()) {
+         result.mismatched_bucket_mask = 0xFFFFU;
+     }
+@@ -1137,6 +1153,7 @@ MerklixSubBucketDiffResult V2PeerProtocolHandler::DiffSubBucketSummary(
+         local_prefix_sids.insert(sid);
+     }
+ 
++    const bool relay_epoch{IsRelayEpoch(scope, remote_sub.context_id, k0, k1)};
+     bool use_terminal_overflow_fallback = false;
+     for (uint8_t sb = 0; sb < 16; ++sb) {
+         const auto &rem = remote_sub.sub_buckets[sb];
+@@ -1151,7 +1168,10 @@ MerklixSubBucketDiffResult V2PeerProtocolHandler::DiffSubBucketSummary(
+ 
+         auto recovered = RecoverGF64Syndromes(delta_s1, delta_s3, delta_s5);
+         if (!recovered.has_value()) {
+-            if (depth_bits == 16 && !remote_sub.overflow_short_ids.empty()) {
++            if (relay_epoch && rem.count <= loc.count) {
++                // See DiffSyncSummary: only where the peer has more.
++            } else if (depth_bits == 16 &&
++                       !remote_sub.overflow_short_ids.empty()) {
+                 use_terminal_overflow_fallback = true;
+             } else {
+                 result.unresolved_sub_buckets.push_back(sb);
+@@ -1175,7 +1195,10 @@ MerklixSubBucketDiffResult V2PeerProtocolHandler::DiffSubBucketSummary(
+         const int64_t actual_diff =
+             static_cast<int64_t>(rem.count) - static_cast<int64_t>(loc.count);
+         if (expected_diff != actual_diff) {
+-            if (depth_bits == 16 && !remote_sub.overflow_short_ids.empty()) {
++            if (relay_epoch && rem.count <= loc.count) {
++                // See DiffSyncSummary: only where the peer has more.
++            } else if (depth_bits == 16 &&
++                       !remote_sub.overflow_short_ids.empty()) {
+                 use_terminal_overflow_fallback = true;
+             } else {
+                 result.unresolved_sub_buckets.push_back(sb);
+@@ -1389,8 +1412,8 @@ void V2PeerProtocolHandler::HandleMerklixSync(
+     if (diff.root_matched) {
+         return;
+     }
+-    FilterRelayHave(scope, summary.context_id, summary.salt_k0, summary.salt_k1,
+-                    diff.single_missing_short_ids);
++    FilterRelayHave(pfrom, scope, summary.context_id, summary.salt_k0,
++                    summary.salt_k1, diff.single_missing_short_ids);
+ 
+     if (!diff.single_missing_short_ids.empty()) {
+         RecordPendingShortTxRequest(pfrom.GetId(), scope, summary.context_id,
+@@ -1526,7 +1549,7 @@ void V2PeerProtocolHandler::HandleMerklixBuck(
+     }
+ 
+     MerklixSubBucketDiffResult diff = DiffSubBucketSummary(sub);
+-    FilterRelayHave(scope, sub.context_id, sub.salt_k0, sub.salt_k1,
++    FilterRelayHave(pfrom, scope, sub.context_id, sub.salt_k0, sub.salt_k1,
+                     diff.missing_short_ids);
+     if (!diff.missing_short_ids.empty()) {
+         RecordPendingShortTxRequest(pfrom.GetId(), scope, sub.context_id,
+diff --git a/src/net/v2_protocol_handler.h b/src/net/v2_protocol_handler.h
+index a86e9aefa2..7285e4df28 100644
+--- a/src/net/v2_protocol_handler.h
++++ b/src/net/v2_protocol_handler.h
+@@ -470,8 +470,8 @@ public:
+     uint64_t ScopedShortId(ReconScope scope, const uint256 &context_id,
+                            uint64_t k0, uint64_t k1, const TxId &txid) const;
+     /** Drop short ids of a relay epoch that we already have */
+-    void FilterRelayHave(ReconScope scope, const uint256 &context_id,
+-                         uint64_t k0, uint64_t k1,
++    void FilterRelayHave(CNode &pfrom, ReconScope scope,
++                         const uint256 &context_id, uint64_t k0, uint64_t k1,
+                          std::vector<uint64_t> &short_ids) const
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+     void SetSnapSyncEnabled(std::optional<bool> enabled)
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 82c76ddd22..d74c58bcd0 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -864,6 +864,17 @@ public:
+                          const std::vector<uint64_t> &short_ids) const override;
+     std::optional<std::vector<CTransactionRef>>
+     RelayReconSet(const uint256 &context_id) const override;
++    void AddRelayShortIdAnnouncements(
++        const CNode &node, const uint256 &epoch_id,
++        const std::vector<uint64_t> &short_ids) override {
++        const auto now{GetTime<std::chrono::microseconds>()};
++        LOCK(cs_main);
++        for (const uint64_t short_id : short_ids) {
++            AddTxAnnouncement(
++                node, TxId{txrelay::ShortIdRequestKey(epoch_id, short_id)}, now,
++                SHORTID_REQUEST_PARAMS);
++        }
++    }
+     bool HaveRelayShortId(const uint256 &context_id,
+                           uint64_t short_id) const override {
+         return m_txrelay_index.Find(context_id, short_id) ==
+@@ -3596,9 +3607,13 @@ PeerManagerImpl::RelayReconSet(const uint256 &context_id) const {
+     if (!m_txrelay_index.FindEpoch(context_id)) {
+         return std::nullopt;
+     }
+-    const auto since{GetTime<std::chrono::microseconds>() -
+-                     std::chrono::microseconds{m_opts.txrecon_window}};
+-    const auto txids{m_txrelay_index.AdmittedSince(since)};
++    // Leave out the newest transactions (two intervals): they are usually
++    // still on their way to the peer by announcement, and would only be
++    // differences that cost bucket drill-down.
++    const auto now{GetTime<std::chrono::microseconds>()};
++    const auto txids{m_txrelay_index.AdmittedSince(
++        now - std::chrono::microseconds{m_opts.txrecon_window},
++        now - 2 * std::chrono::microseconds{m_opts.txrecon_interval})};
+     std::vector<CTransactionRef> txs;
+     txs.reserve(txids.size());
+     LOCK(m_mempool.cs);
+diff --git a/src/net_processing.h b/src/net_processing.h
+index c19d4a17d3..01f726536e 100644
+--- a/src/net_processing.h
++++ b/src/net_processing.h
+@@ -253,6 +253,13 @@ public:
+      */
+     virtual void ProcessShortTxResponse(CNode &node,
+                                         std::span<const CTransactionRef> txs) {}
++    /**
++     * Short ids of a relay epoch that reconciliation found this peer has
++     * and we lack: fetched as if the peer had announced them.
++     */
++    virtual void
++    AddRelayShortIdAnnouncements(const CNode &node, const uint256 &epoch_id,
++                                 const std::vector<uint64_t> &short_ids) {}
+     virtual void MarkPeerKnownTxBatch(NodeId peer_id,
+                                       std::span<const CTransactionRef> txs) {
+         for (const auto &tx : txs) {
+diff --git a/src/test/txrelay_tests.cpp b/src/test/txrelay_tests.cpp
+index 899e2e5c2e..2960c5f2e7 100644
+--- a/src/test/txrelay_tests.cpp
++++ b/src/test/txrelay_tests.cpp
+@@ -631,8 +631,12 @@ BOOST_AUTO_TEST_CASE(reconciliation_round_robin) {
+     }
+     FastRandomContext rng{true};
+     auto tx{MakeTx(rng)};
++    const auto t0{GetTime<std::chrono::seconds>()};
++    SetMockTime(t0);
+     AddToMempool(m_node, tx);
+     h.peerman->RelayTransaction(tx->GetId());
++    // The newest two intervals are left out of the summary: be past them.
++    SetMockTime(t0 + 1s);
+ 
+     // One round per interval, alternating between the two that negotiated.
+     std::vector<NodeId> order;
+@@ -666,6 +670,7 @@ BOOST_AUTO_TEST_CASE(reconciliation_round_robin) {
+     for (size_t i = 0; i < order.size(); ++i) {
+         BOOST_CHECK_EQUAL(order[i], peers[i % 2 ? 2 : 0]->GetId());
+     }
++    SetMockTime(0);
+     chainman.ResetIbd();
+ }
+ 

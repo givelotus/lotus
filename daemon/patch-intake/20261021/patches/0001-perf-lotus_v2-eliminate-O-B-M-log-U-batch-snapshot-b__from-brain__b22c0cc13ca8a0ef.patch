@@ -1,0 +1,2791 @@
+From 60cb822f0922e72d9fec2c4dcaf61a55c0843578 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Fri, 16 Oct 2026 19:18:11 -0700
+Subject: [PATCH 1/2] perf(lotus_v2): eliminate O(B*M log U) batch & snapshot
+ bottlenecks + add TPS benchmarks
+
+Optimizations touching newly built Lotus V2 systems (annotated to roll into
+their respective original patches in the slice stack):
+
+- [Rolls into Patch 020] UtxoOverlayArena & MempoolOverlayLayer
+  (src/lotus_v2/mempool_overlay.{h,cpp}, src/txmempool.{h,cpp}):
+  * Eliminate duplicate SmtInsert/SmtErase tree walks and BLAKE3 hashing on
+    every UtxoOverlayArena::InsertCoin and EraseOutpoint; lazily materialize
+    current_smt_root_ via ExportSmtNode(root_idx_) in GetSmtRoot() with zero
+    BLAKE3 re-hashing (1.95x MerklixOverlayManager::AddTransaction speedup).
+  * Replace std::map<Outpoint, ...> in MempoolOverlayLayer with
+    std::unordered_map<Outpoint, ..., OutpointHasher> for O(1) lookups.
+  * Fast-path CTxMemPool::SyncMerklixOverlayToTip when already anchored at
+    the active tip to avoid redundant GetV2BlockStateSnapshot mutex locks.
+
+- [Rolls into Patch 035] Lock-Free RCU SnapshotPublisher & Mining Template
+  (src/node/snapshot.{h,cpp}, src/txmempool.{h,cpp}, src/primitives/block.{h,cpp}):
+  * Add CTxMemPool::ScopedSnapshotDefer RAII guard to coalesce N per-tx
+    PublishMempoolSnapshot rebuilds during batch operations into a single
+    snapshot publication on scope exit.
+  * Add lightweight PublishMempoolUnbroadcastSnapshot for AddUnbroadcastTx
+    and RemoveUnbroadcastTx so P2P inv trickle updates unbroadcast state in
+    O(log M) without rebuilding the mining template or Merklix roots.
+  * Reuse pre-serialized tx_hex and unchanged MempoolEntrySnapshot records
+    across snapshots via O(M) merge-scan over TxId-sorted vectors.
+  * Extract subtree_a_root and utxo_root in O(1) directly from
+    MerklixOverlayManager in PopulateMiningTemplate instead of recomputing
+    TransactionSubtreeARoot and BuildV2TemplateBaseState from scratch.
+
+- [Rolls into Patch 034 / Patch 036] Batch Validation & ConnectBlock Ordering
+  (src/validation.{h,cpp}, src/rpc/mempool.cpp):
+  * Add ProcessRawTxBatch two-phase all-or-nothing batch validation and
+    commit under a single ScopedSnapshotDefer in submitrawtxbatch, raising
+    MAX_RAWTX_BATCH_COUNT to 1,000 and MAX_RAWTX_BATCH_SIZE_KB to 10,000.
+  * Reorder ConnectTip so m_mempool->ConnectBlockReset runs after
+    disconnectpool.removeForBlock, eliminating O(K*M) ReanchorExistingTxs
+    rebuilds for transactions confirmed in the connected block.
+
+- Add v2_kernel_throughput_benchmark (src/test/lotus_v2_tests.cpp) and 3-node
+  loopback TPS stress suite (test/functional/lotus_v2_loopback_tps_stress.py).
+---
+ src/lotus_v2/mempool_overlay.cpp              |  45 +-
+ src/lotus_v2/mempool_overlay.h                |  34 +-
+ src/node/snapshot.cpp                         | 165 +++-
+ src/node/snapshot.h                           |   9 +
+ src/primitives/block.cpp                      |  56 +-
+ src/primitives/block.h                        |   4 +
+ src/rpc/mempool.cpp                           | 173 ++--
+ src/test/lotus_v2_tests.cpp                   | 527 +++++++++++
+ src/txmempool.cpp                             |  22 +-
+ src/txmempool.h                               |  45 +
+ src/validation.cpp                            | 221 ++++-
+ src/validation.h                              |  16 +
+ .../lotus_v2_loopback_tps_stress.py           | 886 ++++++++++++++++++
+ 13 files changed, 2035 insertions(+), 168 deletions(-)
+ create mode 100755 test/functional/lotus_v2_loopback_tps_stress.py
+
+diff --git a/src/lotus_v2/mempool_overlay.cpp b/src/lotus_v2/mempool_overlay.cpp
+index 9908708fd2..cb688d047a 100644
+--- a/src/lotus_v2/mempool_overlay.cpp
++++ b/src/lotus_v2/mempool_overlay.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "tagged_hash.h"
+ 
++#include <algorithm>
+ #include <cassert>
+ #include <cstring>
+ 
+@@ -430,6 +431,7 @@ void UtxoOverlayArena::Reset(std::shared_ptr<const SmtNode> base_root) {
+ 
+     base_smt_root_ = base_root;
+     current_smt_root_ = base_root;
++    smt_root_dirty_ = false;
+     root_idx_ = ImportSmtNode(base_smt_root_);
+ }
+ 
+@@ -462,6 +464,30 @@ UtxoOverlayArena::ImportSmtNode(const std::shared_ptr<const SmtNode> &smt_node)
+     return AllocNode(node);
+ }
+ 
++std::shared_ptr<const SmtNode>
++UtxoOverlayArena::ExportSmtNode(uint32_t node_idx) const {
++    if (node_idx == kNullIdx) {
++        return nullptr;
++    }
++    const UtxoOverlayNode &n = nodes_[node_idx];
++    auto smt = std::make_shared<SmtNode>();
++    smt->digest = n.digest;
++    smt->count = n.count;
++    if (n.is_leaf) {
++        smt->total_value = n.coin.output.value;
++        smt->key = n.key;
++        smt->coin = std::make_shared<const Coin>(n.coin);
++        return smt;
++    }
++    smt->child[0] =
++        (n.child[0] != kNullIdx) ? ExportSmtNode(n.child[0]) : n.base_child[0];
++    smt->child[1] =
++        (n.child[1] != kNullIdx) ? ExportSmtNode(n.child[1]) : n.base_child[1];
++    smt->total_value = (smt->child[0] ? smt->child[0]->total_value : 0) +
++                       (smt->child[1] ? smt->child[1]->total_value : 0);
++    return smt;
++}
++
+ uint32_t UtxoOverlayArena::MakeLeaf(const Coin &coin, const Hash &key,
+                                     const Hash &leaf_hash) {
+     UtxoOverlayNode leaf{};
+@@ -628,13 +654,23 @@ void UtxoOverlayArena::InsertCoin(const Coin &coin) {
+     }
+     const Hash key = OutpointKey(coin.outpoint);
+     root_idx_ = InsertAt(root_idx_, coin, key, leaf_hash, 0);
+-    SmtInsert(current_smt_root_, coin);
++    // [Optimization — Rolls into Patch 020]: Defer SmtNode export until GetSmtRoot()
++    smt_root_dirty_ = true;
+ }
+ 
+ void UtxoOverlayArena::EraseOutpoint(const Outpoint &outpoint) {
+     const Hash key = OutpointKey(outpoint);
+     root_idx_ = EraseAt(root_idx_, outpoint, key, 0);
+-    SmtErase(current_smt_root_, outpoint);
++    // [Optimization — Rolls into Patch 020]: Defer SmtNode export until GetSmtRoot()
++    smt_root_dirty_ = true;
++}
++
++const std::shared_ptr<const SmtNode> &UtxoOverlayArena::GetSmtRoot() const {
++    if (smt_root_dirty_) {
++        current_smt_root_ = ExportSmtNode(root_idx_);
++        smt_root_dirty_ = false;
++    }
++    return current_smt_root_;
+ }
+ 
+ Hash UtxoOverlayArena::RootDigest() const {
+@@ -779,6 +815,7 @@ std::vector<Outpoint> MempoolOverlayLayer::GetNetErasedOutpoints() const {
+             erased.push_back(op);
+         }
+     }
++    std::sort(erased.begin(), erased.end(), OutpointLess{});
+     return erased;
+ }
+ 
+@@ -790,6 +827,10 @@ std::vector<Coin> MempoolOverlayLayer::GetNetInsertedCoins() const {
+             inserted.push_back(coin);
+         }
+     }
++    std::sort(inserted.begin(), inserted.end(),
++              [](const Coin &a, const Coin &b) {
++                  return OutpointLess{}(a.outpoint, b.outpoint);
++              });
+     return inserted;
+ }
+ 
+diff --git a/src/lotus_v2/mempool_overlay.h b/src/lotus_v2/mempool_overlay.h
+index 73dc71a8c8..fd566d44a3 100644
+--- a/src/lotus_v2/mempool_overlay.h
++++ b/src/lotus_v2/mempool_overlay.h
+@@ -14,8 +14,10 @@
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstring>
+ #include <map>
+ #include <memory>
++#include <unordered_map>
+ #include <vector>
+ 
+ namespace lotus::v2 {
+@@ -114,6 +116,12 @@ struct UtxoOverlayNode {
+ /**
+  * Contiguous arena-backed UTXO SMT overlay supporting O(1) initialization from
+  * a parent block's SmtNode root and path-copying InsertCoin / EraseOutpoint.
++ *
++ * [Optimization — Rolls into Patch 020]:
++ * Eliminates duplicate per-coin SmtInsert/SmtErase tree walks and BLAKE3 hashes
++ * during InsertCoin/EraseOutpoint. Instead, all mutations operate solely on the
++ * contiguous `nodes_` arena and `GetSmtRoot()` lazily exports `current_smt_root_`
++ * from `nodes_[root_idx_]` on demand with zero BLAKE3 re-hashing.
+  */
+ class UtxoOverlayArena {
+ public:
+@@ -130,9 +138,7 @@ public:
+ 
+     Hash RootDigest() const;
+     uint32_t RootIdx() const noexcept { return root_idx_; }
+-    const std::shared_ptr<const SmtNode> &GetSmtRoot() const noexcept {
+-        return current_smt_root_;
+-    }
++    const std::shared_ptr<const SmtNode> &GetSmtRoot() const;
+     const std::shared_ptr<const SmtNode> &GetBaseSmtRoot() const noexcept {
+         return base_smt_root_;
+     }
+@@ -142,10 +148,12 @@ private:
+     std::vector<UtxoOverlayNode> nodes_;
+     uint32_t root_idx_{kNullIdx};
+     std::shared_ptr<const SmtNode> base_smt_root_;
+-    std::shared_ptr<const SmtNode> current_smt_root_;
++    mutable std::shared_ptr<const SmtNode> current_smt_root_;
++    mutable bool smt_root_dirty_{false};
+ 
+     uint32_t AllocNode(const UtxoOverlayNode &node);
+     uint32_t ImportSmtNode(const std::shared_ptr<const SmtNode> &smt_node);
++    std::shared_ptr<const SmtNode> ExportSmtNode(uint32_t node_idx) const;
+     uint32_t MakeLeaf(const Coin &coin, const Hash &key, const Hash &leaf_hash);
+     uint32_t JoinLeaves(uint32_t existing_idx, uint32_t added_idx,
+                         unsigned depth);
+@@ -161,6 +169,18 @@ private:
+ 
+ Hash EmptyTxRoot();
+ 
++/**
++ * O(1) hash functor for Outpoint in unordered_map tables.
++ */
++struct OutpointHasher {
++    size_t operator()(const Outpoint &op) const noexcept {
++        uint64_t h = 0;
++        std::memcpy(&h, op.tx_id.data(), sizeof(h));
++        return static_cast<size_t>(
++            h ^ (static_cast<uint64_t>(op.index) * 0x9e3779b97f4a7c15ULL));
++    }
++};
++
+ /**
+  * Comparator matching Bitcoin/Lotus CTOR TxId ordering (uint256::Compare,
+  * comparing bytes from index 31 down to 0).
+@@ -232,7 +252,7 @@ public:
+ 
+     Hash GetSubtreeARoot() const { return tx_arena_.SubtreeARoot(tx_root_idx_); }
+     Hash GetUtxoRootDigest() const { return utxo_arena_.RootDigest(); }
+-    const std::shared_ptr<const SmtNode> &GetUtxoRoot() const noexcept {
++    const std::shared_ptr<const SmtNode> &GetUtxoRoot() const {
+         return utxo_arena_.GetSmtRoot();
+     }
+     const std::shared_ptr<const SmtNode> &GetBaseUtxoRoot() const noexcept {
+@@ -278,8 +298,8 @@ private:
+     uint64_t sum_non_cb_effective_cost_{0};
+ 
+     std::map<Hash, OverlayTxEntry, CtorTxIdCompare> active_txs_;
+-    std::map<Outpoint, Coin, OutpointLess> created_coins_;
+-    std::map<Outpoint, uint32_t, OutpointLess> spent_outpoints_;
++    std::unordered_map<Outpoint, Coin, OutpointHasher> created_coins_;
++    std::unordered_map<Outpoint, uint32_t, OutpointHasher> spent_outpoints_;
+ };
+ 
+ /**
+diff --git a/src/node/snapshot.cpp b/src/node/snapshot.cpp
+index 0776ab3840..0f2fc951e7 100644
+--- a/src/node/snapshot.cpp
++++ b/src/node/snapshot.cpp
+@@ -94,7 +94,8 @@ BlockHeaderSnapshot MakeBlockHeaderSnapshot(const CBlockIndex &blockindex)
+ }
+ 
+ void PopulateMempoolFieldsLocked(ChainAndMempoolSnapshot &snap,
+-                                 const CTxMemPool &mempool)
++                                 const CTxMemPool &mempool,
++                                 const ChainAndMempoolSnapshot *prev)
+     EXCLUSIVE_LOCKS_REQUIRED(mempool.cs) {
+     snap.mempool_ptr = &mempool;
+     snap.mempool_valid = true;
+@@ -121,13 +122,39 @@ void PopulateMempoolFieldsLocked(ChainAndMempoolSnapshot &snap,
+     snap.mempool_txids.clear();
+     mempool.getAllTxIds(snap.mempool_txids);
+ 
++    const bool can_reuse_prev =
++        prev && prev->mempool_valid && prev->mempool_ptr == &mempool;
++
+     snap.mempool_entries.clear();
+     snap.mempool_entries.reserve(mempool.mapTx.size());
+     snap.mempool_spent_outpoints.clear();
++    snap.mempool_spent_outpoints.reserve(mempool.mapNextTx.size());
+     for (const CTxMemPoolEntryRef &e : mempool.mapTx.get<entry_id>()) {
+         const CTransaction &tx = e->GetTx();
++        const TxId &txid = tx.GetId();
++        for (const CTxIn &txin : tx.vin) {
++            if (!txin.prevout.IsNull()) {
++                snap.mempool_spent_outpoints.push_back(txin.prevout);
++            }
++        }
++
++        const auto &parents = e->GetMemPoolParentsConst();
++        const auto &children = e->GetMemPoolChildrenConst();
++        if (can_reuse_prev) {
++            const MempoolEntrySnapshot *prev_entry = prev->FindMempoolEntry(txid);
++            if (prev_entry && prev_entry->tx.get() == &tx &&
++                prev_entry->modified_fee == e->GetModifiedFee() &&
++                prev_entry->depends.size() == parents.size() &&
++                prev_entry->spentby.size() == children.size()) {
++                MempoolEntrySnapshot entry_snap = *prev_entry;
++                entry_snap.unbroadcast = mempool.IsUnbroadcastTx(txid);
++                snap.mempool_entries.push_back(std::move(entry_snap));
++                continue;
++            }
++        }
++
+         MempoolEntrySnapshot entry_snap{};
+-        entry_snap.txid = tx.GetId();
++        entry_snap.txid = txid;
+         entry_snap.tx = e->GetSharedTx();
+         entry_snap.fee = e->GetFee();
+         entry_snap.modified_fee = e->GetModifiedFee();
+@@ -135,18 +162,14 @@ void PopulateMempoolFieldsLocked(ChainAndMempoolSnapshot &snap,
+         entry_snap.time = count_seconds(e->GetTime());
+         entry_snap.height = static_cast<int>(e->GetHeight());
+ 
+-        std::set<std::string> set_depends;
+-        for (const CTxIn &txin : tx.vin) {
+-            if (!txin.prevout.IsNull()) {
+-                snap.mempool_spent_outpoints.push_back(txin.prevout);
+-            }
+-            if (mempool.exists(txin.prevout.GetTxId())) {
+-                set_depends.insert(txin.prevout.GetTxId().ToString());
++        if (!parents.empty()) {
++            std::set<std::string> set_depends;
++            for (const auto &parent : parents) {
++                set_depends.insert(parent.get()->GetTx().GetId().ToString());
+             }
++            entry_snap.depends.assign(set_depends.begin(), set_depends.end());
+         }
+-        entry_snap.depends.assign(set_depends.begin(), set_depends.end());
+ 
+-        const auto &children = e->GetMemPoolChildrenConst();
+         entry_snap.spentby.reserve(children.size());
+         for (const auto &child : children) {
+             entry_snap.spentby.push_back(
+@@ -164,6 +187,7 @@ void PopulateMempoolFieldsLocked(ChainAndMempoolSnapshot &snap,
+ 
+ void PopulateMiningTemplate(ChainAndMempoolSnapshot &snap,
+                             const CTxMemPool *mempool_locked,
++                            const ChainAndMempoolSnapshot *prev,
+                             SnapshotPublisher &publisher)
+      NO_THREAD_SAFETY_ANALYSIS {
+     if (!snap.chain_valid || snap.height < 0 || !snap.consensus_params) {
+@@ -273,9 +297,33 @@ void PopulateMiningTemplate(ChainAndMempoolSnapshot &snap,
+         tmpl.tx_fees.reserve(selected.size());
+         tmpl.tx_sigchecks.reserve(selected.size());
+         tmpl.tx_hex.reserve(selected.size());
++
++        // [Patch 035 optimization] Reuse pre-serialized tx_hex from the
++        // previous snapshot via an O(M) merge-scan over TxId-sorted vectors.
++        const bool can_reuse_prev_hex =
++            prev && prev->mining_template.template_valid &&
++            prev->mining_template.non_coinbase_txs.size() ==
++                prev->mining_template.tx_hex.size();
++        size_t prev_idx = 0;
+         for (auto &item : selected) {
+             tmpl.non_cb_serialized_size += ::GetSerializeSize(*item.tx);
+-            tmpl.tx_hex.push_back(SerializeTxToHex(*item.tx));
++            if (can_reuse_prev_hex) {
++                const auto &prev_txs = prev->mining_template.non_coinbase_txs;
++                const TxId &target_id = item.tx->GetId();
++                while (prev_idx < prev_txs.size() &&
++                       prev_txs[prev_idx]->GetId() < target_id) {
++                    ++prev_idx;
++                }
++                if (prev_idx < prev_txs.size() &&
++                    prev_txs[prev_idx].get() == item.tx.get()) {
++                    tmpl.tx_hex.push_back(
++                        prev->mining_template.tx_hex[prev_idx]);
++                } else {
++                    tmpl.tx_hex.push_back(SerializeTxToHex(*item.tx));
++                }
++            } else {
++                tmpl.tx_hex.push_back(SerializeTxToHex(*item.tx));
++            }
+             tmpl.non_coinbase_txs.push_back(std::move(item.tx));
+             tmpl.tx_fees.push_back(item.fee);
+             tmpl.tx_sigchecks.push_back(item.sigchecks);
+@@ -284,18 +332,45 @@ void PopulateMiningTemplate(ChainAndMempoolSnapshot &snap,
+ 
+     tmpl.block_reward = tmpl.total_fees + snap.next_subsidy;
+ 
+-    std::vector<lotus::v2::TxIdentityPair> id_pairs;
+-    id_pairs.reserve(tmpl.non_coinbase_txs.size());
+-    for (const auto &ptx : tmpl.non_coinbase_txs) {
+-        lotus::v2::TxIdentityPair pair{};
+-        std::memcpy(pair.tx_hash.data(), ptx->GetHash().begin(), 32);
+-        std::memcpy(pair.tx_id.data(), ptx->GetId().begin(), 32);
+-        id_pairs.push_back(pair);
++    // [Patch 035 optimization] When the template selects the full mempool and
++    // MerklixOverlayManager is anchored at the active tip, read subtree_a_root
++    // and the incremental UTXO overlay arena in O(1) instead of rebuilding
++    // TransactionSubtreeARoot and BuildV2TemplateBaseState in O(M log U).
++    lotus::v2::Hash prev_id{};
++    std::memcpy(prev_id.data(), tmpl.prev_block_hash.begin(), 32);
++    const lotus::v2::MempoolOverlayLayer *spec_overlay =
++        mempool_locked
++            ? &mempool_locked->GetMerklixOverlay().GetSpeculativeOverlay()
++            : nullptr;
++    if (spec_overlay &&
++        mempool_locked->GetMerklixOverlay().IsAnchoredAt(
++            prev_id, uint64_t(tmpl.next_height), uint64_t(tmpl.parent_mtp)) &&
++        (spec_overlay->GetBaseUtxoRoot() != nullptr || tmpl.next_height <= 1) &&
++        tmpl.non_coinbase_txs.size() == spec_overlay->GetTxCount() &&
++        tmpl.non_coinbase_txs.size() == mempool_locked->mapTx.size()) {
++        tmpl.subtree_a_root = spec_overlay->GetSubtreeARoot();
++        tmpl.v2_base_state.utxo_root = spec_overlay->GetUtxoRoot();
++        tmpl.v2_base_state.utxo_arena.reset();
++        tmpl.v2_base_state.mon_state = spec_overlay->GetBaseMonetaryState();
++        tmpl.v2_base_state.sum_non_cb_effective_cost =
++            spec_overlay->GetSumNonCbEffectiveCost();
++        tmpl.v2_base_state.non_cb_tx_count = tmpl.non_coinbase_txs.size();
++        tmpl.v2_base_state.height = uint64_t(tmpl.next_height);
++        tmpl.v2_base_state.parent_mtp = uint64_t(tmpl.parent_mtp);
++    } else {
++        std::vector<lotus::v2::TxIdentityPair> id_pairs;
++        id_pairs.reserve(tmpl.non_coinbase_txs.size());
++        for (const auto &ptx : tmpl.non_coinbase_txs) {
++            lotus::v2::TxIdentityPair pair{};
++            std::memcpy(pair.tx_hash.data(), ptx->GetHash().begin(), 32);
++            std::memcpy(pair.tx_id.data(), ptx->GetId().begin(), 32);
++            id_pairs.push_back(pair);
++        }
++        tmpl.subtree_a_root = lotus::v2::TransactionSubtreeARoot(id_pairs);
++        tmpl.v2_base_state = BuildV2TemplateBaseState(
++            tmpl.non_coinbase_txs, tmpl.prev_block_hash,
++            uint64_t(tmpl.next_height), uint64_t(tmpl.parent_mtp));
+     }
+-    tmpl.subtree_a_root = lotus::v2::TransactionSubtreeARoot(id_pairs);
+-    tmpl.v2_base_state = BuildV2TemplateBaseState(
+-        tmpl.non_coinbase_txs, tmpl.prev_block_hash,
+-        uint64_t(tmpl.next_height), uint64_t(tmpl.parent_mtp));
+     tmpl.template_valid = true;
+ 
+     snap.mining_template = std::move(tmpl);
+@@ -509,10 +584,14 @@ void PublishChainTipSnapshot(ChainstateManager &chainman,
+ 
+     if (mempool) {
+         LOCK(mempool->cs);
+-        PopulateMempoolFieldsLocked(*next, *mempool);
+-        PopulateMiningTemplate(*next, mempool, publisher);
++        mempool->ClearSnapshotDirty();
++        mempool->SyncMerklixOverlayToTip(
++            next->best_block_hash, static_cast<uint64_t>(next->height + 1),
++            static_cast<uint64_t>(next->mediantime));
++        PopulateMempoolFieldsLocked(*next, *mempool, prev.get());
++        PopulateMiningTemplate(*next, mempool, prev.get(), publisher);
+     } else {
+-        PopulateMiningTemplate(*next, nullptr, publisher);
++        PopulateMiningTemplate(*next, nullptr, prev.get(), publisher);
+     }
+ 
+     publisher.Publish(std::move(next));
+@@ -521,14 +600,44 @@ void PublishChainTipSnapshot(ChainstateManager &chainman,
+ void PublishMempoolSnapshot(const CTxMemPool &mempool)
+     NO_THREAD_SAFETY_ANALYSIS {
+     AssertLockHeld(mempool.cs);
++    if (mempool.DeferSnapshotIfActive()) {
++        return;
++    }
+     SnapshotPublisher &publisher = GetGlobalSnapshotPublisher();
+     auto prev = publisher.Load();
+     auto next = prev ? std::make_shared<ChainAndMempoolSnapshot>(*prev)
+                      : std::make_shared<ChainAndMempoolSnapshot>();
+ 
+-    PopulateMempoolFieldsLocked(*next, mempool);
+-    PopulateMiningTemplate(*next, &mempool, publisher);
++    PopulateMempoolFieldsLocked(*next, mempool, prev.get());
++    PopulateMiningTemplate(*next, &mempool, prev.get(), publisher);
++
++    publisher.Publish(std::move(next));
++}
+ 
++void PublishMempoolUnbroadcastSnapshot(const CTxMemPool &mempool,
++                                       const TxId &txid,
++                                       bool unbroadcast)
++    NO_THREAD_SAFETY_ANALYSIS {
++    AssertLockHeld(mempool.cs);
++    if (mempool.DeferSnapshotIfActive()) {
++        return;
++    }
++    SnapshotPublisher &publisher = GetGlobalSnapshotPublisher();
++    auto prev = publisher.Load();
++    if (!prev || !prev->mempool_valid || prev->mempool_ptr != &mempool) {
++        PublishMempoolSnapshot(mempool);
++        return;
++    }
++    auto next = std::make_shared<ChainAndMempoolSnapshot>(*prev);
++    next->unbroadcast_count = mempool.GetUnbroadcastTxs().size();
++    auto it = std::lower_bound(
++        next->mempool_entries.begin(), next->mempool_entries.end(), txid,
++        [](const MempoolEntrySnapshot &entry, const TxId &id) {
++            return entry.txid < id;
++        });
++    if (it != next->mempool_entries.end() && it->txid == txid) {
++        it->unbroadcast = unbroadcast;
++    }
+     publisher.Publish(std::move(next));
+ }
+ 
+diff --git a/src/node/snapshot.h b/src/node/snapshot.h
+index 4977f39d98..5633514010 100644
+--- a/src/node/snapshot.h
++++ b/src/node/snapshot.h
+@@ -267,6 +267,15 @@ void PublishChainTipSnapshot(ChainstateManager &chainman,
+  */
+ void PublishMempoolSnapshot(const CTxMemPool &mempool);
+ 
++/**
++ * [Patch 034 optimization] Publish a lightweight RCU snapshot update when only
++ * a transaction's unbroadcast state changes, avoiding a full template rebuild.
++ * Must be called with mempool.cs held.
++ */
++void PublishMempoolUnbroadcastSnapshot(const CTxMemPool &mempool,
++                                       const TxId &txid,
++                                       bool unbroadcast);
++
+ } // namespace node
+ 
+ #endif // BITCOIN_NODE_SNAPSHOT_H
+diff --git a/src/primitives/block.cpp b/src/primitives/block.cpp
+index 11065886d6..e7ecce8b99 100644
+--- a/src/primitives/block.cpp
++++ b/src/primitives/block.cpp
+@@ -862,25 +862,49 @@ uint256 ComputeV2StateRootFromTemplate(
+     const V2TemplateBaseState &base_state,
+     const CTransaction &coinbase_tx,
+     uint32_t nBits) {
+-    std::shared_ptr<const SmtNode> utxo_root = base_state.utxo_root;
+     lotus::v2::MonetaryState mon_state = base_state.mon_state;
++    lotus::v2::Hash utxo_root_hash{};
+     if (base_state.height > 0) {
+         lotus::v2::Hash txid{};
+         std::memcpy(txid.data(), coinbase_tx.GetId().begin(), 32);
+-        for (size_t j = 0; j < coinbase_tx.vout.size(); ++j) {
+-            if (coinbase_tx.vout[j].scriptPubKey.IsUnspendable()) {
+-                continue;
++        if (base_state.utxo_arena) {
++            lotus::v2::UtxoOverlayArena arena = *base_state.utxo_arena;
++            for (size_t j = 0; j < coinbase_tx.vout.size(); ++j) {
++                if (coinbase_tx.vout[j].scriptPubKey.IsUnspendable()) {
++                    continue;
++                }
++                const lotus::v2::Output v2out =
++                    coinbase_tx.vout[j].ToV2Output();
++                if (!v2out.IsBurn()) {
++                    lotus::v2::Coin coin{
++                        {txid, static_cast<uint32_t>(j)},
++                        v2out,
++                        base_state.height,
++                        base_state.parent_mtp,
++                        true};
++                    arena.InsertCoin(coin);
++                }
+             }
+-            const lotus::v2::Output v2out = coinbase_tx.vout[j].ToV2Output();
+-            if (!v2out.IsBurn()) {
+-                lotus::v2::Coin coin{
+-                    {txid, static_cast<uint32_t>(j)},
+-                    v2out,
+-                    base_state.height,
+-                    base_state.parent_mtp,
+-                    true};
+-                SmtInsert(utxo_root, coin);
++            utxo_root_hash = arena.RootDigest();
++        } else {
++            std::shared_ptr<const SmtNode> utxo_root = base_state.utxo_root;
++            for (size_t j = 0; j < coinbase_tx.vout.size(); ++j) {
++                if (coinbase_tx.vout[j].scriptPubKey.IsUnspendable()) {
++                    continue;
++                }
++                const lotus::v2::Output v2out =
++                    coinbase_tx.vout[j].ToV2Output();
++                if (!v2out.IsBurn()) {
++                    lotus::v2::Coin coin{
++                        {txid, static_cast<uint32_t>(j)},
++                        v2out,
++                        base_state.height,
++                        base_state.parent_mtp,
++                        true};
++                    SmtInsert(utxo_root, coin);
++                }
+             }
++            utxo_root_hash = SmtRoot(utxo_root);
+         }
+         const uint64_t cb_linear_cost =
+             ::GetSerializeSize(coinbase_tx) +
+@@ -895,9 +919,13 @@ uint256 ComputeV2StateRootFromTemplate(
+             base_state.sum_non_cb_effective_cost;
+ 
+         mon_state = AdvanceV2MonetaryStateForBlock(mon_state, nBits, block_cost);
++    } else {
++        utxo_root_hash = base_state.utxo_arena
++                             ? base_state.utxo_arena->RootDigest()
++                             : SmtRoot(base_state.utxo_root);
+     }
+     const lotus::v2::Hash sroot = lotus::v2::StateRoot(
+-        GetActiveV2ChainId(), base_state.height, SmtRoot(utxo_root), mon_state);
++        GetActiveV2ChainId(), base_state.height, utxo_root_hash, mon_state);
+     uint256 out;
+     std::memcpy(out.begin(), sroot.data(), 32);
+     return out;
+diff --git a/src/primitives/block.h b/src/primitives/block.h
+index ddfd7f5a88..a02a8bc36d 100644
+--- a/src/primitives/block.h
++++ b/src/primitives/block.h
+@@ -204,12 +204,16 @@ namespace lotus::v2 {
+ struct Coin;
+ struct SmtNode;
+ struct MonetaryState;
++class UtxoOverlayArena;
+ class MempoolOverlayLayer;
+ class MerklixOverlayManager;
+ } // namespace lotus::v2
+ 
+ struct V2TemplateBaseState {
+     std::shared_ptr<const lotus::v2::SmtNode> utxo_root;
++    // [Patch 035 optimization] Flat arena snapshot from MerklixOverlayManager
++    // avoids exporting O(U) shared_ptr<SmtNode> trees on every mempool update.
++    std::shared_ptr<const lotus::v2::UtxoOverlayArena> utxo_arena;
+     lotus::v2::MonetaryState mon_state{};
+     lotus::v2::MonetaryInteger sum_non_cb_effective_cost{0};
+     size_t non_cb_tx_count{0};
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index ee68f15756..0931aebc4a 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <chainparams.h>
+ #include <core_io.h>
++#include <net_processing.h>
+ #include <node/context.h>
+ #include <node/mempool_persist_args.h>
+ #include <node/snapshot.h>
+@@ -1244,10 +1245,10 @@ static RPCHelpMan testrawtxbatch() {
+             const JSONRPCRequest &request) -> UniValue {
+             const UniValue &raw_transactions = request.params[0].get_array();
+             if (raw_transactions.size() < 1 ||
+-                raw_transactions.size() > MAX_PACKAGE_COUNT) {
++                raw_transactions.size() > MAX_RAWTX_BATCH_COUNT) {
+                 throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                    "Array must contain between 1 and " +
+-                                       ToString(MAX_PACKAGE_COUNT) +
++                                       ToString(MAX_RAWTX_BATCH_COUNT) +
+                                        " transactions.");
+             }
+ 
+@@ -1274,14 +1275,9 @@ static RPCHelpMan testrawtxbatch() {
+ 
+             const PackageMempoolAcceptResult package_result = [&] {
+                 LOCK(::cs_main);
+-                if (txns.size() > 1) {
+-                    return ProcessNewPackage(chainstate, mempool, txns,
+-                                             /*test_accept=*/true);
+-                }
+-                return PackageMempoolAcceptResult(
+-                    txns[0]->GetId(),
+-                    chainman.ProcessTransaction(txns[0],
+-                                                /*test_accept=*/true));
++                return ProcessRawTxBatch(chainstate, mempool, txns,
++                                         /*test_accept=*/true,
++                                         max_raw_tx_fee_rate);
+             }();
+ 
+             UniValue results_arr(UniValue::VARR);
+@@ -1304,32 +1300,21 @@ static RPCHelpMan testrawtxbatch() {
+                     MempoolAcceptResult::ResultType::VALID) {
+                     const Amount fee = tx_result.m_base_fees.value();
+                     const int64_t virtual_size = tx_result.m_vsize.value();
+-                    const Amount max_raw_tx_fee =
+-                        max_raw_tx_fee_rate.GetFee(virtual_size);
+-                    if (max_raw_tx_fee != Amount::zero() &&
+-                        fee > max_raw_tx_fee) {
+-                        result_inner.pushKV("allowed", false);
+-                        result_inner.pushKV("reject-reason",
+-                                            "max-fee-exceeded");
+-                        all_allowed = false;
+-                        exit_early = true;
+-                    } else {
+-                        result_inner.pushKV("allowed", true);
+-                        result_inner.pushKV("size", virtual_size);
+-                        UniValue fees(UniValue::VOBJ);
+-                        fees.pushKV("base", fee);
+-                        fees.pushKV(
+-                            "effective-feerate",
+-                            tx_result.m_effective_feerate.value().GetFeePerK());
+-                        UniValue effective_includes_res(UniValue::VARR);
+-                        for (const auto &txid :
+-                             tx_result.m_txids_fee_calculations.value()) {
+-                            effective_includes_res.push_back(txid.ToString());
+-                        }
+-                        fees.pushKV("effective-includes",
+-                                    std::move(effective_includes_res));
+-                        result_inner.pushKV("fees", std::move(fees));
++                    result_inner.pushKV("allowed", true);
++                    result_inner.pushKV("size", virtual_size);
++                    UniValue fees(UniValue::VOBJ);
++                    fees.pushKV("base", fee);
++                    fees.pushKV(
++                        "effective-feerate",
++                        tx_result.m_effective_feerate.value().GetFeePerK());
++                    UniValue effective_includes_res(UniValue::VARR);
++                    for (const auto &txid :
++                         tx_result.m_txids_fee_calculations.value()) {
++                        effective_includes_res.push_back(txid.ToString());
+                     }
++                    fees.pushKV("effective-includes",
++                                std::move(effective_includes_res));
++                    result_inner.pushKV("fees", std::move(fees));
+                 } else {
+                     all_allowed = false;
+                     result_inner.pushKV("allowed", false);
+@@ -1337,6 +1322,10 @@ static RPCHelpMan testrawtxbatch() {
+                     if (state.GetResult() ==
+                         TxValidationResult::TX_MISSING_INPUTS) {
+                         result_inner.pushKV("reject-reason", "missing-inputs");
++                    } else if (state.GetRejectReason() == "max-fee-exceeded") {
++                        result_inner.pushKV("reject-reason",
++                                            "max-fee-exceeded");
++                        exit_early = true;
+                     } else {
+                         result_inner.pushKV("reject-reason",
+                                             state.GetRejectReason());
+@@ -1453,10 +1442,10 @@ static RPCHelpMan submitrawtxbatch() {
+             const JSONRPCRequest &request) -> UniValue {
+             const UniValue &raw_transactions = request.params[0].get_array();
+             if (raw_transactions.size() < 1 ||
+-                raw_transactions.size() > MAX_PACKAGE_COUNT) {
++                raw_transactions.size() > MAX_RAWTX_BATCH_COUNT) {
+                 throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                    "Array must contain between 1 and " +
+-                                       ToString(MAX_PACKAGE_COUNT) +
++                                       ToString(MAX_RAWTX_BATCH_COUNT) +
+                                        " transactions.");
+             }
+ 
+@@ -1491,19 +1480,17 @@ static RPCHelpMan submitrawtxbatch() {
+ 
+             {
+                 LOCK(::cs_main);
+-                // Phase 1: Test-accept the entire batch without mutating the
+-                // mempool.
+-                const PackageMempoolAcceptResult package_result = [&] {
+-                    AssertLockHeld(::cs_main);
+-                    if (txns.size() > 1) {
+-                        return ProcessNewPackage(chainstate, mempool, txns,
+-                                                 /*test_accept=*/true);
+-                    }
+-                    return PackageMempoolAcceptResult(
+-                        txns[0]->GetId(),
+-                        chainman.ProcessTransaction(txns[0],
+-                                                    /*test_accept=*/true));
+-                }();
++                CTxMemPool::ScopedSnapshotDefer snap_defer(mempool);
++                // [Patch 036 optimization] Single-pass two-phase batch
++                // validation and commit under cs_main + ScopedSnapshotDefer:
++                // Phase 1 runs PreChecks + maxfeerate across all workspaces
++                // without mutating the mempool; Phase 2 commits the prechecked
++                // workspaces directly via SubmitPackage and publishes a single
++                // RCU snapshot when snap_defer exits.
++                const PackageMempoolAcceptResult package_result =
++                    ProcessRawTxBatch(chainstate, mempool, txns,
++                                      /*test_accept=*/false,
++                                      max_raw_tx_fee_rate);
+ 
+                 if (package_result.m_state.GetResult() ==
+                     PackageValidationResult::PCKG_POLICY) {
+@@ -1511,9 +1498,7 @@ static RPCHelpMan submitrawtxbatch() {
+                         package_result.m_state.GetRejectReason();
+                 }
+ 
+-                all_allowed =
+-                    package_result.m_state.GetResult() !=
+-                    PackageValidationResult::PCKG_POLICY;
++                all_allowed = package_result.m_state.IsValid();
+                 bool exit_early{false};
+ 
+                 for (const auto &tx : txns) {
+@@ -1530,33 +1515,21 @@ static RPCHelpMan submitrawtxbatch() {
+                         MempoolAcceptResult::ResultType::VALID) {
+                         const Amount fee = tx_result.m_base_fees.value();
+                         const int64_t virtual_size = tx_result.m_vsize.value();
+-                        const Amount max_raw_tx_fee =
+-                            max_raw_tx_fee_rate.GetFee(virtual_size);
+-                        if (max_raw_tx_fee != Amount::zero() &&
+-                            fee > max_raw_tx_fee) {
+-                            result_inner.pushKV("allowed", false);
+-                            result_inner.pushKV("reject-reason",
+-                                                "max-fee-exceeded");
+-                            all_allowed = false;
+-                            exit_early = true;
+-                        } else {
+-                            result_inner.pushKV("allowed", true);
+-                            result_inner.pushKV("size", virtual_size);
+-                            UniValue fees(UniValue::VOBJ);
+-                            fees.pushKV("base", fee);
+-                            fees.pushKV("effective-feerate",
+-                                        tx_result.m_effective_feerate.value()
+-                                            .GetFeePerK());
+-                            UniValue effective_includes_res(UniValue::VARR);
+-                            for (const auto &txid :
+-                                 tx_result.m_txids_fee_calculations.value()) {
+-                                effective_includes_res.push_back(
+-                                    txid.ToString());
+-                            }
+-                            fees.pushKV("effective-includes",
+-                                        std::move(effective_includes_res));
+-                            result_inner.pushKV("fees", std::move(fees));
++                        result_inner.pushKV("allowed", true);
++                        result_inner.pushKV("size", virtual_size);
++                        UniValue fees(UniValue::VOBJ);
++                        fees.pushKV("base", fee);
++                        fees.pushKV("effective-feerate",
++                                    tx_result.m_effective_feerate.value()
++                                        .GetFeePerK());
++                        UniValue effective_includes_res(UniValue::VARR);
++                        for (const auto &txid :
++                             tx_result.m_txids_fee_calculations.value()) {
++                            effective_includes_res.push_back(txid.ToString());
+                         }
++                        fees.pushKV("effective-includes",
++                                    std::move(effective_includes_res));
++                        result_inner.pushKV("fees", std::move(fees));
+                     } else {
+                         all_allowed = false;
+                         result_inner.pushKV("allowed", false);
+@@ -1565,6 +1538,11 @@ static RPCHelpMan submitrawtxbatch() {
+                             TxValidationResult::TX_MISSING_INPUTS) {
+                             result_inner.pushKV("reject-reason",
+                                                 "missing-inputs");
++                        } else if (state.GetRejectReason() ==
++                                   "max-fee-exceeded") {
++                            result_inner.pushKV("reject-reason",
++                                                "max-fee-exceeded");
++                            exit_early = true;
+                         } else {
+                             result_inner.pushKV("reject-reason",
+                                                 state.GetRejectReason());
+@@ -1575,40 +1553,29 @@ static RPCHelpMan submitrawtxbatch() {
+                     results_arr.push_back(std::move(result_inner));
+                 }
+ 
+-                // Phase 2: All transactions passed Phase 1. Commit them to the
+-                // mempool under the same cs_main lock acquisition.
+                 if (all_allowed) {
+                     for (const auto &tx : txns) {
+-                        const MempoolAcceptResult commit_res =
+-                            chainman.ProcessTransaction(tx,
+-                                                        /*test_accept=*/false);
+-                        if (commit_res.m_result_type !=
+-                                MempoolAcceptResult::ResultType::VALID &&
+-                            commit_res.m_result_type !=
+-                                MempoolAcceptResult::ResultType::
+-                                    MEMPOOL_ENTRY) {
+-                            all_allowed = false;
+-                            break;
+-                        }
++                        mempool.AddUnbroadcastTx(tx->GetId());
++                    }
++                    const auto cur_snap =
++                        node::GetGlobalSnapshotPublisher().Load();
++                    if (!cur_snap || !cur_snap->chain_valid ||
++                        cur_snap->chainman_ptr != &chainman) {
++                        snap_defer.CancelFlush();
++                        node::PublishChainTipSnapshot(chainman, &mempool);
+                     }
+-                    node::PublishMempoolSnapshot(mempool);
+-                    node::PublishChainTipSnapshot(chainman, &mempool);
+                 }
+             }
+ 
+             if (all_allowed) {
+-                for (const auto &tx : txns) {
+-                    if (!mempool.exists(tx->GetId())) {
+-                        continue;
+-                    }
+-                    std::string err_string;
+-                    (void)BroadcastTransaction(
+-                        node, tx, err_string, /*max_tx_fee=*/Amount::zero(),
+-                        /*relay=*/true, /*wait_callback=*/true);
+-                }
+                 if (node.validation_signals) {
+                     node.validation_signals->SyncWithValidationInterfaceQueue();
+                 }
++                if (node.peerman) {
++                    for (const auto &tx : txns) {
++                        node.peerman->RelayTransaction(tx->GetId());
++                    }
++                }
+             }
+ 
+             UniValue ret(UniValue::VOBJ);
+diff --git a/src/test/lotus_v2_tests.cpp b/src/test/lotus_v2_tests.cpp
+index 48ff3c5725..e288c1e788 100644
+--- a/src/test/lotus_v2_tests.cpp
++++ b/src/test/lotus_v2_tests.cpp
+@@ -2,7 +2,11 @@
+ // Distributed under the MIT software license, see the accompanying
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
++#include <coins.h>
+ #include <consensus/merkle.h>
++#include <consensus/tx_verify.h>
++#include <consensus/validation.h>
++#include <key.h>
+ #include <lotus_v2/commitment.h>
+ #include <lotus_v2/disk_state.h>
+ #include <lotus_v2/header.h>
+@@ -16,19 +20,26 @@
+ #include <lotus_v2/vendor/blake3/blake3_impl.h>
+ #include <primitives/block.h>
+ #include <primitives/transaction.h>
++#include <script/interpreter.h>
+ #include <script/script.h>
++#include <script/sign.h>
++#include <script/signingprovider.h>
+ #include <test/util/random.h>
+ #include <test/util/setup_common.h>
+ #include <util/fs.h>
+ #include <util/strencodings.h>
++#include <validation.h>
+ 
+ #include <boost/test/unit_test.hpp>
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <chrono>
+ #include <cstring>
++#include <iostream>
+ #include <string>
++#include <thread>
+ #include <vector>
+ 
+ namespace {
+@@ -500,4 +511,520 @@ BOOST_AUTO_TEST_CASE(blake3_simd_microbenchmark) {
+                        << " speedup=" << full_speedup << "x");
+ }
+ 
++BOOST_FIXTURE_TEST_CASE(v2_kernel_throughput_benchmark, TestChain100Setup) {
++    const unsigned int hw_threads =
++        std::max(1U, std::thread::hardware_concurrency());
++
++    // =========================================================================
++    // 1. BLAKE3 NEON SIMD Hashing (Single-Core & Multi-Core)
++    // =========================================================================
++    constexpr size_t kChunkCount = 64;
++    constexpr size_t kBufSize = kChunkCount * BLAKE3_CHUNK_LEN; // 64 KiB
++    constexpr size_t kItersPerThread = 512; // 32 MiB per thread
++    std::vector<uint8_t> buf(kBufSize);
++    for (size_t i = 0; i < buf.size(); ++i) {
++        buf[i] = static_cast<uint8_t>((i * 131 + 17) & 0xff);
++    }
++    std::vector<const uint8_t *> chunk_ptrs(kChunkCount);
++    for (size_t i = 0; i < kChunkCount; ++i) {
++        chunk_ptrs[i] = buf.data() + i * BLAKE3_CHUNK_LEN;
++    }
++
++    // 1a. Single-core blake3_hash_many (1KB chunks)
++    std::vector<uint8_t> cvs_sc(kChunkCount * BLAKE3_OUT_LEN);
++    const auto b3_sc_t0 = std::chrono::steady_clock::now();
++    for (size_t iter = 0; iter < kItersPerThread; ++iter) {
++        blake3_hash_many(chunk_ptrs.data(), kChunkCount,
++                         BLAKE3_CHUNK_LEN / BLAKE3_BLOCK_LEN, IV, iter, true, 0,
++                         CHUNK_START, CHUNK_END, cvs_sc.data());
++    }
++    const auto b3_sc_t1 = std::chrono::steady_clock::now();
++    const double b3_sc_sec =
++        std::chrono::duration<double>(b3_sc_t1 - b3_sc_t0).count();
++    const double b3_sc_mb =
++        static_cast<double>(kBufSize * kItersPerThread) / (1000.0 * 1000.0);
++    const double b3_sc_mbs = b3_sc_mb / b3_sc_sec;
++    const double b3_sc_chunk_hps =
++        static_cast<double>(kChunkCount * kItersPerThread) / b3_sc_sec;
++
++    // 1b. Multi-core blake3_hash_many (1KB chunks)
++    const auto b3_mc_t0 = std::chrono::steady_clock::now();
++    {
++        std::vector<std::thread> workers;
++        workers.reserve(hw_threads);
++        for (unsigned int tid = 0; tid < hw_threads; ++tid) {
++            workers.emplace_back([&, tid]() {
++                std::vector<uint8_t> local_cvs(kChunkCount * BLAKE3_OUT_LEN);
++                for (size_t iter = 0; iter < kItersPerThread; ++iter) {
++                    blake3_hash_many(chunk_ptrs.data(), kChunkCount,
++                                     BLAKE3_CHUNK_LEN / BLAKE3_BLOCK_LEN, IV,
++                                     iter + tid * 10000, true, 0, CHUNK_START,
++                                     CHUNK_END, local_cvs.data());
++                }
++                if (local_cvs[0] == 0xff) {
++                    std::atomic_signal_fence(std::memory_order_seq_cst);
++                }
++            });
++        }
++        for (auto &w : workers) {
++            w.join();
++        }
++    }
++    const auto b3_mc_t1 = std::chrono::steady_clock::now();
++    const double b3_mc_sec =
++        std::chrono::duration<double>(b3_mc_t1 - b3_mc_t0).count();
++    const double b3_mc_mb =
++        b3_sc_mb * static_cast<double>(hw_threads);
++    const double b3_mc_mbs = b3_mc_mb / b3_mc_sec;
++    const double b3_mc_chunk_hps =
++        static_cast<double>(kChunkCount * kItersPerThread * hw_threads) /
++        b3_mc_sec;
++
++    // 1c. 250-byte Transaction Hashing (single-core & multi-core)
++    constexpr size_t kTxHashIters = 200000;
++    std::array<uint8_t, 250> sample_tx_bytes{};
++    for (size_t i = 0; i < sample_tx_bytes.size(); ++i) {
++        sample_tx_bytes[i] = static_cast<uint8_t>(i * 7 + 3);
++    }
++    uint8_t tx_digest[32]{};
++    const auto b3_tx_sc_t0 = std::chrono::steady_clock::now();
++    for (size_t i = 0; i < kTxHashIters; ++i) {
++        sample_tx_bytes[0] = static_cast<uint8_t>(i);
++        blake3_hasher h;
++        blake3_hasher_init(&h);
++        blake3_hasher_update(&h, sample_tx_bytes.data(), sample_tx_bytes.size());
++        blake3_hasher_finalize(&h, tx_digest, 32);
++    }
++    const auto b3_tx_sc_t1 = std::chrono::steady_clock::now();
++    const double b3_tx_sc_sec =
++        std::chrono::duration<double>(b3_tx_sc_t1 - b3_tx_sc_t0).count();
++    const double b3_tx_sc_hps =
++        static_cast<double>(kTxHashIters) / b3_tx_sc_sec;
++
++    const auto b3_tx_mc_t0 = std::chrono::steady_clock::now();
++    {
++        std::vector<std::thread> workers;
++        workers.reserve(hw_threads);
++        for (unsigned int tid = 0; tid < hw_threads; ++tid) {
++            workers.emplace_back([tid]() {
++                std::array<uint8_t, 250> local_tx{};
++                local_tx[1] = static_cast<uint8_t>(tid);
++                uint8_t out[32]{};
++                for (size_t i = 0; i < kTxHashIters; ++i) {
++                    local_tx[0] = static_cast<uint8_t>(i);
++                    blake3_hasher h;
++                    blake3_hasher_init(&h);
++                    blake3_hasher_update(&h, local_tx.data(), local_tx.size());
++                    blake3_hasher_finalize(&h, out, 32);
++                }
++            });
++        }
++        for (auto &w : workers) {
++            w.join();
++        }
++    }
++    const auto b3_tx_mc_t1 = std::chrono::steady_clock::now();
++    const double b3_tx_mc_sec =
++        std::chrono::duration<double>(b3_tx_mc_t1 - b3_tx_mc_t0).count();
++    const double b3_tx_mc_hps =
++        static_cast<double>(kTxHashIters * hw_threads) / b3_tx_mc_sec;
++
++    // =========================================================================
++    // 2. TxOverlayArena + SmtNode Persistent Merklix Overlay Insertion
++    // =========================================================================
++    constexpr size_t kOverlayTxCount = 10000;
++    const fs::path db_dir = m_args.GetDataDirNet() / "v2_kernel_bench_db";
++    fs::create_directories(db_dir);
++
++    lotus::v2::DiskStateOptions opts{};
++    opts.identity[0] = 0x42;
++    opts.profile_digest[0] = 0x99;
++    lotus::v2::DiskStateMetadata gen_meta{};
++    gen_meta.tip[0] = 0x01;
++    lotus::v2::DiskStateStore store;
++    lotus::v2::DiskStateError err;
++    BOOST_REQUIRE_MESSAGE(
++        lotus::v2::DiskStateStore::Open(fs::PathToString(db_dir), opts,
++                                        gen_meta, store, err),
++        err.message);
++
++    lotus::v2::DiskStateMetadata b1_meta{};
++    b1_meta.tip[0] = 0x11;
++    std::shared_ptr<const lotus::v2::SmtNode> base_utxo_root;
++    std::vector<lotus::v2::Coin> base_coins;
++    base_coins.reserve(kOverlayTxCount);
++    {
++        lotus::v2::DiskStateTransaction txn;
++        BOOST_REQUIRE_MESSAGE(store.Begin(txn, err), err.message);
++        for (uint32_t i = 0; i < kOverlayTxCount; ++i) {
++            lotus::v2::Hash txid{};
++            txid[0] = 0x70;
++            std::memcpy(&txid[4], &i, sizeof(i));
++            lotus::v2::Coin coin{};
++            coin.outpoint = {txid, 0};
++            coin.output.value = 100000;
++            coin.output.branches = {lotus::v2::Hash32{1}};
++            coin.output.paths = {{0}};
++            coin.creation_height = 1;
++            coin.creation_parent_mtp = 1000;
++            coin.coinbase = false;
++            BOOST_REQUIRE_MESSAGE(txn.Insert(coin, err), err.message);
++            lotus::v2::SmtInsert(base_utxo_root, coin);
++            base_coins.push_back(coin);
++        }
++        BOOST_REQUIRE_MESSAGE(txn.Commit(b1_meta, err), err.message);
++    }
++
++    // Pre-build 10,000 overlay transactions in memory
++    struct PrebuiltOverlayTx {
++        lotus::v2::Hash txid;
++        lotus::v2::Hash txhash;
++        lotus::v2::Outpoint spent_op;
++        lotus::v2::Coin out_coin;
++    };
++    std::vector<PrebuiltOverlayTx> overlay_txs(kOverlayTxCount);
++    for (uint32_t i = 0; i < kOverlayTxCount; ++i) {
++        lotus::v2::Hash txid{};
++        txid[0] = 0x80;
++        std::memcpy(&txid[4], &i, sizeof(i));
++        overlay_txs[i].txid = txid;
++        overlay_txs[i].txhash = txid;
++        overlay_txs[i].spent_op = base_coins[i].outpoint;
++        overlay_txs[i].out_coin.outpoint = {txid, 0};
++        overlay_txs[i].out_coin.output.value = 99000;
++        overlay_txs[i].out_coin.output.branches = {lotus::v2::Hash32{1}};
++        overlay_txs[i].out_coin.output.paths = {{0}};
++        overlay_txs[i].out_coin.creation_height = 2;
++        overlay_txs[i].out_coin.creation_parent_mtp = 1120;
++    }
++
++    // 2a. Measure TxOverlayArena::InsertTxLeaf alone (pure Subtree A Merklix radix arena)
++    lotus::v2::TxOverlayArena pure_tx_arena;
++    pure_tx_arena.Reserve(kOverlayTxCount * 2 + 16);
++    uint32_t arena_root_idx = lotus::v2::TxOverlayArena::kNullIdx;
++    const auto arena_t0 = std::chrono::steady_clock::now();
++    for (size_t i = 0; i < kOverlayTxCount; ++i) {
++        arena_root_idx = pure_tx_arena.InsertTxLeaf(
++            arena_root_idx, overlay_txs[i].txid, overlay_txs[i].txhash);
++    }
++    const auto arena_t1 = std::chrono::steady_clock::now();
++    BOOST_CHECK_EQUAL(pure_tx_arena.Count(arena_root_idx), kOverlayTxCount);
++    const double arena_sec =
++        std::chrono::duration<double>(arena_t1 - arena_t0).count();
++    const double arena_tps =
++        static_cast<double>(kOverlayTxCount) / arena_sec;
++
++    // 2b. Measure full MerklixOverlayManager::AddTransaction (TxOverlayArena +
++    // persistent SmtNode UTXO delete & insert + fee accumulators)
++    lotus::v2::MerklixOverlayManager mgr;
++    mgr.ResetToTip(b1_meta.tip, base_utxo_root,
++                   lotus::v2::GetInitialV2MonetaryState(), 2, 1120);
++    const auto ovl_t0 = std::chrono::steady_clock::now();
++    for (size_t i = 0; i < kOverlayTxCount; ++i) {
++        BOOST_REQUIRE(mgr.AddTransaction(
++            overlay_txs[i].txid, overlay_txs[i].txhash, 250,
++            {overlay_txs[i].spent_op}, {overlay_txs[i].out_coin}, 1000, 1));
++    }
++    const auto ovl_t1 = std::chrono::steady_clock::now();
++    const double ovl_sec =
++        std::chrono::duration<double>(ovl_t1 - ovl_t0).count();
++    const double ovl_tps =
++        static_cast<double>(kOverlayTxCount) / ovl_sec;
++
++    // 2c. Measure FreezeEpochBatch + O(1) root extraction + DiskStateStore::CommitFinalizedOverlay
++    const auto freeze_t0 = std::chrono::steady_clock::now();
++    const auto &frozen = mgr.FreezeEpochBatch();
++    const lotus::v2::Hash utxo_digest = frozen.GetUtxoRootDigest();
++    const auto freeze_t1 = std::chrono::steady_clock::now();
++    const double freeze_us =
++        std::chrono::duration<double, std::micro>(freeze_t1 - freeze_t0).count();
++    BOOST_CHECK(!utxo_digest.empty());
++
++    lotus::v2::DiskStateMetadata b2_meta{};
++    b2_meta.tip[0] = 0x22;
++    const auto disk_t0 = std::chrono::steady_clock::now();
++    BOOST_REQUIRE_MESSAGE(
++        store.CommitFinalizedOverlay(frozen, {}, b2_meta, err), err.message);
++    const auto disk_t1 = std::chrono::steady_clock::now();
++    const double disk_sec =
++        std::chrono::duration<double>(disk_t1 - disk_t0).count();
++    const double disk_tps =
++        static_cast<double>(kOverlayTxCount) / disk_sec;
++
++    // =========================================================================
++    // 3. GF(2^64) BCH Syndrome Computation & Root Solving
++    // =========================================================================
++    constexpr size_t kSyndromeTxCount = 1000000;
++    const auto [k0, k1] = lotus::v2::DeriveEpochSipHashKey(b1_meta.tip, 1);
++    lotus::v2::BucketSyndrome syn_sc{};
++    const auto syn_sc_t0 = std::chrono::steady_clock::now();
++    for (uint32_t i = 0; i < kSyndromeTxCount; ++i) {
++        lotus::v2::Hash txid{};
++        std::memcpy(txid.data(), &i, sizeof(i));
++        const uint64_t sid = lotus::v2::ComputeShortTxId(k0, k1, txid);
++        syn_sc.Add(sid);
++    }
++    const auto syn_sc_t1 = std::chrono::steady_clock::now();
++    const double syn_sc_sec =
++        std::chrono::duration<double>(syn_sc_t1 - syn_sc_t0).count();
++    const double syn_sc_tps =
++        static_cast<double>(kSyndromeTxCount) / syn_sc_sec;
++
++    // Multi-core syndrome accumulation
++    const auto syn_mc_t0 = std::chrono::steady_clock::now();
++    {
++        std::vector<std::thread> workers;
++        workers.reserve(hw_threads);
++        for (unsigned int tid = 0; tid < hw_threads; ++tid) {
++            workers.emplace_back([&, tid]() {
++                lotus::v2::BucketSyndrome local_syn{};
++                for (uint32_t i = 0; i < kSyndromeTxCount; ++i) {
++                    lotus::v2::Hash txid{};
++                    txid[8] = static_cast<uint8_t>(tid);
++                    std::memcpy(txid.data(), &i, sizeof(i));
++                    const uint64_t sid =
++                        lotus::v2::ComputeShortTxId(k0, k1, txid);
++                    local_syn.Add(sid);
++                }
++                if (local_syn.s1 == 1ULL) {
++                    std::atomic_signal_fence(std::memory_order_seq_cst);
++                }
++            });
++        }
++        for (auto &w : workers) {
++            w.join();
++        }
++    }
++    const auto syn_mc_t1 = std::chrono::steady_clock::now();
++    const double syn_mc_sec =
++        std::chrono::duration<double>(syn_mc_t1 - syn_mc_t0).count();
++    const double syn_mc_tps =
++        static_cast<double>(kSyndromeTxCount * hw_threads) / syn_mc_sec;
++
++    // Degree-2 BCH root solving in GF(2^64)
++    constexpr size_t kDecodeIters = 100000;
++    std::vector<lotus::v2::BucketSyndrome> deg2_syndromes(kDecodeIters);
++    for (size_t i = 0; i < kDecodeIters; ++i) {
++        const uint64_t r1 = (uint64_t(i + 1) * 0x9e3779b97f4a7c15ULL) | 1ULL;
++        const uint64_t r2 = (uint64_t(i + 1) * 0xbf58476d1ce4e5b9ULL) | 2ULL;
++        deg2_syndromes[i].Add(r1);
++        deg2_syndromes[i].Add(r2);
++    }
++    size_t decoded_roots_total = 0;
++    const auto bch_sc_t0 = std::chrono::steady_clock::now();
++    for (size_t i = 0; i < kDecodeIters; ++i) {
++        auto res = lotus::v2::DecodeBucketSyndrome(deg2_syndromes[i]);
++        decoded_roots_total += res.roots.size();
++    }
++    const auto bch_sc_t1 = std::chrono::steady_clock::now();
++    BOOST_CHECK_EQUAL(decoded_roots_total, kDecodeIters * 2);
++    const double bch_sc_sec =
++        std::chrono::duration<double>(bch_sc_t1 - bch_sc_t0).count();
++    const double bch_sc_buckets_ps =
++        static_cast<double>(kDecodeIters) / bch_sc_sec;
++    const double bch_sc_roots_ps =
++        static_cast<double>(decoded_roots_total) / bch_sc_sec;
++
++    const auto bch_mc_t0 = std::chrono::steady_clock::now();
++    {
++        std::vector<std::thread> workers;
++        workers.reserve(hw_threads);
++        for (unsigned int tid = 0; tid < hw_threads; ++tid) {
++            workers.emplace_back([&]() {
++                size_t local_roots = 0;
++                for (size_t i = 0; i < kDecodeIters; ++i) {
++                    auto res =
++                        lotus::v2::DecodeBucketSyndrome(deg2_syndromes[i]);
++                    local_roots += res.roots.size();
++                }
++                if (local_roots == 0) {
++                    std::atomic_signal_fence(std::memory_order_seq_cst);
++                }
++            });
++        }
++        for (auto &w : workers) {
++            w.join();
++        }
++    }
++    const auto bch_mc_t1 = std::chrono::steady_clock::now();
++    const double bch_mc_sec =
++        std::chrono::duration<double>(bch_mc_t1 - bch_mc_t0).count();
++    const double bch_mc_buckets_ps =
++        static_cast<double>(kDecodeIters * hw_threads) / bch_mc_sec;
++    const double bch_mc_roots_ps =
++        static_cast<double>(decoded_roots_total * hw_threads) / bch_mc_sec;
++
++    // =========================================================================
++    // 4. CheckTxInputs + Script/Signature Verification + ConnectBlock Throughput
++    // =========================================================================
++    constexpr size_t kValTxCount = 2000;
++    this->mineBlocks(2);
++    CScript coinbase_spk =
++        CScript() << ToByteVector(coinbaseKey.GetPubKey()) << OP_CHECKSIG;
++
++    // Create a fan-out funding block with kValTxCount outputs so we have
++    // kValTxCount independent UTXOs in CoinsTip()
++    CMutableTransaction fanout_mtx;
++    fanout_mtx.nVersion = 2;
++    fanout_mtx.vin.emplace_back(COutPoint(m_coinbase_txns[0]->GetId(), 0));
++    const Amount total_in = m_coinbase_txns[0]->vout[0].nValue;
++    const Amount per_out = (total_in - 100000 * SATOSHI) / int64_t(kValTxCount);
++    fanout_mtx.vout.resize(kValTxCount);
++    for (size_t i = 0; i < kValTxCount; ++i) {
++        fanout_mtx.vout[i].nValue = per_out;
++        fanout_mtx.vout[i].scriptPubKey = coinbase_spk;
++    }
++    {
++        FillableSigningProvider keystore;
++        keystore.AddKey(coinbaseKey);
++        SignatureData sigdata;
++        BOOST_REQUIRE(ProduceSignature(
++            keystore,
++            MutableTransactionSignatureCreator(
++                &fanout_mtx, 0, total_in, SigHashType().withForkId()),
++            coinbase_spk, sigdata));
++        UpdateInput(fanout_mtx.vin[0], sigdata);
++    }
++    CTransactionRef fanout_tx = MakeTransactionRef(fanout_mtx);
++    CreateAndProcessBlock({fanout_mtx}, coinbase_spk);
++
++    // Pre-construct and sign kValTxCount independent spending transactions
++    std::vector<CMutableTransaction> signed_mtxs;
++    std::vector<CTransactionRef> signed_txs;
++    signed_mtxs.reserve(kValTxCount);
++    signed_txs.reserve(kValTxCount);
++    {
++        FillableSigningProvider keystore;
++        keystore.AddKey(coinbaseKey);
++        const TxId fanout_txid = fanout_tx->GetId();
++        for (size_t i = 0; i < kValTxCount; ++i) {
++            CMutableTransaction mtx;
++            mtx.nVersion = 2;
++            mtx.vin.emplace_back(COutPoint(fanout_txid, uint32_t(i)));
++            mtx.vout.emplace_back(per_out - 1000 * SATOSHI, coinbase_spk);
++            SignatureData sigdata;
++            BOOST_REQUIRE(ProduceSignature(
++                keystore,
++                MutableTransactionSignatureCreator(
++                    &mtx, 0, per_out, SigHashType().withForkId()),
++                coinbase_spk, sigdata));
++            UpdateInput(mtx.vin[0], sigdata);
++            signed_mtxs.push_back(mtx);
++            signed_txs.push_back(MakeTransactionRef(std::move(mtx)));
++        }
++    }
++
++    // 4a. Consensus::CheckTxInputs single-core throughput
++    double check_inputs_tps = 0.0;
++    {
++        LOCK(cs_main);
++        const CCoinsViewCache &view =
++            m_node.chainman->ActiveChainstate().CoinsTip();
++        const int spend_height =
++            m_node.chainman->ActiveChain().Height() + 1;
++        constexpr size_t kCheckLoops = 50;
++        const auto ci_t0 = std::chrono::steady_clock::now();
++        for (size_t loop = 0; loop < kCheckLoops; ++loop) {
++            for (const auto &tx : signed_txs) {
++                TxValidationState state;
++                Amount fee = Amount::zero();
++                BOOST_REQUIRE(Consensus::CheckTxInputs(*tx, state, view,
++                                                       spend_height, fee));
++            }
++        }
++        const auto ci_t1 = std::chrono::steady_clock::now();
++        const double ci_sec =
++            std::chrono::duration<double>(ci_t1 - ci_t0).count();
++        check_inputs_tps =
++            static_cast<double>(kValTxCount * kCheckLoops) / ci_sec;
++    }
++
++    // 4b. VerifyScript + Signature Verification (single-core & multi-core)
++    const uint32_t script_flags = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_STRICTENC |
++                                  SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S |
++                                  SCRIPT_VERIFY_NULLFAIL |
++                                  SCRIPT_ENABLE_SIGHASH_FORKID;
++    std::vector<PrecomputedTransactionData> txdata_vec;
++    txdata_vec.reserve(kValTxCount);
++    for (const auto &tx : signed_txs) {
++        txdata_vec.emplace_back(*tx);
++    }
++
++    const auto vs_sc_t0 = std::chrono::steady_clock::now();
++    for (size_t i = 0; i < kValTxCount; ++i) {
++        ScriptError serror = ScriptError::UNKNOWN;
++        TransactionSignatureChecker checker(signed_txs[i].get(), 0, per_out,
++                                            txdata_vec[i]);
++        BOOST_REQUIRE(VerifyScript(signed_txs[i]->vin[0].scriptSig,
++                                   coinbase_spk, script_flags, checker,
++                                   &serror));
++    }
++    const auto vs_sc_t1 = std::chrono::steady_clock::now();
++    const double vs_sc_sec =
++        std::chrono::duration<double>(vs_sc_t1 - vs_sc_t0).count();
++    const double vs_sc_tps = static_cast<double>(kValTxCount) / vs_sc_sec;
++
++    const auto vs_mc_t0 = std::chrono::steady_clock::now();
++    {
++        std::vector<std::thread> workers;
++        workers.reserve(hw_threads);
++        for (unsigned int tid = 0; tid < hw_threads; ++tid) {
++            workers.emplace_back([&]() {
++                for (size_t i = 0; i < kValTxCount; ++i) {
++                    ScriptError serror = ScriptError::UNKNOWN;
++                    TransactionSignatureChecker checker(
++                        signed_txs[i].get(), 0, per_out, txdata_vec[i]);
++                    bool ok = VerifyScript(signed_txs[i]->vin[0].scriptSig,
++                                           coinbase_spk, script_flags, checker,
++                                           &serror);
++                    assert(ok);
++                }
++            });
++        }
++        for (auto &w : workers) {
++            w.join();
++        }
++    }
++    const auto vs_mc_t1 = std::chrono::steady_clock::now();
++    const double vs_mc_sec =
++        std::chrono::duration<double>(vs_mc_t1 - vs_mc_t0).count();
++    const double vs_mc_tps =
++        static_cast<double>(kValTxCount * hw_threads) / vs_mc_sec;
++
++    // 4c. Full Block Assembly + ConnectBlock (2,000 txs)
++    const auto cb_t0 = std::chrono::steady_clock::now();
++    CBlock big_block = CreateAndProcessBlock(signed_mtxs, coinbase_spk);
++    const auto cb_t1 = std::chrono::steady_clock::now();
++    const double cb_sec =
++        std::chrono::duration<double>(cb_t1 - cb_t0).count();
++    const double cb_tps = static_cast<double>(kValTxCount) / cb_sec;
++    BOOST_CHECK_EQUAL(big_block.vtx.size(), kValTxCount + 1);
++
++    std::cout << "\n=== V2 KERNEL THROUGHPUT BENCHMARK RESULTS (threads="
++              << hw_threads << ") ===\n"
++              << "BLAKE3_HASH_MANY_SC_MBPS=" << b3_sc_mbs
++              << " BLAKE3_HASH_MANY_SC_HPS=" << b3_sc_chunk_hps << "\n"
++              << "BLAKE3_HASH_MANY_MC_MBPS=" << b3_mc_mbs
++              << " BLAKE3_HASH_MANY_MC_HPS=" << b3_mc_chunk_hps << "\n"
++              << "BLAKE3_250B_TX_SC_HPS=" << b3_tx_sc_hps
++              << " BLAKE3_250B_TX_MC_HPS=" << b3_tx_mc_hps << "\n"
++              << "TX_OVERLAY_ARENA_INSERT_TPS=" << arena_tps << "\n"
++              << "MERKLIX_OVERLAY_MGR_ADD_TX_TPS=" << ovl_tps << "\n"
++              << "MERKLIX_FREEZE_EPOCH_US=" << freeze_us << "\n"
++              << "DISK_STATE_COMMIT_FINALIZED_OVERLAY_TPS=" << disk_tps << "\n"
++              << "GF64_SYNDROME_ACCUM_SC_TPS=" << syn_sc_tps
++              << " GF64_SYNDROME_ACCUM_MC_TPS=" << syn_mc_tps << "\n"
++              << "GF64_BCH_DEG2_SOLVE_SC_BUCKETS_PS=" << bch_sc_buckets_ps
++              << " GF64_BCH_DEG2_SOLVE_SC_ROOTS_PS=" << bch_sc_roots_ps << "\n"
++              << "GF64_BCH_DEG2_SOLVE_MC_BUCKETS_PS=" << bch_mc_buckets_ps
++              << " GF64_BCH_DEG2_SOLVE_MC_ROOTS_PS=" << bch_mc_roots_ps << "\n"
++              << "CHECK_TX_INPUTS_SC_TPS=" << check_inputs_tps << "\n"
++              << "VERIFY_SCRIPT_SIG_SC_TPS=" << vs_sc_tps
++              << " VERIFY_SCRIPT_SIG_MC_TPS=" << vs_mc_tps << "\n"
++              << "CREATE_AND_CONNECT_BLOCK_2000TX_TPS=" << cb_tps
++              << " CREATE_AND_CONNECT_BLOCK_2000TX_MS=" << (cb_sec * 1000.0)
++              << "\n=== END V2 KERNEL THROUGHPUT BENCHMARK ===\n"
++              << std::endl;
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index 52dfef1449..76af1ba4d3 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -398,6 +398,18 @@ void CTxMemPool::_clear() {
+     ++nTransactionsUpdated;
+ }
+ 
++CTxMemPool::ScopedSnapshotDefer::~ScopedSnapshotDefer() {
++    LOCK(m_pool.cs);
++    assert(m_pool.m_defer_snapshot_depth > 0);
++    --m_pool.m_defer_snapshot_depth;
++    if (m_pool.m_defer_snapshot_depth == 0 && m_pool.m_snapshot_dirty) {
++        m_pool.m_snapshot_dirty = false;
++        if (m_flush_on_exit) {
++            node::PublishMempoolSnapshot(m_pool);
++        }
++    }
++}
++
+ const lotus::v2::MempoolOverlayLayer &CTxMemPool::FreezeEpochBatch() {
+     AssertLockHeld(cs);
+     return m_merklix_overlay.FreezeEpochBatch();
+@@ -409,6 +421,12 @@ void CTxMemPool::SyncMerklixOverlayToTip(const BlockHash &tip_hash,
+     AssertLockHeld(cs);
+     lotus::v2::Hash tip_id{};
+     std::memcpy(tip_id.data(), tip_hash.begin(), 32);
++    if (m_merklix_overlay.IsAnchoredAt(tip_id, next_height, next_mtp) &&
++        (m_merklix_overlay.GetSpeculativeOverlay().GetBaseUtxoRoot() !=
++             nullptr ||
++         next_height <= 1)) {
++        return;
++    }
+     std::shared_ptr<const lotus::v2::SmtNode> utxo_root;
+     lotus::v2::MonetaryState mon_state = lotus::v2::GetInitialV2MonetaryState();
+     GetV2BlockStateSnapshot(tip_hash, utxo_root, mon_state);
+@@ -929,7 +947,7 @@ void CTxMemPool::AddUnbroadcastTx(const TxId &txid) {
+     LOCK(cs);
+     if (exists(txid)) {
+         if (m_unbroadcast_txids.insert(txid).second) {
+-            node::PublishMempoolSnapshot(*this);
++            node::PublishMempoolUnbroadcastSnapshot(*this, txid, true);
+         }
+     }
+ }
+@@ -943,7 +961,7 @@ void CTxMemPool::RemoveUnbroadcastTx(const TxId &txid, const bool unchecked) {
+             txid.GetHex(),
+             (unchecked ? " before confirmation that txn was sent out" : ""));
+         if (!unchecked) {
+-            node::PublishMempoolSnapshot(*this);
++            node::PublishMempoolUnbroadcastSnapshot(*this, txid, false);
+         }
+     }
+ }
+diff --git a/src/txmempool.h b/src/txmempool.h
+index 15bcc1a9fb..91618ce5e4 100644
+--- a/src/txmempool.h
++++ b/src/txmempool.h
+@@ -639,8 +639,53 @@ public:
+                            uint64_t next_mtp)
+         EXCLUSIVE_LOCKS_REQUIRED(cs);
+ 
++    /**
++     * [Patch 034 optimization] If a ScopedSnapshotDefer scope is active on this
++     * mempool, mark the snapshot dirty and return true so callers skip
++     * redundant per-tx snapshot rebuilds during batch mutations.
++     */
++    bool DeferSnapshotIfActive() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        AssertLockHeld(cs);
++        if (m_defer_snapshot_depth > 0) {
++            m_snapshot_dirty = true;
++            return true;
++        }
++        return false;
++    }
++
++    void ClearSnapshotDirty() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        AssertLockHeld(cs);
++        m_snapshot_dirty = false;
++    }
++
++    /**
++     * RAII guard that coalesces multiple mempool snapshot publications within a
++     * batch mutation (submitrawtxbatch, SubmitPackage, removeForBlock,
++     * TrimToSize) into a single RCU publish when the outermost guard exits.
++     */
++    class ScopedSnapshotDefer {
++    private:
++        const CTxMemPool &m_pool;
++        bool m_flush_on_exit{true};
++
++    public:
++        explicit ScopedSnapshotDefer(const CTxMemPool &pool) noexcept
++            : m_pool(pool) {
++            LOCK(m_pool.cs);
++            ++m_pool.m_defer_snapshot_depth;
++        }
++        ScopedSnapshotDefer(const ScopedSnapshotDefer &) = delete;
++        ScopedSnapshotDefer &operator=(const ScopedSnapshotDefer &) = delete;
++
++        void CancelFlush() noexcept { m_flush_on_exit = false; }
++
++        ~ScopedSnapshotDefer();
++    };
++
+ private:
+     mutable lotus::v2::MerklixOverlayManager m_merklix_overlay GUARDED_BY(cs);
++    mutable uint32_t m_defer_snapshot_depth GUARDED_BY(cs){0};
++    mutable bool m_snapshot_dirty GUARDED_BY(cs){false};
+ 
+     /** Set ancestor state for an entry */
+     void UpdateEntryForAncestors(txiter it, const setEntries *setAncestors)
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 16f38d68dc..08f5e09e94 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -382,6 +382,22 @@ public:
+             };
+         }
+ 
++        /** Parameters for all-or-nothing batch validation/submission (testrawtxbatch / submitrawtxbatch). */
++        static ATMPArgs
++        RawTxBatch(const Config &config, int64_t accept_time,
++                   std::vector<COutPoint> &coins_to_uncache, bool test_accept) {
++            return ATMPArgs{
++                config,
++                accept_time,
++                /*bypass_limits=*/false,
++                coins_to_uncache,
++                /*test_accept=*/test_accept,
++                /*height_override=*/0,
++                /*package_submission=*/!test_accept,
++                /*package_feerates=*/false,
++            };
++        }
++
+         /** Parameters for a single transaction within a package. */
+         static ATMPArgs SingleInPackageAccept(const ATMPArgs &package_args) {
+             return ATMPArgs{
+@@ -430,6 +446,16 @@ public:
+                                ATMPArgs &args)
+         EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+ 
++    /**
++     * All-or-nothing batch validation and single-pass commit for
++     * testrawtxbatch and submitrawtxbatch.
++     */
++    PackageMempoolAcceptResult
++    AcceptRawTxBatch(const std::vector<CTransactionRef> &txns,
++                     ATMPArgs &args,
++                     const CFeeRate &max_raw_tx_fee_rate)
++        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
++
+     /**
+      * Submission of a subpackage.
+      * If subpackage size == 1, calls AcceptSingleTransaction() with adjusted
+@@ -889,6 +915,13 @@ bool MemPoolAccept::SubmitPackage(
+     std::map<TxId, MempoolAcceptResult> &results) {
+     AssertLockHeld(cs_main);
+     AssertLockHeld(m_pool.cs);
++    CTxMemPool::ScopedSnapshotDefer snap_defer(m_pool);
++    const CBlockIndex *tip = m_active_chainstate.m_chain.Tip();
++    if (tip) {
++        m_pool.SyncMerklixOverlayToTip(
++            tip->GetBlockHash(), static_cast<uint64_t>(tip->nHeight + 1),
++            static_cast<uint64_t>(tip->GetMedianTimePast()));
++    }
+     // Sanity check: none of the transactions should be in the mempool.
+     assert(std::all_of(
+         workspaces.cbegin(), workspaces.cend(),
+@@ -1024,6 +1057,12 @@ MemPoolAccept::AcceptSingleTransaction(const CTransactionRef &ptx,
+                                             effective_feerate, single_txid);
+     }
+ 
++    if (tip) {
++        m_pool.SyncMerklixOverlayToTip(
++            tip->GetBlockHash(), static_cast<uint64_t>(tip->nHeight + 1),
++            static_cast<uint64_t>(tip->GetMedianTimePast()));
++    }
++
+     if (!Finalize(args, ws)) {
+         // The only possible failure reason is fee-related (mempool full).
+         // Failed for fee reasons. Provide the effective feerate and which txns
+@@ -1159,6 +1198,137 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(
+     return PackageMempoolAcceptResult(package_state, std::move(results));
+ }
+ 
++PackageMempoolAcceptResult MemPoolAccept::AcceptRawTxBatch(
++    const std::vector<CTransactionRef> &txns,
++    ATMPArgs &args,
++    const CFeeRate &max_raw_tx_fee_rate) {
++    AssertLockHeld(cs_main);
++
++    PackageValidationState package_state;
++    const size_t batch_count = txns.size();
++    if (batch_count > MAX_RAWTX_BATCH_COUNT) {
++        package_state.Invalid(PackageValidationResult::PCKG_POLICY,
++                              "package-too-many-transactions");
++        return PackageMempoolAcceptResult(package_state, {});
++    }
++
++    if (batch_count > 1) {
++        const int64_t total_size = std::accumulate(
++            txns.cbegin(), txns.cend(), int64_t{0},
++            [](int64_t sum, const auto &tx) {
++                return sum + GetVirtualTransactionSize(*tx);
++            });
++        if (total_size > int64_t(MAX_RAWTX_BATCH_SIZE_KB) * 1000) {
++            package_state.Invalid(PackageValidationResult::PCKG_POLICY,
++                                  "package-too-large");
++            return PackageMempoolAcceptResult(package_state, {});
++        }
++
++        std::unordered_set<TxId, SaltedTxIdHasher> later_txids;
++        later_txids.reserve(batch_count);
++        for (const auto &tx : txns) {
++            later_txids.insert(tx->GetId());
++        }
++        if (later_txids.size() != batch_count) {
++            package_state.Invalid(PackageValidationResult::PCKG_POLICY,
++                                  "package-contains-duplicates");
++            return PackageMempoolAcceptResult(package_state, {});
++        }
++
++        std::unordered_set<COutPoint, SaltedOutpointHasher> inputs_seen;
++        inputs_seen.reserve(batch_count * 2);
++        for (const auto &tx : txns) {
++            for (const auto &input : tx->vin) {
++                if (input.nFlags == 3) {
++                    continue;
++                }
++                if (later_txids.find(input.prevout.GetTxId()) !=
++                    later_txids.end()) {
++                    package_state.Invalid(PackageValidationResult::PCKG_POLICY,
++                                          "package-not-sorted");
++                    return PackageMempoolAcceptResult(package_state, {});
++                }
++                if (inputs_seen.find(input.prevout) != inputs_seen.end()) {
++                    package_state.Invalid(PackageValidationResult::PCKG_POLICY,
++                                          "conflict-in-package");
++                    return PackageMempoolAcceptResult(package_state, {});
++                }
++            }
++            later_txids.erase(tx->GetId());
++            for (const auto &input : tx->vin) {
++                if (input.nFlags != 3) {
++                    inputs_seen.insert(input.prevout);
++                }
++            }
++        }
++    }
++
++    const uint32_t script_flags = GetNextBlockScriptFlags(
++        m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman);
++    std::vector<Workspace> workspaces;
++    workspaces.reserve(txns.size());
++    for (const auto &tx : txns) {
++        workspaces.emplace_back(tx, script_flags);
++    }
++
++    std::map<TxId, MempoolAcceptResult> results;
++    LOCK(m_pool.cs);
++    CTxMemPool::ScopedSnapshotDefer snap_defer(m_pool);
++
++    auto cleanup_views = [this]() {
++        for (const auto &outpoint : m_viewmempool.GetNonBaseCoins()) {
++            m_view.Uncache(outpoint);
++        }
++        m_viewmempool.Reset();
++    };
++
++    for (Workspace &ws : workspaces) {
++        if (!PreChecks(args, ws)) {
++            package_state.Invalid(PackageValidationResult::PCKG_TX,
++                                  "transaction failed");
++            results.emplace(ws.m_ptx->GetId(),
++                            MempoolAcceptResult::Failure(ws.m_state));
++            cleanup_views();
++            return PackageMempoolAcceptResult(package_state,
++                                              std::move(results));
++        }
++        m_viewmempool.PackageAddTransaction(ws.m_ptx);
++
++        const Amount max_raw_tx_fee =
++            max_raw_tx_fee_rate.GetFee(ws.m_vsize);
++        if (max_raw_tx_fee != Amount::zero() &&
++            ws.m_base_fees > max_raw_tx_fee) {
++            package_state.Invalid(PackageValidationResult::PCKG_TX,
++                                  "max-fee-exceeded");
++            ws.m_state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
++                               "max-fee-exceeded");
++            results.emplace(ws.m_ptx->GetId(),
++                            MempoolAcceptResult::Failure(ws.m_state));
++            cleanup_views();
++            return PackageMempoolAcceptResult(package_state,
++                                              std::move(results));
++        }
++    }
++
++    if (args.m_test_accept) {
++        for (Workspace &ws : workspaces) {
++            const TxId &ws_txid = ws.m_ptx->GetId();
++            const CFeeRate effective_feerate{
++                ws.m_modified_fees, static_cast<uint32_t>(ws.m_vsize)};
++            results.emplace(ws_txid,
++                            MempoolAcceptResult::Success(
++                                ws.m_vsize, ws.m_base_fees, effective_feerate,
++                                std::vector<TxId>{ws_txid}));
++        }
++        cleanup_views();
++        return PackageMempoolAcceptResult(package_state, std::move(results));
++    }
++
++    SubmitPackage(args, workspaces, package_state, results);
++    cleanup_views();
++    return PackageMempoolAcceptResult(package_state, std::move(results));
++}
++
+ PackageMempoolAcceptResult
+ MemPoolAccept::AcceptSubPackage(const std::vector<CTransactionRef> &subpackage,
+                                 ATMPArgs &args) {
+@@ -1512,6 +1682,33 @@ PackageMempoolAcceptResult ProcessNewPackage(Chainstate &active_chainstate,
+     return result;
+ }
+ 
++PackageMempoolAcceptResult
++ProcessRawTxBatch(Chainstate &active_chainstate, CTxMemPool &pool,
++                  const Package &package, bool test_accept,
++                  const CFeeRate &max_raw_tx_fee_rate) {
++    AssertLockHeld(cs_main);
++    assert(!package.empty());
++    assert(std::all_of(package.cbegin(), package.cend(),
++                       [](const auto &tx) { return tx != nullptr; }));
++
++    const Config &config = active_chainstate.m_chainman.GetConfig();
++    std::vector<COutPoint> coins_to_uncache;
++    auto args = MemPoolAccept::ATMPArgs::RawTxBatch(
++        config, GetTime(), coins_to_uncache, test_accept);
++    PackageMempoolAcceptResult result =
++        MemPoolAccept(pool, active_chainstate)
++            .AcceptRawTxBatch(package, args, max_raw_tx_fee_rate);
++
++    if (test_accept || result.m_state.IsInvalid()) {
++        for (const COutPoint &hashTx : coins_to_uncache) {
++            active_chainstate.CoinsTip().Uncache(hashTx);
++        }
++    }
++    BlockValidationState state_dummy;
++    active_chainstate.FlushStateToDisk(state_dummy, FlushStateMode::PERIODIC);
++    return result;
++}
++
+ Amount GetBlockSubsidy(int nHeight, const Consensus::Params &consensusParams) {
+     int halvings = nHeight / consensusParams.nSubsidyHalvingInterval;
+     // Force block reward to zero when right shift is undefined.
+@@ -3120,6 +3317,7 @@ bool Chainstate::DisconnectTip(BlockValidationState &state,
+     }
+ 
+     if (m_mempool) {
++        CTxMemPool::ScopedSnapshotDefer snap_defer(*m_mempool);
+         // If this block is deactivating a fork, we move all mempool
+         // transactions in front of disconnectpool for reprocessing in a future
+         // updateMempoolForReorg call
+@@ -3137,17 +3335,16 @@ bool Chainstate::DisconnectTip(BlockValidationState &state,
+         if (disconnectpool) {
+             disconnectpool->addForBlock(block.vtx, *m_mempool);
+         }
+-    }
+-
+-    m_chain.SetTip(*pindexDelete->pprev);
+-
+-    UpdateTip(pindexDelete->pprev);
+-    if (m_mempool) {
+         m_mempool->ConnectBlockReset(
+             pindexDelete->pprev->GetBlockHash(),
+             static_cast<uint64_t>(pindexDelete->pprev->nHeight + 1),
+             static_cast<uint64_t>(pindexDelete->pprev->GetMedianTimePast()));
++        snap_defer.CancelFlush();
+     }
++
++    m_chain.SetTip(*pindexDelete->pprev);
++
++    UpdateTip(pindexDelete->pprev);
+     // Let wallets know transactions went from 1-confirmed to
+     // 0-confirmed or conflicted:
+     if (m_chainman.m_options.signals) {
+@@ -3334,6 +3531,7 @@ bool Chainstate::ConnectTip(BlockValidationState &state,
+                  m_chainman.num_blocks_total);
+     // Remove conflicting transactions from the mempool.
+     if (m_mempool) {
++        CTxMemPool::ScopedSnapshotDefer snap_defer(*m_mempool);
+         disconnectpool.removeForBlock(blockConnecting.vtx, *m_mempool);
+ 
+         // If this block is activating a fork, we move all mempool transactions
+@@ -3347,18 +3545,17 @@ bool Chainstate::ConnectTip(BlockValidationState &state,
+                 "Disconnecting mempool due to acceptance of upgrade block\n");
+             disconnectpool.importMempool(*m_mempool);
+         }
+-    }
+-
+-    // Update m_chain & related variables.
+-    m_chain.SetTip(*pindexNew);
+-    UpdateTip(pindexNew);
+-    if (m_mempool) {
+         m_mempool->ConnectBlockReset(
+             pindexNew->GetBlockHash(),
+             static_cast<uint64_t>(pindexNew->nHeight + 1),
+             static_cast<uint64_t>(pindexNew->GetMedianTimePast()));
++        snap_defer.CancelFlush();
+     }
+ 
++    // Update m_chain & related variables.
++    m_chain.SetTip(*pindexNew);
++    UpdateTip(pindexNew);
++
+     const auto time_6{SteadyClock::now()};
+     m_chainman.time_post_connect += time_6 - time_5;
+     m_chainman.time_total += time_6 - time_1;
+diff --git a/src/validation.h b/src/validation.h
+index a2d70ebed6..80f1d3a501 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -365,6 +365,22 @@ ProcessNewPackage(Chainstate &active_chainstate, CTxMemPool &pool,
+                   const Package &txns, bool test_accept)
+     EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+ 
++/** Maximum number of transactions in a Lotus V2 testrawtxbatch / submitrawtxbatch call. */
++static constexpr uint32_t MAX_RAWTX_BATCH_COUNT{1000};
++/** Maximum total virtual size of transactions in a rawtxbatch in KB (10 MB). */
++static constexpr uint32_t MAX_RAWTX_BATCH_SIZE_KB{10000};
++
++/**
++ * [Patch 036 optimization] Validate and optionally commit an all-or-nothing
++ * batch of raw transactions in a single pass under cs_main, coalescing RCU
++ * snapshot publication via CTxMemPool::ScopedSnapshotDefer.
++ */
++PackageMempoolAcceptResult
++ProcessRawTxBatch(Chainstate &active_chainstate, CTxMemPool &pool,
++                  const Package &txns, bool test_accept,
++                  const CFeeRate &max_raw_tx_fee_rate = CFeeRate(Amount::zero()))
++    EXCLUSIVE_LOCKS_REQUIRED(cs_main);
++
+ /**
+  * Simple class for regulating resource usage during CheckInputScripts (and
+  * CScriptCheck), atomic so as to be compatible with parallel validation.
+diff --git a/test/functional/lotus_v2_loopback_tps_stress.py b/test/functional/lotus_v2_loopback_tps_stress.py
+new file mode 100755
+index 0000000000..689939d49b
+--- /dev/null
++++ b/test/functional/lotus_v2_loopback_tps_stress.py
+@@ -0,0 +1,886 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Multi-Node Loopback TPS Stress Test & Benchmark Suite for Lotus V2 (lotusd)."""
++
++import base64
++import http.client
++import json
++import math
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import threading
++import time
++from pathlib import Path
++
++# Add functional test framework to sys.path for transaction construction & signing
++SCRIPT_DIR = Path(__file__).resolve().parent
++if (SCRIPT_DIR / "test_framework").is_dir():
++    sys.path.insert(0, str(SCRIPT_DIR))
++else:
++    sys.path.insert(0, str(SCRIPT_DIR / "test" / "functional"))
++
++from test_framework.address import ADDRESS_ECREG_P2SH_OP_TRUE, SCRIPTSIG_OP_TRUE
++from test_framework.hash import hash160
++from test_framework.key import ECKey
++from test_framework.messages import (
++    COutPoint,
++    CTransaction,
++    CTxIn,
++    CTxOut,
++    FromHex,
++    ToHex,
++)
++from test_framework.script import (
++    OP_CHECKSIG,
++    OP_DUP,
++    OP_EQUALVERIFY,
++    OP_HASH160,
++    CScript,
++)
++from test_framework.signature_hash import (
++    SIGHASH_ALL,
++    SIGHASH_FORKID,
++    SignatureHashForkId,
++)
++from test_framework.txtools import pad_tx
++
++LOTUSD_BIN = Path(
++    os.environ.get("LOTUSD", "/private/tmp/build-lotus-v2-stress/src/lotusd")
++)
++RPC_USER = "stressuser"
++RPC_PASS = "stresspass"
++AUTH_HEADER = "Basic " + base64.b64encode(
++    f"{RPC_USER}:{RPC_PASS}".encode("utf-8")
++).decode("ascii")
++
++# High ports in 31000-31999 range (strictly isolated)
++NODES_CFG = [
++    {"id": 0, "p2p_port": 31110, "rpc_port": 31111},
++    {"id": 1, "p2p_port": 31112, "rpc_port": 31113},
++    {"id": 2, "p2p_port": 31114, "rpc_port": 31115},
++]
++
++
++class KeepAliveRPCClient:
++    """Thread-local HTTP/1.1 keep-alive JSON-RPC client for minimal client overhead."""
++
++    def __init__(self, host: str, port: int, timeout: float = 180.0):
++        self.host = host
++        self.port = port
++        self.timeout = timeout
++        self._local = threading.local()
++        self._id = 0
++
++    def _get_conn(self) -> http.client.HTTPConnection:
++        conn = getattr(self._local, "conn", None)
++        if conn is None:
++            conn = http.client.HTTPConnection(
++                self.host, self.port, timeout=self.timeout
++            )
++            self._local.conn = conn
++        return conn
++
++    def _reset_conn(self):
++        conn = getattr(self._local, "conn", None)
++        if conn is not None:
++            try:
++                conn.close()
++            except Exception:
++                pass
++            self._local.conn = None
++
++    def call(self, method: str, params=None):
++        if params is None:
++            params = []
++        self._id += 1
++        payload = json.dumps(
++            {"jsonrpc": "2.0", "id": self._id, "method": method, "params": params}
++        ).encode("utf-8")
++        headers = {
++            "Authorization": AUTH_HEADER,
++            "Content-Type": "application/json",
++            "Connection": "keep-alive",
++        }
++        for attempt in range(3):
++            conn = self._get_conn()
++            try:
++                conn.request("POST", "/", body=payload, headers=headers)
++                resp = conn.getresponse()
++                body = resp.read()
++                data = json.loads(body.decode("utf-8"))
++                if data.get("error") is not None:
++                    raise RuntimeError(f"RPC {method} error: {data['error']}")
++                return data["result"]
++            except (
++                http.client.HTTPException,
++                ConnectionError,
++                OSError,
++            ):
++                self._reset_conn()
++                if attempt == 2:
++                    raise
++
++    def call_raw_payload(self, preencoded_json_bytes: bytes):
++        headers = {
++            "Authorization": AUTH_HEADER,
++            "Content-Type": "application/json",
++            "Connection": "keep-alive",
++        }
++        for attempt in range(3):
++            conn = self._get_conn()
++            try:
++                conn.request("POST", "/", body=preencoded_json_bytes, headers=headers)
++                resp = conn.getresponse()
++                body = resp.read()
++                data = json.loads(body.decode("utf-8"))
++                if data.get("error") is not None:
++                    raise RuntimeError(f"RPC raw error: {data['error']}")
++                return data["result"]
++            except (
++                http.client.HTTPException,
++                ConnectionError,
++                OSError,
++            ):
++                self._reset_conn()
++                if attempt == 2:
++                    raise
++
++
++def percentile(sorted_vals, pct: float) -> float:
++    if not sorted_vals:
++        return 0.0
++    idx = min(len(sorted_vals) - 1, max(0, int(math.ceil(pct / 100.0 * len(sorted_vals)) - 1)))
++    return sorted_vals[idx]
++
++
++def wait_for_rpc(client: KeepAliveRPCClient, timeout: float = 30.0, proc=None, err_path=None):
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        if proc is not None and proc.poll() is not None:
++            err_txt = Path(err_path).read_text() if err_path and Path(err_path).exists() else ""
++            raise RuntimeError(f"lotusd on port {client.port} exited with {proc.returncode}: {err_txt}")
++        try:
++            info = client.call("getblockchaininfo")
++            if isinstance(info, dict) and "blocks" in info:
++                return info
++        except Exception:
++            time.sleep(0.1)
++    raise TimeoutError(f"Node on port {client.port} did not become ready in {timeout}s")
++
++
++def sync_all_blocks(clients, timeout: float = 180.0, base_dir: Path = None):
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        hashes = [c.call("getbestblockhash") for c in clients]
++        if len(set(hashes)) == 1:
++            return hashes[0]
++        time.sleep(0.05)
++    if base_dir is not None:
++        for i in range(len(clients)):
++            dbg = base_dir / f"node{i}" / "regtest" / "debug.log"
++            if dbg.exists():
++                lines = dbg.read_text(errors="replace").splitlines()[-30:]
++                print(f"--- node{i} debug.log tail ---\n" + "\n".join(lines))
++    raise TimeoutError(f"Nodes failed to sync blocks within {timeout}s (heights={[c.call('getblockcount') for c in clients]})")
++
++
++def build_p2sh_op_true_tx(prev_txid_int: int, prev_vout: int, value_sats: int, spk_bytes: bytes) -> CTransaction:
++    tx = CTransaction()
++    tx.nVersion = 2
++    tx.vin = [CTxIn(COutPoint(prev_txid_int, prev_vout), SCRIPTSIG_OP_TRUE, 0xFFFFFFFE)]
++    tx.vout = [CTxOut(value_sats, CScript(spk_bytes))]
++    pad_tx(tx)
++    return tx
++
++
++def build_signed_p2pkh_tx(
++    prev_txid_int: int,
++    prev_vout: int,
++    in_value_sats: int,
++    out_value_sats: int,
++    privkey: ECKey,
++    pubkey_bytes: bytes,
++    p2pkh_spk: CScript,
++) -> CTransaction:
++    tx = CTransaction()
++    tx.nVersion = 2
++    tx.vin = [CTxIn(COutPoint(prev_txid_int, prev_vout), b"", 0xFFFFFFFE)]
++    tx.vout = [CTxOut(out_value_sats, p2pkh_spk)]
++    pad_tx(tx)
++    sighash = SignatureHashForkId(
++        p2pkh_spk, tx, 0, SIGHASH_ALL | SIGHASH_FORKID, in_value_sats
++    )
++    sig = privkey.sign_schnorr(sighash) + bytes([SIGHASH_ALL | SIGHASH_FORKID])
++    tx.vin[0].scriptSig = CScript([sig, pubkey_bytes])
++    return tx
++
++
++def main():
++    base_dir = Path(tempfile.mkdtemp(prefix="lotus-v2-stress-run-", dir="/private/tmp"))
++    procs = []
++    clients = []
++
++    print(f"[*] Using isolated stress-test directory: {base_dir}")
++    try:
++        # 1. Start 3 regtest lotusd nodes on loopback with high ports
++        for cfg in NODES_CFG:
++            node_dir = base_dir / f"node{cfg['id']}"
++            node_dir.mkdir(parents=True, exist_ok=True)
++            cmd = [
++                str(LOTUSD_BIN),
++                "-regtest",
++                f"-datadir={node_dir}",
++                f"-port={cfg['p2p_port']}",
++                f"-bind=127.0.0.1:{cfg['p2p_port']}",
++                f"-rpcport={cfg['rpc_port']}",
++                "-rpcallowip=127.0.0.1",
++                f"-rpcuser={RPC_USER}",
++                f"-rpcpassword={RPC_PASS}",
++                "-server=1",
++                "-listen=1",
++                "-listenonion=0",
++                "-discover=0",
++                "-dnsseed=0",
++                "-natpmp=0",
++                "-rpcthreads=16",
++                "-rpcworkqueue=2048",
++                "-par=8",
++                "-maxmempool=500",
++                "-checkmempool=0",
++                "-whitelist=127.0.0.1",
++            ]
++            err_log = open(node_dir / "stderr.log", "w")
++            proc = subprocess.Popen(
++                cmd, stdout=subprocess.DEVNULL, stderr=err_log
++            )
++            procs.append(proc)
++            clients.append(KeepAliveRPCClient("127.0.0.1", cfg["rpc_port"]))
++
++        for idx, c in enumerate(clients):
++            wait_for_rpc(c, proc=procs[idx], err_path=base_dir / f"node{idx}" / "stderr.log")
++        print("[*] All 3 lotusd regtest nodes started and responding to RPC.")
++
++        # Connect Node 0 <-> Node 1 <-> Node 2
++        clients[0].call("addnode", [f"127.0.0.1:{NODES_CFG[1]['p2p_port']}", "onetry"])
++        clients[0].call("addnode", [f"127.0.0.1:{NODES_CFG[2]['p2p_port']}", "onetry"])
++        clients[1].call("addnode", [f"127.0.0.1:{NODES_CFG[2]['p2p_port']}", "onetry"])
++
++        deadline = time.monotonic() + 15.0
++        while time.monotonic() < deadline:
++            if (
++                len(clients[0].call("getpeerinfo")) >= 2
++                and len(clients[1].call("getpeerinfo")) >= 2
++            ):
++                break
++            time.sleep(0.05)
++        print(
++            f"[*] P2P mesh established: node0 peers={len(clients[0].call('getpeerinfo'))}, "
++            f"node1 peers={len(clients[1].call('getpeerinfo'))}, "
++            f"node2 peers={len(clients[2].call('getpeerinfo'))}"
++        )
++
++        # 2. Mine 140 blocks to mature 40 coinbase UTXOs
++        op_true_spk_hex = clients[0].call(
++            "validateaddress", [ADDRESS_ECREG_P2SH_OP_TRUE]
++        )["scriptPubKey"]
++        op_true_spk = bytes.fromhex(op_true_spk_hex)
++
++        privkey = ECKey()
++        privkey.set((42).to_bytes(32, "big"), True)
++        pubkey_bytes = privkey.get_pubkey().get_bytes()
++        p2pkh_spk = CScript(
++            [OP_DUP, OP_HASH160, hash160(pubkey_bytes), OP_EQUALVERIFY, OP_CHECKSIG]
++        )
++
++        block_hashes = clients[0].call(
++            "generatetoaddress", [140, ADDRESS_ECREG_P2SH_OP_TRUE]
++        )
++        sync_all_blocks(clients, base_dir=base_dir)
++
++        # Extract the first 35 mature coinbase transactions
++        mature_cb_utxos = []
++        for bh in block_hashes[:35]:
++            blk = clients[0].call("getblock", [bh, 2])
++            cb_tx = blk["tx"][0]
++            txid_hex = cb_tx["txid"]
++            val_sats = int(round(float(cb_tx["vout"][0]["value"]) * 100))
++            mature_cb_utxos.append((int(txid_hex, 16), 0, val_sats))
++
++        # 3. Create 6,000 independent OP_TRUE UTXOs (30 fan-out txs x 200 outputs)
++        #    and 2,000 independent P2PKH UTXOs (10 fan-out txs x 200 outputs)
++        print("[*] Pre-funding 6,000 P2SH(OP_TRUE) UTXOs and 2,000 P2PKH UTXOs...")
++        op_true_utxos = []
++        p2pkh_utxos = []
++
++        fanout_hex_batch = []
++        for i in range(25):
++            cb_txid_int, cb_vout, cb_sats = mature_cb_utxos[i]
++            tx = CTransaction()
++            tx.nVersion = 2
++            tx.vin = [CTxIn(COutPoint(cb_txid_int, cb_vout), SCRIPTSIG_OP_TRUE, 0xFFFFFFFE)]
++            per_out = (cb_sats - 200_000) // 240
++            tx.vout = [CTxOut(per_out, CScript(op_true_spk)) for _ in range(240)]
++            pad_tx(tx)
++            fanout_hex_batch.append(ToHex(tx))
++            txid_int = tx.txid_int
++            for vout_idx in range(240):
++                op_true_utxos.append((txid_int, vout_idx, per_out))
++
++        for i in range(25, 35):
++            cb_txid_int, cb_vout, cb_sats = mature_cb_utxos[i]
++            tx = CTransaction()
++            tx.nVersion = 2
++            tx.vin = [CTxIn(COutPoint(cb_txid_int, cb_vout), SCRIPTSIG_OP_TRUE, 0xFFFFFFFE)]
++            per_out = (cb_sats - 200_000) // 200
++            tx.vout = [CTxOut(per_out, p2pkh_spk) for _ in range(200)]
++            pad_tx(tx)
++            fanout_hex_batch.append(ToHex(tx))
++            txid_int = tx.txid_int
++            for vout_idx in range(200):
++                p2pkh_utxos.append((txid_int, vout_idx, per_out))
++
++        for chunk_start in range(0, len(fanout_hex_batch), 10):
++            res = clients[0].call("submitrawtxbatch", [fanout_hex_batch[chunk_start : chunk_start + 10]])
++            assert res["accepted"], f"Fan-out batch failed: {res}"
++        clients[0].call("generatetoaddress", [1, ADDRESS_ECREG_P2SH_OP_TRUE])
++        sync_all_blocks(clients, base_dir=base_dir)
++        print(
++            f"[*] Funded and synced {len(op_true_utxos)} OP_TRUE UTXOs and "
++            f"{len(p2pkh_utxos)} P2PKH UTXOs across all 3 nodes at height "
++            f"{clients[0].call('getblockcount')}."
++        )
++
++        # Check whether submitrawtxbatch supports >50 tx batches natively
++        supports_large_batch = True
++        try:
++            clients[0].call("testrawtxbatch", [fanout_hex_batch * 2])
++        except Exception as e:
++            if "between 1 and 50" in str(e):
++                supports_large_batch = False
++        print(f"[*] Native >50 tx batch support: {supports_large_batch}")
++
++        # 4. Pre-construct & pre-sign all transactions in memory BEFORE starting clocks
++        print("[*] Pre-constructing 6,000 OP_TRUE txs and 2,000 Schnorr-signed P2PKH txs in memory...")
++        t_prep0 = time.perf_counter()
++        prebuilt_op_true_hex = []
++        prebuilt_op_true_next_utxos = []
++        for txid_int, vout_idx, sats in op_true_utxos:
++            next_sats = sats - 1000
++            tx = build_p2sh_op_true_tx(txid_int, vout_idx, next_sats, op_true_spk)
++            prebuilt_op_true_hex.append(ToHex(tx))
++            prebuilt_op_true_next_utxos.append((tx.txid_int, 0, next_sats))
++
++        # Also pre-build Round 2 of 6,000 OP_TRUE txs spending Round 1 outputs
++        prebuilt_op_true_r2_hex = []
++        for txid_int, vout_idx, sats in prebuilt_op_true_next_utxos:
++            next_sats = sats - 1000
++            tx = build_p2sh_op_true_tx(txid_int, vout_idx, next_sats, op_true_spk)
++            prebuilt_op_true_r2_hex.append(ToHex(tx))
++
++        prebuilt_p2pkh_hex = []
++        for txid_int, vout_idx, sats in p2pkh_utxos:
++            next_sats = sats - 1000
++            tx = build_signed_p2pkh_tx(
++                txid_int, vout_idx, sats, next_sats, privkey, pubkey_bytes, p2pkh_spk
++            )
++            prebuilt_p2pkh_hex.append(ToHex(tx))
++        t_prep1 = time.perf_counter()
++        print(
++            f"[*] Pre-constructed 14,000 transactions in {t_prep1 - t_prep0:.2f}s "
++            f"(avg P2PKH tx={len(prebuilt_p2pkh_hex[0]) // 2}B, OP_TRUE tx={len(prebuilt_op_true_hex[0]) // 2}B)."
++        )
++
++        results = {"supports_large_batch": supports_large_batch}
++
++        # =====================================================================
++        # BENCHMARK A: Batch RPC Ingestion & Validation TPS
++        # =====================================================================
++        print("\n=== Running Benchmark A: Batch RPC Ingestion & Validation TPS ===")
++
++        def run_batch_ingestion(tx_hex_list, batch_size: int, num_workers: int, target_port: int):
++            eff_batch_size = min(batch_size, 50) if not supports_large_batch else batch_size
++            batches = []
++            for idx in range(0, len(tx_hex_list), eff_batch_size):
++                chunk = tx_hex_list[idx : idx + eff_batch_size]
++                body = json.dumps(
++                    {
++                        "jsonrpc": "2.0",
++                        "id": idx,
++                        "method": "submitrawtxbatch",
++                        "params": [chunk],
++                    }
++                ).encode("utf-8")
++                batches.append((len(chunk), body))
++
++            q_lock = threading.Lock()
++            next_idx = [0]
++            latencies_ms = []
++            accepted_txs = [0]
++
++            def worker():
++                local_client = KeepAliveRPCClient("127.0.0.1", target_port)
++                # Warm up TCP connection before barrier
++                local_client.call("getBlockCount" if False else "getblockcount")
++                local_lats = []
++                local_acc = 0
++                while True:
++                    with q_lock:
++                        i = next_idx[0]
++                        if i >= len(batches):
++                            break
++                        next_idx[0] = i + 1
++                    count, body = batches[i]
++                    t0 = time.perf_counter()
++                    r = local_client.call_raw_payload(body)
++                    t1 = time.perf_counter()
++                    if not r.get("accepted"):
++                        raise RuntimeError(f"Batch rejected: {r}")
++                    local_lats.append((t1 - t0) * 1000.0)
++                    local_acc += count
++                with q_lock:
++                    latencies_ms.extend(local_lats)
++                    accepted_txs[0] += local_acc
++
++            # Pre-warm worker threads
++            threads = [threading.Thread(target=worker) for _ in range(num_workers)]
++            t_start = time.perf_counter()
++            for th in threads:
++                th.start()
++            for th in threads:
++                th.join()
++            t_end = time.perf_counter()
++
++            elapsed = t_end - t_start
++            latencies_ms.sort()
++            tps = accepted_txs[0] / elapsed
++            return {
++                "tx_count": accepted_txs[0],
++                "batch_size": batch_size,
++                "workers": num_workers,
++                "elapsed_sec": elapsed,
++                "tps": tps,
++                "batch_p50_ms": percentile(latencies_ms, 50),
++                "batch_p95_ms": percentile(latencies_ms, 95),
++                "batch_p99_ms": percentile(latencies_ms, 99),
++                "per_tx_p50_us": (percentile(latencies_ms, 50) * 1000.0) / batch_size,
++                "per_tx_p95_us": (percentile(latencies_ms, 95) * 1000.0) / batch_size,
++                "per_tx_p99_us": (percentile(latencies_ms, 99) * 1000.0) / batch_size,
++            }
++
++        # A1: 500 Schnorr-Signed P2PKH transactions (batch=200, workers=8)
++        res_a1 = run_batch_ingestion(
++            prebuilt_p2pkh_hex[:500], batch_size=200, num_workers=8, target_port=NODES_CFG[0]["rpc_port"]
++        )
++        results["bench_a_schnorr_p2pkh_b200"] = res_a1
++        print(
++            f"[A1] Schnorr-Signed P2PKH (500 txs, batch=200, 8 workers): "
++            f"{res_a1['tps']:.1f} tx/s | batch p50={res_a1['batch_p50_ms']:.2f}ms "
++            f"p95={res_a1['batch_p95_ms']:.2f}ms p99={res_a1['batch_p99_ms']:.2f}ms"
++        )
++
++        # Wait for Nodes 1 & 2 to finish receiving the 500 P2PKH txs before mining block
++        t_a1_wait = time.perf_counter()
++        while time.perf_counter() - t_a1_wait < 60.0:
++            if clients[1].call("getmempoolinfo")["size"] >= 500 and clients[2].call("getmempoolinfo")["size"] >= 500:
++                break
++            time.sleep(0.05)
++
++        # Mine a block to clear the 500 P2PKH txs before testing batch size scaling
++        clients[0].call("generatetoaddress", [1, ADDRESS_ECREG_P2SH_OP_TRUE])
++        sync_all_blocks(clients, base_dir=base_dir)
++
++        # Start 2-second macOS /usr/bin/sample profiler on Node 0 during Benchmark A2
++        sample_out = Path("/private/tmp/lotus-v2-node0-sample.txt")
++        sample_proc = None
++        if not sample_out.exists():
++            try:
++                sample_proc = subprocess.Popen(
++                    ["/usr/bin/sample", str(procs[0].pid), "2", "1", "-file", str(sample_out)],
++                    stdout=subprocess.DEVNULL,
++                    stderr=subprocess.DEVNULL,
++                )
++            except Exception:
++                sample_proc = None
++
++        # A2: Compare single sendrawtransaction (batch=1) vs submitrawtxbatch (batch=50, 100, 250, 500)
++        # Slice 500 OP_TRUE Round 1 txs:
++        # - 50 txs for batch=1
++        # - 50 txs for batch=50
++        # - 100 txs for batch=100
++        # - 100 txs for batch=250
++        # - 200 txs for batch=500
++        res_b1 = run_batch_ingestion(
++            prebuilt_op_true_hex[0:50], batch_size=1, num_workers=8, target_port=NODES_CFG[0]["rpc_port"]
++        )
++        res_b50 = run_batch_ingestion(
++            prebuilt_op_true_hex[50:100], batch_size=50, num_workers=8, target_port=NODES_CFG[0]["rpc_port"]
++        )
++        res_b100 = run_batch_ingestion(
++            prebuilt_op_true_hex[100:200], batch_size=100, num_workers=8, target_port=NODES_CFG[0]["rpc_port"]
++        )
++        res_b250 = run_batch_ingestion(
++            prebuilt_op_true_hex[200:300], batch_size=250, num_workers=8, target_port=NODES_CFG[0]["rpc_port"]
++        )
++        res_b500 = run_batch_ingestion(
++            prebuilt_op_true_hex[300:500], batch_size=500, num_workers=8, target_port=NODES_CFG[0]["rpc_port"]
++        )
++        if sample_proc is not None:
++            try:
++                sample_proc.wait(timeout=5)
++            except Exception:
++                pass
++        results["bench_a_b1"] = res_b1
++        results["bench_a_b50"] = res_b50
++        results["bench_a_b100"] = res_b100
++        results["bench_a_b250"] = res_b250
++        results["bench_a_b500"] = res_b500
++
++        for label, r in [
++            ("batch=1", res_b1),
++            ("batch=50", res_b50),
++            ("batch=100", res_b100),
++            ("batch=250", res_b250),
++            ("batch=500", res_b500),
++        ]:
++            print(
++                f"[A2] {label:10s} ({r['tx_count']} txs): {r['tps']:8.1f} tx/s | "
++                f"batch p50={r['batch_p50_ms']:6.2f}ms p95={r['batch_p95_ms']:6.2f}ms p99={r['batch_p99_ms']:6.2f}ms | "
++                f"per-tx p50={r['per_tx_p50_us']:6.1f}us"
++            )
++
++        # Verify Node 0 mempool has all 500 transactions!
++        mp0_info = clients[0].call("getmempoolinfo")
++        print(f"[*] Node 0 mempool after Benchmark A: size={mp0_info['size']} bytes={mp0_info['bytes']}")
++
++        # Wait for Nodes 1 & 2 to finish syncing the 500 txs over P2P before Benchmark C & D
++        t_wait0 = time.perf_counter()
++        while time.perf_counter() - t_wait0 < 60.0:
++            s1 = clients[1].call("getmempoolinfo")["size"]
++            s2 = clients[2].call("getmempoolinfo")["size"]
++            if s1 >= 500 and s2 >= 500:
++                break
++            time.sleep(0.05)
++
++        # =====================================================================
++        # BENCHMARK C: Concurrent Lock-Free Read RPCs Under Heavy Write Load
++        # =====================================================================
++        print("\n=== Running Benchmark C: Concurrent Lock-Free Read RPCs Under Heavy Write Load ===")
++        # Sample a confirmed txid/outpoint and a mempool txid for gettxout & getrawtransaction
++        sample_mp_txids = clients[0].call("getrawmempool", [False])
++        sample_txid = sample_mp_txids[0]
++        best_hash = clients[0].call("getbestblockhash")
++        best_height = clients[0].call("getblockcount")
++
++        # C1: Unloaded Lock-Free Read RPC Throughput (12 reader threads, 3.0 seconds)
++        read_methods = [
++            ("getblockchaininfo", []),
++            ("getmempoolinfo", []),
++            ("getrawmempool", [False]),
++            ("gettxout", [sample_txid, 0, True]),
++            ("getrawtransaction", [sample_txid, False]),
++            ("getblocktemplate", [{"rules": ["lotus_v2"]}]),
++            ("getblockheader", [best_hash, True]),
++            ("getblockhash", [best_height]),
++        ]
++
++        def run_read_benchmark(duration_sec: float, num_readers: int, writer_fn=None):
++            stop_flag = threading.Event()
++            per_method_lats = {m: [] for m, _ in read_methods}
++            lock = threading.Lock()
++
++            def reader_worker(tid: int):
++                rc = KeepAliveRPCClient("127.0.0.1", NODES_CFG[0]["rpc_port"])
++                rc.call("getblockcount")
++                local_lats = {m: [] for m, _ in read_methods}
++                step = tid
++                while not stop_flag.is_set():
++                    m, params = read_methods[step % len(read_methods)]
++                    step += 1
++                    t0 = time.perf_counter()
++                    rc.call(m, params)
++                    t1 = time.perf_counter()
++                    local_lats[m].append((t1 - t0) * 1000.0)
++                with lock:
++                    for m in local_lats:
++                        per_method_lats[m].extend(local_lats[m])
++
++            writer_stats = {"batches": 0, "txs": 0}
++            writer_thread = None
++            if writer_fn is not None:
++                writer_thread = threading.Thread(
++                    target=writer_fn, args=(stop_flag, writer_stats)
++                )
++
++            readers = [
++                threading.Thread(target=reader_worker, args=(i,))
++                for i in range(num_readers)
++            ]
++            t0 = time.perf_counter()
++            if writer_thread is not None:
++                writer_thread.start()
++            for r in readers:
++                r.start()
++            time.sleep(duration_sec)
++            stop_flag.set()
++            for r in readers:
++                r.join()
++            if writer_thread is not None:
++                writer_thread.join()
++            t1 = time.perf_counter()
++            elapsed = t1 - t0
++
++            summary = {}
++            total_reqs = 0
++            all_lats = []
++            for m, _ in read_methods:
++                lats = sorted(per_method_lats[m])
++                total_reqs += len(lats)
++                all_lats.extend(lats)
++                summary[m] = {
++                    "count": len(lats),
++                    "rps": len(lats) / elapsed,
++                    "p50_ms": percentile(lats, 50),
++                    "p95_ms": percentile(lats, 95),
++                    "p99_ms": percentile(lats, 99),
++                }
++            all_lats.sort()
++            return {
++                "elapsed_sec": elapsed,
++                "total_reqs": total_reqs,
++                "total_rps": total_reqs / elapsed,
++                "overall_p50_ms": percentile(all_lats, 50),
++                "overall_p95_ms": percentile(all_lats, 95),
++                "overall_p99_ms": percentile(all_lats, 99),
++                "methods": summary,
++                "writer_stats": writer_stats,
++            }
++
++        res_c_unloaded = run_read_benchmark(duration_sec=2.5, num_readers=12, writer_fn=None)
++        results["bench_c_unloaded"] = res_c_unloaded
++        print(
++            f"[C1] Unloaded Lock-Free Read RPCs (12 threads, 500-tx mempool): "
++            f"{res_c_unloaded['total_rps']:.1f} req/s | overall p50={res_c_unloaded['overall_p50_ms']:.3f}ms "
++            f"p95={res_c_unloaded['overall_p95_ms']:.3f}ms p99={res_c_unloaded['overall_p99_ms']:.3f}ms"
++        )
++
++        c2_txs = prebuilt_op_true_hex[1000:1300]
++        b1_txs = prebuilt_op_true_hex[1300:1800]
++        b2_txs = prebuilt_op_true_hex[1800:2300]
++
++        def heavy_writer(stop_flag: threading.Event, stats: dict):
++            wc = KeepAliveRPCClient("127.0.0.1", NODES_CFG[0]["rpc_port"])
++            offset = 0
++            bsize = 50 if not supports_large_batch else 100
++            while not stop_flag.is_set() and offset < len(c2_txs):
++                chunk = c2_txs[offset : offset + bsize]
++                offset += bsize
++                r = wc.call("submitrawtxbatch", [chunk])
++                if r.get("accepted"):
++                    stats["batches"] += 1
++                    stats["txs"] += len(chunk)
++
++        res_c_loaded = run_read_benchmark(
++            duration_sec=2.5, num_readers=12, writer_fn=heavy_writer
++        )
++        results["bench_c_loaded"] = res_c_loaded
++        print(
++            f"[C2] Loaded Lock-Free Read RPCs (while ingesting {res_c_loaded['writer_stats']['txs']} txs): "
++            f"{res_c_loaded['total_rps']:.1f} req/s | overall p50={res_c_loaded['overall_p50_ms']:.3f}ms "
++            f"p95={res_c_loaded['overall_p95_ms']:.3f}ms p99={res_c_loaded['overall_p99_ms']:.3f}ms"
++        )
++        for m, mstat in res_c_loaded["methods"].items():
++            print(
++                f"     - {m:20s}: {mstat['rps']:7.1f} req/s | "
++                f"p50={mstat['p50_ms']:.3f}ms p95={mstat['p95_ms']:.3f}ms p99={mstat['p99_ms']:.3f}ms"
++            )
++
++        # Wait for the C2 transactions to settle across all 3 nodes before D1/D2
++        t_c2_settle = time.perf_counter()
++        while time.perf_counter() - t_c2_settle < 30.0:
++            s0 = clients[0].call("getmempoolinfo")["size"]
++            s1 = clients[1].call("getmempoolinfo")["size"]
++            s2 = clients[2].call("getmempoolinfo")["size"]
++            if s1 >= s0 and s2 >= s0:
++                break
++            time.sleep(0.05)
++
++        # =====================================================================
++        # BENCHMARK D: O(1) Block Assembly & tmplblock Relay
++        # =====================================================================
++        print("\n=== Running Benchmark D: O(1) Block Assembly & tmplblock Relay ===")
++        gbt_lats_ms = []
++        last_gbt = None
++        for _ in range(50):
++            t0 = time.perf_counter()
++            last_gbt = clients[0].call("getblocktemplate", [{"rules": ["lotus_v2"]}])
++            t1 = time.perf_counter()
++            gbt_lats_ms.append((t1 - t0) * 1000.0)
++        gbt_lats_ms.sort()
++        gbt_tx_count = len(last_gbt["transactions"])
++        print(
++            f"[D1] O(1) getblocktemplate ({gbt_tx_count} mempool txs): "
++            f"p50={percentile(gbt_lats_ms, 50):.3f}ms p95={percentile(gbt_lats_ms, 95):.3f}ms "
++            f"p99={percentile(gbt_lats_ms, 99):.3f}ms"
++        )
++
++        t_mine0 = time.perf_counter()
++        mined_hashes = clients[0].call("generatetoaddress", [1, ADDRESS_ECREG_P2SH_OP_TRUE])
++        t_mine1 = time.perf_counter()
++        mined_bh = mined_hashes[0]
++        sync_all_blocks(clients, base_dir=base_dir)
++        t_sync1 = time.perf_counter()
++
++        blk_info = clients[0].call("getblock", [mined_bh, 2])
++        full_block_hex = clients[0].call("getblock", [mined_bh, 0])
++        full_block_bytes = len(full_block_hex) // 2
++        cb_tx_hex = blk_info["tx"][0]["hex"]
++        cb_tx_bytes = len(cb_tx_hex) // 2
++        # CompactTemplateBlock wire size = 138B V2 Header + CompactSize + CoinbaseTx
++        tmplblock_wire_bytes = 138 + 1 + cb_tx_bytes
++
++        mine_ms = (t_mine1 - t_mine0) * 1000.0
++        relay_and_connect_ms = (t_sync1 - t_mine0) * 1000.0
++        compression_ratio = full_block_bytes / tmplblock_wire_bytes
++
++        results["bench_d_block"] = {
++            "tx_count": len(blk_info["tx"]),
++            "full_block_bytes": full_block_bytes,
++            "coinbase_tx_bytes": cb_tx_bytes,
++            "tmplblock_wire_bytes": tmplblock_wire_bytes,
++            "compression_ratio": compression_ratio,
++            "gbt_p50_ms": percentile(gbt_lats_ms, 50),
++            "gbt_p95_ms": percentile(gbt_lats_ms, 95),
++            "gbt_p99_ms": percentile(gbt_lats_ms, 99),
++            "mine_and_connect_node0_ms": mine_ms,
++            "mine_and_connect_node0_tps": len(blk_info["tx"]) / (t_mine1 - t_mine0),
++            "three_node_relay_and_connect_ms": relay_and_connect_ms,
++            "three_node_relay_and_connect_tps": len(blk_info["tx"]) / (t_sync1 - t_mine0),
++        }
++        print(
++            f"[D2] Mined & connected {len(blk_info['tx'])}-tx block ({full_block_bytes:,} B vs "
++            f"{tmplblock_wire_bytes} B tmplblock = {compression_ratio:.1f}x compression): "
++            f"Node0={mine_ms:.2f}ms ({results['bench_d_block']['mine_and_connect_node0_tps']:.0f} tx/s), "
++            f"3-Node Sync={relay_and_connect_ms:.2f}ms ({results['bench_d_block']['three_node_relay_and_connect_tps']:.0f} tx/s)"
++        )
++
++        # B1: Push 500 txs into Node 0 and time exact P2P inv trickle propagation to Node 1 and Node 2
++        base_mp1 = clients[1].call("getmempoolinfo")["size"]
++        base_mp2 = clients[2].call("getmempoolinfo")["size"]
++        t_p2p0 = time.perf_counter()
++        run_batch_ingestion(
++            b1_txs, batch_size=250, num_workers=6, target_port=NODES_CFG[0]["rpc_port"]
++        )
++        t_ingest_done = time.perf_counter()
++
++        n1_done_t = None
++        n2_done_t = None
++        while time.perf_counter() - t_p2p0 < 60.0:
++            s1 = clients[1].call("getmempoolinfo")["size"] - base_mp1
++            s2 = clients[2].call("getmempoolinfo")["size"] - base_mp2
++            now = time.perf_counter()
++            if s1 >= len(b1_txs) and n1_done_t is None:
++                n1_done_t = now
++            if s2 >= len(b1_txs) and n2_done_t is None:
++                n2_done_t = now
++            if n1_done_t is not None and n2_done_t is not None:
++                break
++            time.sleep(0.01)
++
++        p2p_n1_sec = (n1_done_t or time.perf_counter()) - t_p2p0
++        p2p_n2_sec = (n2_done_t or time.perf_counter()) - t_p2p0
++        p2p_both_sec = max(p2p_n1_sec, p2p_n2_sec)
++
++        # B2: Multi-Node Parallel Batch Ingestion across all 3 nodes simultaneously (500 txs)
++        t_multi0 = time.perf_counter()
++        threads_multi = []
++        for node_idx in range(3):
++            th = threading.Thread(
++                target=run_batch_ingestion,
++                args=(b2_txs, 250, 4, NODES_CFG[node_idx]["rpc_port"]),
++            )
++            threads_multi.append(th)
++        for th in threads_multi:
++            th.start()
++        for th in threads_multi:
++            th.join()
++        t_multi1 = time.perf_counter()
++        multi_sec = t_multi1 - t_multi0
++
++        results["bench_b_p2p_propagation"] = {
++            "tx_count": len(b1_txs),
++            "node0_ingest_sec": t_ingest_done - t_p2p0,
++            "node0_ingest_tps": len(b1_txs) / (t_ingest_done - t_p2p0),
++            "node1_p2p_sync_sec": p2p_n1_sec,
++            "node1_p2p_sync_tps": len(b1_txs) / p2p_n1_sec,
++            "node2_p2p_sync_sec": p2p_n2_sec,
++            "node2_p2p_sync_tps": len(b1_txs) / p2p_n2_sec,
++            "all_nodes_p2p_sync_sec": p2p_both_sec,
++            "all_nodes_p2p_sync_tps": len(b1_txs) / p2p_both_sec,
++            "multi_node_direct_batch_sec": multi_sec,
++            "multi_node_direct_batch_tps": len(b2_txs) / multi_sec,
++        }
++        print(
++            f"[B1] P2P Trickle/Broadcast Propagation ({len(b1_txs)} txs, Node0 -> Node1 & Node2): "
++            f"Node1={p2p_n1_sec:.2f}s ({len(b1_txs) / p2p_n1_sec:.1f} tx/s), "
++            f"Node2={p2p_n2_sec:.2f}s ({len(b1_txs) / p2p_n2_sec:.1f} tx/s)"
++        )
++        print(
++            f"[B2] Multi-Node Synchronized Batch Ingestion ({len(b2_txs)} txs -> all 3 nodes): "
++            f"{multi_sec:.3f}s ({len(b2_txs) / multi_sec:.1f} cluster tx/s)"
++        )
++
++        if supports_large_batch:
++            clients[0].call("generatetoaddress", [1, ADDRESS_ECREG_P2SH_OP_TRUE])
++            sync_all_blocks(clients, base_dir=base_dir)
++            burst_txs = (
++                prebuilt_op_true_hex[500:1000]
++                + prebuilt_op_true_hex[2300:6000]
++                + prebuilt_op_true_r2_hex[0:500]
++            )
++            res_burst = run_batch_ingestion(
++                burst_txs, batch_size=1000, num_workers=8, target_port=NODES_CFG[0]["rpc_port"]
++            )
++            results["bench_a_high_scale_4700_b1000"] = res_burst
++            print(
++                f"[A3] High-Scale Burst ({res_burst['tx_count']} txs, batch=1000, 8 workers): "
++                f"{res_burst['tps']:.1f} tx/s | batch p50={res_burst['batch_p50_ms']:.2f}ms "
++                f"p95={res_burst['batch_p95_ms']:.2f}ms | per-tx p50={res_burst['per_tx_p50_us']:.1f}us"
++            )
++            clients[0].call("generatetoaddress", [1, ADDRESS_ECREG_P2SH_OP_TRUE])
++            sync_all_blocks(clients, base_dir=base_dir)
++            res_a1_1000 = run_batch_ingestion(
++                prebuilt_p2pkh_hex[500:1500], batch_size=200, num_workers=8, target_port=NODES_CFG[0]["rpc_port"]
++            )
++            results["bench_a_schnorr_p2pkh_1000_b200"] = res_a1_1000
++            print(
++                f"[A1b] Schnorr-Signed P2PKH (1000 txs, batch=200, 8 workers): "
++                f"{res_a1_1000['tps']:.1f} tx/s | batch p50={res_a1_1000['batch_p50_ms']:.2f}ms "
++                f"p95={res_a1_1000['batch_p95_ms']:.2f}ms p99={res_a1_1000['batch_p99_ms']:.2f}ms"
++            )
++
++        # Save JSON results
++        out_json = Path("/private/tmp/lotus-v2-loopback-stress-results.json")
++        out_json.write_text(json.dumps(results, indent=2))
++        print(f"\n[*] Saved complete benchmark metrics to {out_json}")
++
++    finally:
++        for p in procs:
++            try:
++                p.terminate()
++                p.wait(timeout=10)
++            except Exception:
++                try:
++                    p.kill()
++                except Exception:
++                    pass
++        shutil.rmtree(base_dir, ignore_errors=True)
++        print(f"[*] Cleaned up temporary stress directory {base_dir}")
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.50.1 (Apple Git-155)
+

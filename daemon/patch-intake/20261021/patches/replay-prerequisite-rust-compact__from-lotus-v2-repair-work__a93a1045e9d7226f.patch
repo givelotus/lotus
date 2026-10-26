@@ -1,0 +1,187 @@
+From cbdea9068226fffdbed3b44cab424ba6431acff0 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 19:25:08 -0700
+Subject: [PATCH] chronik(v2): keep eCash's compact UtxoDataOutput duplicate
+ entries
+
+v2/026 "chronik(v2): isolate MDBX access and persist branch, asset and
+explorer indexes" is a split of v2/012, which predates ecash/007
+"chronik: migrate index storage and merge operations to MDBX". Its copy of
+chronik-db/src/group.rs dropped ecash/007's UtxoDataOutput dup encoding
+(sats LE8 || raw script) and gave UtxoData a default postcard
+ser_dup_data/deser_dup_data, so on V2 the token_id_utxo, lokad_id_utxo and
+txid_utxo (and plugin) duplicate entries were written in a second layout
+(zigzag varint sats || varint length || script) through a separate code
+path. Nothing V2-specific needs it: the V2 groups (groups/v2.rs) use
+UtxoDataValue, whose layout v2/026 did not change.
+
+Restore group.rs to ecash/007 (required ser_dup_data/deser_dup_data, the
+compact UtxoDataOutput impl) and decode_utxo_dup's ecash/007 error
+(DeserializeUnexpectedEnd over the whole entry). v2/026's other changes to
+group_utxos.rs stay: dupsort by FIXED_DUP_SIZE, exact-value delete of
+fixed-size entries when the spent coin is known, the compaction filter
+and the visitor-based reads. A new test pins the bytes.
+
+Tier: V2 (fixup to v2/026 chronik(v2): isolate MDBX access and persist branch, asset and explorer indexes)
+---
+ chronik/chronik-db/src/group.rs          | 42 ++++++++++-------
+ chronik/chronik-db/src/io/group_utxos.rs | 60 +++++++++++++++++++++++-
+ 2 files changed, 84 insertions(+), 18 deletions(-)
+
+diff --git a/chronik/chronik-db/src/group.rs b/chronik/chronik-db/src/group.rs
+index b933726d8c..fc1dbb2187 100644
+--- a/chronik/chronik-db/src/group.rs
++++ b/chronik/chronik-db/src/group.rs
+@@ -133,27 +133,21 @@ pub trait Group {
+ pub trait UtxoData:
+     Default + for<'a> Deserialize<'a> + Serialize + 'static
+ {
+-    /// When `Some(size)`, the total encoded duplicate entry size (`12` bytes of
+-    /// big-endian `(tx_num, out_idx)` plus fixed-size `UtxoData`) is constant,
+-    /// enabling `MDBX_DUPFIXED` on the column family.
++    /// Total duplicate value byte size (`12 + data_size`) when the serialized
++    /// duplicate value has a fixed length (enabling `MDBX_DUPFIXED`), or `None`
++    /// when variable-length.
+     const FIXED_DUP_SIZE: Option<usize> = None;
+ 
+     /// Function that extracts the [`UtxoData`] from an output.
+     fn from_output(output: &TxOutput) -> Self;
+ 
+-    /// Append the serialized `UtxoData` payload for an `MDBX_DUPSORT` entry.
+-    fn ser_dup_data(&self, buf: &mut Vec<u8>) {
+-        buf.extend_from_slice(
+-            &crate::ser::db_serialize(self)
+-                .expect("UtxoData serialization should not fail"),
+-        );
+-    }
++    /// Append the compact duplicate-value payload after the 12-byte big-endian
++    /// `(tx_num, out_idx)` outpoint prefix.
++    fn ser_dup_data(&self, buf: &mut Vec<u8>);
+ 
+-    /// Deserialize the `UtxoData` payload from the suffix of an `MDBX_DUPSORT`
+-    /// entry.
+-    fn deser_dup_data(bytes: &[u8]) -> Option<Self> {
+-        crate::ser::db_deserialize(bytes).ok()
+-    }
++    /// Decode the compact duplicate-value payload following the 12-byte
++    /// big-endian `(tx_num, out_idx)` outpoint prefix.
++    fn deser_dup_data(bytes: &[u8]) -> Option<Self>;
+ }
+ 
+ /// [`UtxoData`] that only stores the output sats but not the script.
+@@ -162,7 +156,7 @@ pub trait UtxoData:
+ pub type UtxoDataValue = i64;
+ 
+ impl UtxoData for UtxoDataValue {
+-    const FIXED_DUP_SIZE: Option<usize> = Some(12 + 8);
++    const FIXED_DUP_SIZE: Option<usize> = Some(20);
+ 
+     fn from_output(output: &TxOutput) -> Self {
+         output.sats
+@@ -183,9 +177,25 @@ impl UtxoData for UtxoDataValue {
+ pub type UtxoDataOutput = (i64, Bytes);
+ 
+ impl UtxoData for UtxoDataOutput {
++    const FIXED_DUP_SIZE: Option<usize> = None;
++
+     fn from_output(output: &TxOutput) -> Self {
+         (output.sats, output.script.bytecode().clone())
+     }
++
++    fn ser_dup_data(&self, buf: &mut Vec<u8>) {
++        buf.extend_from_slice(&self.0.to_le_bytes());
++        buf.extend_from_slice(&self.1);
++    }
++
++    fn deser_dup_data(bytes: &[u8]) -> Option<Self> {
++        if bytes.len() < 8 {
++            return None;
++        }
++        let arr: [u8; 8] = bytes[..8].try_into().ok()?;
++        let sats = i64::from_le_bytes(arr);
++        Some((sats, Bytes::copy_from_slice(&bytes[8..])))
++    }
+ }
+ 
+ /// Helper which returns the `G::Member`s of both inputs and outputs of the
+diff --git a/chronik/chronik-db/src/io/group_utxos.rs b/chronik/chronik-db/src/io/group_utxos.rs
+index f44fb134c5..3d7693a891 100644
+--- a/chronik/chronik-db/src/io/group_utxos.rs
++++ b/chronik/chronik-db/src/io/group_utxos.rs
+@@ -208,8 +208,8 @@ fn decode_utxo_dup<D: UtxoData>(bytes: &[u8]) -> Result<UtxoEntry<D>> {
+         D::deser_dup_data(&bytes[OUTPOINT_PREFIX_LEN..]).ok_or_else(|| {
+             crate::ser::SerError::DeserializeError {
+                 type_name: std::any::type_name::<D>(),
+-                error: postcard::Error::DeserializeBadEncoding,
+-                bytes: bytes[OUTPOINT_PREFIX_LEN..].to_vec(),
++                error: postcard::Error::DeserializeUnexpectedEnd,
++                bytes: bytes.to_vec(),
+             }
+         })?;
+     Ok(UtxoEntry {
+@@ -508,6 +508,62 @@ mod tests {
+         test::{make_inputs_tx, ser_value, ValueGroup},
+     };
+ 
++    use super::{decode_utxo_dup, encode_utxo_dup};
++    use crate::group::{UtxoDataOutput, UtxoDataValue};
++
++    #[test]
++    fn test_utxo_dup_layout() -> Result<()> {
++        // tx_num BE8 || out_idx BE4 || sats LE8 [|| raw script], as eCash
++        // writes it; the native Chronik reads and writes the same bytes.
++        let entry = UtxoEntry::<UtxoDataOutput> {
++            outpoint: DbOutpoint {
++                tx_num: 77,
++                out_idx: 2,
++            },
++            data: (546, vec![0x76, 0xa9].into()),
++        };
++        let ser = encode_utxo_dup(&entry);
++        assert_eq!(
++            hex::encode(&ser),
++            "000000000000004d00000002220200000000000076a9",
++        );
++        assert_eq!(decode_utxo_dup::<UtxoDataOutput>(&ser)?, entry);
++        let empty = UtxoEntry::<UtxoDataOutput> {
++            data: (0, vec![].into()),
++            ..entry.clone()
++        };
++        let ser = encode_utxo_dup(&empty);
++        assert_eq!(ser.len(), 20);
++        assert_eq!(decode_utxo_dup::<UtxoDataOutput>(&ser)?, empty);
++        let value = UtxoEntry::<UtxoDataValue> {
++            outpoint: entry.outpoint,
++            data: 546,
++        };
++        assert_eq!(
++            hex::encode(encode_utxo_dup(&value)),
++            "000000000000004d000000022202000000000000",
++        );
++
++        // Short payloads are reported over the whole entry.
++        assert_eq!(
++            decode_utxo_dup::<UtxoDataOutput>(&[0; 19])
++                .unwrap_err()
++                .to_string(),
++            "Inconsistent DB: Cannot deserialize byte sequence as (i64, \
++             bytes::bytes::Bytes): Hit the end of buffer, expected more \
++             data. Byte sequence: 00000000000000000000000000000000000000",
++        );
++        assert_eq!(
++            decode_utxo_dup::<UtxoDataValue>(&[0; 13])
++                .unwrap_err()
++                .to_string(),
++            "Inconsistent DB: Cannot deserialize byte sequence as i64: Hit \
++             the end of buffer, expected more data. Byte sequence: \
++             00000000000000000000000000",
++        );
++        Ok(())
++    }
++
+     #[test]
+     fn test_value_group_utxos() -> Result<()> {
+         abc_rust_error::install();
+-- 
+2.50.1 (Apple Git-155)
+

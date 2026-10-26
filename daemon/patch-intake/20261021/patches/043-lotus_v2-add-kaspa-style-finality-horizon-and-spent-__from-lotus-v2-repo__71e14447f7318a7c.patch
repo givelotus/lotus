@@ -1,0 +1,398 @@
+From 920e2fe8b36b91f194b56b6a8b7e6750bf4460b0 Mon Sep 17 00:00:00 2001
+From: Lotus V2 Builder <builder@lotus.org>
+Date: Sat, 17 Oct 2026 13:58:17 -0700
+Subject: [PATCH] lotus_v2: add Kaspa-style finality horizon and spent-undo
+ pruning
+
+Track the Avalanche/proof-of-work finality horizon in DiskStateStore and
+prune historical spent-coin undo records deeper than the finality window.
+---
+ src/lotus_v2/disk_state.cpp        | 137 +++++++++++++++++++++++-
+ src/lotus_v2/disk_state.h          |   9 ++
+ src/test/mempool_overlay_tests.cpp | 161 +++++++++++++++++++++++++++++
+ 3 files changed, 305 insertions(+), 2 deletions(-)
+
+diff --git a/src/lotus_v2/disk_state.cpp b/src/lotus_v2/disk_state.cpp
+index 95c8e9c588..9f00922ab6 100644
+--- a/src/lotus_v2/disk_state.cpp
++++ b/src/lotus_v2/disk_state.cpp
+@@ -709,6 +709,8 @@ struct DiskStateStore::Impl {
+     bool active{};
+     bool poisoned{};
+     std::optional<std::pair<Hash, uint64_t>> finalized;
++    uint64_t pruned_horizon_height{0};
++    std::optional<Hash> pruned_horizon_tip;
+     mutable DiskStateStats stats;
+     mutable QueryBudget *query{};
+     struct BudgetScope {
+@@ -778,7 +780,7 @@ struct DiskStateStore::Impl {
+     void RouteKey(BytesView key, MDBX_dbi &dbi_out, BytesView &subkey_out) const {
+         if (key == "V" || key == "S" || key == "I" || key == "J" ||
+             key == "K" || key == "P" || key == "R" || key == "T" ||
+-            key == "B_cursor" || key == "U_cursor") {
++            key == "B_cursor" || key == "U_cursor" || key == "H_prune") {
+             dbi_out = dbi_meta;
+             subkey_out = key;
+             return;
+@@ -1792,6 +1794,17 @@ bool DiskStateStore::Open(const std::string &directory, const DiskStateOptions &
+         if (options.header_index) (void)impl->CheckedActive();
+         if (options.recovery) (void)impl->Journal(options.recovery->max_journal_bytes);
+         if (options.candidates) (void)impl->View();
++        if (const Value hp = impl->Read("H_prune")) {
++            if (hp->size() == 41) {
++                Reader r{*hp};
++                impl->pruned_horizon_height = r.Int(8);
++                const uint64_t has_tip = r.Int(1);
++                const Hash h_tip = r.Digest();
++                if (has_tip) {
++                    impl->pruned_horizon_tip = h_tip;
++                }
++            }
++        }
+         out.impl_ = std::move(impl);
+     });
+ }
+@@ -2365,6 +2378,12 @@ bool DiskStateStore::PeelBlockStateReverse(
+         if (impl_->head.metadata.tip != expected_tip_h) {
+             Fail(DiskStateErrorCode::UndoMismatch, "reverse peel tip mismatch");
+         }
++        if ((impl_->pruned_horizon_tip && expected_tip_h == *impl_->pruned_horizon_tip) ||
++            (impl_->pruned_horizon_height > 0 &&
++             parent_header.height < impl_->pruned_horizon_height)) {
++            Fail(DiskStateErrorCode::UndoMismatch,
++                 "cannot reverse-peel past pruned finality horizon");
++        }
+         Hash parent_id{};
+         Require(HeaderBytes(parent_header) == Bytes(parent_metadata.header.begin(), parent_metadata.header.end()) &&
+                 BlockId(impl_->options.identity, parent_header, parent_id) &&
+@@ -2413,6 +2432,116 @@ bool DiskStateStore::PeelBlockStateReverse(
+         tx.End();
+     });
+ }
++uint64_t DiskStateStore::PrunedUndoHorizonHeight() const {
++    return impl_ ? impl_->pruned_horizon_height : 0;
++}
++bool DiskStateStore::PruneFinalizedUndoHorizon(
++    uint64_t finalized_tip_height,
++    uint64_t keep_recent_blocks,
++    DiskStateError &error,
++    uint64_t *pruned_count_out) {
++    if (pruned_count_out) {
++        *pruned_count_out = 0;
++    }
++    return Guard(error, [&] {
++        if (!impl_) Fail(DiskStateErrorCode::Closed, "closed store");
++        impl_->Usable();
++        impl_->Ordinary();
++        if (impl_->active) Fail(DiskStateErrorCode::TransactionAborted, "active transaction");
++        impl_->CheckCachedHead();
++
++        if (finalized_tip_height <= keep_recent_blocks) {
++            return;
++        }
++        const uint64_t cutoff_height = finalized_tip_height - keep_recent_blocks;
++        std::set<Hash> to_prune;
++        std::optional<Hash> horizon_tip = impl_->pruned_horizon_tip;
++
++        if (impl_->options.header_index) {
++            const auto active = impl_->CheckedActive();
++            if (active && finalized_tip_height > active->height) {
++                Fail(DiskStateErrorCode::UndoMismatch,
++                     "finalized tip height exceeds active chain height");
++            }
++            if (active && cutoff_height <= active->height) {
++                if (const Value hv = impl_->Read(ActiveKey(cutoff_height))) {
++                    horizon_tip = ParseHash(*hv);
++                }
++            }
++            for (uint64_t h = 1; h <= cutoff_height; ++h) {
++                if (const Value v = impl_->Read(ActiveKey(h))) {
++                    to_prune.insert(ParseHash(*v));
++                }
++            }
++            MDBX_txn *rtxn = impl_->EnsureReadTxn();
++            MdbxCursorGuard cur;
++            CheckMdbx(mdbx_cursor_open(rtxn, impl_->dbi_undo_locs, &cur.cur),
++                      "mdbx_cursor_open(prune_undo)");
++            MDBX_val k{}, v{};
++            for (int rc = mdbx_cursor_get(cur.cur, &k, &v, MDBX_FIRST);
++                 rc == MDBX_SUCCESS;
++                 rc = mdbx_cursor_get(cur.cur, &k, &v, MDBX_NEXT)) {
++                if (k.iov_len == 32) {
++                    Hash id{};
++                    std::memcpy(id.data(), k.iov_base, 32);
++                    if (const auto hdr = impl_->CheckedHeader(id)) {
++                        if (hdr->header.height <= cutoff_height) {
++                            to_prune.insert(id);
++                        }
++                    }
++                }
++            }
++        } else {
++            Hash cur_tip = impl_->head.metadata.tip;
++            uint64_t cur_h = finalized_tip_height;
++            while (cur_h > 0) {
++                if (cur_h <= cutoff_height) {
++                    if (cur_h == cutoff_height) {
++                        horizon_tip = cur_tip;
++                    }
++                    if (impl_->RawLocation(impl_->dbi_undo_locs, cur_tip)) {
++                        to_prune.insert(cur_tip);
++                    }
++                }
++                const Value u_bytes = impl_->Read(UndoKey(cur_tip));
++                if (!u_bytes) {
++                    break;
++                }
++                Reader r{*u_bytes};
++                const Head before = ParseHead(r.BlobView(), impl_->options);
++                cur_tip = before.metadata.tip;
++                --cur_h;
++            }
++        }
++
++        MdbxWriteBatch batch;
++        DiskStateStats stats;
++        uint64_t pruned_count = 0;
++        for (const Hash &id : to_prune) {
++            if (impl_->RawLocation(impl_->dbi_undo_locs, id)) {
++                AddBatch(batch, UndoKey(id), std::nullopt, stats);
++                ++pruned_count;
++            }
++        }
++
++        const uint64_t next_horizon_height =
++            std::max(impl_->pruned_horizon_height, cutoff_height);
++        Bytes hp;
++        hp.reserve(41);
++        Put(hp, next_horizon_height, 8);
++        Put(hp, horizon_tip.has_value() ? 1 : 0, 1);
++        PutHash(hp, horizon_tip.value_or(Hash{}));
++        AddBatch(batch, "H_prune", hp, stats);
++
++        impl_->Write(batch);
++        impl_->pruned_horizon_height = next_horizon_height;
++        impl_->pruned_horizon_tip = horizon_tip;
++        impl_->stats = stats;
++        if (pruned_count_out) {
++            *pruned_count_out = pruned_count;
++        }
++    });
++}
+ bool DiskStateStore::ReadCoin(const Outpoint &outpoint, std::optional<Coin> &out, DiskStateError &error) const {
+     return Guard(error, [&] {
+         if (!impl_) Fail(DiskStateErrorCode::Closed, "closed store");
+@@ -2860,6 +2989,10 @@ bool DiskStateStore::DisconnectImpl(const Hash &expected_tip, const DiskStateMet
+             Require(indexed_active && indexed_active->tip == expected_tip, "indexed disconnect active tip");
+             if (indexed_active->height == 0) Fail(DiskStateErrorCode::UndoMismatch, "cannot disconnect indexed genesis");
+         }
++        if ((impl_->pruned_horizon_tip && expected_tip == *impl_->pruned_horizon_tip) ||
++            (indexed_active && indexed_active->height <= impl_->pruned_horizon_height)) {
++            Fail(DiskStateErrorCode::Missing, "cannot disconnect past pruned finality horizon");
++        }
+         const Value undo = impl_->Read(UndoKey(expected_tip));
+         if (!undo) Fail(DiskStateErrorCode::Missing, "missing undo");
+         if (recovery && recovery->expected_undo_digest)
+@@ -3010,7 +3143,7 @@ bool RawDiskStateSnapshot(const std::string &directory,
+                 BytesView sk(static_cast<const char *>(k.iov_base), k.iov_len);
+                 BytesView sv(static_cast<const char *>(v.iov_base), v.iov_len);
+                 if (prefix == 0) {
+-                    if (sk == "B_cursor" || sk == "U_cursor") continue;
++                    if (sk == "B_cursor" || sk == "U_cursor" || sk == "H_prune") continue;
+                     if (sk == "S") {
+                         out[Bytes(sk)] = ExpandCompactHeadBytes(sv, [&](const DiskBlockLocation &loc) {
+                             return impl.ReadFlatSegment(true, loc);
+diff --git a/src/lotus_v2/disk_state.h b/src/lotus_v2/disk_state.h
+index 0142b071fe..ee6b1235a6 100644
+--- a/src/lotus_v2/disk_state.h
++++ b/src/lotus_v2/disk_state.h
+@@ -233,6 +233,15 @@ public:
+     // madvise(POSIX_MADV_WILLNEED) + cursor warm-up on the memory-mapped store.
+     bool PrefetchOutpointsAsync(std::span<const Outpoint> outpoints,
+                                 DiskStateError &error) const;
++    // Kaspa-style Finality Horizon & Spent-Undo Pruning:
++    // Safely deletes ancient block undo records (h <= finalized_tip_height - keep_recent_blocks)
++    // from dbi_undo_locs while preserving 100% of the live UTXO state tree,
++    // headers, and the recent keep_recent_blocks reverse-peel window.
++    bool PruneFinalizedUndoHorizon(uint64_t finalized_tip_height,
++                                   uint64_t keep_recent_blocks,
++                                   DiskStateError &error,
++                                   uint64_t *pruned_count_out = nullptr);
++    uint64_t PrunedUndoHorizonHeight() const;
+     DiskStateStats LastStats() const;
+ private:
+     struct Impl;
+diff --git a/src/test/mempool_overlay_tests.cpp b/src/test/mempool_overlay_tests.cpp
+index 372cd0e214..77f48768a0 100644
+--- a/src/test/mempool_overlay_tests.cpp
++++ b/src/test/mempool_overlay_tests.cpp
+@@ -890,5 +890,166 @@ BOOST_AUTO_TEST_CASE(monaddb_16_shard_parallel_merklix_and_prefetch) {
+     }
+ }
+ 
++BOOST_AUTO_TEST_CASE(kaspa_finality_horizon_undo_pruning) {
++    const fs::path db_dir = m_args.GetDataDirNet() / "v2_kaspa_undo_prune_test";
++    fs::create_directories(db_dir);
++
++    lotus::v2::DiskStateOptions opts{};
++    opts.identity[0] = 0x55;
++    opts.profile_digest[0] = 0x66;
++
++    const lotus::v2::MonetaryState mon = lotus::v2::GetInitialV2MonetaryState();
++    const auto mon_bytes = lotus::v2::EncodeMonetaryState(mon);
++
++    auto make_header_and_meta = [&](uint64_t height,
++                                    const lotus::v2::Hash &prev_id,
++                                    const lotus::v2::Hash &utxo_root,
++                                    lotus::v2::Header &hdr_out,
++                                    lotus::v2::DiskStateMetadata &meta_out) {
++        hdr_out = lotus::v2::Header{};
++        hdr_out.prev_id = prev_id;
++        hdr_out.bits = 0x207fffff;
++        hdr_out.time = 1000 + height * 120;
++        hdr_out.nonce = height;
++        hdr_out.version = lotus::v2::kHeaderVersion;
++        hdr_out.size = 200;
++        hdr_out.height = height;
++        hdr_out.tx_root[0] = static_cast<uint8_t>(height + 1);
++        hdr_out.state_root =
++            lotus::v2::StateRoot(opts.identity, height, utxo_root, mon);
++
++        std::array<uint8_t, lotus::v2::HEADER_SIZE> hdr_bytes{};
++        BOOST_REQUIRE(lotus::v2::SerializeHeader(hdr_out, hdr_bytes));
++        lotus::v2::Hash bid{};
++        BOOST_REQUIRE(lotus::v2::BlockId(opts.identity, hdr_out, bid));
++
++        meta_out = lotus::v2::DiskStateMetadata{};
++        meta_out.tip = bid;
++        meta_out.header.assign(hdr_bytes.begin(), hdr_bytes.end());
++        meta_out.monetary.assign(mon_bytes.begin(), mon_bytes.end());
++    };
++
++    std::vector<lotus::v2::Header> headers(6);
++    std::vector<lotus::v2::DiskStateMetadata> metas(6);
++    std::vector<lotus::v2::Hash> roots(6);
++    std::vector<lotus::v2::Coin> coins(6);
++
++    std::shared_ptr<const lotus::v2::SmtNode> running_smt;
++    roots[0] = lotus::v2::EmptyUtxoRoot();
++    make_header_and_meta(0, lotus::v2::Hash{}, roots[0], headers[0], metas[0]);
++
++    lotus::v2::DiskStateStore store;
++    lotus::v2::DiskStateError err;
++    BOOST_REQUIRE_MESSAGE(
++        lotus::v2::DiskStateStore::Open(fs::PathToString(db_dir), opts,
++                                        metas[0], store, err),
++        err.message);
++    BOOST_CHECK_EQUAL(store.PrunedUndoHorizonHeight(), 0U);
++
++    // Connect blocks 1..5, each spending the previous block's coin (for h >= 2)
++    // and inserting a new coin.
++    for (uint64_t h = 1; h <= 5; ++h) {
++        lotus::v2::Coin c{};
++        c.outpoint.tx_id[0] = static_cast<uint8_t>(0x80 + h);
++        c.outpoint.index = 0;
++        c.output.value = 50000 + h * 1000;
++        c.output.branches = {lotus::v2::Hash32{1}};
++        c.output.paths = {{0}};
++        c.creation_height = h;
++        c.creation_parent_mtp = 900 + h * 120;
++        c.coinbase = false;
++        coins[h] = c;
++
++        if (h >= 2) {
++            lotus::v2::SmtErase(running_smt, coins[h - 1].outpoint);
++        }
++        lotus::v2::SmtInsert(running_smt, c);
++        roots[h] = lotus::v2::SmtRoot(running_smt);
++        make_header_and_meta(h, metas[h - 1].tip, roots[h], headers[h],
++                             metas[h]);
++
++        lotus::v2::DiskStateTransaction txn;
++        BOOST_REQUIRE_MESSAGE(store.Begin(txn, err), err.message);
++        if (h >= 2) {
++            BOOST_REQUIRE_MESSAGE(txn.Erase(coins[h - 1].outpoint, err),
++                                  err.message);
++        }
++        BOOST_REQUIRE_MESSAGE(txn.Insert(c, err), err.message);
++        BOOST_REQUIRE_MESSAGE(txn.Commit(metas[h], err), err.message);
++        BOOST_CHECK(store.Root() == roots[h]);
++    }
++
++    // Verify undo locations exist for all blocks 1..5 before pruning
++    for (uint64_t h = 1; h <= 5; ++h) {
++        std::optional<lotus::v2::DiskUndoLocation> uloc;
++        BOOST_REQUIRE(store.ReadUndoLocation(metas[h].tip, uloc, err));
++        BOOST_CHECK(uloc.has_value());
++    }
++
++    // Prune finalized undo records up to cutoff = 5 - 2 = 3 (heights 1, 2, 3)
++    uint64_t pruned_count = 0;
++    BOOST_REQUIRE_MESSAGE(
++        store.PruneFinalizedUndoHorizon(5, 2, err, &pruned_count), err.message);
++    BOOST_CHECK_EQUAL(pruned_count, 3U);
++    BOOST_CHECK_EQUAL(store.PrunedUndoHorizonHeight(), 3U);
++    BOOST_CHECK(store.Root() == roots[5]);
++
++    // Idempotent second call prunes 0 additional records
++    uint64_t second_pruned = 99;
++    BOOST_REQUIRE_MESSAGE(
++        store.PruneFinalizedUndoHorizon(5, 2, err, &second_pruned),
++        err.message);
++    BOOST_CHECK_EQUAL(second_pruned, 0U);
++
++    // Undo locations for h = 1, 2, 3 are pruned; h = 4, 5 remain intact
++    for (uint64_t h = 1; h <= 5; ++h) {
++        std::optional<lotus::v2::DiskUndoLocation> uloc;
++        BOOST_REQUIRE(store.ReadUndoLocation(metas[h].tip, uloc, err));
++        if (h <= 3) {
++            BOOST_CHECK(!uloc.has_value());
++        } else {
++            BOOST_CHECK(uloc.has_value());
++        }
++    }
++
++    // Reverse-peel from h=5 -> h=4 and h=4 -> h=3 (above horizon) succeeds
++    BOOST_REQUIRE_MESSAGE(
++        store.PeelBlockStateReverse(metas[5].tip, metas[4], headers[4],
++                                    {coins[5].outpoint}, {coins[4]}, err),
++        err.message);
++    BOOST_CHECK(store.Root() == roots[4]);
++
++    BOOST_REQUIRE_MESSAGE(
++        store.PeelBlockStateReverse(metas[4].tip, metas[3], headers[3],
++                                    {coins[4].outpoint}, {coins[3]}, err),
++        err.message);
++    BOOST_CHECK(store.Root() == roots[3]);
++
++    // Reverse-peel from h=3 -> h=2 (past pruned finality horizon) must fail cleanly
++    BOOST_CHECK(!store.PeelBlockStateReverse(metas[3].tip, metas[2], headers[2],
++                                             {coins[3].outpoint}, {coins[2]},
++                                             err));
++    BOOST_CHECK(err.code == lotus::v2::DiskStateErrorCode::UndoMismatch);
++    BOOST_CHECK(store.Root() == roots[3]);
++
++    // Disconnect at h=3 (pruned horizon) must also fail cleanly with Missing
++    BOOST_CHECK(!store.Disconnect(metas[3].tip, err));
++    BOOST_CHECK(err.code == lotus::v2::DiskStateErrorCode::Missing);
++    BOOST_CHECK(store.Root() == roots[3]);
++
++    // Reopen store from disk and verify pruned horizon metadata persists
++    store = lotus::v2::DiskStateStore{};
++    opts.existing_only = true;
++    BOOST_REQUIRE_MESSAGE(
++        lotus::v2::DiskStateStore::Open(fs::PathToString(db_dir), opts,
++                                        metas[0], store, err),
++        err.message);
++    BOOST_CHECK_EQUAL(store.PrunedUndoHorizonHeight(), 3U);
++    BOOST_CHECK(store.Root() == roots[3]);
++    BOOST_CHECK(!store.Disconnect(metas[3].tip, err));
++    BOOST_CHECK(err.code == lotus::v2::DiskStateErrorCode::Missing);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+ 
++
+-- 
+2.50.1 (Apple Git-155)
+

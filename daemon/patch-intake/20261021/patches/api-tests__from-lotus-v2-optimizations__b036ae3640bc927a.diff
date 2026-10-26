@@ -1,0 +1,167 @@
+diff --git a/src/test/validationinterface_tests.cpp b/src/test/validationinterface_tests.cpp
+index 206841cab3..7c704d1903 100644
+--- a/src/test/validationinterface_tests.cpp
++++ b/src/test/validationinterface_tests.cpp
+@@ -14,6 +14,11 @@
+ 
+ #include <boost/test/unit_test.hpp>
+ 
++#include <condition_variable>
++#include <deque>
++#include <future>
++#include <util/task_runner.h>
++
+ BOOST_FIXTURE_TEST_SUITE(validationinterface_tests, ChainTestingSetup)
+ 
+ struct TestSubscriberNoop final : public CValidationInterface {
+@@ -673,4 +678,113 @@ BOOST_FIXTURE_TEST_CASE(transaction_invalidated, TestChain100Setup) {
+     }
+ }
+ 
++
++// A subscriber with an independently scheduled FIFO, like Chronik. Latches
++// establish ordering: no timing delay is used to infer that the fence blocked.
++class SecondaryQueueSubscriber final : public CValidationInterface {
++    std::mutex mutex;
++    std::condition_variable ready;
++    std::deque<std::function<void()>> queue;
++    bool stopping{false};
++    std::thread worker;
++
++    void Enqueue(std::function<void()> task) {
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            queue.push_back(std::move(task));
++        }
++        ready.notify_one();
++    }
++
++public:
++    std::promise<void> release_indexing;
++    std::future<void> release{release_indexing.get_future()};
++    std::atomic<bool> indexed{false};
++    std::mutex observation_mutex;
++    std::condition_variable observation;
++    bool fence_entered{false};
++    bool sync_returned{false};
++
++    SecondaryQueueSubscriber() : worker([this] {
++        for (;;) {
++            std::function<void()> task;
++            {
++                std::unique_lock<std::mutex> lock(mutex);
++                ready.wait(lock, [&] { return stopping || !queue.empty(); });
++                if (queue.empty()) return;
++                task = std::move(queue.front());
++                queue.pop_front();
++            }
++            task();
++        }
++    }) {}
++
++    ~SecondaryQueueSubscriber() {
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            stopping = true;
++        }
++        ready.notify_one();
++        worker.join();
++    }
++
++    void TransactionFinalized(const CTransactionRef &) override {
++        Enqueue([this] {
++            release.wait();
++            indexed = true;
++        });
++    }
++
++    void SyncTransactionQueue() override {
++        auto promise = std::make_shared<std::promise<void>>();
++        auto completed = promise->get_future();
++        Enqueue([promise] { promise->set_value(); });
++        {
++            std::lock_guard<std::mutex> lock(observation_mutex);
++            fence_entered = true;
++        }
++        observation.notify_one();
++        completed.wait();
++    }
++};
++
++static void CheckSecondaryQueueFence(bool flush) {
++    ValidationSignals signals(std::make_unique<util::ImmediateTaskRunner>());
++    auto subscriber = std::make_shared<SecondaryQueueSubscriber>();
++    signals.RegisterSharedValidationInterface(subscriber);
++    signals.TransactionFinalized(MakeTransactionRef());
++    auto sync = std::async(std::launch::async, [&] {
++        if (flush) signals.FlushBackgroundCallbacks();
++        else signals.SyncWithValidationInterfaceQueue();
++        {
++            std::lock_guard<std::mutex> lock(subscriber->observation_mutex);
++            subscriber->sync_returned = true;
++        }
++        subscriber->observation.notify_one();
++    });
++    {
++        std::unique_lock<std::mutex> lock(subscriber->observation_mutex);
++        // Without the hook, sync_returned wakes us and both assertions fail;
++        // the regression never hangs waiting for an absent hook.
++        subscriber->observation.wait(lock, [&] {
++            return subscriber->fence_entered || subscriber->sync_returned;
++        });
++        BOOST_CHECK(subscriber->fence_entered);
++        BOOST_CHECK(!subscriber->sync_returned);
++        BOOST_CHECK(!subscriber->indexed);
++    }
++    subscriber->release_indexing.set_value();
++    sync.get();
++    BOOST_CHECK(subscriber->indexed);
++    signals.UnregisterAllValidationInterfaces();
++}
++
++BOOST_AUTO_TEST_CASE(flush_waits_for_secondary_queue) {
++    CheckSecondaryQueueFence(true);
++}
++
++BOOST_AUTO_TEST_CASE(sync_waits_for_secondary_queue) {
++    CheckSecondaryQueueFence(false);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/validationinterface.cpp b/src/validationinterface.cpp
+index ead1bdc79a..0825429aa0 100644
+--- a/src/validationinterface.cpp
++++ b/src/validationinterface.cpp
+@@ -111,6 +111,9 @@ ValidationSignals::~ValidationSignals() = default;
+ 
+ void ValidationSignals::FlushBackgroundCallbacks() {
+     m_internals->m_task_runner->flush();
++    m_internals->Iterate([](CValidationInterface &callbacks) {
++        callbacks.SyncTransactionQueue();
++    });
+ }
+ 
+ size_t ValidationSignals::CallbacksPending() {
+@@ -157,6 +160,9 @@ void ValidationSignals::SyncWithValidationInterfaceQueue() {
+     std::promise<void> promise;
+     CallFunctionInValidationInterfaceQueue([&promise] { promise.set_value(); });
+     promise.get_future().wait();
++    m_internals->Iterate([](CValidationInterface &callbacks) {
++        callbacks.SyncTransactionQueue();
++    });
+ }
+ 
+ // Use a macro instead of a function for conditional logging to prevent
+diff --git a/src/validationinterface.h b/src/validationinterface.h
+index 1eb1142127..07c24e6557 100644
+--- a/src/validationinterface.h
++++ b/src/validationinterface.h
+@@ -51,6 +51,8 @@ protected:
+      * public and virtual.
+      */
+     ~CValidationInterface() = default;
++    /** Wait for prior callbacks offloaded to a subscriber's secondary queue. */
++    virtual void SyncTransactionQueue() {}
+     /**
+      * Notifies listeners when the block chain tip advances.
+      *

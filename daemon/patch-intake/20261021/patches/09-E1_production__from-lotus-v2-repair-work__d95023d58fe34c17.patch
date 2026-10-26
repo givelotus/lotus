@@ -1,0 +1,717 @@
+From 1780d80b47e860e10fd68d51cb6c20b3117038eb Mon Sep 17 00:00:00 2001
+From: Canonical endpoint audit <audit@localhost>
+Date: Sun, 18 Oct 2026 22:34:17 -0700
+Subject: [PATCH] avalanche: start negotiated frozen-epoch reconciliation from
+ production relay
+
+---
+ src/avalanche/processor.cpp                   | 109 +++++++----
+ src/avalanche/processor.h                     |  12 +-
+ .../test/preconsensus_batch_tests.cpp         | 162 ++++++++++++++++
+ src/init.cpp                                  |   5 +
+ src/net_processing.cpp                        | 183 ++++++++++++++----
+ src/protocol.cpp                              |   2 +
+ src/protocol.h                                |   2 +
+ 7 files changed, 403 insertions(+), 72 deletions(-)
+
+diff --git a/src/avalanche/processor.cpp b/src/avalanche/processor.cpp
+index fdf276507a..c73829c5a2 100644
+--- a/src/avalanche/processor.cpp
++++ b/src/avalanche/processor.cpp
+@@ -1552,8 +1552,9 @@ bool Processor::registerMempoolBatch(const MempoolBatchAnnouncement &batch,
+         const bool isNew =
+             m_mempoolBatches.find(batchId) == m_mempoolBatches.end();
+         if (isNew && m_mempoolBatches.size() >= MAX_MEMPOOL_BATCH_RECORDS) {
+-            // Evict the oldest unfinalized batch record first; fall back to the
+-            // oldest record if all tracked records are finalized.
++            // Evict an unaccepted, unfinalized record first. Untrusted
++            // announcements must not evict an active verified local proposal.
++            // Fall back to the oldest record if every record is accepted.
+             auto evictIt = m_mempoolBatchOrder.begin();
+             for (auto it = m_mempoolBatchOrder.begin();
+                  it != m_mempoolBatchOrder.end(); ++it) {
+@@ -1570,7 +1571,7 @@ bool Processor::registerMempoolBatch(const MempoolBatchAnnouncement &batch,
+                                 [&](const MempoolBatchAnnouncement &b) {
+                                     return b.ComputeBatchId() == *it;
+                                 });
+-                if (!isFin) {
++                if (!isFin && !m_acceptedMempoolBatches.count(*it)) {
+                     evictIt = it;
+                     break;
+                 }
+@@ -1578,6 +1579,32 @@ bool Processor::registerMempoolBatch(const MempoolBatchAnnouncement &batch,
+             if (evictIt != m_mempoolBatchOrder.end()) {
+                 const uint256 evictId = *evictIt;
+                 m_mempoolBatchOrder.erase(evictIt);
++                const auto old = m_mempoolBatches.find(evictId);
++                if (old != m_mempoolBatches.end()) {
++                    const auto parent = old->second.prev_block_hash;
++                    const auto seq = old->second.epoch_seq;
++                    auto slots = m_epochBatchBySlot.find(parent);
++                    if (slots != m_epochBatchBySlot.end()) {
++                        const auto slot = slots->second.find(seq);
++                        if (slot != slots->second.end() && slot->second == evictId) slots->second.erase(slot);
++                        if (slots->second.empty()) m_epochBatchBySlot.erase(slots);
++                    }
++                    auto finalized = m_finalizedMempoolBatches.find(parent);
++                    if (finalized != m_finalizedMempoolBatches.end()) {
++                        std::erase_if(finalized->second, [&](const auto &b) { return b.ComputeBatchId() == evictId; });
++                        if (finalized->second.empty()) m_finalizedMempoolBatches.erase(finalized);
++                    }
++                    const bool retainedSlot = std::any_of(m_mempoolBatches.begin(), m_mempoolBatches.end(),
++                        [&](const auto &entry) { return entry.first != evictId && entry.second.prev_block_hash == parent && entry.second.epoch_seq == seq; });
++                    if (!retainedSlot) {
++                        auto conflicts = m_conflictedBatchEpochs.find(parent);
++                        if (conflicts != m_conflictedBatchEpochs.end()) {
++                            conflicts->second.erase(seq);
++                            if (conflicts->second.empty()) m_conflictedBatchEpochs.erase(conflicts);
++                        }
++                    }
++                }
++                m_conflictedBatchIds.erase(evictId);
+                 m_mempoolBatches.erase(evictId);
+                 m_acceptedMempoolBatches.erase(evictId);
+             }
+@@ -1725,6 +1752,27 @@ void Processor::markMempoolBatchConflict(const uint256 &batchId) {
+ }
+ 
+ namespace {
++bool CanRetainNextEpoch(const CTxMemPool &pool) EXCLUSIVE_LOCKS_REQUIRED(pool.cs) {
++    AssertLockHeld(pool.cs);
++    const auto &manager = pool.GetOverlayManager();
++    if (manager.GetFrozenEpochs().size() >= 64) return false;
++    size_t count = 0, bytes = 0;
++    auto add = [&](const lotus::v2::MempoolOverlayLayer &layer) {
++        count += layer.GetTxCount();
++        if (count > 65536) return false;
++        for (const auto &[_, entry] : layer.GetOrderedTxs()) {
++            const auto tx = std::static_pointer_cast<const CTransaction>(entry.tx_ref);
++            if (!tx) return false;
++            bytes += GetSerializeSize(*tx);
++            if (bytes > 64 * 1024 * 1024) return false;
++        }
++        return true;
++    };
++    if (!add(manager.GetSpeculativeOverlay())) return false;
++    for (const auto &layer : manager.GetFrozenEpochs()) if (!add(layer)) return false;
++    return true;
++}
++
+ MempoolBatchAnnouncement BuildBatchAnnouncementFromLayer(
+     const BlockHash &prevBlockHash, uint32_t epochSeq,
+     const uint256 &parentBatchId, const lotus::v2::MempoolOverlayLayer &layer) {
+@@ -1779,7 +1827,6 @@ void Processor::finalizeMempoolBatch(const uint256 &batchId) {
+     }
+ 
+     if (newlyFinalized) {
+-        std::optional<MempoolBatchAnnouncement> pipelinedNextBatch;
+         if (mempool) {
+             LOCK(mempool->cs);
+             lotus::v2::Hash target_root{};
+@@ -1792,47 +1839,34 @@ void Processor::finalizeMempoolBatch(const uint256 &batchId) {
+                     break;
+                 }
+             }
+-            if (!already_frozen &&
++            if (!already_frozen && CanRetainNextEpoch(*mempool) &&
+                 overlay_mgr.GetSpeculativeOverlay().GetSubtreeARoot() ==
+                     target_root) {
+                 mempool->FreezeEpochBatch();
+             }
+ 
+-            // Event-driven back-to-back pipelining: if the speculative overlay
+-            // has accumulated additional transactions beyond this finalized
+-            // batch and the adaptive controller allows pipelining, freeze and
+-            // announce Delta_{e+1} immediately.
+-            const auto &specOverlay = overlay_mgr.GetSpeculativeOverlay();
+-            lotus::v2::Hash expectedParentBlock{};
+-            std::memcpy(expectedParentBlock.data(),
+-                        batch.prev_block_hash.begin(), 32);
+-            if (specOverlay.GetParentBlockId() == expectedParentBlock &&
+-                specOverlay.GetTxCount() > batch.tx_count &&
+-                specOverlay.GetSubtreeARoot() != target_root) {
+-                const size_t tailTxCount =
+-                    specOverlay.GetTxCount() - batch.tx_count;
+-                const auto now = Now<SteadyMilliseconds>();
+-                if (m_adaptiveEpochController.shouldPipelineNextBatch(
+-                        tailTxCount, now)) {
+-                    const auto &nextLayer = mempool->FreezeEpochBatch();
+-                    pipelinedNextBatch = BuildBatchAnnouncementFromLayer(
+-                        batch.prev_block_hash, batch.epoch_seq + 1, batchId,
+-                        nextLayer);
+-                    m_adaptiveEpochController.recordBatchFrozen(now);
+-                }
+-            }
+-
+-        }
+-        if (pipelinedNextBatch.has_value()) {
+-            registerMempoolBatch(*pipelinedNextBatch, /*accepted=*/true,
+-                                 /*reconcile=*/true);
+         }
++        tryFreezeAndRegisterNextEpochBatch(batch.prev_block_hash);
+         if (cb) {
+             cb(batch);
+         }
+     }
+ }
+ 
++bool Processor::getLatestAcceptedMempoolBatch(
++    const BlockHash &parent, MempoolBatchAnnouncement &out) const {
++    LOCK(cs_mempoolBatches);
++    bool found = false;
++    for (const auto &[id, batch] : m_mempoolBatches) {
++        if (batch.prev_block_hash == parent && m_acceptedMempoolBatches.count(id) &&
++            (!found || batch.epoch_seq > out.epoch_seq)) {
++            out = batch;
++            found = true;
++        }
++    }
++    return found;
++}
++
+ bool Processor::tryFreezeAndRegisterNextEpochBatch(
+     const BlockHash &prevBlockHash, MempoolBatchAnnouncement *outBatch,
+     bool force) {
+@@ -1840,6 +1874,7 @@ bool Processor::tryFreezeAndRegisterNextEpochBatch(
+         return false;
+     }
+ 
++    LOCK(cs_epochFreeze);
+     uint32_t nextEpochSeq = 1;
+     uint256 parentBatchId = uint256::ZERO;
+     size_t baselineTxCount = 0;
+@@ -1854,12 +1889,19 @@ bool Processor::tryFreezeAndRegisterNextEpochBatch(
+             baselineTxCount = lastFin.tx_count;
+         }
+     }
++    // Only a local proposal prevents another local freeze. An unaccepted
++    // remote announcement must not reserve our next slot indefinitely.
++    if (m_localEpochProposal && m_localEpochProposal->prev_block_hash == prevBlockHash &&
++        m_localEpochProposal->epoch_seq == nextEpochSeq) return false;
+ 
+     std::optional<MempoolBatchAnnouncement> createdBatch;
+     {
+         LOCK(mempool->cs);
+         auto &overlay_mgr = mempool->GetOverlayManager();
+         const auto &specOverlay = overlay_mgr.GetSpeculativeOverlay();
++        // Keep referenced immutable epochs until the parent changes. At the
++        // retention bound, ordinary transaction/block relay remains available.
++        if (!CanRetainNextEpoch(*mempool) || mempool->GetTotalTxSize() > 32 * 1024 * 1024) return false;
+         lotus::v2::Hash expectedParentBlock{};
+         std::memcpy(expectedParentBlock.data(), prevBlockHash.begin(), 32);
+         if (specOverlay.GetParentBlockId() != expectedParentBlock ||
+@@ -1878,6 +1920,7 @@ bool Processor::tryFreezeAndRegisterNextEpochBatch(
+         m_adaptiveEpochController.recordBatchFrozen(now);
+     }
+ 
++    m_localEpochProposal = *createdBatch;
+     if (!registerMempoolBatch(*createdBatch, /*accepted=*/true,
+                               /*reconcile=*/true)) {
+         return false;
+diff --git a/src/avalanche/processor.h b/src/avalanche/processor.h
+index a3792ab1ed..31de76574e 100644
+--- a/src/avalanche/processor.h
++++ b/src/avalanche/processor.h
+@@ -274,6 +274,8 @@ class Processor final : public NetEventsInterface {
+     std::unordered_map<BlockHash, StakingReward, SaltedUint256Hasher>
+         stakingRewards GUARDED_BY(cs_stakingRewards);
+ 
++    mutable Mutex cs_epochFreeze;
++    std::optional<MempoolBatchAnnouncement> m_localEpochProposal GUARDED_BY(cs_epochFreeze);
+     mutable Mutex cs_mempoolBatches;
+     std::unordered_map<uint256, MempoolBatchAnnouncement, SaltedUint256Hasher>
+         m_mempoolBatches GUARDED_BY(cs_mempoolBatches);
+@@ -449,7 +451,7 @@ public:
+                        std::string &error)
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_peerManager, !cs_finalizedItems,
+                                  !cs_invalidatedBlocks, !cs_finalizationTip,
+-                                 !cs_mempoolBatches);
++                                 !cs_epochFreeze, !cs_mempoolBatches);
+ 
+     template <typename Callable>
+     auto withPeerManager(Callable &&func) const
+@@ -575,7 +577,7 @@ public:
+     void markMempoolBatchConflict(const uint256 &batchId)
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_mempoolBatches);
+     void finalizeMempoolBatch(const uint256 &batchId)
+-        EXCLUSIVE_LOCKS_REQUIRED(!cs_mempoolBatches, !cs_finalizedItems);
++        EXCLUSIVE_LOCKS_REQUIRED(!cs_epochFreeze, !cs_mempoolBatches, !cs_finalizedItems);
+     void rejectMempoolBatch(const uint256 &batchId)
+         EXCLUSIVE_LOCKS_REQUIRED(!cs_mempoolBatches);
+     std::vector<MempoolBatchAnnouncement>
+@@ -606,10 +608,14 @@ public:
+         return m_adaptiveEpochController;
+     }
+ 
++    bool getLatestAcceptedMempoolBatch(const BlockHash &parent,
++                                      MempoolBatchAnnouncement &out) const
++        EXCLUSIVE_LOCKS_REQUIRED(!cs_mempoolBatches);
++
+     bool tryFreezeAndRegisterNextEpochBatch(
+         const BlockHash &prevBlockHash,
+         MempoolBatchAnnouncement *outBatch = nullptr, bool force = false)
+-        EXCLUSIVE_LOCKS_REQUIRED(!cs_mempoolBatches, !cs_finalizedItems);
++        EXCLUSIVE_LOCKS_REQUIRED(!cs_epochFreeze, !cs_mempoolBatches, !cs_finalizedItems);
+ 
+     /**
+      * Track and poll Avalanche state anchors (BlockHash + 256-shard Merklix
+diff --git a/src/avalanche/test/preconsensus_batch_tests.cpp b/src/avalanche/test/preconsensus_batch_tests.cpp
+index cc9d7e6722..7c67f84d52 100644
+--- a/src/avalanche/test/preconsensus_batch_tests.cpp
++++ b/src/avalanche/test/preconsensus_batch_tests.cpp
+@@ -14,6 +14,10 @@
+ #include <consensus/merkle.h>
+ #include <consensus/validation.h>
+ #include <net_processing.h>
++#include <netmessagemaker.h>
++#include <net/v2_protocol_handler.h>
++#include <script/standard.h>
++#include <test/util/validation.h>
+ #include <policy/block/parkingpolicy.h>
+ #include <policy/block/preconsensus.h>
+ #include <primitives/block.h>
+@@ -34,6 +38,20 @@ namespace avalanche {
+ namespace {
+     struct AvalancheTest {
+         static void runEventLoop(Processor &p) { p.runEventLoop(); }
++        static void setFinalizationTip(Processor &p, const CBlockIndex *tip) {
++            LOCK(p.cs_finalizationTip);
++            p.finalizationTip = tip;
++        }
++        static void checkBatchIndicesBounded(const Processor &p) {
++            LOCK(p.cs_mempoolBatches);
++            size_t slots = 0, finalized = 0;
++            for (const auto &[_, entries] : p.m_epochBatchBySlot) slots += entries.size();
++            for (const auto &[_, entries] : p.m_finalizedMempoolBatches) finalized += entries.size();
++            BOOST_CHECK_LE(p.m_mempoolBatches.size(), Processor::MAX_MEMPOOL_BATCH_RECORDS);
++            BOOST_CHECK_LE(slots, Processor::MAX_MEMPOOL_BATCH_RECORDS);
++            BOOST_CHECK_LE(finalized, Processor::MAX_MEMPOOL_BATCH_RECORDS);
++            BOOST_CHECK_LE(p.m_conflictedBatchIds.size(), Processor::MAX_MEMPOOL_BATCH_RECORDS);
++        }
+         static uint64_t getRound(const Processor &p) { return p.round; }
+         static NodeId getPolledNode(Processor &p, uint64_t round) {
+             auto queries = p.queries.getReadView();
+@@ -939,4 +957,148 @@ BOOST_FIXTURE_TEST_CASE(
+     BOOST_CHECK(finalizedChain[1] == batch2);
+ }
+ 
++BOOST_FIXTURE_TEST_CASE(production_epoch_sender_and_exact_scope_verification,
++                        AvalancheTestChain100Setup) {
++    using namespace std::chrono_literals;
++    using namespace lotus::v2::net;
++    auto &processor = *m_node.avalanche;
++    auto &chainman = static_cast<TestChainstateManager &>(*m_node.chainman);
++    if (chainman.IsInitialBlockDownload()) chainman.JumpOutOfIbd();
++    const auto *tip = WITH_LOCK(cs_main, return chainman.ActiveTip());
++    AvalancheTest::setFinalizationTip(processor, tip);
++    auto proof = buildRandomProof(chainman.ActiveChainstate(), MIN_VALID_PROOF_SCORE);
++    BOOST_REQUIRE(processor.withPeerManager([&](avalanche::PeerManager &pm) { return pm.registerProof(proof); }));
++    const auto services = ServiceFlags(NODE_NETWORK | NODE_AVALANCHE | NODE_MERKLIX |
++        NODE_MERKLIX_BATCH | NODE_MERKLIX_SIZED | NODE_MERKLIX_EPOCH);
++    std::vector<CNode *> nodes;
++    std::atomic<bool> interrupt{false};
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    for (int i = 0; i < 8; ++i) {
++        auto *node = new CNode(1800 + i, nullptr, CAddress(), 0, 0, 0, CAddress(), "",
++                              ConnectionType::OUTBOUND_FULL_RELAY, false);
++        m_node.peerman->InitializeNode(config, *node, services);
++        m_connman->AddTestNode(*node);
++        nodes.push_back(node);
++        auto version = NetMsg::Make(NetMsgType::VERSION, PROTOCOL_VERSION,
++            Using<CustomUintFormatter<8>>(services), int64_t{}, int64_t{},
++            WithParams(CNetAddr::V1, CService{}), int64_t{},
++            WithParams(CNetAddr::V1, CService{}), uint64_t{1}, std::string{},
++            int32_t{}, true, uint64_t{1});
++        DataStream stream(version.data);
++        m_node.peerman->ProcessMessage(config, *node, NetMsgType::VERSION, stream, 1s, interrupt);
++        DataStream verack;
++        m_node.peerman->ProcessMessage(config, *node, NetMsgType::VERACK, verack, 1s, interrupt);
++        BOOST_REQUIRE(node->fSuccessfullyConnected);
++        BOOST_REQUIRE(processor.withPeerManager([&](avalanche::PeerManager &pm) {
++            return pm.addNode(node->GetId(), proof->getId(), DEFAULT_AVALANCHE_MAX_ELEMENT_POLL);
++        }));
++    }
++    BOOST_REQUIRE(processor.isQuorumEstablished());
++    const CScript redeem = CScript() << std::vector<uint8_t>(48, 0x42) << OP_DROP << OP_TRUE;
++    const auto script = GetScriptForDestination(ScriptHash(redeem));
++    std::vector<CTransactionRef> txs;
++    for (int i = 0; i < 2; ++i) {
++        CMutableTransaction mutable_tx;
++        mutable_tx.nVersion = 2;
++        mutable_tx.vin.emplace_back(COutPoint(TxId(GetRandHash()), 0));
++        mutable_tx.vin[0].scriptSig = CScript() << ToByteVector(redeem);
++        mutable_tx.vout.emplace_back(1000 * SATOSHI, script);
++        auto tx = MakeTransactionRef(std::move(mutable_tx));
++        {
++            LOCK(cs_main);
++            chainman.ActiveChainstate().CoinsTip().AddCoin(tx->vin[0].prevout,
++                Coin(CTxOut(5000 * SATOSHI, script), 1, false), true);
++        }
++        BOOST_REQUIRE(chainman.ProcessTransaction(tx, false).m_result_type == MempoolAcceptResult::ResultType::VALID);
++        txs.push_back(tx);
++    }
++    auto drain = [&](CNode &node) {
++        V1TransportDeserializer decoder(config, node.GetId());
++        std::vector<CNetMessage> messages;
++        LOCK(node.cs_vSend);
++        for (const auto &chunk : node.vSendMsg) {
++            Span<const uint8_t> bytes{chunk};
++            while (!bytes.empty()) {
++                BOOST_REQUIRE_GE(decoder.Read(config, bytes), 0);
++                if (decoder.Complete()) {
++                    bool rejected = false;
++                    messages.push_back(decoder.GetMessage(0us, rejected));
++                    BOOST_REQUIRE(!rejected);
++                }
++            }
++        }
++        node.vSendMsg.clear(); node.nSendSize = 0; node.fPauseSend = false;
++        return messages;
++    };
++    auto &node = *nodes.front();
++    drain(node);
++    auto &controller = processor.getAdaptiveEpochController();
++    controller.recordBatchFrozen(Now<SteadyMilliseconds>() - 2s);
++    const auto freezes = controller.getFreezeCount();
++    BOOST_REQUIRE(m_node.peerman->SendMessages(config, &node));
++    avalanche::MempoolBatchAnnouncement announced;
++    bool got_batch = false, got_sketch = false;
++    // The mock connection's zero send-buffer cap can pause after AVABATCH;
++    // drain it and permit the next pass to send the named epoch sketch.
++    for (int pass = 0; pass < 3; ++pass) {
++        for (auto &message : drain(node)) {
++            if (message.m_type == NetMsgType::AVABATCH) {
++                message.m_recv >> announced;
++                got_batch = true;
++            }
++            if (message.m_type == NetMsgType::MERKLIXSIZED) {
++                MerklixSizedSync push; message.m_recv >> push;
++                got_sketch |= push.summary.scope == uint8_t(ReconScope::EPOCH_BATCH);
++            }
++        }
++        m_node.peerman->SendMessages(config, &node);
++    }
++    BOOST_REQUIRE(got_batch);
++    BOOST_CHECK(got_sketch);
++    BOOST_CHECK_EQUAL(announced.tx_count, 2U);
++    BOOST_CHECK_EQUAL(controller.getFreezeCount(), freezes + 1);
++    BOOST_CHECK(!processor.tryFreezeAndRegisterNextEpochBatch(tip->GetBlockHash(), nullptr, true));
++    // Receiver acceptance is checked through production ProcessMessage and
++    // SendMessages. The admitted exact scope is provided directly here; the
++    // separate 10k transport test covers fetching that scope over SHORTTX.
++    auto *handler = m_node.peerman->GetV2ProtocolHandler();
++    auto receive = [&](avalanche::MempoolBatchAnnouncement batch, bool expected) {
++        const auto id = batch.ComputeBatchId();
++        BOOST_REQUIRE(handler->SetScopedTransactions(ReconScope::EPOCH_BATCH, id, txs));
++        SetMockTime(GetTime() + 1);
++        DataStream wire; wire << batch;
++        m_node.peerman->ProcessMessage(config, node, NetMsgType::AVABATCH, wire,
++                                       GetTime<std::chrono::microseconds>(), interrupt);
++        drain(node);
++        m_node.peerman->SendMessages(config, &node);
++        BOOST_CHECK_EQUAL(processor.isMempoolBatchLocallyAccepted(id), expected);
++        drain(node);
++    };
++    auto wrong_utxo = announced; wrong_utxo.utxo_root.begin()[0] ^= 1;
++    receive(wrong_utxo, false);
++    auto wrong_ids = announced; wrong_ids.short_ids_hash.begin()[0] ^= 1;
++    receive(wrong_ids, false);
++    processor.rejectMempoolBatch(announced.ComputeBatchId());
++    BOOST_CHECK(!processor.isMempoolBatchLocallyAccepted(announced.ComputeBatchId()));
++    receive(announced, true);
++    // A full snapshot needs no cached or finalized predecessor on a cold peer.
++    auto cold = announced;
++    cold.epoch_seq = 2;
++    cold.parent_batch_id = GetRandHash();
++    BOOST_CHECK(!processor.isMempoolBatchKnown(cold.parent_batch_id));
++    receive(cold, true);
++    auto invalid_seq = cold; invalid_seq.epoch_seq = 3;
++    receive(invalid_seq, false);
++    for (size_t i = 0; i < Processor::MAX_MEMPOOL_BATCH_RECORDS + 3; ++i) {
++        auto unaccepted = announced;
++        unaccepted.epoch_seq = static_cast<uint32_t>(i + 2);
++        unaccepted.parent_batch_id = announced.ComputeBatchId();
++        BOOST_REQUIRE(processor.registerMempoolBatch(unaccepted, false, false));
++    }
++    BOOST_CHECK(processor.isMempoolBatchKnown(announced.ComputeBatchId()));
++    BOOST_CHECK(processor.isMempoolBatchLocallyAccepted(announced.ComputeBatchId()));
++    AvalancheTest::checkBatchIndicesBounded(processor);
++    // No claim of real quorum finalization or WAN epoch latency is made here.
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/init.cpp b/src/init.cpp
+index 8fcd2ce189..04148e7305 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -602,6 +602,8 @@ void SetupServerArgs(NodeContext &node) {
+         "-epochminms=<n>",
+         "Minimum adaptive epoch settling window in milliseconds (1..1000, default: 100)",
+         ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg("-merklixepochs", "Announce frozen preconsensus epochs to capable peers (default: 1)",
++                   ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+     argsman.AddArg(
+         "-merklixsized",
+         "Negotiate initial Merklix sketches and complete short-ID lists (default: 1)",
+@@ -3055,6 +3057,9 @@ bool AppInitMain(Config &config, RPCServer &rpcServer,
+ 
+     if (args.GetBoolArg("-merklixreconciliation", true)) {
+         nLocalServices = ServiceFlags(nLocalServices | NODE_MERKLIX);
++        if (node.avalanche && args.GetBoolArg("-merklixepochs", true)) {
++            nLocalServices = ServiceFlags(nLocalServices | NODE_MERKLIX_EPOCH);
++        }
+         if (args.GetBoolArg("-merklixbatch", true)) {
+             nLocalServices = ServiceFlags(nLocalServices | NODE_MERKLIX_BATCH);
+             if (args.GetBoolArg("-merklixsized", true)) {
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 393a659f43..645e6d584b 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -396,6 +396,15 @@ struct Peer {
+     /** Services this peer offered to us. */
+     std::atomic<ServiceFlags> m_their_services{NODE_NONE};
+ 
++    // Accessed only under g_msgproc_mutex; lifetime follows the peer.
++    uint256 m_last_epoch_announced;
++    bool m_epoch_sketch_pending{false};
++    std::chrono::microseconds m_next_epoch_announcement{0};
++    std::optional<avalanche::MempoolBatchAnnouncement> m_pending_epoch;
++    std::chrono::microseconds m_pending_epoch_expires{0};
++    std::chrono::microseconds m_next_epoch_check{0};
++    lotus::v2::net::ReconCostBudget m_epoch_validation_budget;
++
+     /** Protects misbehavior data members */
+     Mutex m_misbehavior_mutex;
+     /**
+@@ -1429,6 +1438,12 @@ private:
+         EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+ 
+     lotus::v2::net::V2PeerProtocolHandler m_v2_protocol_handler;
++    std::chrono::microseconds m_next_epoch_freeze{0};
++    void MaybeSendEpoch(CNode &node, Peer &peer, std::chrono::microseconds now)
++        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
++    std::optional<bool> ValidateEpochScope(const avalanche::MempoolBatchAnnouncement &batch)
++        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
++
+ 
+     // All of the following cache a recent block, and are protected by
+     // m_most_recent_block_mutex
+@@ -7917,43 +7932,24 @@ void PeerManagerImpl::ProcessMessage(
+     }
+ 
+     if (msg_type == NetMsgType::AVABATCH) {
+-        if (!m_avalanche) {
+-            return;
+-        }
+-        avalanche::MempoolBatchAnnouncement announcement;
+-        vRecv >> announcement;
+-        if (announcement.tx_count == 0 || !announcement.IsValid()) {
+-            return;
++        if (!m_avalanche || !(peer->m_our_services & NODE_MERKLIX_EPOCH) ||
++            !(peer->m_their_services.load() & NODE_MERKLIX_EPOCH) ||
++            !m_v2_protocol_handler.CheckPeerRateLimit(pfrom.GetId(), time_received)) return;
++        avalanche::MempoolBatchAnnouncement batch;
++        vRecv >> batch;
++        if (!vRecv.empty() || !batch.IsValid() || batch.tx_count == 0 ||
++            batch.tx_count > lotus::v2::net::V2PeerProtocolHandler::MAX_SCOPED_TXS) return;
++        const bool active_parent = WITH_LOCK(cs_main, return m_chainman.ActiveTip() &&
++            m_chainman.ActiveTip()->GetBlockHash() == batch.prev_block_hash);
++        if (!active_parent) return;
++        const auto id = batch.ComputeBatchId();
++        if (!m_avalanche->registerMempoolBatch(batch, /*accepted=*/false) ||
++            !m_v2_protocol_handler.AuthorizeScopedRoot(lotus::v2::net::ReconScope::EPOCH_BATCH,
++                id, batch.subtree_a_root)) return;
++        if (!peer->m_pending_epoch || peer->m_pending_epoch->ComputeBatchId() != id) {
++            peer->m_pending_epoch = batch;
++            peer->m_pending_epoch_expires = time_received + 10s;
+         }
+-        const bool known_prev = WITH_LOCK(
+-            cs_main, return m_chainman.m_blockman.LookupBlockIndex(
+-                                announcement.prev_block_hash) != nullptr);
+-        if (!known_prev) {
+-            return;
+-        }
+-        bool locally_accepted = false;
+-        {
+-            LOCK(m_mempool.cs);
+-            const auto &spec =
+-                m_mempool.GetMerklixOverlay().GetSpeculativeOverlay();
+-            lotus::v2::Hash sub_a{};
+-            std::memcpy(sub_a.data(), announcement.subtree_a_root.begin(), 32);
+-            if (spec.GetTxCount() == announcement.tx_count &&
+-                spec.GetSubtreeARoot() == sub_a) {
+-                locally_accepted = true;
+-                std::vector<CTransactionRef> ordered_txs;
+-                ordered_txs.reserve(spec.GetTxCount());
+-                for (const auto &[_, oentry] : spec.GetOrderedTxs()) {
+-                    ordered_txs.push_back(
+-                        std::static_pointer_cast<const CTransaction>(
+-                            oentry.tx_ref));
+-                }
+-                m_v2_protocol_handler.RegisterCandidateOverlay(
+-                    announcement.prev_block_hash, std::move(ordered_txs));
+-            }
+-        }
+-        m_avalanche->registerMempoolBatch(announcement,
+-                                          /*locallyAccepted=*/locally_accepted);
+         return;
+     }
+ 
+@@ -9279,6 +9275,120 @@ bool PeerManagerImpl::SetupAddressRelay(const CNode &node, Peer &peer) {
+     return true;
+ }
+ 
++std::optional<bool> PeerManagerImpl::ValidateEpochScope(const avalanche::MempoolBatchAnnouncement &batch) {
++    using namespace lotus::v2;
++    const auto txs = m_v2_protocol_handler.GetScopedTransactions(
++        net::ReconScope::EPOCH_BATCH, batch.ComputeBatchId());
++    if (txs.size() < batch.tx_count) return std::nullopt;
++    if (txs.size() != batch.tx_count || net::ComputeScopedMerklixRoot(txs) != batch.subtree_a_root) return false;
++    // Every epoch is a full snapshot rebuilt from the confirmed block base.
++    // Cold peers need not download or locally finalize preceding snapshots.
++    if (!batch.epoch_seq || batch.epoch_seq > batch.tx_count ||
++        (batch.epoch_seq == 1) != batch.parent_batch_id.IsNull()) return false;
++    LOCK2(cs_main, m_mempool.cs);
++    const auto *tip = m_chainman.ActiveTip();
++    if (!tip || tip->GetBlockHash() != batch.prev_block_hash) return false;
++    m_mempool.SyncMerklixOverlayToTip(batch.prev_block_hash, tip->nHeight + 1, tip->GetMedianTimePast());
++    const auto &base = m_mempool.GetOverlayManager().GetSpeculativeOverlay();
++    std::unordered_set<TxId, SaltedTxIdHasher> selected;
++    for (const auto &tx : txs) selected.insert(tx->GetId());
++    std::vector<std::tuple<CTransactionRef, int64_t, int64_t>> entries;
++    entries.reserve(txs.size());
++    for (const auto &tx : txs) {
++        const auto entry = m_mempool.GetIter(tx->GetId());
++        if (!entry) {
++            // An admitted transaction was evicted since download. Re-fetch the
++            // complete authorized scope through normal transaction admission.
++            if (!m_v2_protocol_handler.SetScopedTransactions(net::ReconScope::EPOCH_BATCH,
++                    batch.ComputeBatchId(), {})) return false;
++            return std::nullopt;
++        }
++        for (const auto &input : tx->vin) {
++            if (m_mempool.exists(input.prevout.GetTxId())) {
++                if (!selected.count(input.prevout.GetTxId())) return false;
++            } else if (!m_chainman.ActiveChainstate().CoinsTip().HaveCoin(input.prevout)) return false;
++        }
++        entries.emplace_back(tx, (**entry)->GetFee() / SATOSHI, (**entry)->GetSigChecks());
++    }
++    MempoolOverlayLayer exact(base.GetParentBlockId(), base.GetBaseUtxoRoot(),
++        base.GetBaseMonetaryState(), base.GetHeight(), base.GetParentMtp(), base.GetLayerId());
++    if (AddTransactionsToOverlayBatch(exact, entries) != entries.size()) return false;
++    uint256 utxo;
++    const auto digest = exact.GetUtxoRootDigest();
++    std::memcpy(utxo.begin(), digest.data(), 32);
++    HashWriter ordered;
++    for (const auto &[id, _] : exact.GetOrderedTxs()) ordered.write(std::as_bytes(std::span{id}));
++    if (utxo != batch.utxo_root || ordered.GetHash() != batch.short_ids_hash) return false;
++    m_v2_protocol_handler.RegisterCandidateOverlay(batch.prev_block_hash, txs);
++    return true;
++}
++
++void PeerManagerImpl::MaybeSendEpoch(CNode &node, Peer &peer, std::chrono::microseconds now) {
++    using namespace lotus::v2::net;
++    if (!m_avalanche || !(peer.m_our_services & NODE_MERKLIX_EPOCH) ||
++        !(peer.m_their_services.load() & NODE_MERKLIX_EPOCH) || node.fPauseSend ||
++        node.IsBlockOnlyConn() || node.IsAddrFetchConn()) return;
++    if (peer.m_pending_epoch) {
++        if (now >= peer.m_pending_epoch_expires) peer.m_pending_epoch.reset();
++        else if (now >= peer.m_next_epoch_check) {
++            peer.m_next_epoch_check = now + 100ms;
++            // Charge the full bounded validation visit cost before copying or
++            // rebuilding an untrusted exact scope. A depleted budget waits.
++            if (peer.m_epoch_validation_budget.Consume(0, 16 * peer.m_pending_epoch->tx_count, false, now)) {
++                const auto accepted = ValidateEpochScope(*peer.m_pending_epoch);
++                if (accepted.has_value()) {
++                    if (*accepted) m_avalanche->setMempoolBatchAccepted(peer.m_pending_epoch->ComputeBatchId());
++                    peer.m_pending_epoch.reset();
++                }
++            }
++        }
++    }
++    if (!m_avalanche->isQuorumEstablished() || m_chainman.IsInitialBlockDownload()) return;
++    const CBlockIndex *tip = WITH_LOCK(cs_main, return m_chainman.ActiveTip());
++    if (!tip || !m_avalanche->isPreconsensusActivated(tip)) return;
++    if (now >= m_next_epoch_freeze) {
++        m_next_epoch_freeze = now + m_avalanche->getAdaptiveEpochController().getSettlingWindow();
++        {
++            LOCK2(cs_main, m_mempool.cs);
++            if (tip != m_chainman.ActiveTip()) return;
++            m_mempool.SyncMerklixOverlayToTip(tip->GetBlockHash(), tip->nHeight + 1, tip->GetMedianTimePast());
++        }
++        m_avalanche->tryFreezeAndRegisterNextEpochBatch(tip->GetBlockHash());
++    }
++    avalanche::MempoolBatchAnnouncement batch;
++    if (!m_avalanche->getLatestAcceptedMempoolBatch(tip->GetBlockHash(), batch)) return;
++    const auto id = batch.ComputeBatchId();
++    if (peer.m_last_epoch_announced == id && now < peer.m_next_epoch_announcement) {
++        if (peer.m_epoch_sketch_pending)
++            peer.m_epoch_sketch_pending = !m_v2_protocol_handler.PushScopedSync(node, ReconScope::EPOCH_BATCH, id);
++        return;
++    }
++    std::vector<CTransactionRef> txs;
++    {
++        LOCK(m_mempool.cs);
++        for (const auto &frozen : m_mempool.GetOverlayManager().GetFrozenEpochs()) {
++            const auto root = frozen.GetSubtreeARoot();
++            if (std::memcmp(root.data(), batch.subtree_a_root.begin(), 32)) continue;
++            txs.reserve(frozen.GetTxCount());
++            for (const auto &[_, entry] : frozen.GetOrderedTxs())
++                txs.push_back(std::static_pointer_cast<const CTransaction>(entry.tx_ref));
++            break;
++        }
++    }
++    if (txs.size() != batch.tx_count ||
++        !m_v2_protocol_handler.AuthorizeScopedRoot(ReconScope::EPOCH_BATCH, id, batch.subtree_a_root) ||
++        !m_v2_protocol_handler.SetScopedTransactions(
++            ReconScope::EPOCH_BATCH, id, std::move(txs))) return;
++    // The unchanged announcement payload names the immutable exact-set scope;
++    // the negotiated sketch immediately starts reconciliation of that scope.
++    m_connman.PushMessage(&node, NetMsg::Make(NetMsgType::AVABATCH, batch));
++    peer.m_epoch_sketch_pending = true;
++    if (!node.fPauseSend)
++        peer.m_epoch_sketch_pending = !m_v2_protocol_handler.PushScopedSync(node, ReconScope::EPOCH_BATCH, id);
++    peer.m_last_epoch_announced = id;
++    peer.m_next_epoch_announcement = now + 1s;
++}
++
+ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+     AssertLockHeld(g_msgproc_mutex);
+ 
+@@ -9304,6 +9414,7 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+     m_v2_protocol_handler.CheckFastSyncTimeouts(pto->GetId(), current_time);
+     m_v2_protocol_handler.DrainShortTxResponses(*pto);
+     m_v2_protocol_handler.DrainReconMessages(*pto, current_time);
++    MaybeSendEpoch(*pto, *peer, current_time);
+     if (gArgs.GetBoolArg("-merklixreconciliation", true)) {
+         const auto cadence = m_avalanche
+             ? m_avalanche->getAdaptiveEpochController().getSettlingWindow()
+diff --git a/src/protocol.cpp b/src/protocol.cpp
+index 0e20613333..525114c30d 100644
+--- a/src/protocol.cpp
++++ b/src/protocol.cpp
+@@ -290,6 +290,8 @@ static std::string serviceFlagToStr(const size_t bit) {
+             return "MERKLIX";
+         case NODE_MERKLIX_BATCH:
+             return "MERKLIX_BATCH";
++        case NODE_MERKLIX_EPOCH:
++            return "MERKLIX_EPOCH";
+         case NODE_MERKLIX_SIZED:
+             return "MERKLIX_SIZED";
+         default:
+diff --git a/src/protocol.h b/src/protocol.h
+index 6e1b54ee65..9822c0166a 100644
+--- a/src/protocol.h
++++ b/src/protocol.h
+@@ -470,6 +470,8 @@ enum ServiceFlags : uint64_t {
+     NODE_MERKLIX_BATCH = (1 << 27),
+     // Push initial syndromes or a complete bounded short-ID list.
+     NODE_MERKLIX_SIZED = (1 << 29),
++    /** Frozen epoch announcements and exact epoch-scope reconciliation. */
++    NODE_MERKLIX_EPOCH = (1 << 28),
+ };
+ 
+ /**
+-- 
+2.50.1 (Apple Git-155)
+

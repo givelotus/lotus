@@ -1,0 +1,366 @@
+From 8785bc64b512ff2256e36272a338b1072833102f Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 16:44:58 -0700
+Subject: [PATCH 4/6] primitives: inline small_vector storage for CTransaction
+ inputs and outputs
+
+Each CTransaction allocated two heap blocks for its vin and vout
+std::vectors. Store them in boost::container::small_vector with room
+for one input and two outputs inline, covering the common payment
+shape, so such transactions need no separate vin/vout allocations and
+their elements sit next to the transaction header. Larger transactions
+spill to the heap exactly like std::vector.
+
+prevector cannot be used here: it requires trivially copyable elements
+and CTxIn/CTxOut own CScripts. CMutableTransaction keeps std::vector.
+
+- SerializeTransaction writes inputs/outputs through
+  SerializeTxElements, producing the same bytes as std::vector
+  serialization for any container.
+- CTransaction is built from CMutableTransaction by element-wise copy
+  or move; moving still steals each element's script storage.
+- The deserializing constructor reads straight into the inline
+  containers instead of through a CMutableTransaction, whose
+  std::vectors would otherwise allocate on every P2P tx and block
+  transaction. UnserializeTransaction calls the same
+  VectorFormatter<DefaultFormatter> that std::vector deserialization
+  uses, so wire format and the batched-allocation DoS limit are
+  unchanged for both types.
+- core_memusage counts small_vector heap usage only once it spills.
+- CheckMinerFund takes Span<const CTxOut>.
+- boost/container/small_vector.hpp is added to the Boost lint
+  whitelist; it is header-only.
+
+sizeof(CTransaction) grows from 192 to 352 bytes on LP64. The inline
+space is wasted for transactions that spill (more than one input or
+more than two outputs).
+
+Test: serialization is byte-identical to CMutableTransaction across
+0-3 inputs and 0-4 outputs (inline and spilled), round-trips, and
+memory accounting reports no heap use while inline.
+---
+ src/core_memusage.h                  | 19 ++++++---
+ src/minerfund.cpp                    |  2 +-
+ src/minerfund.h                      |  3 +-
+ src/primitives/transaction.cpp       | 23 ++++++++---
+ src/primitives/transaction.h         | 60 +++++++++++++++++++++++-----
+ src/test/transaction_tests.cpp       | 45 +++++++++++++++++++++
+ test/lint/lint-boost-dependencies.sh |  1 +
+ 7 files changed, 130 insertions(+), 23 deletions(-)
+
+diff --git a/src/core_memusage.h b/src/core_memusage.h
+index eb738d98ec..1aba130b02 100644
+--- a/src/core_memusage.h
++++ b/src/core_memusage.h
+@@ -26,16 +26,23 @@ static inline size_t RecursiveDynamicUsage(const CTxOut &out) {
+     return RecursiveDynamicUsage(out.scriptPubKey);
+ }
+ 
++namespace memusage {
++/** Heap usage of a small_vector: zero while its elements fit inline. */
++template <typename X, size_t N>
++static inline size_t
++DynamicUsage(const boost::container::small_vector<X, N> &v) {
++    return v.capacity() > N ? MallocUsage(v.capacity() * sizeof(X)) : 0;
++}
++} // namespace memusage
++
+ static inline size_t RecursiveDynamicUsage(const CTransaction &tx) {
+     size_t mem =
+         memusage::DynamicUsage(tx.vin) + memusage::DynamicUsage(tx.vout);
+-    for (std::vector<CTxIn>::const_iterator it = tx.vin.begin();
+-         it != tx.vin.end(); it++) {
+-        mem += RecursiveDynamicUsage(*it);
++    for (const CTxIn &in : tx.vin) {
++        mem += RecursiveDynamicUsage(in);
+     }
+-    for (std::vector<CTxOut>::const_iterator it = tx.vout.begin();
+-         it != tx.vout.end(); it++) {
+-        mem += RecursiveDynamicUsage(*it);
++    for (const CTxOut &out : tx.vout) {
++        mem += RecursiveDynamicUsage(out);
+     }
+     return mem;
+ }
+diff --git a/src/minerfund.cpp b/src/minerfund.cpp
+index d69f32a8f4..eeb80cdbef 100644
+--- a/src/minerfund.cpp
++++ b/src/minerfund.cpp
+@@ -57,7 +57,7 @@ GetMinerFundWhitelist(const Consensus::Params &params) {
+ }
+ 
+ bool CheckMinerFund(const Consensus::Params &params,
+-                    const std::vector<CTxOut> &coinbaseTxOut,
++                    Span<const CTxOut> coinbaseTxOut,
+                     const Amount &blockReward, const CBlockIndex *pprev) {
+     const auto whitelist = GetMinerFundWhitelist(params);
+     if (whitelist.empty()) {
+diff --git a/src/minerfund.h b/src/minerfund.h
+index a1963154d5..b776dff47e 100644
+--- a/src/minerfund.h
++++ b/src/minerfund.h
+@@ -6,6 +6,7 @@
+ #define BITCOIN_MINERFUND_H
+ 
+ #include <script/standard.h>
++#include <span.h>
+ #include <util/hasher.h>
+ 
+ #include <unordered_set>
+@@ -29,7 +30,7 @@ GetMinerFundWhitelist(const Consensus::Params &params);
+  * Returns false if there is an invalid miner fund. True otherwise.
+  */
+ bool CheckMinerFund(const Consensus::Params &params,
+-                    const std::vector<CTxOut> &coinbaseTxOut,
++                    Span<const CTxOut> coinbaseTxOut,
+                     const Amount &blockReward, const CBlockIndex *pprev);
+ 
+ #endif // BITCOIN_MINERFUND_H
+diff --git a/src/primitives/transaction.cpp b/src/primitives/transaction.cpp
+index 1d493a80d4..84740d22ab 100644
+--- a/src/primitives/transaction.cpp
++++ b/src/primitives/transaction.cpp
+@@ -11,6 +11,7 @@
+ #include <tinyformat.h>
+ 
+ #include <cassert>
++#include <iterator>
+ 
+ std::string COutPoint::ToString() const {
+     return strprintf("COutPoint(%s, %u)", txid.ToString().substr(0, 10), n);
+@@ -42,7 +43,8 @@ std::string CTxOut::ToString() const {
+ CMutableTransaction::CMutableTransaction()
+     : nVersion{CTransaction::CURRENT_VERSION}, nLockTime{0} {}
+ CMutableTransaction::CMutableTransaction(const CTransaction &tx)
+-    : vin(tx.vin), vout(tx.vout), nVersion{tx.nVersion},
++    : vin(tx.vin.begin(), tx.vin.end()), vout(tx.vout.begin(), tx.vout.end()),
++      nVersion{tx.nVersion},
+       nLockTime{tx.nLockTime} {}
+ 
+ static uint256 ComputeCMutableTransactionHash(const CMutableTransaction &tx) {
+@@ -77,16 +79,27 @@ CTransaction::CTransaction()
+       m_serialize_size(ComputeSerializeSize()), hash(),
+       m_precomputed(PrecomputedTransactionData::Compute(*this)) {}
+ CTransaction::CTransaction(const CMutableTransaction &tx)
+-    : vin(tx.vin), vout(tx.vout), nVersion(tx.nVersion),
+-      nLockTime(tx.nLockTime), m_serialize_size(ComputeSerializeSize()),
++    : vin(tx.vin.begin(), tx.vin.end()), vout(tx.vout.begin(), tx.vout.end()),
++      nVersion(tx.nVersion), nLockTime(tx.nLockTime),
++      m_serialize_size(ComputeSerializeSize()),
+       hash(ComputeHash()),
+       m_precomputed(PrecomputedTransactionData::Compute(*this)) {}
+ CTransaction::CTransaction(CMutableTransaction &&tx)
+-    : vin(std::move(tx.vin)), vout(std::move(tx.vout)), nVersion(tx.nVersion),
+-      nLockTime(tx.nLockTime), m_serialize_size(ComputeSerializeSize()),
++    : vin(std::make_move_iterator(tx.vin.begin()),
++          std::make_move_iterator(tx.vin.end())),
++      vout(std::make_move_iterator(tx.vout.begin()),
++           std::make_move_iterator(tx.vout.end())),
++      nVersion(tx.nVersion), nLockTime(tx.nLockTime),
++      m_serialize_size(ComputeSerializeSize()),
+       hash(ComputeHash()),
+       m_precomputed(PrecomputedTransactionData::Compute(*this)) {}
+ 
++CTransaction::CTransaction(Fields &&fields)
++    : vin(std::move(fields.vin)), vout(std::move(fields.vout)),
++      nVersion(fields.nVersion), nLockTime(fields.nLockTime),
++      m_serialize_size(ComputeSerializeSize()), hash(ComputeHash()),
++      m_precomputed(PrecomputedTransactionData::Compute(*this)) {}
++
+ Amount CTransaction::GetValueOut() const {
+     Amount nValueOut = Amount::zero();
+     for (const auto &tx_out : vout) {
+diff --git a/src/primitives/transaction.h b/src/primitives/transaction.h
+index 7369dc62bd..41e5fc43f2 100644
+--- a/src/primitives/transaction.h
++++ b/src/primitives/transaction.h
+@@ -14,6 +14,8 @@
+ #include <serialize.h>
+ #include <support/allocators/chunked_slab.h>
+ 
++#include <boost/container/small_vector.hpp>
++
+ /**
+  * An outpoint - a combination of a transaction hash and an index n into its
+  * vout.
+@@ -170,22 +172,47 @@ inline void UnserializeTransaction(TxType &tx, Stream &s) {
+     s >> tx.nVersion;
+     tx.vin.clear();
+     tx.vout.clear();
++    // VectorFormatter is what std::vector<CTxIn/CTxOut> deserialization
++    // uses, including its batched-allocation DoS limit; spelling it out
++    // lets the same code fill CTransaction's inline containers.
+     /* Try to read the vin. In case the dummy is there, this will be read as an
+      * empty vector. */
+-    s >> tx.vin;
++    VectorFormatter<DefaultFormatter>{}.Unser(s, tx.vin);
+     /* We read a non-empty vin. Assume a normal vout follows. */
+-    s >> tx.vout;
++    VectorFormatter<DefaultFormatter>{}.Unser(s, tx.vout);
+     s >> tx.nLockTime;
+ }
+ 
++/**
++ * Serialize a vector of inputs or outputs exactly like std::vector<T>,
++ * whatever container holds them.
++ */
++template <typename Stream, typename Container>
++inline void SerializeTxElements(Stream &s, const Container &elems) {
++    WriteCompactSize(s, elems.size());
++    for (const auto &elem : elems) {
++        s << elem;
++    }
++}
++
+ template <typename Stream, typename TxType>
+ inline void SerializeTransaction(const TxType &tx, Stream &s) {
+     s << tx.nVersion;
+-    s << tx.vin;
+-    s << tx.vout;
++    SerializeTxElements(s, tx.vin);
++    SerializeTxElements(s, tx.vout);
+     s << tx.nLockTime;
+ }
+ 
++/**
++ * Inputs and outputs of a CTransaction keep room for the common 1-input,
++ * 2-output transaction inline, avoiding two heap allocations per
++ * transaction. Larger transactions spill to the heap like std::vector.
++ */
++static constexpr size_t TX_INLINE_INPUTS{1};
++static constexpr size_t TX_INLINE_OUTPUTS{2};
++using CTxInVector = boost::container::small_vector<CTxIn, TX_INLINE_INPUTS>;
++using CTxOutVector = boost::container::small_vector<CTxOut, TX_INLINE_OUTPUTS>;
++
+ class CTransaction;
+ 
+ /** Precompute sighash midstate to avoid quadratic hashing */
+@@ -230,8 +257,8 @@ public:
+     // actually immutable; deserialization and assignment are implemented,
+     // and bypass the constness. This is safe, as they update the entire
+     // structure, including the hash.
+-    const std::vector<CTxIn> vin;
+-    const std::vector<CTxOut> vout;
++    const CTxInVector vin;
++    const CTxOutVector vout;
+     const uint32_t nVersion;
+     const uint32_t nLockTime;
+ 
+@@ -244,6 +271,20 @@ private:
+     uint256 ComputeHash() const;
+     uint32_t ComputeSerializeSize() const;
+ 
++    /** Fields read straight from a stream, without a CMutableTransaction. */
++    struct Fields {
++        CTxInVector vin;
++        CTxOutVector vout;
++        uint32_t nVersion{0};
++        uint32_t nLockTime{0};
++    };
++    template <typename Stream> static Fields ReadFields(Stream &s) {
++        Fields fields;
++        UnserializeTransaction(fields, s);
++        return fields;
++    }
++    explicit CTransaction(Fields &&fields);
++
+ public:
+     /** Construct a CTransaction that qualifies as IsNull() */
+     CTransaction();
+@@ -267,8 +308,7 @@ public:
+      * const fields.
+      */
+     template <typename Stream>
+-    CTransaction(deserialize_type, Stream &s)
+-        : CTransaction(CMutableTransaction(deserialize, s)) {}
++    CTransaction(deserialize_type, Stream &s) : CTransaction(ReadFields(s)) {}
+ 
+     bool IsNull() const { return vin.empty() && vout.empty(); }
+ 
+@@ -307,8 +347,8 @@ public:
+     std::string ToString() const;
+ };
+ #if defined(__x86_64__)
+-static_assert(sizeof(CTransaction) == 192,
+-              "sizeof CTransaction is expected to be 192 bytes");
++static_assert(sizeof(CTransaction) == 352,
++              "sizeof CTransaction is expected to be 352 bytes");
+ #endif
+ 
+ inline PrecomputedTransactionData::PrecomputedTransactionData(
+diff --git a/src/test/transaction_tests.cpp b/src/test/transaction_tests.cpp
+index 5473089973..6d29065238 100644
+--- a/src/test/transaction_tests.cpp
++++ b/src/test/transaction_tests.cpp
+@@ -13,6 +13,7 @@
+ #include <consensus/tx_verify.h>
+ #include <consensus/validation.h>
+ #include <core_io.h>
++#include <core_memusage.h>
+ #include <key.h>
+ #include <policy/policy.h>
+ #include <policy/settings.h>
+@@ -1014,4 +1015,48 @@ BOOST_AUTO_TEST_CASE(cached_size_and_precomputed_data) {
+     }
+ }
+ 
++BOOST_AUTO_TEST_CASE(inline_inputs_and_outputs) {
++    // CTransaction keeps TX_INLINE_INPUTS inputs and TX_INLINE_OUTPUTS
++    // outputs inline; serialization must be byte-identical to the
++    // std::vector-based CMutableTransaction whether or not they spill.
++    FastRandomContext rng{/*fDeterministic=*/true};
++    for (size_t n_in = 0; n_in <= TX_INLINE_INPUTS + 2; ++n_in) {
++        for (size_t n_out = 0; n_out <= TX_INLINE_OUTPUTS + 2; ++n_out) {
++            CMutableTransaction mtx;
++            for (size_t i = 0; i < n_in; ++i) {
++                mtx.vin.emplace_back(TxId{rng.rand256()}, uint32_t(i),
++                                     CScript() << rng.randbytes(70));
++            }
++            for (size_t i = 0; i < n_out; ++i) {
++                mtx.vout.emplace_back(int64_t(i + 1) * SATOSHI,
++                                      CScript() << OP_TRUE);
++            }
++            DataStream expected{};
++            expected << mtx;
++
++            CMutableTransaction moved{mtx};
++            for (const CTransaction &tx :
++                 {CTransaction{mtx}, CTransaction{std::move(moved)}}) {
++                DataStream actual{};
++                actual << tx;
++                BOOST_CHECK_EQUAL(HexStr(actual), HexStr(expected));
++                BOOST_CHECK(tx.GetId() == mtx.GetId());
++                BOOST_CHECK(CMutableTransaction{tx}.vin == mtx.vin);
++                BOOST_CHECK(CMutableTransaction{tx}.vout == mtx.vout);
++
++                // Round-trip through deserialization.
++                DataStream ss{expected};
++                const CTransaction decoded{deserialize, ss};
++                BOOST_CHECK(decoded.GetHash() == tx.GetHash());
++
++                // No heap usage is reported while elements fit inline.
++                BOOST_CHECK_EQUAL(memusage::DynamicUsage(tx.vin) == 0,
++                                  n_in <= TX_INLINE_INPUTS);
++                BOOST_CHECK_EQUAL(memusage::DynamicUsage(tx.vout) == 0,
++                                  n_out <= TX_INLINE_OUTPUTS);
++            }
++        }
++    }
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/test/lint/lint-boost-dependencies.sh b/test/lint/lint-boost-dependencies.sh
+index 3b02003739..77424a8c56 100755
+--- a/test/lint/lint-boost-dependencies.sh
++++ b/test/lint/lint-boost-dependencies.sh
+@@ -9,6 +9,7 @@
+ export LC_ALL=C
+ 
+ EXPECTED_BOOST_INCLUDES=(
++    boost/container/small_vector.hpp
+     boost/mpl/list.hpp
+     boost/mpl/size.hpp
+     boost/multiprecision/cpp_int.hpp
+-- 
+2.50.1 (Apple Git-155)
+

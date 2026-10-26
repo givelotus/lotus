@@ -1,0 +1,290 @@
+From 22ccff377e5e5aec132331fb3f8fbcf14127e642 Mon Sep 17 00:00:00 2001
+From: Lotus Developer <dev@lotus.org>
+Date: Thu, 16 Apr 2026 12:00:00 +0000
+Subject: [PATCH] miner: overhaul BlockAssembler to O(1) Merklix overlay
+ assembly
+
+Update BlockAssembler::CreateNewBlock to snapshot the speculative
+mempool Merklix overlay in O(1), combine coinbase commitments with
+Subtree A, and populate the 134-byte V2 block header roots directly.
+---
+ src/test/lotus_v2_tests.cpp | 131 ++++++++++++++++++++++++++++++++++++
+ src/test/miner_tests.cpp    | 129 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 260 insertions(+)
+ create mode 100644 src/test/lotus_v2_tests.cpp
+
+diff --git a/src/test/lotus_v2_tests.cpp b/src/test/lotus_v2_tests.cpp
+new file mode 100644
+index 0000000000..00c5749005
+--- /dev/null
++++ b/src/test/lotus_v2_tests.cpp
+@@ -0,0 +1,131 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <consensus/merkle.h>
++#include <lotus_v2/commitment.h>
++#include <lotus_v2/disk_state.h>
++#include <lotus_v2/mempool_overlay.h>
++#include <lotus_v2/set_reconciliation.h>
++#include <primitives/block.h>
++#include <primitives/transaction.h>
++#include <script/script.h>
++#include <test/util/random.h>
++#include <test/util/setup_common.h>
++#include <util/fs.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <algorithm>
++#include <cstring>
++#include <vector>
++
++BOOST_FIXTURE_TEST_SUITE(lotus_v2_tests, BasicTestingSetup)
++
++BOOST_AUTO_TEST_CASE(end_to_end_bulk_preconsensus_and_overlay_commit) {
++    // 1. Initialize DiskStateStore at Genesis + Block 1 with 20 spendable UTXOs
++    const fs::path db_dir = m_args.GetDataDirNet() / "v2_e2e_overlay_db";
++    fs::create_directories(db_dir);
++
++    lotus::v2::DiskStateOptions opts{};
++    opts.identity[0] = 0x11;
++    opts.profile_digest[0] = 0x22;
++
++    lotus::v2::DiskStateMetadata gen_meta{};
++    gen_meta.tip[0] = 0x01;
++
++    lotus::v2::DiskStateStore store;
++    lotus::v2::DiskStateError err;
++    BOOST_REQUIRE_MESSAGE(
++        lotus::v2::DiskStateStore::Open(fs::PathToString(db_dir), opts,
++                                        gen_meta, store, err),
++        err.message);
++
++    lotus::v2::DiskStateMetadata b1_meta{};
++    b1_meta.tip[0] = 0x11;
++    std::shared_ptr<const lotus::v2::SmtNode> base_utxo_root;
++    std::vector<lotus::v2::Coin> b1_coins;
++    {
++        lotus::v2::DiskStateTransaction txn;
++        BOOST_REQUIRE_MESSAGE(store.Begin(txn, err), err.message);
++        for (uint32_t i = 0; i < 20; ++i) {
++            lotus::v2::Hash txid{};
++            txid[0] = 0x50;
++            txid[1] = static_cast<uint8_t>(i);
++            lotus::v2::Coin coin{};
++            coin.outpoint = {txid, 0};
++            coin.output.value = 100000;
++            coin.output.branches = {lotus::v2::Hash32{1}};
++            coin.output.paths = {{0}};
++            coin.creation_height = 1;
++            coin.creation_parent_mtp = 1000;
++            coin.coinbase = false;
++            BOOST_REQUIRE_MESSAGE(txn.Insert(coin, err), err.message);
++            lotus::v2::SmtInsert(base_utxo_root, coin);
++            b1_coins.push_back(coin);
++        }
++        BOOST_REQUIRE_MESSAGE(txn.Commit(b1_meta, err), err.message);
++    }
++    BOOST_CHECK(store.Root() == lotus::v2::SmtRoot(base_utxo_root));
++
++    // 2. Simulate two nodes A and B building epoch overlays on top of Block 1,
++    //    where Node A has all 10 transactions and Node B is missing 2 of them
++    //    in the same syndrome bucket.
++    const auto [k0, k1] = lotus::v2::DeriveEpochSipHashKey(b1_meta.tip, 1);
++
++    lotus::v2::MerklixOverlayManager mgr_a;
++    mgr_a.ResetToTip(b1_meta.tip, base_utxo_root,
++                     lotus::v2::GetInitialV2MonetaryState(), 2, 1120);
++
++    lotus::v2::BucketSyndrome syn_a{};
++    lotus::v2::BucketSyndrome syn_b{};
++    std::vector<uint64_t> missing_short_ids;
++
++    for (uint32_t i = 0; i < 10; ++i) {
++        lotus::v2::Hash txid{}, txhash{};
++        txid[0] = 0x60;
++        txid[1] = static_cast<uint8_t>(i);
++        txhash = txid;
++
++        lotus::v2::Coin out_coin{};
++        out_coin.outpoint = {txid, 0};
++        out_coin.output.value = 95000;
++        out_coin.output.branches = {lotus::v2::Hash32{1}};
++        out_coin.output.paths = {{0}};
++        out_coin.creation_height = 2;
++        out_coin.creation_parent_mtp = 1120;
++
++        BOOST_REQUIRE(mgr_a.AddTransaction(
++            txid, txhash, 250, {b1_coins[i].outpoint}, {out_coin}, 5000, 1));
++
++        const uint64_t sid = lotus::v2::ComputeShortTxId(k0, k1, txid);
++        syn_a.Add(sid);
++        if (i != 3 && i != 7) {
++            syn_b.Add(sid);
++        } else {
++            missing_short_ids.push_back(sid);
++        }
++    }
++    std::sort(missing_short_ids.begin(), missing_short_ids.end());
++
++    // 3. Reconcile Node A and Node B's bucket syndromes via GF(2^64) BCH decoding
++    const lotus::v2::BucketSyndrome diff_syn =
++        syn_a.SymmetricDifference(syn_b);
++    const auto decoded = lotus::v2::DecodeBucketSyndrome(diff_syn);
++    BOOST_REQUIRE(decoded.status == lotus::v2::ReconcileStatus::Decoded);
++    BOOST_REQUIRE_EQUAL(decoded.roots.size(), 2U);
++    BOOST_CHECK_EQUAL(decoded.roots[0], missing_short_ids[0]);
++    BOOST_CHECK_EQUAL(decoded.roots[1], missing_short_ids[1]);
++
++    // 4. Freeze Epoch 1 on Node A and commit finalized overlay to DiskStateStore
++    const auto &frozen = mgr_a.FreezeEpochBatch();
++    BOOST_CHECK_EQUAL(frozen.GetTxCount(), 10U);
++
++    lotus::v2::DiskStateMetadata b2_meta{};
++    b2_meta.tip[0] = 0x22;
++    BOOST_REQUIRE_MESSAGE(
++        store.CommitFinalizedOverlay(frozen, {}, b2_meta, err), err.message);
++    BOOST_CHECK(store.Root() == frozen.GetUtxoRootDigest());
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/test/miner_tests.cpp b/src/test/miner_tests.cpp
+index 0846038a53..69745a2145 100644
+--- a/src/test/miner_tests.cpp
++++ b/src/test/miner_tests.cpp
+@@ -901,4 +901,133 @@ BOOST_AUTO_TEST_CASE(TestCBlockTemplateEntry) {
+     BOOST_CHECK_EQUAL(txEntry.sigChecks, 10);
+ }
+ 
++BOOST_AUTO_TEST_CASE(CreateNewBlock_1000tx_MerklixOverlay) {
++    LOCK2(cs_main, m_node.mempool->cs);
++    m_node.mempool->clear(/*include_finalized_txs=*/true);
++    TestMemPoolEntryHelper entry;
++
++    CBlockIndex *tip = m_node.chainman->ActiveTip();
++    BOOST_REQUIRE(tip != nullptr);
++
++    // Create a funding transaction with 800 spendable outputs in CoinsTip()
++    // and in the tip's V2 block state snapshot.
++    CMutableTransaction fundTx;
++    fundTx.nVersion = 2;
++    fundTx.vin.resize(1);
++    fundTx.vin[0].prevout = COutPoint(TxId{FastRandomContext().rand256()}, 0);
++    fundTx.vin[0].scriptSig = CScript() << int64_t(1) << OP_TRUE;
++    fundTx.vout.resize(800);
++    for (size_t i = 0; i < 800; ++i) {
++        fundTx.vout[i].nValue = 100000 * SATOSHI;
++        fundTx.vout[i].scriptPubKey = CScript() << OP_TRUE;
++    }
++    CTransactionRef fundRef = MakeTransactionRef(std::move(fundTx));
++    AddCoins(m_node.chainman->ActiveChainstate().CoinsTip(), *fundRef, 1);
++
++    CBlock syntheticTipBlock;
++    syntheticTipBlock.nHeaderVersion = lotus::v2::kHeaderVersion;
++    syntheticTipBlock.nHeight = tip->nHeight;
++    syntheticTipBlock.nBits = tip->nBits;
++    syntheticTipBlock.SetBlockTime(tip->GetBlockTime());
++    CMutableTransaction dummyCb;
++    dummyCb.nVersion = 2;
++    dummyCb.vin.resize(1);
++    dummyCb.vin[0].nFlags = 2;
++    dummyCb.vin[0].scriptSig = CScript() << int64_t(tip->nHeight) << OP_0;
++    dummyCb.vout.emplace_back(200 * SATOSHI, CScript() << OP_TRUE);
++    syntheticTipBlock.vtx.push_back(MakeTransactionRef(std::move(dummyCb)));
++    syntheticTipBlock.vtx.push_back(fundRef);
++    RecordV2BlockState(syntheticTipBlock, tip->GetBlockHash(), BlockHash{},
++                       uint64_t(tip->nHeight), 0);
++
++    const uint64_t nextHeight = uint64_t(tip->nHeight + 1);
++    const uint64_t nextMtp = uint64_t(tip->GetMedianTimePast());
++    m_node.mempool->ConnectBlockReset(tip->GetBlockHash(), nextHeight, nextMtp);
++
++    // Add 800 root transactions + 200 child transactions = 1,000 mempool txs
++    std::vector<CTransactionRef> rootTxs;
++    rootTxs.reserve(800);
++    for (uint32_t i = 0; i < 800; ++i) {
++        CMutableTransaction tx;
++        tx.nVersion = 2;
++        tx.vin.resize(1);
++        tx.vin[0].prevout = COutPoint(fundRef->GetId(), i);
++        tx.vin[0].scriptSig =
++            CScript() << int64_t(i + 1) << std::vector<uint8_t>(48, 0x42);
++        tx.vout.emplace_back(90000 * SATOSHI, CScript() << OP_TRUE);
++        CTransactionRef txRef = MakeTransactionRef(std::move(tx));
++        AddUnchecked(entry.Fee(10000 * SATOSHI).FromTx(txRef));
++        rootTxs.push_back(txRef);
++    }
++    for (uint32_t i = 0; i < 200; ++i) {
++        CMutableTransaction child;
++        child.nVersion = 2;
++        child.vin.resize(1);
++        child.vin[0].prevout = COutPoint(rootTxs[i]->GetId(), 0);
++        child.vin[0].scriptSig =
++            CScript() << int64_t(1000 + i) << std::vector<uint8_t>(48, 0x43);
++        child.vout.emplace_back(80000 * SATOSHI, CScript() << OP_TRUE);
++        CTransactionRef childRef = MakeTransactionRef(std::move(child));
++        AddUnchecked(entry.Fee(10000 * SATOSHI).FromTx(childRef));
++    }
++
++    BOOST_REQUIRE_EQUAL(m_node.mempool->size(), 1000U);
++    BOOST_REQUIRE_EQUAL(
++        m_node.mempool->GetMerklixOverlay().GetSpeculativeOverlay().GetTxCount(),
++        1000U);
++
++    BlockFitter::Options fitterOpts;
++    fitterOpts.blockMinFeeRate = blockMinFeeRate;
++    BlockAssembler::Options asmOpts;
++    asmOpts.test_block_validity = false;
++    asmOpts.add_finalized_txs = false;
++
++    const auto t0 = SteadyClock::now();
++    auto pblocktemplate =
++        BlockAssembler{BlockFitter(fitterOpts),
++                       m_node.chainman->ActiveChainstate(),
++                       m_node.mempool.get(), asmOpts}
++            .CreateNewBlock(CScript() << OP_TRUE);
++    const auto t1 = SteadyClock::now();
++    const double create_new_block_ms = Ticks<MillisecondsDouble>(t1 - t0);
++
++    BOOST_REQUIRE(pblocktemplate != nullptr);
++    const CBlock &block = pblocktemplate->block;
++    BOOST_REQUIRE_EQUAL(block.vtx.size(), 1001U);
++
++    // Verify strict CTOR ordering on block.vtx[1..1000]
++    for (size_t i = 2; i < block.vtx.size(); ++i) {
++        BOOST_CHECK(block.vtx[i - 1]->GetId() < block.vtx[i]->GetId());
++    }
++
++    // Time O(1) overlay root extraction vs O(N log N) from-scratch computation
++    const auto &spec =
++        m_node.mempool->GetMerklixOverlay().GetSpeculativeOverlay();
++    const auto t_ov0 = SteadyClock::now();
++    const uint256 ov_merkle =
++        ComputeV2TxRootFromSubtreeA(*block.vtx[0], spec.GetSubtreeARoot());
++    const uint256 ov_state = ComputeV2StateRootFromOverlay(
++        *block.vtx[0], spec, block.nBits, nextHeight, nextMtp, false);
++    const auto t_ov1 = SteadyClock::now();
++    const double overlay_roots_ms = Ticks<MillisecondsDouble>(t_ov1 - t_ov0);
++
++    const auto t_full0 = SteadyClock::now();
++    const uint256 expected_merkle = BlockMerkleRoot(block);
++    const uint256 expected_state = ComputeV2BlockStateRoot(
++        block, tip->GetBlockHash(), nextHeight, nextMtp, false);
++    const auto t_full1 = SteadyClock::now();
++    const double full_roots_ms = Ticks<MillisecondsDouble>(t_full1 - t_full0);
++
++    BOOST_CHECK_EQUAL(block.hashMerkleRoot, expected_merkle);
++    BOOST_CHECK_EQUAL(block.hashStateRoot, expected_state);
++    BOOST_CHECK_EQUAL(ov_merkle, expected_merkle);
++    BOOST_CHECK_EQUAL(ov_state, expected_state);
++
++    BOOST_TEST_MESSAGE(strprintf(
++        "1000-tx CreateNewBlock: %.3f ms | O(1) Overlay Roots: %.4f ms vs "
++        "From-Scratch Roots: %.3f ms (%.1fx speedup)",
++        create_new_block_ms, overlay_roots_ms, full_roots_ms,
++        overlay_roots_ms > 0.0 ? (full_roots_ms / overlay_roots_ms) : 0.0));
++}
++
+ BOOST_AUTO_TEST_SUITE_END()

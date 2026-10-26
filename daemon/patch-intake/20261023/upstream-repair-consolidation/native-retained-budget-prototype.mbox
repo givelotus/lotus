@@ -1,0 +1,257 @@
+From aa1a3f1eb7892ca050b188a0f4fb057310c30139 Mon Sep 17 00:00:00 2001
+From: Canonical patch progression <213740+schancel@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 17:46:03 -0700
+Subject: [PATCH 1/2] fixup! net: admit peer transactions on an admission
+ thread (-parallelmempool)
+
+---
+ src/net_processing.cpp               | 34 ++++++++++++++++++++--
+ src/node/txadmission.h               | 43 ++++++++++++++++++++++++++++
+ src/test/txadmission_queue_tests.cpp | 42 +++++++++++++++++++++++++++
+ 3 files changed, 116 insertions(+), 3 deletions(-)
+
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 57523d40bd..411339bd1e 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -748,6 +748,10 @@ struct Peer {
+     std::deque<CTransactionRef>
+         m_tx_admission_held_txs GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+ 
++    /** Compact-response reservations follow held bodies through disconnect. */
++    std::vector<node::TxAdmissionRetainedBudget::Reservation>
++        m_tx_admission_held_budgets GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
++
+     /** A coalesced decode failure, handled after its decoded prefix. */
+     std::exception_ptr m_tx_admission_exception
+         GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+@@ -1210,6 +1214,7 @@ private:
+     };
+ 
+     std::unique_ptr<node::TxAdmissionQueue> m_tx_admission_queue;
++    node::TxAdmissionRetainedBudget m_tx_admission_retained_budget{64U << 20};
+     std::thread m_tx_admission_thread;
+     std::atomic<bool> m_tx_admission_running{false};
+     Mutex m_tx_admission_done_mutex;
+@@ -4171,7 +4176,24 @@ void PeerManagerImpl::ProcessShortTxResponse(
+     }
+     // The handler already checked response bounds and request eligibility.
+     // Use the same bounded admission/verdict path as ordinary TX messages.
+-    if (m_tx_admission_running.load()) {
++    constexpr size_t retained_limit = 64U << 20;
++    size_t retained_bytes{0};
++    for (const auto &tx : txs) {
++        if (!tx) continue;
++        const size_t bytes = tx->GetTotalSize();
++        if (bytes > retained_limit - retained_bytes) {
++            retained_bytes = retained_limit + 1;
++            break;
++        }
++        retained_bytes += bytes;
++    }
++    auto reservation = m_tx_admission_running.load()
++        ? m_tx_admission_retained_budget.TryReserve(retained_bytes)
++        : std::nullopt;
++    // Reserve before queueing anything. If the extra retention budget is full,
++    // process this already-decoded response serially, retaining no extra FIFO.
++    if (reservation) {
++        peer->m_tx_admission_held_budgets.push_back(std::move(*reservation));
+         for (const auto &tx : txs) {
+             if (tx) AddKnownTx(*peer, tx->GetId());
+         }
+@@ -4185,8 +4207,11 @@ void PeerManagerImpl::ProcessShortTxResponse(
+                 peer->m_tx_admission_held_txs.push_back(tx);
+             }
+         }
+-        // At most one bounded response is retained: ProcessMessages drains
+-        // held transactions before reading another frame from this peer.
++        // The primary queue accounts queued bodies. Keep the conservative
++        // whole-response reservation until all additional held bodies drain.
++        if (peer->m_tx_admission_held_txs.empty()) {
++            peer->m_tx_admission_held_budgets.clear();
++        }
+         return;
+     }
+     // Serial control: orphan handling, 1p1c, reject caches and relay apply.
+@@ -10051,6 +10076,9 @@ bool PeerManagerImpl::ProcessMessages(const Config &config, CNode *pfrom,
+                                        /*count_full=*/false)) {
+                 peer->m_tx_admission_held_txs.pop_front();
+             }
++            if (peer->m_tx_admission_held_txs.empty()) {
++                peer->m_tx_admission_held_budgets.clear();
++            }
+             return peer->m_tx_admission_held_txs.empty() || admission_progress;
+         }
+         if (peer->m_tx_admission_exception) {
+diff --git a/src/node/txadmission.h b/src/node/txadmission.h
+index 2e5a3e0d62..49c90c793c 100644
+--- a/src/node/txadmission.h
++++ b/src/node/txadmission.h
+@@ -10,6 +10,7 @@
+ #include <sync.h>
+ #include <util/time.h>
+ 
++#include <atomic>
+ #include <chrono>
+ #include <condition_variable>
+ #include <cstddef>
+@@ -17,6 +18,8 @@
+ #include <deque>
+ #include <map>
+ #include <memory>
++#include <optional>
++#include <utility>
+ #include <vector>
+ 
+ namespace node {
+@@ -28,6 +31,46 @@ static constexpr int DEFAULT_PARALLEL_MEMPOOL_THREADS{0};
+ /** Most script-check threads -parallelmempoolthreads may ask for. */
+ static constexpr int MAX_PARALLEL_MEMPOOL_THREADS{64};
+ 
++/** Additional serialized-byte budget for decoded compact responses retained
++ * outside the primary queue. Reservations may outlive their budget owner. */
++class TxAdmissionRetainedBudget {
++    struct State {
++        const size_t limit;
++        std::atomic<size_t> used{0};
++        explicit State(size_t limit_in) : limit(limit_in) {}
++    };
++    std::shared_ptr<State> m_state;
++public:
++    class Reservation {
++        friend class TxAdmissionRetainedBudget;
++        std::shared_ptr<State> m_state;
++        size_t m_bytes;
++        Reservation(std::shared_ptr<State> state, size_t bytes)
++            : m_state(std::move(state)), m_bytes(bytes) {}
++    public:
++        Reservation(const Reservation &) = delete;
++        Reservation &operator=(const Reservation &) = delete;
++        Reservation(Reservation &&other) noexcept
++            : m_state(std::move(other.m_state)), m_bytes(other.m_bytes) {}
++        ~Reservation() {
++            if (m_state) m_state->used.fetch_sub(m_bytes, std::memory_order_relaxed);
++        }
++    };
++    explicit TxAdmissionRetainedBudget(size_t limit)
++        : m_state(std::make_shared<State>(limit)) {}
++    std::optional<Reservation> TryReserve(size_t bytes) {
++        size_t used = m_state->used.load(std::memory_order_relaxed);
++        do {
++            if (bytes > m_state->limit - used) return std::nullopt;
++        } while (!m_state->used.compare_exchange_weak(
++            used, used + bytes, std::memory_order_relaxed));
++        return Reservation{m_state, bytes};
++    }
++    size_t Used() const noexcept {
++        return m_state->used.load(std::memory_order_relaxed);
++    }
++};
++
+ /** A received transaction waiting for mempool admission. */
+ struct TxAdmissionItem {
+     NodeId peer{-1};
+diff --git a/src/test/txadmission_queue_tests.cpp b/src/test/txadmission_queue_tests.cpp
+index f618bdbd69..cd5f9718e2 100644
+--- a/src/test/txadmission_queue_tests.cpp
++++ b/src/test/txadmission_queue_tests.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <atomic>
+ #include <map>
++#include <limits>
+ #include <thread>
+ #include <vector>
+ 
+@@ -33,6 +34,47 @@ TxAdmissionItem Item(NodeId peer, uint32_t n) {
+ 
+ BOOST_FIXTURE_TEST_SUITE(txadmission_queue_tests, BasicTestingSetup)
+ 
++BOOST_AUTO_TEST_CASE(retained_compact_bodies_share_a_lifetime_safe_byte_budget) {
++    node::TxAdmissionRetainedBudget budget{64};
++    auto a = budget.TryReserve(40);
++    BOOST_REQUIRE(a.has_value());
++    BOOST_CHECK(!budget.TryReserve(25));
++    auto b = budget.TryReserve(24);
++    BOOST_REQUIRE(b.has_value());
++    BOOST_CHECK_EQUAL(budget.Used(), 64U);
++    auto moved = std::move(*a);
++    a.reset();
++    BOOST_CHECK_EQUAL(budget.Used(), 64U);
++    b.reset();
++    BOOST_CHECK_EQUAL(budget.Used(), 40U);
++    BOOST_CHECK(budget.TryReserve(24).has_value());
++    BOOST_CHECK(!budget.TryReserve(std::numeric_limits<size_t>::max()));
++    // A disconnected peer can retain a reservation after its manager dies.
++    std::optional<node::TxAdmissionRetainedBudget::Reservation> surviving;
++    {
++        node::TxAdmissionRetainedBudget temporary{1};
++        surviving.emplace(std::move(*temporary.TryReserve(1)));
++    }
++    surviving.reset();
++}
++
++BOOST_AUTO_TEST_CASE(retained_compact_body_budget_is_bounded_across_threads) {
++    node::TxAdmissionRetainedBudget budget{64};
++    std::atomic<bool> over_limit{false};
++    std::vector<std::thread> threads;
++    for (int i = 0; i < 8; ++i) {
++        threads.emplace_back([&] {
++            for (int j = 0; j < 2000; ++j) {
++                auto reservation = budget.TryReserve(17);
++                if (budget.Used() > 64) over_limit.store(true);
++            }
++        });
++    }
++    for (auto &thread : threads) thread.join();
++    BOOST_CHECK(!over_limit.load());
++    BOOST_CHECK_EQUAL(budget.Used(), 0U);
++}
++
+ BOOST_AUTO_TEST_CASE(round_robin_keeps_per_peer_order) {
+     TxAdmissionQueue q{{}};
+     // Peer 1 floods, peers 2 and 3 send a little.
+-- 
+2.50.1 (Apple Git-155)
+
+
+From d78bd865566caef67a546e93077a4c1be4d1a5e0 Mon Sep 17 00:00:00 2001
+From: Canonical patch progression <213740+schancel@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 17:47:22 -0700
+Subject: [PATCH 2/2] fixup! net: admit peer transactions on an admission
+ thread (-parallelmempool)
+
+---
+ src/net_processing.cpp | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 411339bd1e..4f97fc3cc3 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -740,6 +740,11 @@ struct Peer {
+     /** A non-transaction message read while transactions were pending. */
+     std::optional<CNetMessage>
+         m_tx_admission_held_msg GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
++    // Declared before held bodies so destruction releases the bodies first.
++    /** Compact-response reservations follow held bodies through disconnect. */
++    std::vector<node::TxAdmissionRetainedBudget::Reservation>
++        m_tx_admission_held_budgets GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
++
+     /**
+      * Transactions that could not be queued yet, in arrival order: an
+      * earlier copy is still in admission (handled after that copy's verdict,
+@@ -748,10 +753,6 @@ struct Peer {
+     std::deque<CTransactionRef>
+         m_tx_admission_held_txs GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+ 
+-    /** Compact-response reservations follow held bodies through disconnect. */
+-    std::vector<node::TxAdmissionRetainedBudget::Reservation>
+-        m_tx_admission_held_budgets GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+-
+     /** A coalesced decode failure, handled after its decoded prefix. */
+     std::exception_ptr m_tx_admission_exception
+         GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+-- 
+2.50.1 (Apple Git-155)
+

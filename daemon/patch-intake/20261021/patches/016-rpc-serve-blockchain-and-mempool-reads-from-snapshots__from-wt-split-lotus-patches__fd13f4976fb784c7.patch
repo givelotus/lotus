@@ -1,0 +1,823 @@
+From 7a22df86589c4b8f3b7c47c48377e2bf2ca9c25d Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:29 -0700
+Subject: [PATCH] rpc: serve blockchain and mempool reads from snapshots
+
+Extract this concern so its mechanism can be reviewed and measured independently.
+No source semantics are added or removed by this history operation.
+
+Original patch rationale (describes the unsplit source, not every extracted part):
+Add SnapshotPublisher RCU snapshots for lock-free read RPCs and O(1)
+getblocktemplate / submitminedheader.
+
+Original-Commit: 399c3d5cf2aa9602aff967024c7f4053b06d206c
+Original-Patch: ecash/014
+Split-Concern: read-rpc
+
+Historical compilation prerequisites are tracked separately in daemon/patch-audit;
+this provenance-preserving split does not imply standalone build validation.
+---
+ src/rpc/blockchain.cpp     | 303 +++++++++++++++++++++++--------------
+ src/rpc/mempool.cpp        | 125 ++++++++++-----
+ src/rpc/rawtransaction.cpp | 120 ++++++++++++++-
+ 3 files changed, 403 insertions(+), 145 deletions(-)
+
+diff --git a/src/rpc/blockchain.cpp b/src/rpc/blockchain.cpp
+index ed3047776562fed3dad8364b20eafde7174c7f87..3e545435e4ade9a1b91e9f8cdae552c9f5200197 100644
+--- a/src/rpc/blockchain.cpp
++++ b/src/rpc/blockchain.cpp
+@@ -26,8 +26,10 @@
+ #include <node/blockstorage.h>
+ #include <node/coinstats.h>
+ #include <node/context.h>
++#include <node/snapshot.h>
+ #include <node/utxo_snapshot.h>
+ #include <primitives/transaction.h>
++#include <rpc/async_waiter.h>
+ #include <rpc/server.h>
+ #include <rpc/server_util.h>
+ #include <rpc/util.h>
+@@ -217,6 +219,28 @@ UniValue blockToJSON(BlockManager &blockman, const CBlock &block,
+     return result;
+ }
+ 
++static std::shared_ptr<const node::ChainAndMempoolSnapshot>
++LoadOrInitChainSnapshot(const std::any &context, ChainstateManager &chainman) {
++    auto node_ctx_ptr = std::any_cast<node::NodeContext *>(&context);
++    const node::NodeContext *node_ctx =
++        node_ctx_ptr ? *node_ctx_ptr : nullptr;
++    node::SnapshotPublisher &publisher =
++        (node_ctx && node_ctx->snapshot_publisher)
++            ? *node_ctx->snapshot_publisher
++            : node::GetGlobalSnapshotPublisher();
++    auto snap = publisher.Load();
++    if (snap && snap->chain_valid && snap->chainman_ptr == &chainman) {
++        return snap;
++    }
++    const CTxMemPool *mempool =
++        (node_ctx && node_ctx->mempool) ? node_ctx->mempool.get() : nullptr;
++    {
++        LOCK(cs_main);
++        node::PublishChainTipSnapshot(chainman, mempool);
++    }
++    return publisher.Load();
++}
++
+ static RPCHelpMan getblockcount() {
+     return RPCHelpMan{
+         "getblockcount",
+@@ -229,8 +253,8 @@ static RPCHelpMan getblockcount() {
+         [&](const RPCHelpMan &self, const Config &config,
+             const JSONRPCRequest &request) -> UniValue {
+             ChainstateManager &chainman = EnsureAnyChainman(request.context);
+-            LOCK(cs_main);
+-            return chainman.ActiveHeight();
++            auto snap = LoadOrInitChainSnapshot(request.context, chainman);
++            return CHECK_NONFATAL(snap)->height;
+         },
+     };
+ }
+@@ -247,8 +271,8 @@ static RPCHelpMan getbestblockhash() {
+         [&](const RPCHelpMan &self, const Config &config,
+             const JSONRPCRequest &request) -> UniValue {
+             ChainstateManager &chainman = EnsureAnyChainman(request.context);
+-            LOCK(cs_main);
+-            return chainman.ActiveTip()->GetBlockHash().GetHex();
++            auto snap = LoadOrInitChainSnapshot(request.context, chainman);
++            return CHECK_NONFATAL(snap)->best_block_hash.GetHex();
+         },
+     };
+ }
+@@ -260,6 +284,7 @@ void RPCNotifyBlockChange(const CBlockIndex *pindex) {
+         latestblock.height = pindex->nHeight;
+     }
+     cond_blockchange.notify_all();
++    GetRPCBlockChangeWaiter().NotifyAll();
+ }
+ 
+ static RPCHelpMan waitfornewblock() {
+@@ -282,39 +307,37 @@ static RPCHelpMan waitfornewblock() {
+         RPCExamples{HelpExampleCli("waitfornewblock", "1000") +
+                     HelpExampleRpc("waitfornewblock", "1000")},
+         [&](const RPCHelpMan &self, const Config &config,
+-            const JSONRPCRequest &request) -> UniValue {
++            const JSONRPCRequest &request,
++            boost::asio::any_io_executor executor)
++            -> boost::asio::awaitable<UniValue> {
+             int timeout = 0;
+             if (!request.params[0].isNull()) {
+                 timeout = request.params[0].getInt<int>();
+             }
+ 
++            CUpdatedBlock initial_block;
++            {
++                LOCK(cs_blockchange);
++                initial_block = latestblock;
++            }
++
++            co_await GetRPCBlockChangeWaiter().WaitUntil(
++                executor, std::chrono::milliseconds(timeout), [initial_block]() {
++                    LOCK(cs_blockchange);
++                    return latestblock.height != initial_block.height ||
++                           latestblock.hash != initial_block.hash ||
++                           !IsRPCRunning();
++                });
++
+             CUpdatedBlock block;
+             {
+-                WAIT_LOCK(cs_blockchange, lock);
+-                block = latestblock;
+-                if (timeout) {
+-                    cond_blockchange.wait_for(
+-                        lock, std::chrono::milliseconds(timeout),
+-                        [&block]() EXCLUSIVE_LOCKS_REQUIRED(cs_blockchange) {
+-                            return latestblock.height != block.height ||
+-                                   latestblock.hash != block.hash ||
+-                                   !IsRPCRunning();
+-                        });
+-                } else {
+-                    cond_blockchange.wait(
+-                        lock,
+-                        [&block]() EXCLUSIVE_LOCKS_REQUIRED(cs_blockchange) {
+-                            return latestblock.height != block.height ||
+-                                   latestblock.hash != block.hash ||
+-                                   !IsRPCRunning();
+-                        });
+-                }
++                LOCK(cs_blockchange);
+                 block = latestblock;
+             }
+             UniValue ret(UniValue::VOBJ);
+             ret.pushKV("hash", block.hash.GetHex());
+             ret.pushKV("height", block.height);
+-            return ret;
++            co_return ret;
+         },
+     };
+ }
+@@ -345,7 +368,9 @@ static RPCHelpMan waitforblock() {
+                                    "\"0000000000079f8ef3d2c688c244eb7a4570b24c9"
+                                    "ed7b4a8c619eb02596f8862\", 1000")},
+         [&](const RPCHelpMan &self, const Config &config,
+-            const JSONRPCRequest &request) -> UniValue {
++            const JSONRPCRequest &request,
++            boost::asio::any_io_executor executor)
++            -> boost::asio::awaitable<UniValue> {
+             int timeout = 0;
+ 
+             BlockHash hash(ParseHashV(request.params[0], "blockhash"));
+@@ -354,29 +379,22 @@ static RPCHelpMan waitforblock() {
+                 timeout = request.params[1].getInt<int>();
+             }
+ 
++            co_await GetRPCBlockChangeWaiter().WaitUntil(
++                executor, std::chrono::milliseconds(timeout), [hash]() {
++                    LOCK(cs_blockchange);
++                    return latestblock.hash == hash || !IsRPCRunning();
++                });
++
+             CUpdatedBlock block;
+             {
+-                WAIT_LOCK(cs_blockchange, lock);
+-                if (timeout) {
+-                    cond_blockchange.wait_for(
+-                        lock, std::chrono::milliseconds(timeout),
+-                        [&hash]() EXCLUSIVE_LOCKS_REQUIRED(cs_blockchange) {
+-                            return latestblock.hash == hash || !IsRPCRunning();
+-                        });
+-                } else {
+-                    cond_blockchange.wait(
+-                        lock,
+-                        [&hash]() EXCLUSIVE_LOCKS_REQUIRED(cs_blockchange) {
+-                            return latestblock.hash == hash || !IsRPCRunning();
+-                        });
+-                }
++                LOCK(cs_blockchange);
+                 block = latestblock;
+             }
+ 
+             UniValue ret(UniValue::VOBJ);
+             ret.pushKV("hash", block.hash.GetHex());
+             ret.pushKV("height", block.height);
+-            return ret;
++            co_return ret;
+         },
+     };
+ }
+@@ -404,7 +422,9 @@ static RPCHelpMan waitforblockheight() {
+         RPCExamples{HelpExampleCli("waitforblockheight", "100 1000") +
+                     HelpExampleRpc("waitforblockheight", "100, 1000")},
+         [&](const RPCHelpMan &self, const Config &config,
+-            const JSONRPCRequest &request) -> UniValue {
++            const JSONRPCRequest &request,
++            boost::asio::any_io_executor executor)
++            -> boost::asio::awaitable<UniValue> {
+             int timeout = 0;
+ 
+             int height = request.params[0].getInt<int>();
+@@ -413,30 +433,21 @@ static RPCHelpMan waitforblockheight() {
+                 timeout = request.params[1].getInt<int>();
+             }
+ 
++            co_await GetRPCBlockChangeWaiter().WaitUntil(
++                executor, std::chrono::milliseconds(timeout), [height]() {
++                    LOCK(cs_blockchange);
++                    return latestblock.height >= height || !IsRPCRunning();
++                });
++
+             CUpdatedBlock block;
+             {
+-                WAIT_LOCK(cs_blockchange, lock);
+-                if (timeout) {
+-                    cond_blockchange.wait_for(
+-                        lock, std::chrono::milliseconds(timeout),
+-                        [&height]() EXCLUSIVE_LOCKS_REQUIRED(cs_blockchange) {
+-                            return latestblock.height >= height ||
+-                                   !IsRPCRunning();
+-                        });
+-                } else {
+-                    cond_blockchange.wait(
+-                        lock,
+-                        [&height]() EXCLUSIVE_LOCKS_REQUIRED(cs_blockchange) {
+-                            return latestblock.height >= height ||
+-                                   !IsRPCRunning();
+-                        });
+-                }
++                LOCK(cs_blockchange);
+                 block = latestblock;
+             }
+             UniValue ret(UniValue::VOBJ);
+             ret.pushKV("hash", block.hash.GetHex());
+             ret.pushKV("height", block.height);
+-            return ret;
++            co_return ret;
+         },
+     };
+ }
+@@ -474,8 +485,8 @@ static RPCHelpMan getdifficulty() {
+         [&](const RPCHelpMan &self, const Config &config,
+             const JSONRPCRequest &request) -> UniValue {
+             ChainstateManager &chainman = EnsureAnyChainman(request.context);
+-            LOCK(cs_main);
+-            return GetDifficulty(*CHECK_NONFATAL(chainman.ActiveTip()));
++            auto snap = LoadOrInitChainSnapshot(request.context, chainman);
++            return CHECK_NONFATAL(snap)->difficulty;
+         },
+     };
+ }
+@@ -551,10 +562,22 @@ static RPCHelpMan getblockhash() {
+         [&](const RPCHelpMan &self, const Config &config,
+             const JSONRPCRequest &request) -> UniValue {
+             ChainstateManager &chainman = EnsureAnyChainman(request.context);
++            int nHeight = request.params[0].getInt<int>();
++
++            auto snap = LoadOrInitChainSnapshot(request.context, chainman);
++            if (snap && snap->active_chain) {
++                if (nHeight < 0 || nHeight > snap->height) {
++                    throw JSONRPCError(RPC_INVALID_PARAMETER,
++                                       "Block height out of range");
++                }
++                if (const auto *hdr =
++                        snap->active_chain->FindByHeight(nHeight)) {
++                    return hdr->hash.GetHex();
++                }
++            }
++
+             LOCK(cs_main);
+             const CChain &active_chain = chainman.ActiveChain();
+-
+-            int nHeight = request.params[0].getInt<int>();
+             if (nHeight < 0 || nHeight > active_chain.Height()) {
+                 throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                    "Block height out of range");
+@@ -635,11 +658,56 @@ static RPCHelpMan getblockheader() {
+                 fVerbose = request.params[1].get_bool();
+             }
+ 
++            ChainstateManager &chainman = EnsureAnyChainman(request.context);
++            auto snap = LoadOrInitChainSnapshot(request.context, chainman);
++            if (snap && snap->active_chain) {
++                if (const auto *hdr = snap->active_chain->FindByHash(hash)) {
++                    if (!fVerbose) {
++                        DataStream ssBlock{};
++                        ssBlock << hdr->header;
++                        return HexStr(ssBlock);
++                    }
++                    UniValue result(UniValue::VOBJ);
++                    result.pushKV("hash", hdr->hash.GetHex());
++                    result.pushKV("confirmations",
++                                  snap->height - hdr->height + 1);
++                    result.pushKV("height", hdr->height);
++                    result.pushKV("version", hdr->header.nVersion);
++                    result.pushKV("versionHex",
++                                  strprintf("%08x", hdr->header.nVersion));
++                    result.pushKV("merkleroot",
++                                  hdr->header.hashMerkleRoot.GetHex());
++                    result.pushKV("time", hdr->time);
++                    result.pushKV("mediantime", hdr->mediantime);
++                    result.pushKV("nonce", uint64_t(hdr->header.nNonce));
++                    result.pushKV("bits",
++                                  strprintf("%08x", hdr->header.nBits));
++                    result.pushKV("difficulty", hdr->difficulty);
++                    result.pushKV("chainwork", hdr->chainwork.GetHex());
++                    result.pushKV("nTx", hdr->nTx);
++                    if (hdr->height > 0) {
++                        if (const auto *prev_hdr =
++                                snap->active_chain->FindByHeight(hdr->height -
++                                                                 1)) {
++                            result.pushKV("previousblockhash",
++                                          prev_hdr->hash.GetHex());
++                        }
++                    }
++                    if (hdr->height < snap->height) {
++                        if (const auto *next_hdr =
++                                snap->active_chain->FindByHeight(hdr->height +
++                                                                 1)) {
++                            result.pushKV("nextblockhash",
++                                          next_hdr->hash.GetHex());
++                        }
++                    }
++                    return result;
++                }
++            }
++
+             const CBlockIndex *pblockindex;
+             const CBlockIndex *tip;
+             {
+-                ChainstateManager &chainman =
+-                    EnsureAnyChainman(request.context);
+                 LOCK(cs_main);
+                 pblockindex = chainman.m_blockman.LookupBlockIndex(hash);
+                 tip = chainman.ActiveTip();
+@@ -1270,7 +1338,6 @@ RPCHelpMan gettxout() {
+             const JSONRPCRequest &request) -> UniValue {
+             NodeContext &node = EnsureAnyNodeContext(request.context);
+             ChainstateManager &chainman = EnsureChainman(node);
+-            LOCK(cs_main);
+ 
+             UniValue ret(UniValue::VOBJ);
+ 
+@@ -1282,6 +1349,35 @@ RPCHelpMan gettxout() {
+                 fMempool = request.params[2].get_bool();
+             }
+ 
++            if (fMempool) {
++                EnsureMemPool(node);
++            }
++
++            auto snap = LoadOrInitChainSnapshot(request.context, chainman);
++            if (snap && fMempool && snap->mempool_valid &&
++                snap->mempool_ptr == node.mempool.get()) {
++                if (snap->IsSpentInMempool(out)) {
++                    return UniValue::VNULL;
++                }
++                if (const auto *entry =
++                        snap->FindMempoolEntry(out.GetTxId())) {
++                    if (!entry->tx || out.GetN() >= entry->tx->vout.size()) {
++                        return UniValue::VNULL;
++                    }
++                    const CTxOut &txout = entry->tx->vout[out.GetN()];
++                    ret.pushKV("bestblock", snap->best_block_hash.GetHex());
++                    ret.pushKV("confirmations", 0);
++                    ret.pushKV("value", txout.nValue);
++                    UniValue o(UniValue::VOBJ);
++                    ScriptPubKeyToUniv(txout.scriptPubKey, o, true);
++                    ret.pushKV("scriptPubKey", std::move(o));
++                    ret.pushKV("coinbase", false);
++                    return ret;
++                }
++            }
++
++            LOCK(cs_main);
++
+             Chainstate &active_chainstate = chainman.ActiveChainstate();
+             CCoinsViewCache *coins_view = &active_chainstate.CoinsTip();
+ 
+@@ -1409,6 +1505,11 @@ RPCHelpMan getblockchaininfo() {
+                 {RPCResult::Type::NUM, "prune_target_size",
+                  "the target size used by pruning (only present if automatic "
+                  "pruning is enabled)"},
++                {RPCResult::Type::BOOL, "fast_sync_active",
++                 "whether V2 fast-sync reverse block peeling is active"},
++                {RPCResult::Type::NUM, "earliest_verified_height",
++                 "the lowest block height verified back toward genesis (0 when "
++                 "fully verified)"},
+                 {RPCResult::Type::STR, "warnings",
+                  "any network and blockchain warnings"},
+             }},
+@@ -1416,57 +1517,39 @@ RPCHelpMan getblockchaininfo() {
+                     HelpExampleRpc("getblockchaininfo", "")},
+         [&](const RPCHelpMan &self, const Config &config,
+             const JSONRPCRequest &request) -> UniValue {
+-            const CChainParams &chainparams = config.GetChainParams();
+-
+             ChainstateManager &chainman = EnsureAnyChainman(request.context);
+-            LOCK(cs_main);
+-            Chainstate &active_chainstate = chainman.ActiveChainstate();
+-
+-            const CBlockIndex &tip{
+-                *CHECK_NONFATAL(active_chainstate.m_chain.Tip())};
+-            const int height{tip.nHeight};
++            const auto snap_ptr =
++                LoadOrInitChainSnapshot(request.context, chainman);
++            const node::ChainAndMempoolSnapshot &snap =
++                *CHECK_NONFATAL(snap_ptr);
+ 
+             UniValue obj(UniValue::VOBJ);
+-            obj.pushKV("chain", chainparams.GetChainTypeString());
+-            obj.pushKV("blocks", height);
+-            obj.pushKV("headers", chainman.m_best_header
+-                                      ? chainman.m_best_header->nHeight
+-                                      : -1);
+-            auto avalanche_finalized_tip{chainman.GetAvalancheFinalizedTip()};
++            obj.pushKV("chain", snap.chain_type_string);
++            obj.pushKV("blocks", snap.height);
++            obj.pushKV("headers", snap.headers_height);
+             obj.pushKV("finalized_blockhash",
+-                       avalanche_finalized_tip
+-                           ? avalanche_finalized_tip->GetBlockHash().GetHex()
+-                           : chainparams.GenesisBlock().GetHash().GetHex());
+-            obj.pushKV("bestblockhash", tip.GetBlockHash().GetHex());
+-            obj.pushKV("difficulty", GetDifficulty(tip));
+-            obj.pushKV("time", tip.GetBlockTime());
+-            obj.pushKV("mediantime", tip.GetMedianTimePast());
+-            obj.pushKV(
+-                "verificationprogress",
+-                GuessVerificationProgress(chainman.GetParams().TxData(), &tip));
+-            obj.pushKV("initialblockdownload",
+-                       chainman.IsInitialBlockDownload());
+-            obj.pushKV("chainwork", tip.nChainWork.GetHex());
+-            obj.pushKV("size_on_disk",
+-                       chainman.m_blockman.CalculateCurrentUsage());
+-            obj.pushKV("pruned", chainman.m_blockman.IsPruneMode());
+-
+-            if (chainman.m_blockman.IsPruneMode()) {
+-                const auto prune_height{GetPruneHeight(
+-                    chainman.m_blockman, active_chainstate.m_chain)};
+-                obj.pushKV("pruneheight",
+-                           prune_height ? prune_height.value() + 1 : 0);
+-
+-                const bool automatic_pruning{
+-                    chainman.m_blockman.GetPruneTarget() !=
+-                    BlockManager::PRUNE_TARGET_MANUAL};
+-                obj.pushKV("automatic_pruning", automatic_pruning);
+-                if (automatic_pruning) {
+-                    obj.pushKV("prune_target_size",
+-                               chainman.m_blockman.GetPruneTarget());
++                       snap.finalized_block_hash.GetHex());
++            obj.pushKV("bestblockhash", snap.best_block_hash.GetHex());
++            obj.pushKV("difficulty", snap.difficulty);
++            obj.pushKV("time", snap.time);
++            obj.pushKV("mediantime", snap.mediantime);
++            obj.pushKV("verificationprogress", snap.verification_progress);
++            obj.pushKV("initialblockdownload", snap.initial_block_download);
++            obj.pushKV("chainwork", snap.chainwork.GetHex());
++            obj.pushKV("size_on_disk", snap.size_on_disk);
++            obj.pushKV("pruned", snap.pruned);
++
++            if (snap.pruned) {
++                obj.pushKV("pruneheight", snap.prune_height);
++                obj.pushKV("automatic_pruning", snap.automatic_pruning);
++                if (snap.automatic_pruning) {
++                    obj.pushKV("prune_target_size", snap.prune_target_size);
+                 }
+             }
+ 
++            obj.pushKV("fast_sync_active", snap.fast_sync_active);
++            obj.pushKV("earliest_verified_height",
++                       snap.earliest_verified_height);
+             obj.pushKV("warnings", GetWarnings(false).original);
+             return obj;
+         },
+diff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp
+index 2b0952b0d7aff45a9ba189545c4d33431f1d2a82..f85470077bd62d92cba1afa89ba5a53b885be69e 100644
+--- a/src/rpc/mempool.cpp
++++ b/src/rpc/mempool.cpp
+@@ -10,6 +10,7 @@
+ #include <core_io.h>
+ #include <node/context.h>
+ #include <node/mempool_persist_args.h>
++#include <node/snapshot.h>
+ #include <node/types.h>
+ #include <policy/settings.h>
+ #include <primitives/transaction.h>
+@@ -400,6 +401,46 @@ static void entryToJSON(const CTxMemPool &pool, UniValue &info,
+     info.pushKV("unbroadcast", pool.IsUnbroadcastTx(tx.GetId()));
+ }
+ 
++static void entrySnapshotToJSON(UniValue &info,
++                                const node::MempoolEntrySnapshot &e) {
++    UniValue fees(UniValue::VOBJ);
++    fees.pushKV("base", e.fee);
++    fees.pushKV("modified", e.modified_fee);
++    info.pushKV("fees", std::move(fees));
++
++    info.pushKV("size", static_cast<int>(e.tx_size));
++    info.pushKV("time", e.time);
++    info.pushKV("height", e.height);
++
++    UniValue depends(UniValue::VARR);
++    depends.reserve(e.depends.size());
++    for (const std::string &dep : e.depends) {
++        depends.push_back(dep);
++    }
++    info.pushKV("depends", std::move(depends));
++
++    UniValue spent(UniValue::VARR);
++    spent.reserve(e.spentby.size());
++    for (const std::string &child : e.spentby) {
++        spent.push_back(child);
++    }
++    info.pushKV("spentby", std::move(spent));
++    info.pushKV("unbroadcast", e.unbroadcast);
++}
++
++static std::shared_ptr<const node::ChainAndMempoolSnapshot>
++LoadOrInitMempoolSnapshot(const CTxMemPool &pool) {
++    auto snap = node::GetGlobalSnapshotPublisher().Load();
++    if (snap && snap->mempool_valid && snap->mempool_ptr == &pool) {
++        return snap;
++    }
++    {
++        LOCK(pool.cs);
++        node::PublishMempoolSnapshot(pool);
++    }
++    return node::GetGlobalSnapshotPublisher().Load();
++}
++
+ UniValue MempoolToJSON(const CTxMemPool &pool, bool verbose,
+                        bool include_mempool_sequence) {
+     if (verbose) {
+@@ -408,28 +449,26 @@ UniValue MempoolToJSON(const CTxMemPool &pool, bool verbose,
+                 RPC_INVALID_PARAMETER,
+                 "Verbose results cannot contain mempool sequence values.");
+         }
+-        LOCK(pool.cs);
++        const auto snap_ptr = LoadOrInitMempoolSnapshot(pool);
++        const node::ChainAndMempoolSnapshot &snap = *CHECK_NONFATAL(snap_ptr);
++        snap.EnsureMempoolVectors();
+         UniValue o(UniValue::VOBJ);
+-        for (const CTxMemPoolEntryRef &e : pool.mapTx) {
+-            const TxId &txid = e->GetTx().GetId();
++        for (const node::MempoolEntrySnapshot &e : snap.mempool_entries) {
+             UniValue info(UniValue::VOBJ);
+-            entryToJSON(pool, info, e);
++            entrySnapshotToJSON(info, e);
+             // Mempool has unique entries so there is no advantage in using
+             // UniValue::pushKV, which checks if the key already exists in O(N).
+             // UniValue::pushKVEnd is used instead which currently is O(1).
+-            o.pushKVEnd(txid.ToString(), std::move(info));
++            o.pushKVEnd(e.txid.ToString(), std::move(info));
+         }
+         return o;
+     } else {
+-        uint64_t mempool_sequence;
+-        std::vector<TxId> vtxids;
+-        {
+-            LOCK(pool.cs);
+-            pool.getAllTxIds(vtxids);
+-            mempool_sequence = pool.GetSequence();
+-        }
++        const auto snap_ptr = LoadOrInitMempoolSnapshot(pool);
++        const node::ChainAndMempoolSnapshot &snap = *CHECK_NONFATAL(snap_ptr);
++        snap.EnsureMempoolVectors();
+         UniValue a(UniValue::VARR);
+-        for (const TxId &txid : vtxids) {
++        a.reserve(snap.mempool_txids.size());
++        for (const TxId &txid : snap.mempool_txids) {
+             a.push_back(txid.ToString());
+         }
+ 
+@@ -438,7 +477,7 @@ UniValue MempoolToJSON(const CTxMemPool &pool, bool verbose,
+         } else {
+             UniValue o(UniValue::VOBJ);
+             o.pushKV("txids", std::move(a));
+-            o.pushKV("mempool_sequence", mempool_sequence);
++            o.pushKV("mempool_sequence", snap.mempool_sequence);
+             return o;
+         }
+     }
+@@ -671,40 +710,58 @@ static RPCHelpMan getmempoolentry() {
+             TxId txid(ParseHashV(request.params[0], "parameter 1"));
+ 
+             const CTxMemPool &mempool = EnsureAnyMemPool(request.context);
+-            LOCK(mempool.cs);
++            const auto snap_ptr = LoadOrInitMempoolSnapshot(mempool);
++            const node::ChainAndMempoolSnapshot &snap =
++                *CHECK_NONFATAL(snap_ptr);
+ 
+-            CTxMemPool::txiter it = mempool.mapTx.find(txid);
+-            if (it == mempool.mapTx.end()) {
++            const node::MempoolEntrySnapshot *entry =
++                snap.FindMempoolEntry(txid);
++            if (!entry) {
+                 throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                                    "Transaction not in mempool");
+             }
+ 
+             UniValue info(UniValue::VOBJ);
+-            entryToJSON(mempool, info, *it);
++            entrySnapshotToJSON(info, *entry);
+             return info;
+         },
+     };
+ }
+ 
+ UniValue MempoolInfoToJSON(const CTxMemPool &pool) {
+-    // Make sure this call is atomic in the pool.
+-    LOCK(pool.cs);
++    const auto snap_ptr = LoadOrInitMempoolSnapshot(pool);
++    const node::ChainAndMempoolSnapshot &snap = *CHECK_NONFATAL(snap_ptr);
++    double rolling_fee = snap.rolling_minimum_fee_rate;
++    if (snap.block_since_last_rolling_fee_bump && rolling_fee != 0) {
++        const int64_t time = GetTime();
++        if (time > snap.last_rolling_fee_update + 10) {
++            double halflife = CTxMemPool::ROLLING_FEE_HALFLIFE;
++            if (snap.mempool_usage < snap.max_mempool / 4) {
++                halflife /= 4;
++            } else if (snap.mempool_usage < snap.max_mempool / 2) {
++                halflife /= 2;
++            }
++            rolling_fee =
++                rolling_fee /
++                pow(2.0, (time - snap.last_rolling_fee_update) / halflife);
++        }
++    }
++    const CFeeRate decayed_min_fee = std::max(
++        CFeeRate(int64_t(ceill(rolling_fee)) * SATOSHI), snap.min_relay_tx_fee);
+     UniValue ret(UniValue::VOBJ);
+-    ret.pushKV("loaded", pool.GetLoadTried());
+-    ret.pushKV("size", (int64_t)pool.size());
+-    ret.pushKV("bytes", (int64_t)pool.GetTotalTxSize());
+-    ret.pushKV("finalized_txs_size", (int64_t)pool.GetFinalizedTxCount());
+-    ret.pushKV("finalized_txs_bytes", (int64_t)pool.GetTotalFinalizedTxSize());
++    ret.pushKV("loaded", snap.mempool_loaded);
++    ret.pushKV("size", (int64_t)snap.mempool_size);
++    ret.pushKV("bytes", (int64_t)snap.mempool_bytes);
++    ret.pushKV("finalized_txs_size", (int64_t)snap.finalized_txs_size);
++    ret.pushKV("finalized_txs_bytes", (int64_t)snap.finalized_txs_bytes);
+     ret.pushKV("finalized_txs_sigchecks",
+-               (int64_t)pool.GetTotalFinalizedTxSigchecks());
+-    ret.pushKV("usage", (int64_t)pool.DynamicMemoryUsage());
+-    ret.pushKV("total_fee", pool.GetTotalFee());
+-    ret.pushKV("maxmempool", pool.m_opts.max_size_bytes);
+-    ret.pushKV(
+-        "mempoolminfee",
+-        std::max(pool.GetMinFee(), pool.m_opts.min_relay_feerate).GetFeePerK());
+-    ret.pushKV("minrelaytxfee", pool.m_opts.min_relay_feerate.GetFeePerK());
+-    ret.pushKV("unbroadcastcount", uint64_t{pool.GetUnbroadcastTxs().size()});
++               (int64_t)snap.finalized_txs_sigchecks);
++    ret.pushKV("usage", (int64_t)snap.mempool_usage);
++    ret.pushKV("total_fee", snap.total_fee);
++    ret.pushKV("maxmempool", snap.max_mempool);
++    ret.pushKV("mempoolminfee", decayed_min_fee.GetFeePerK());
++    ret.pushKV("minrelaytxfee", snap.min_relay_tx_fee.GetFeePerK());
++    ret.pushKV("unbroadcastcount", uint64_t{snap.unbroadcast_count});
+     return ret;
+ }
+ 
+diff --git a/src/rpc/rawtransaction.cpp b/src/rpc/rawtransaction.cpp
+index 12772e1352d90d00db69ea570fee87a3bdd9634a..656c032b44d2a4be31f08513d9e943d7cbff51dc 100644
+--- a/src/rpc/rawtransaction.cpp
++++ b/src/rpc/rawtransaction.cpp
+@@ -16,6 +16,7 @@
+ #include <node/coin.h>
+ #include <node/context.h>
+ #include <node/psbt.h>
++#include <node/snapshot.h>
+ #include <node/transaction.h>
+ #include <policy/packages.h>
+ #include <policy/policy.h>
+@@ -171,11 +172,128 @@ static RPCHelpMan getrawtransaction() {
+                                : request.params[1].get_bool();
+             }
+ 
+-            if (!request.params[2].isNull()) {
++            node::SnapshotPublisher &publisher =
++                node.snapshot_publisher ? *node.snapshot_publisher
++                                        : node::GetGlobalSnapshotPublisher();
++            auto snap = publisher.Load();
++            if ((!snap || !snap->chain_valid ||
++                 snap->chainman_ptr != &chainman) &&
++                request.params[2].isNull()) {
++                // Lazy one-time initialization if no snapshot has been published yet.
+                 LOCK(cs_main);
++                node::PublishChainTipSnapshot(chainman, node.mempool.get());
++                snap = publisher.Load();
++            }
+ 
++            if (request.params[2].isNull()) {
++                const bool mempool_snap_ready =
++                    !node.mempool ||
++                    (snap && snap->mempool_valid &&
++                     snap->mempool_ptr == node.mempool.get());
++                if (node.mempool && snap && snap->mempool_valid &&
++                    snap->mempool_ptr == node.mempool.get()) {
++                    if (const auto *entry = snap->FindMempoolEntry(txid)) {
++                        if (entry->tx) {
++                            if (!fVerbose) {
++                                return EncodeHexTx(*entry->tx);
++                            }
++                            UniValue result(UniValue::VOBJ);
++                            TxToUniv(*entry->tx, BlockHash(), result, true);
++                            return result;
++                        }
++                    }
++                }
++                if (mempool_snap_ready) {
++                    if (!g_txindex) {
++                        throw JSONRPCError(
++                            RPC_INVALID_ADDRESS_OR_KEY,
++                            "No such mempool transaction. Use -txindex or "
++                            "provide a block hash to enable blockchain "
++                            "transaction queries. Use gettransaction for "
++                            "wallet transactions.");
++                    }
++                    const bool f_txindex_ready =
++                        g_txindex->BlockUntilSyncedToCurrentChain();
++                    CTransactionRef indexed_tx;
++                    BlockHash indexed_block;
++                    if (g_txindex->FindTx(txid, indexed_block, indexed_tx) &&
++                        indexed_tx) {
++                        if (!fVerbose) {
++                            return EncodeHexTx(*indexed_tx);
++                        }
++                        if (snap && snap->chain_valid &&
++                            snap->chainman_ptr == &chainman &&
++                            snap->active_chain) {
++                            if (const auto *hdr =
++                                    snap->active_chain->FindByHash(
++                                        indexed_block)) {
++                                UniValue result(UniValue::VOBJ);
++                                TxToUniv(*indexed_tx, BlockHash(), result,
++                                         true);
++                                result.pushKV("blockhash",
++                                              indexed_block.GetHex());
++                                result.pushKV("confirmations",
++                                              1 + snap->height - hdr->height);
++                                result.pushKV("time", hdr->time);
++                                result.pushKV("blocktime", hdr->time);
++                                return result;
++                            }
++                        }
++                    } else {
++                        const std::string errmsg =
++                            !f_txindex_ready
++                                ? "No such mempool transaction. Blockchain "
++                                  "transactions are still in the process of "
++                                  "being indexed"
++                                : "No such mempool or blockchain transaction";
++                        throw JSONRPCError(
++                            RPC_INVALID_ADDRESS_OR_KEY,
++                            errmsg +
++                                ". Use gettransaction for wallet transactions.");
++                    }
++                }
++            } else {
+                 BlockHash blockhash(
+                     ParseHashV(request.params[2], "parameter 3"));
++                if (snap && snap->chain_valid &&
++                    snap->chainman_ptr == &chainman && snap->active_chain) {
++                    if (const auto *hdr =
++                            snap->active_chain->FindByHash(blockhash)) {
++                        if (!hdr->has_data) {
++                            throw JSONRPCError(RPC_MISC_ERROR,
++                                               "Block not available");
++                        }
++                        CBlock block;
++                        if (chainman.m_blockman.ReadBlock(block,
++                                                          hdr->data_pos)) {
++                            for (const auto &ptx : block.vtx) {
++                                if (ptx->GetId() == txid) {
++                                    if (!fVerbose) {
++                                        return EncodeHexTx(*ptx);
++                                    }
++                                    UniValue result(UniValue::VOBJ);
++                                    result.pushKV("in_active_chain", true);
++                                    TxToUniv(*ptx, BlockHash(), result, true);
++                                    result.pushKV("blockhash",
++                                                  blockhash.GetHex());
++                                    result.pushKV("confirmations",
++                                                  1 + snap->height -
++                                                      hdr->height);
++                                    result.pushKV("time", hdr->time);
++                                    result.pushKV("blocktime", hdr->time);
++                                    return result;
++                                }
++                            }
++                            throw JSONRPCError(
++                                RPC_INVALID_ADDRESS_OR_KEY,
++                                "No such transaction found in the provided "
++                                "block. Use gettransaction for wallet "
++                                "transactions.");
++                        }
++                    }
++                }
++
++                LOCK(cs_main);
+                 blockindex = chainman.m_blockman.LookupBlockIndex(blockhash);
+                 if (!blockindex) {
+                     throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+-- 
+2.50.1 (Apple Git-155)
+

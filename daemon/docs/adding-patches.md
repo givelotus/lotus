@@ -1,10 +1,100 @@
+# Submodule migration: base-only scaffold
+
+The active migration uses `daemon/sources.json` and exact gitlinks in `.gitmodules`.
+`make -C daemon setup SERIES=all` initializes sources only. It never applies a
+mailbox, rebases a stack, changes a published source branch, or resets local work.
+Use `make -C daemon status` and `make -C daemon source-verify` to check repository
+URLs, gitlinks, HEADs and exact trees.
+
+Review the proposed order with `make -C daemon source-plan SERIES=v2`;
+`PLAN_ARGS=--commits` lists the individual inputs and `PLAN_ARGS=--json` exports
+the full plan. Shared eCash changes target `daemon/ecashd` in
+`givelotus/bitcoin-abc`. After review, that exact shared tip is fetched into
+`daemon/lotusd` as the parent of the Lotus-only commits. The native stage must
+not replay the shared list again. Cross-repository branch updates require
+explicit coordination; `rebase.updateRefs` cannot update another repository.
+
+The six source paths are `daemon/ecashd`, `daemon/lotusd`, `daemon/lotusv1`,
+`daemon/doged`, `daemon/bitcoincashd` and `daemon/bitcoind`. Builds resolve these
+paths and use `daemon/.build/<series>` instead of writing inside the submodules.
+Build/run and historical replay/release entrypoints are gated until the relevant
+stack is reviewed and promoted. No new stack application command is enabled in
+this phase.
+
+Dogecoin has three distinct identities: the original Doged export source,
+the historical ABC replay base, and the pinned current ABC master used as the
+new replay target. Its 174 exported changes plus retained fixes are pending
+review and replay on that new target; the original Doged history stays preserved.
+
+The reviewed source reference has all 378 shared eCash commits; the historical
+mailbox export has 377. This is informational archival lag. Normal source
+initialization and builds do not read or require patch-series files. V1's generated local release-metadata variant is
+also explicitly distinguished from the published source reference. All old
+source histories, patch inputs and benchmark identities remain preserved.
+
+Private source clones require credentials with read access to the private
+`givelotus` repositories. The optional authenticated source-layout CI job uses
+`DAEMON_REPOS_TOKEN`; the ordinary layout tests do not fetch private sources.
+
+## Historical workspace workflow (retained for provenance)
+
+The workflow below describes the pre-submodule manager. Its mutation commands
+are disabled by the scaffold guard; it is not the current setup procedure.
+
 # Adding and updating daemon patches
 
 Run commands below from the monorepo root. A patch is one ordinary Git commit,
 exported with `git format-patch` and replayed with `git am`. Its commit body should
 explain the problem, the chosen fix, dependencies and validation limits.
 
-## Add a patch
+## Mechanistic Branch-First Workflow (`daemon/scripts/lotus-git.py`)
+
+Subdaemon stacks (`daemon/ecash`, `daemon/v2`, `daemon/v1`, `daemon/doged`,
+`daemon/bchn`, `daemon/bitcoin`) are maintained directly as Git branches with
+their tip SHAs pinned in `daemon/*-version`—no `.patch` file generation is
+needed during normal development:
+
+```sh
+# 1. Inspect branch, base, and pin status across all subdaemons:
+make -C daemon status
+
+# 2. Initialize workspace Git refs (rebase.updateRefs=true, rebase.autoSquash=true,
+#    rerere.enabled=true, base/abc, daemon/ecash, and daemon/v2):
+make -C daemon init SERIES=v2
+
+# 3. Iterate using ordinary Git commits (and --fixup commits) in the workspace:
+cd daemon/workspace-v2
+git add path/to/changed/file
+# Either create a new feature commit:
+git commit -m "subsystem: describe the change"
+# Or create a fixup targeting an earlier commit (by SHA or :/subject-substring):
+git commit --fixup <earlier-sha>
+cd ../..
+
+# 3b. Non-interactively autosquash all fixup! commits and update daemon/ecash + daemon/v2:
+make -C daemon autosquash SERIES=v2
+
+# 4a. If a new commit is chain-agnostic and belongs in the eCash base tier (daemon/ecash),
+#     sink it down onto daemon/ecash and replay daemon/v2 on top automatically:
+make -C daemon sink-to-ecash COMMIT=HEAD
+
+# 4b. Pin the updated branch SHAs in daemon/*-version and push daemon/* branches:
+make -C daemon sync SERIES=v2 PUSH=1
+
+# 5. Extract selected commit(s) onto a clean branch off base/abc for an upstream PR:
+make -C daemon extract-pr SERIES=ecash BRANCH=pr/my-feature COMMITS="<sha1> <sha2>"
+
+# 6. Rebase the entire two-tier stack (daemon/ecash -> daemon/v2) onto a new upstream commit:
+make -C daemon rebase-upstream SERIES=v2 COMMIT=<sha-or-latest>
+```
+
+- **When to use `git commit --fixup <sha>`:** Any time a bugfix, compiler warning fix, test fix, or review refinement belongs to an earlier commit in `base/abc..daemon/ecash` or `daemon/ecash..daemon/v2`. Follow with `make -C daemon autosquash SERIES=v2` (which runs `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash --update-refs` without opening an interactive editor).
+- `make -C daemon sync` verifies linear history and refuses if any unsquashed `fixup!` or `squash!` commits remain.
+- If legacy `.patch` files are ever needed for external archival, pass `PATCHES=1` (`make -C daemon sync SERIES=v2 PATCHES=1`).
+
+---
+
+## Legacy Single-Patch Export (`mkpatch`)
 
 Work in a separate monorepo checkout so setup cannot change a running node's
 source workspace:

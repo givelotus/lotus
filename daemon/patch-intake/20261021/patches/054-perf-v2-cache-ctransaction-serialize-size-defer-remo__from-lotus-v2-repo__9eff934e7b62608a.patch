@@ -1,0 +1,860 @@
+From 4fa28ceeca28264dc97ddec45acabf17fc851359 Mon Sep 17 00:00:00 2001
+From: Lotus V2 Builder <builder@lotus.org>
+Date: Sat, 17 Oct 2026 13:58:25 -0700
+Subject: [PATCH] perf(v2): cache CTransaction serialize size, defer
+ removeForBlock overlay walks, and optimize ConnectTip/Snapshot hotpaths
+
+Cache serialized byte size on CTransaction, batch Merklix overlay removals
+during removeForBlock, and eliminate redundant copies in ConnectTip and
+SnapshotPublisher.
+---
+ src/net/v2_protocol_handler.cpp |   1 +
+ src/node/miner.cpp              |   5 +
+ src/node/snapshot.cpp           | 191 ++++++++++++++++++++------------
+ src/primitives/block.cpp        | 165 ++++++++++++++++++---------
+ src/primitives/transaction.cpp  |  18 ++-
+ src/primitives/transaction.h    |  83 ++++++++++++--
+ src/rpc/mining.cpp              |  13 +++
+ src/test/lotus_v2_tests.cpp     |   3 +
+ src/txmempool.cpp               |  70 ++++++++++--
+ src/txmempool.h                 |   1 +
+ 10 files changed, 401 insertions(+), 149 deletions(-)
+
+diff --git a/src/net/v2_protocol_handler.cpp b/src/net/v2_protocol_handler.cpp
+index 1ac94f4ce7..303890c32e 100644
+--- a/src/net/v2_protocol_handler.cpp
++++ b/src/net/v2_protocol_handler.cpp
+@@ -488,6 +488,7 @@ std::shared_ptr<const CBlock> V2PeerProtocolHandler::MatchCandidateOverlay(
+                 }
+             }
+             auto block = std::make_shared<CBlock>(header);
++            block->m_checked_merkle_root = true;
+             block->vtx.reserve(1 + layer.GetTxCount());
+             block->vtx.push_back(coinbase_tx);
+             for (const auto &[_, oentry] : layer.GetOrderedTxs()) {
+diff --git a/src/node/miner.cpp b/src/node/miner.cpp
+index 2356bd3df8..07d97f7f27 100644
+--- a/src/node/miner.cpp
++++ b/src/node/miner.cpp
+@@ -328,6 +328,11 @@ BlockAssembler::CreateNewBlock(const CScript &scriptPubKeyIn) {
+         pblock->hashStateRoot = ComputeV2StateRootFromOverlay(
+             *pblock->vtx[0], spec_overlay, pblock->nBits, uint64_t(nHeight),
+             uint64_t(pindexPrev->GetMedianTimePast()), false);
++        lotus::v2::Hash cb_txid{};
++        std::memcpy(cb_txid.data(), pblock->vtx[0]->GetId().begin(), 32);
++        if (!spec_overlay.Contains(cb_txid)) {
++            pblock->m_checked_merkle_root = true;
++        }
+     } else {
+         pblock->hashMerkleRoot = BlockMerkleRoot(*pblock);
+         pblock->hashStateRoot = ComputeV2BlockStateRoot(
+diff --git a/src/node/snapshot.cpp b/src/node/snapshot.cpp
+index 470897acc7..95d9a98836 100644
+--- a/src/node/snapshot.cpp
++++ b/src/node/snapshot.cpp
+@@ -210,88 +210,139 @@ void PopulateMiningTemplate(ChainAndMempoolSnapshot &snap,
+     tmpl.non_cb_serialized_size = 0;
+ 
+     if (mempool_locked && !mempool_locked->mapTx.empty()) {
++        if (mempool_locked->GetOverlayManager()
++                .GetSpeculativeOverlay()
++                .GetParentBlockId() == lotus::v2::Hash{}) {
++            mempool_locked->SyncMerklixOverlayToTip(
++                tmpl.prev_block_hash, uint64_t(tmpl.next_height),
++                uint64_t(tmpl.parent_mtp));
++        }
++        const auto &spec_overlay =
++            mempool_locked->GetOverlayManager().GetSpeculativeOverlay();
+         struct SelectedEntry {
+             CTransactionRef tx;
+             Amount fee;
+             int64_t sigchecks;
+         };
+-        struct DepNode {
+-            CTxMemPoolEntryRef entry;
+-            size_t missing_parents;
+-            std::vector<size_t> children;
+-        };
+-        std::vector<DepNode> nodes;
+-        nodes.reserve(mempool_locked->mapTx.size());
+-        std::unordered_map<TxId, size_t, SaltedTxIdHasher> locations;
+-        locations.reserve(mempool_locked->mapTx.size());
+-        for (const auto &entry :
+-             mempool_locked->mapTx.get<entry_id>()) {
+-            locations.emplace(entry->GetTx().GetId(), nodes.size());
+-            nodes.push_back(
+-                {entry, entry->GetMemPoolParentsConst().size(), {}});
+-        }
+-        for (size_t child = 0; child < nodes.size(); ++child) {
+-            for (const auto &parent :
+-                 nodes[child].entry->GetMemPoolParentsConst()) {
+-                const auto pos = locations.find(parent.get()->GetTx().GetId());
+-                if (pos != locations.end()) {
+-                    nodes[pos->second].children.push_back(child);
++        BlockFitter blockFitter(GetConfig());
++        std::vector<SelectedEntry> selected;
++        selected.reserve(mempool_locked->mapTx.size());
++
++        bool used_ctor_overlay_selection = false;
++        if (mempool_locked->mapDeltas.empty() &&
++            spec_overlay.GetTxCount() == mempool_locked->mapTx.size()) {
++            bool all_eligible = true;
++            for (const auto &[_, oentry] : spec_overlay.GetOrderedTxs()) {
++                auto tx = std::static_pointer_cast<const CTransaction>(
++                    oentry.tx_ref);
++                if (!tx) {
++                    all_eligible = false;
++                    break;
++                }
++                const uint64_t tx_size = tx->GetTotalSize();
++                const Amount fee = oentry.fee_sats * SATOSHI;
++                if (blockFitter.isBelowBlockMinFeeRate(
++                        CFeeRate(fee, tx_size)) ||
++                    !blockFitter.testTxFits(tx_size, oentry.sigchecks)) {
++                    all_eligible = false;
++                    break;
++                }
++                TxValidationState tx_state;
++                if (!ContextualCheckTransaction(*snap.consensus_params, *tx,
++                                                tx_state, tmpl.next_height,
++                                                tmpl.parent_mtp)) {
++                    all_eligible = false;
++                    break;
+                 }
++                blockFitter.addTx(tx_size, oentry.sigchecks, fee);
++                tmpl.total_fees += fee;
++                selected.push_back({std::move(tx), fee, oentry.sigchecks});
+             }
+-        }
+-        auto lowerPriority = [&nodes](size_t a, size_t b) {
+-            return CompareTxMemPoolEntryByModifiedFeeRate{}(nodes[b].entry,
+-                                                            nodes[a].entry);
+-        };
+-        std::priority_queue<size_t, std::vector<size_t>,
+-                            decltype(lowerPriority)>
+-            ready(lowerPriority);
+-        for (size_t i = 0; i < nodes.size(); ++i) {
+-            if (nodes[i].missing_parents == 0) {
+-                ready.push(i);
++            if (all_eligible) {
++                used_ctor_overlay_selection = true;
++            } else {
++                blockFitter.resetBlock();
++                tmpl.total_fees = Amount::zero();
++                selected.clear();
+             }
+         }
+ 
+-        BlockFitter blockFitter(GetConfig());
+-        std::vector<SelectedEntry> selected;
+-        selected.reserve(nodes.size());
+-
+-        while (!ready.empty()) {
+-            const size_t idx = ready.top();
+-            ready.pop();
+-            const auto &entry = nodes[idx].entry;
+-            if (blockFitter.isBelowBlockMinFeeRate(
+-                    entry->GetModifiedFeeRate())) {
+-                break;
++        if (!used_ctor_overlay_selection) {
++            struct DepNode {
++                CTxMemPoolEntryRef entry;
++                size_t missing_parents;
++                std::vector<size_t> children;
++            };
++            std::vector<DepNode> nodes;
++            nodes.reserve(mempool_locked->mapTx.size());
++            std::unordered_map<TxId, size_t, SaltedTxIdHasher> locations;
++            locations.reserve(mempool_locked->mapTx.size());
++            for (const auto &entry :
++                 mempool_locked->mapTx.get<entry_id>()) {
++                locations.emplace(entry->GetTx().GetId(), nodes.size());
++                nodes.push_back(
++                    {entry, entry->GetMemPoolParentsConst().size(), {}});
+             }
+-            const uint64_t tx_size = entry->GetTxSize();
+-            const int64_t tx_sigchecks = entry->GetSigChecks();
+-            if (!blockFitter.testTxFits(tx_size, tx_sigchecks)) {
+-                continue;
++            for (size_t child = 0; child < nodes.size(); ++child) {
++                for (const auto &parent :
++                     nodes[child].entry->GetMemPoolParentsConst()) {
++                    const auto pos =
++                        locations.find(parent.get()->GetTx().GetId());
++                    if (pos != locations.end()) {
++                        nodes[pos->second].children.push_back(child);
++                    }
++                }
+             }
+-            TxValidationState tx_state;
+-            if (!ContextualCheckTransaction(*snap.consensus_params,
+-                                            entry->GetTx(), tx_state,
+-                                            tmpl.next_height,
+-                                            tmpl.parent_mtp)) {
+-                continue;
++            auto lowerPriority = [&nodes](size_t a, size_t b) {
++                return CompareTxMemPoolEntryByModifiedFeeRate{}(
++                    nodes[b].entry, nodes[a].entry);
++            };
++            std::priority_queue<size_t, std::vector<size_t>,
++                                decltype(lowerPriority)>
++                ready(lowerPriority);
++            for (size_t i = 0; i < nodes.size(); ++i) {
++                if (nodes[i].missing_parents == 0) {
++                    ready.push(i);
++                }
+             }
+-            blockFitter.addTx(tx_size, tx_sigchecks, entry->GetFee());
+-            tmpl.total_fees += entry->GetFee();
+-            selected.push_back(
+-                {entry->GetSharedTx(), entry->GetFee(), tx_sigchecks});
+-            for (const size_t child : nodes[idx].children) {
+-                if (nodes[child].missing_parents > 0 &&
+-                    --nodes[child].missing_parents == 0) {
+-                    ready.push(child);
++
++            while (!ready.empty()) {
++                const size_t idx = ready.top();
++                ready.pop();
++                const auto &entry = nodes[idx].entry;
++                if (blockFitter.isBelowBlockMinFeeRate(
++                        entry->GetModifiedFeeRate())) {
++                    break;
++                }
++                const uint64_t tx_size = entry->GetTxSize();
++                const int64_t tx_sigchecks = entry->GetSigChecks();
++                if (!blockFitter.testTxFits(tx_size, tx_sigchecks)) {
++                    continue;
++                }
++                TxValidationState tx_state;
++                if (!ContextualCheckTransaction(*snap.consensus_params,
++                                                entry->GetTx(), tx_state,
++                                                tmpl.next_height,
++                                                tmpl.parent_mtp)) {
++                    continue;
++                }
++                blockFitter.addTx(tx_size, tx_sigchecks, entry->GetFee());
++                tmpl.total_fees += entry->GetFee();
++                selected.push_back(
++                    {entry->GetSharedTx(), entry->GetFee(), tx_sigchecks});
++                for (const size_t child : nodes[idx].children) {
++                    if (nodes[child].missing_parents > 0 &&
++                        --nodes[child].missing_parents == 0) {
++                        ready.push(child);
++                    }
+                 }
+             }
+-        }
+ 
+-        std::sort(selected.begin(), selected.end(),
+-                  [](const SelectedEntry &a, const SelectedEntry &b) {
+-                      return a.tx->GetId() < b.tx->GetId();
+-                  });
++            std::sort(selected.begin(), selected.end(),
++                      [](const SelectedEntry &a, const SelectedEntry &b) {
++                          return a.tx->GetId() < b.tx->GetId();
++                      });
++        }
+ 
+         tmpl.non_coinbase_txs.reserve(selected.size());
+         tmpl.tx_fees.reserve(selected.size());
+@@ -306,7 +357,7 @@ void PopulateMiningTemplate(ChainAndMempoolSnapshot &snap,
+                 prev->mining_template.tx_hex.size();
+         size_t prev_idx = 0;
+         for (auto &item : selected) {
+-            tmpl.non_cb_serialized_size += ::GetSerializeSize(*item.tx);
++            tmpl.non_cb_serialized_size += item.tx->GetTotalSize();
+             if (can_reuse_prev_hex) {
+                 const auto &prev_txs = prev->mining_template.non_coinbase_txs;
+                 const TxId &target_id = item.tx->GetId();
+@@ -353,8 +404,10 @@ void PopulateMiningTemplate(ChainAndMempoolSnapshot &snap,
+             tmpl.non_coinbase_txs.size() == spec_overlay.GetTxCount() &&
+             tmpl.non_coinbase_txs.size() == mempool_locked->mapTx.size()) {
+             tmpl.subtree_a_root = spec_overlay.GetSubtreeARoot();
+-            tmpl.v2_base_state.utxo_root = spec_overlay.GetUtxoRoot();
+-            tmpl.v2_base_state.utxo_arena.reset();
++            tmpl.v2_base_state.utxo_arena =
++                std::make_shared<const lotus::v2::UtxoOverlayArena>(
++                    spec_overlay.GetUtxoArena());
++            tmpl.v2_base_state.utxo_root.reset();
+             tmpl.v2_base_state.mon_state =
+                 spec_overlay.GetBaseMonetaryState();
+             tmpl.v2_base_state.non_cb_tx_count = spec_overlay.GetTxCount();
+diff --git a/src/primitives/block.cpp b/src/primitives/block.cpp
+index 5bc45f7cd9..96f2b9d8a0 100644
+--- a/src/primitives/block.cpp
++++ b/src/primitives/block.cpp
+@@ -73,6 +73,8 @@ lotus::v2::MonetaryState InitialV2MonetaryState() {
+     return lotus::v2::GetInitialV2MonetaryState();
+ }
+ 
++bool g_v2_state_persist_dir_ready = false;
++
+ void SaveV2BlockStateToDiskLocked(const BlockHash &blockHash,
+                                   const V2BlockStateSnapshot &snap) {
+     if (g_v2_state_persist_dir.empty()) {
+@@ -80,57 +82,90 @@ void SaveV2BlockStateToDiskLocked(const BlockHash &blockHash,
+     }
+     std::error_code ec;
+     const std::filesystem::path dir(g_v2_state_persist_dir);
+-    std::filesystem::create_directories(dir, ec);
+-    if (ec) {
+-        return;
++    if (!g_v2_state_persist_dir_ready) {
++        std::filesystem::create_directories(dir, ec);
++        if (ec) {
++            return;
++        }
++        g_v2_state_persist_dir_ready = true;
+     }
+-    const std::filesystem::path final_path =
+-        dir / (blockHash.GetHex() + ".bin");
+-    const std::filesystem::path tmp_path =
+-        dir / (blockHash.GetHex() + ".bin.tmp");
++    const std::string hex_hash = blockHash.GetHex();
++    const std::filesystem::path final_path = dir / (hex_hash + ".bin");
++    const std::filesystem::path tmp_path = dir / (hex_hash + ".bin.tmp");
++
+     std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+     if (!out) {
+-        return;
++        std::filesystem::create_directories(dir, ec);
++        out.open(tmp_path, std::ios::binary | std::ios::trunc);
++        if (!out) {
++            return;
++        }
+     }
++
++    // Stream block state deltas in bounded 64 KiB chunks so large blocks never
++    // allocate a massive contiguous buffer while avoiding per-field write calls.
++    constexpr size_t kStreamChunkBytes = 64 * 1024;
++    std::vector<uint8_t> buf;
++    buf.reserve(kStreamChunkBytes + 1024);
++
++    auto flush_chunk = [&]() -> bool {
++        if (buf.empty()) {
++            return true;
++        }
++        out.write(reinterpret_cast<const char *>(buf.data()),
++                  static_cast<std::streamsize>(buf.size()));
++        buf.clear();
++        return static_cast<bool>(out);
++    };
++    auto append_u32_le = [&buf](uint32_t v) {
++        buf.push_back(static_cast<uint8_t>(v));
++        buf.push_back(static_cast<uint8_t>(v >> 8));
++        buf.push_back(static_cast<uint8_t>(v >> 16));
++        buf.push_back(static_cast<uint8_t>(v >> 24));
++    };
++    auto append_u64_le = [&buf](uint64_t v) {
++        for (unsigned i = 0; i < 8; ++i) {
++            buf.push_back(static_cast<uint8_t>(v >> (8 * i)));
++        }
++    };
++
+     const auto mon_bytes = lotus::v2::EncodeMonetaryState(snap.mon_state);
+-    out.write(reinterpret_cast<const char *>(mon_bytes.data()),
+-              mon_bytes.size());
+-    for (unsigned i = 0; i < 8; ++i) {
+-        const uint8_t b = static_cast<uint8_t>(kDeltaSnapshotMagic >> (8 * i));
+-        out.write(reinterpret_cast<const char *>(&b), 1);
+-    }
+-    out.write(reinterpret_cast<const char *>(snap.parent_hash.begin()), 32);
+-    const uint32_t erased_count =
+-        static_cast<uint32_t>(snap.erased_outpoints.size());
+-    for (unsigned i = 0; i < 4; ++i) {
+-        const uint8_t b = static_cast<uint8_t>(erased_count >> (8 * i));
+-        out.write(reinterpret_cast<const char *>(&b), 1);
+-    }
++    buf.insert(buf.end(), mon_bytes.begin(), mon_bytes.end());
++    append_u64_le(kDeltaSnapshotMagic);
++    buf.insert(buf.end(), snap.parent_hash.begin(),
++               snap.parent_hash.begin() + 32);
++    append_u32_le(static_cast<uint32_t>(snap.erased_outpoints.size()));
+     for (const auto &op : snap.erased_outpoints) {
+-        out.write(reinterpret_cast<const char *>(op.tx_id.data()), 32);
+-        for (unsigned i = 0; i < 4; ++i) {
+-            const uint8_t b = static_cast<uint8_t>(op.index >> (8 * i));
+-            out.write(reinterpret_cast<const char *>(&b), 1);
++        buf.insert(buf.end(), op.tx_id.begin(), op.tx_id.end());
++        append_u32_le(op.index);
++        if (buf.size() >= kStreamChunkBytes && !flush_chunk()) {
++            out.close();
++            std::filesystem::remove(tmp_path, ec);
++            return;
+         }
+     }
+-    const uint32_t inserted_count =
+-        static_cast<uint32_t>(snap.inserted_coins.size());
+-    for (unsigned i = 0; i < 4; ++i) {
+-        const uint8_t b = static_cast<uint8_t>(inserted_count >> (8 * i));
+-        out.write(reinterpret_cast<const char *>(&b), 1);
+-    }
++    append_u32_le(static_cast<uint32_t>(snap.inserted_coins.size()));
++    std::vector<uint8_t> encoded;
++    encoded.reserve(128);
+     for (const auto &coin : snap.inserted_coins) {
+-        std::vector<uint8_t> encoded;
++        encoded.clear();
+         if (!lotus::v2::EncodeCoin(coin, encoded)) {
++            out.close();
++            std::filesystem::remove(tmp_path, ec);
+             return;
+         }
+-        const uint32_t len = static_cast<uint32_t>(encoded.size());
+-        for (unsigned i = 0; i < 4; ++i) {
+-            const uint8_t b = static_cast<uint8_t>(len >> (8 * i));
+-            out.write(reinterpret_cast<const char *>(&b), 1);
++        append_u32_le(static_cast<uint32_t>(encoded.size()));
++        buf.insert(buf.end(), encoded.begin(), encoded.end());
++        if (buf.size() >= kStreamChunkBytes && !flush_chunk()) {
++            out.close();
++            std::filesystem::remove(tmp_path, ec);
++            return;
+         }
+-        out.write(reinterpret_cast<const char *>(encoded.data()),
+-                  encoded.size());
++    }
++    if (!flush_chunk()) {
++        out.close();
++        std::filesystem::remove(tmp_path, ec);
++        return;
+     }
+     out.close();
+     if (!out) {
+@@ -623,6 +658,7 @@ void SetV2StatePersistDir(const std::string &dir_path) {
+     std::lock_guard<std::mutex> lock(g_v2_utxo_mutex);
+     if (g_v2_state_persist_dir != dir_path) {
+         g_v2_state_persist_dir = dir_path;
++        g_v2_state_persist_dir_ready = false;
+         g_v2_state_snapshots.clear();
+         for (auto &slot : g_v2_candidate_cache) {
+             slot.valid = false;
+@@ -768,31 +804,53 @@ uint256 ComputeV2StateRootFromOverlay(
+         return out;
+     }
+ 
+-    std::shared_ptr<const SmtNode> final_utxo_root = overlay.GetUtxoRoot();
+     lotus::v2::Hash cb_txid{};
+     std::memcpy(cb_txid.data(), coinbase_tx.GetId().begin(), 32);
++    lotus::v2::Hash utxo_digest{};
++    std::shared_ptr<const SmtNode> final_utxo_root;
+     std::vector<lotus::v2::Coin> cb_coins;
+-    for (size_t j = 0; j < coinbase_tx.vout.size(); ++j) {
+-        if (coinbase_tx.vout[j].scriptPubKey.IsUnspendable()) {
+-            continue;
++
++    if (!record) {
++        lotus::v2::UtxoOverlayArena arena = overlay.GetUtxoArena();
++        for (size_t j = 0; j < coinbase_tx.vout.size(); ++j) {
++            if (coinbase_tx.vout[j].scriptPubKey.IsUnspendable()) {
++                continue;
++            }
++            const lotus::v2::Output v2out = coinbase_tx.vout[j].ToV2Output();
++            if (!v2out.IsBurn()) {
++                lotus::v2::Coin coin{
++                    {cb_txid, static_cast<uint32_t>(j)},
++                    v2out,
++                    nHeight,
++                    nParentMtp,
++                    true};
++                arena.InsertCoin(coin);
++            }
+         }
+-        const lotus::v2::Output v2out = coinbase_tx.vout[j].ToV2Output();
+-        if (!v2out.IsBurn()) {
+-            lotus::v2::Coin coin{
+-                {cb_txid, static_cast<uint32_t>(j)},
+-                v2out,
+-                nHeight,
+-                nParentMtp,
+-                true};
+-            SmtInsert(final_utxo_root, coin);
+-            if (record) {
++        utxo_digest = arena.RootDigest();
++    } else {
++        final_utxo_root = overlay.GetUtxoRoot();
++        for (size_t j = 0; j < coinbase_tx.vout.size(); ++j) {
++            if (coinbase_tx.vout[j].scriptPubKey.IsUnspendable()) {
++                continue;
++            }
++            const lotus::v2::Output v2out = coinbase_tx.vout[j].ToV2Output();
++            if (!v2out.IsBurn()) {
++                lotus::v2::Coin coin{
++                    {cb_txid, static_cast<uint32_t>(j)},
++                    v2out,
++                    nHeight,
++                    nParentMtp,
++                    true};
++                SmtInsert(final_utxo_root, coin);
+                 cb_coins.push_back(std::move(coin));
+             }
+         }
++        utxo_digest = SmtRoot(final_utxo_root);
+     }
+ 
+     const uint64_t cb_linear_cost =
+-        ::GetSerializeSize(coinbase_tx) +
++        coinbase_tx.GetTotalSize() +
+         uint64_t(coinbase_tx.vin.size() * 64 + coinbase_tx.vout.size() * 64);
+     const uint64_t cb_eff_cost = lotus::v2::TransactionEffectiveCost(
+         cb_linear_cost, kDefaultMonetaryProfile);
+@@ -806,7 +864,6 @@ uint256 ComputeV2StateRootFromOverlay(
+         AdvanceV2MonetaryStateForBlock(overlay.GetBaseMonetaryState(), nBits,
+                                        block_cost);
+ 
+-    const lotus::v2::Hash utxo_digest = SmtRoot(final_utxo_root);
+     const lotus::v2::Hash sroot = lotus::v2::StateRoot(
+         GetActiveV2ChainId(), nHeight, utxo_digest, next_mon_state);
+     uint256 out;
+diff --git a/src/primitives/transaction.cpp b/src/primitives/transaction.cpp
+index 184926c31f..278af465c7 100644
+--- a/src/primitives/transaction.cpp
++++ b/src/primitives/transaction.cpp
+@@ -405,6 +405,8 @@ void CTransaction::InitHashes() {
+     std::memcpy(hash.begin(), txid.data(), 32);
+     std::memcpy(m_witness_hash.begin(), txhash.data(), 32);
+     std::memcpy(m_outputs_hash.begin(), outputs_root.data(), 32);
++    m_serialize_size = 0;
++    m_serialize_size = static_cast<uint32_t>(::GetSerializeSize(*this));
+ }
+ 
+ /**
+@@ -413,18 +415,18 @@ void CTransaction::InitHashes() {
+  */
+ CTransaction::CTransaction()
+     : vin(), vout(), nVersion(CTransaction::CURRENT_VERSION), nLockTime(0),
+-      fHasV2Lock(false), nV2Lock(0), hash(), m_witness_hash(),
+-      m_outputs_hash() {}
++      fHasV2Lock(false), m_serialize_size(0), nV2Lock(0), hash(),
++      m_witness_hash(), m_outputs_hash() {}
+ CTransaction::CTransaction(const CMutableTransaction &tx)
+     : vin(tx.vin), vout(tx.vout), nVersion(tx.nVersion),
+-      nLockTime(tx.nLockTime), fHasV2Lock(tx.fHasV2Lock), nV2Lock(tx.nV2Lock),
+-      hash(), m_witness_hash(), m_outputs_hash() {
++      nLockTime(tx.nLockTime), fHasV2Lock(tx.fHasV2Lock), m_serialize_size(0),
++      nV2Lock(tx.nV2Lock), hash(), m_witness_hash(), m_outputs_hash() {
+     InitHashes();
+ }
+ CTransaction::CTransaction(CMutableTransaction &&tx)
+     : vin(std::move(tx.vin)), vout(std::move(tx.vout)), nVersion(tx.nVersion),
+-      nLockTime(tx.nLockTime), fHasV2Lock(tx.fHasV2Lock), nV2Lock(tx.nV2Lock),
+-      hash(), m_witness_hash(), m_outputs_hash() {
++      nLockTime(tx.nLockTime), fHasV2Lock(tx.fHasV2Lock), m_serialize_size(0),
++      nV2Lock(tx.nV2Lock), hash(), m_witness_hash(), m_outputs_hash() {
+     InitHashes();
+ }
+ 
+@@ -445,10 +447,6 @@ Amount CTransaction::GetValueOut() const {
+     return nValueOut;
+ }
+ 
+-unsigned int CTransaction::GetTotalSize() const {
+-    return ::GetSerializeSize(*this);
+-}
+-
+ std::string CTransaction::ToString() const {
+     std::string str;
+     str += strprintf("CTransaction(txid=%s, ver=%u, vin.size=%u, vout.size=%u, "
+diff --git a/src/primitives/transaction.h b/src/primitives/transaction.h
+index b2eeb8fae0..5a78af7c70 100644
+--- a/src/primitives/transaction.h
++++ b/src/primitives/transaction.h
+@@ -457,6 +457,56 @@ inline void SerializeTransaction(const TxType &tx, Stream &s) {
+         const uint16_t out_count = static_cast<uint16_t>(tx.vout.size());
+         s << version << lock << in_count << out_count;
+         for (const auto &txin : tx.vin) {
++            if ((txin.nFlags == 1 && !txin.vWitnesses.empty()) ||
++                (txin.nFlags == 2 &&
++                 (txin.fHasCoinbaseData || txin.scriptSig.empty())) ||
++                txin.nFlags == 3) {
++                s.write(AsBytes(Span{txin.prevout.GetTxId().begin(), 32}));
++                const uint32_t prev_index = txin.prevout.GetN();
++                uint32_t seq = txin.nSequence;
++                if (txin.nFlags == 2) {
++                    seq = CTxIn::SEQUENCE_FINAL;
++                } else if (txin.nFlags == 1 && seq != CTxIn::SEQUENCE_FINAL &&
++                           (seq & ~0x40ffffU)) {
++                    seq = CTxIn::SEQUENCE_FINAL;
++                }
++                s << prev_index << seq << txin.nFlags;
++                if (txin.nFlags == 1) {
++                    WriteCompactSize(s, txin.nPathIndex);
++                    WriteCompactSize(s, txin.vWitnesses.size());
++                    for (const auto &w : txin.vWitnesses) {
++                        s << w.script;
++                        WriteCompactSize(s, w.siblings.size());
++                        for (const auto &sib : w.siblings) {
++                            s.write(AsBytes(Span{sib.data(), 32}));
++                        }
++                        WriteCompactSize(s, w.arguments.size());
++                        for (const auto &arg : w.arguments) {
++                            s << arg;
++                        }
++                    }
++                } else if (txin.nFlags == 2) {
++                    WriteCompactSize(s, txin.fHasCoinbaseData ? 1 : 0);
++                    if (txin.fHasCoinbaseData) {
++                        s << txin.vCoinbaseData;
++                    }
++                } else if (txin.nFlags == 3) {
++                    const lotus::v2::BranchWitness empty_w{};
++                    const auto &w = txin.vWitnesses.empty()
++                                        ? empty_w
++                                        : txin.vWitnesses[0];
++                    s << w.script;
++                    WriteCompactSize(s, w.siblings.size());
++                    for (const auto &sib : w.siblings) {
++                        s.write(AsBytes(Span{sib.data(), 32}));
++                    }
++                    WriteCompactSize(s, w.arguments.size());
++                    for (const auto &arg : w.arguments) {
++                        s << arg;
++                    }
++                }
++                continue;
++            }
+             const lotus::v2::Input in = txin.ToV2Input();
+             s.write(AsBytes(Span{in.prev_txid.data(), 32}));
+             s << in.prev_index << in.sequence << in.flags;
+@@ -495,17 +545,18 @@ inline void SerializeTransaction(const TxType &tx, Stream &s) {
+             }
+         }
+         for (const auto &txout : tx.vout) {
+-            const lotus::v2::Output out = txout.ToV2Output();
+-            s << out.flags << out.value;
+-            if (out.HasToken()) {
+-                s.write(AsBytes(Span{out.token_id.data(), 32}));
++            const uint64_t val = static_cast<uint64_t>(
++                std::max<int64_t>(0, txout.nValue / SATOSHI));
++            s << txout.nFlags << val;
++            if ((txout.nFlags & 1) != 0) {
++                s.write(AsBytes(Span{txout.tokenId.begin(), 32}));
+             }
+-            WriteCompactSize(s, out.branches.size());
+-            for (const auto &b : out.branches) {
++            WriteCompactSize(s, txout.vBranches.size());
++            for (const auto &b : txout.vBranches) {
+                 s.write(AsBytes(Span{b.data(), 32}));
+             }
+-            WriteCompactSize(s, out.paths.size());
+-            for (const auto &p : out.paths) {
++            WriteCompactSize(s, txout.vPaths.size());
++            for (const auto &p : txout.vPaths) {
+                 WriteCompactSize(s, p.size());
+                 for (uint8_t idx : p) {
+                     WriteCompactSize(s, idx);
+@@ -548,6 +599,11 @@ public:
+     const uint32_t nVersion;
+     const uint32_t nLockTime;
+     const bool fHasV2Lock{false};
++
++private:
++    uint32_t m_serialize_size{0};
++
++public:
+     const uint64_t nV2Lock{0};
+ 
+ private:
+@@ -569,6 +625,12 @@ public:
+     explicit CTransaction(CMutableTransaction &&tx);
+ 
+     template <typename Stream> inline void Serialize(Stream &s) const {
++        if constexpr (std::is_same_v<std::remove_cvref_t<Stream>, SizeComputer>) {
++            if (m_serialize_size > 0) {
++                s.seek(m_serialize_size);
++                return;
++            }
++        }
+         SerializeTransaction(*this, s);
+     }
+ 
+@@ -596,7 +658,10 @@ public:
+      * Get the total transaction size in bytes.
+      * @return Total transaction size in bytes
+      */
+-    unsigned int GetTotalSize() const;
++    unsigned int GetTotalSize() const {
++        return m_serialize_size > 0 ? m_serialize_size
++                                    : ::GetSerializeSize(*this);
++    }
+ 
+     bool IsCoinBase() const {
+         return (vin.size() == 1 &&
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index 41be43c792..709203fe27 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -1955,6 +1955,19 @@ static UniValue SubmitSealedBlockImpl(const Config &config,
+     block.vtx.push_back(std::move(coinbase_tx));
+     block.vtx.insert(block.vtx.end(), tmpl_opt->non_coinbase_txs.begin(),
+                      tmpl_opt->non_coinbase_txs.end());
++    const TxId &cb_txid = block.vtx[0]->GetId();
++    const auto lb = std::lower_bound(
++        tmpl_opt->non_coinbase_txs.begin(), tmpl_opt->non_coinbase_txs.end(),
++        cb_txid, [](const CTransactionRef &a, const TxId &b) {
++            return a->GetId() < b;
++        });
++    const bool cb_collides =
++        (lb != tmpl_opt->non_coinbase_txs.end() && (*lb)->GetId() == cb_txid);
++    if (!cb_collides &&
++        ComputeV2TxRootFromSubtreeA(*block.vtx[0], tmpl_opt->subtree_a_root) ==
++            block.hashMerkleRoot) {
++        block.m_checked_merkle_root = true;
++    }
+ 
+     const BlockHash hash = block.GetHash();
+     {
+diff --git a/src/test/lotus_v2_tests.cpp b/src/test/lotus_v2_tests.cpp
+index 67fd988155..dd38dcb8c9 100644
+--- a/src/test/lotus_v2_tests.cpp
++++ b/src/test/lotus_v2_tests.cpp
+@@ -1457,10 +1457,13 @@ BOOST_AUTO_TEST_CASE(legacy_to_v7_adapter_roundtrip) {
+ 
+     DataStream ss{};
+     ss << adapted;
++    const size_t expected_size = ss.size();
+     CTransaction deserialized(deserialize, ss);
+     BOOST_CHECK_EQUAL(deserialized.nVersion, 7U);
+     BOOST_CHECK_EQUAL(deserialized.GetId(), adapted.GetId());
+     BOOST_CHECK_EQUAL(deserialized.GetHash(), adapted.GetHash());
++    BOOST_CHECK_EQUAL(deserialized.GetTotalSize(), expected_size);
++    BOOST_CHECK_EQUAL(GetSerializeSize(deserialized), expected_size);
+ }
+ 
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index c52f7b74a5..9b59776176 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -235,8 +235,12 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason) {
+     const CTransaction &tx = (*it)->GetTx();
+     const TxId &txid = tx.GetId();
+ 
+-    FlushPendingOverlayAdds();
+-    RemoveTransactionFromOverlay(m_merklix_overlay, tx);
++    if (m_defer_snapshot_depth > 0) {
++        m_pending_overlay_removes.push_back(txid);
++    } else {
++        FlushPendingOverlayAdds();
++        RemoveTransactionFromOverlay(m_merklix_overlay, tx);
++    }
+ 
+     if (reason != MemPoolRemovalReason::BLOCK) {
+         if (m_opts.signals) {
+@@ -422,6 +426,7 @@ void CTxMemPool::_clear() {
+     mapTx.clear();
+     mapNextTx.clear();
+     m_pending_overlay_adds.clear();
++    m_pending_overlay_removes.clear();
+     m_merklix_overlay.Clear();
+     m_utxo_fast_filter.ClearMempool();
+     totalTxSize = 0;
+@@ -435,12 +440,45 @@ void CTxMemPool::_clear() {
+ 
+ void CTxMemPool::FlushPendingOverlayAdds() const {
+     AssertLockHeld(cs);
+-    if (m_pending_overlay_adds.empty()) {
++    if (m_pending_overlay_adds.empty() && m_pending_overlay_removes.empty()) {
+         return;
+     }
+-    auto pending = std::move(m_pending_overlay_adds);
+-    m_pending_overlay_adds.clear();
+-    AddTransactionsToOverlayBatch(m_merklix_overlay, pending);
++    if (!m_pending_overlay_removes.empty()) {
++        if (mapTx.empty()) {
++            m_pending_overlay_adds.clear();
++            m_pending_overlay_removes.clear();
++            m_merklix_overlay.Clear();
++            return;
++        }
++        if (m_pending_overlay_removes.size() >= mapTx.size()) {
++            m_pending_overlay_adds.clear();
++            m_pending_overlay_removes.clear();
++            m_merklix_overlay.Clear();
++            std::vector<std::tuple<CTransactionRef, int64_t, int64_t>> remaining;
++            remaining.reserve(mapTx.size());
++            for (const auto &entry : mapTx.get<entry_id>()) {
++                remaining.emplace_back(entry->GetSharedTx(),
++                                       entry->GetFee() / SATOSHI,
++                                       entry->GetSigChecks());
++            }
++            AddTransactionsToOverlayBatch(m_merklix_overlay, remaining);
++            return;
++        }
++    }
++    if (!m_pending_overlay_adds.empty()) {
++        auto pending = std::move(m_pending_overlay_adds);
++        m_pending_overlay_adds.clear();
++        AddTransactionsToOverlayBatch(m_merklix_overlay, pending);
++    }
++    if (!m_pending_overlay_removes.empty()) {
++        auto removes = std::move(m_pending_overlay_removes);
++        m_pending_overlay_removes.clear();
++        for (const TxId &rm_txid : removes) {
++            lotus::v2::Hash id{};
++            std::memcpy(id.data(), rm_txid.begin(), 32);
++            m_merklix_overlay.RemoveTransaction(id);
++        }
++    }
+ }
+ 
+ CTxMemPool::ScopedSnapshotDefer::~ScopedSnapshotDefer() {
+@@ -477,6 +515,9 @@ void CTxMemPool::SyncMerklixOverlayToTip(const BlockHash &tip_hash,
+         FlushPendingOverlayAdds();
+         return;
+     }
++    if (!m_pending_overlay_removes.empty()) {
++        FlushPendingOverlayAdds();
++    }
+     std::shared_ptr<const lotus::v2::SmtNode> utxo_root;
+     lotus::v2::MonetaryState mon_state = lotus::v2::GetInitialV2MonetaryState();
+     GetV2BlockStateSnapshot(tip_hash, utxo_root, mon_state);
+@@ -489,16 +530,31 @@ void CTxMemPool::ConnectBlockReset(const BlockHash &new_tip_hash,
+                                    uint64_t next_height,
+                                    uint64_t next_mtp) {
+     AssertLockHeld(cs);
+-    FlushPendingOverlayAdds();
+     lotus::v2::Hash tip_id{};
+     std::memcpy(tip_id.data(), new_tip_hash.begin(), 32);
+     std::shared_ptr<const lotus::v2::SmtNode> utxo_root;
+     lotus::v2::MonetaryState mon_state = lotus::v2::GetInitialV2MonetaryState();
+     GetV2BlockStateSnapshot(new_tip_hash, utxo_root, mon_state);
+     if (mapTx.empty()) {
++        m_pending_overlay_adds.clear();
++        m_pending_overlay_removes.clear();
+         m_merklix_overlay.ResetToTip(tip_id, std::move(utxo_root), mon_state,
+                                      next_height, next_mtp);
++    } else if (!m_pending_overlay_removes.empty()) {
++        m_pending_overlay_adds.clear();
++        m_pending_overlay_removes.clear();
++        m_merklix_overlay.ResetToTip(tip_id, std::move(utxo_root), mon_state,
++                                     next_height, next_mtp);
++        std::vector<std::tuple<CTransactionRef, int64_t, int64_t>> remaining;
++        remaining.reserve(mapTx.size());
++        for (const auto &entry : mapTx.get<entry_id>()) {
++            remaining.emplace_back(entry->GetSharedTx(),
++                                   entry->GetFee() / SATOSHI,
++                                   entry->GetSigChecks());
++        }
++        AddTransactionsToOverlayBatch(m_merklix_overlay, remaining);
+     } else {
++        FlushPendingOverlayAdds();
+         m_merklix_overlay.ReanchorExistingTxs(
+             tip_id, std::move(utxo_root), mon_state, next_height, next_mtp);
+     }
+diff --git a/src/txmempool.h b/src/txmempool.h
+index 03e79fa723..1b8c899f9e 100644
+--- a/src/txmempool.h
++++ b/src/txmempool.h
+@@ -719,6 +719,7 @@ private:
+     mutable lotus::v2::MerklixOverlayManager m_merklix_overlay GUARDED_BY(cs);
+     mutable std::vector<std::tuple<CTransactionRef, int64_t, int64_t>>
+         m_pending_overlay_adds GUARDED_BY(cs);
++    mutable std::vector<TxId> m_pending_overlay_removes GUARDED_BY(cs);
+     mutable lotus::v2::UtxoFastFilter m_utxo_fast_filter;
+     mutable uint32_t m_defer_snapshot_depth GUARDED_BY(cs){0};
+     mutable bool m_snapshot_dirty GUARDED_BY(cs){false};
+-- 
+2.50.1 (Apple Git-155)
+

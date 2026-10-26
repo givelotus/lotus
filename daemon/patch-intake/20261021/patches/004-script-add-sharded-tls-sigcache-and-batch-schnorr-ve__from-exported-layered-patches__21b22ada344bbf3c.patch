@@ -1,0 +1,4261 @@
+From 6e8887cd8d81dade1a838c09afb25cb0f48699e7 Mon Sep 17 00:00:00 2001
+From: Lotus Developer <dev@lotus.org>
+Date: Thu, 16 Apr 2026 12:00:00 +0000
+Subject: [PATCH] script: add sharded TLS sigcache and batch Schnorr
+ verification
+
+Optimize signature and script verification throughput by introducing a 16-shard
+cuckoo signature cache (`SignatureCache`) with thread-local lookaside caching
+and batch Schnorr signature verification (`BatchVerifySchnorr` / `CheckInputsBatch`)
+across parallel script check worker threads.
+---
+ src/CMakeLists.txt                            |   5 +-
+ src/bench/verify_script.cpp                   |  72 ++
+ src/lotus_v2/CMakeLists.txt                   |  26 +
+ src/lotus_v2/commitment.cpp                   | 249 +++++
+ src/lotus_v2/commitment.h                     |  60 ++
+ src/lotus_v2/header.cpp                       | 138 +++
+ src/lotus_v2/header.h                         |  48 +
+ src/lotus_v2/output.cpp                       | 270 +++++
+ src/lotus_v2/output.h                         |  43 +
+ src/lotus_v2/signing.cpp                      | 995 ++++++++++++++++++
+ src/lotus_v2/signing.h                        | 220 ++++
+ src/lotus_v2/tagged_hash.cpp                  |  75 ++
+ src/lotus_v2/tagged_hash.h                    |  36 +
+ src/lotus_v2/transaction.cpp                  | 550 ++++++++++
+ src/lotus_v2/transaction.h                    |  76 ++
+ src/node/snapshot.h                           |   3 +-
+ src/primitives/transaction.cpp                |  31 +-
+ src/primitives/transaction.h                  |  19 +-
+ src/script/sigcache.cpp                       | 132 ++-
+ src/script/sigcache.h                         |  29 +-
+ src/secp256k1/include/secp256k1_schnorr.h     |   9 +
+ src/secp256k1/include/secp256k1_schnorrsig.h  |  23 +
+ src/secp256k1/src/modules/schnorr/main_impl.h | 118 +++
+ .../src/modules/schnorrsig/main_impl.h        | 108 ++
+ src/test/sigcache_tests.cpp                   |  48 +
+ src/validation.cpp                            | 358 ++++++-
+ src/validation.h                              |  11 +-
+ 27 files changed, 3681 insertions(+), 71 deletions(-)
+ create mode 100644 src/lotus_v2/CMakeLists.txt
+ create mode 100644 src/lotus_v2/commitment.cpp
+ create mode 100644 src/lotus_v2/commitment.h
+ create mode 100644 src/lotus_v2/header.cpp
+ create mode 100644 src/lotus_v2/header.h
+ create mode 100644 src/lotus_v2/output.cpp
+ create mode 100644 src/lotus_v2/output.h
+ create mode 100644 src/lotus_v2/signing.cpp
+ create mode 100644 src/lotus_v2/signing.h
+ create mode 100644 src/lotus_v2/tagged_hash.cpp
+ create mode 100644 src/lotus_v2/tagged_hash.h
+ create mode 100644 src/lotus_v2/transaction.cpp
+ create mode 100644 src/lotus_v2/transaction.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index bb216f2ce6..f959b5a96e 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -338,6 +338,7 @@ add_subdirectory(crc32c)
+ add_subdirectory(crypto)
+ add_subdirectory(leveldb)
+ add_subdirectory(secp256k1)
++add_subdirectory(lotus_v2)
+ add_subdirectory(univalue)
+ 
+ # Find the git root, and returns the full path to the .git/logs/HEAD file if
+@@ -557,7 +558,7 @@ add_library(common
+ 	${NETWORK_SOURCES}
+ )
+ 
+-target_link_libraries(common bitcoinconsensus util secp256k1 script)
++target_link_libraries(common bitcoinconsensus util secp256k1 script lotus_v2_header)
+ 
+ # script library
+ add_library(script
+@@ -974,7 +975,7 @@ if(BUILD_CHAINSTATE)
+ 			# To access the config/ and obj/ directories
+ 			${CMAKE_CURRENT_BINARY_DIR}
+ 	)
+-	target_link_libraries(bitcoinkernel crypto univalue secp256k1 leveldb)
++	target_link_libraries(bitcoinkernel crypto univalue secp256k1 lotus_v2_header leveldb)
+ 	link_boost_headers_only(bitcoinkernel headers)
+ 
+ 	if(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
+diff --git a/src/bench/verify_script.cpp b/src/bench/verify_script.cpp
+index 30c91154d8..ec88aa9937 100644
+--- a/src/bench/verify_script.cpp
++++ b/src/bench/verify_script.cpp
+@@ -3,18 +3,24 @@
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
+ #include <bench/bench.h>
++#include <hash.h>
+ #include <key.h>
++#include <lotus_v2/signing.h>
+ #if defined(HAVE_CONSENSUS_LIB)
+ #include <script/bitcoinconsensus.h>
+ #endif
+ #include <script/interpreter.h>
+ #include <script/script.h>
+ #include <script/script_error.h>
++#include <script/sigcache.h>
+ #include <script/standard.h>
+ #include <streams.h>
++#include <test/util/setup_common.h>
+ #include <test/util/transaction_utils.h>
++#include <tinyformat.h>
+ 
+ #include <array>
++#include <cstring>
+ 
+ static void VerifyNestedIfScript(benchmark::Bench &bench) {
+     std::vector<std::vector<uint8_t>> stack;
+@@ -38,4 +44,70 @@ static void VerifyNestedIfScript(benchmark::Bench &bench) {
+     });
+ }
+ 
++static void VerifySchnorrIndividual64(benchmark::Bench &bench) {
++    BasicTestingSetup test_setup;
++    constexpr size_t N = 64;
++    std::vector<CPubKey> pubkeys(N);
++    std::vector<uint256> msgs(N);
++    std::vector<std::vector<uint8_t>> sigs(N);
++    for (size_t i = 0; i < N; ++i) {
++        CKey k;
++        k.MakeNewKey(true);
++        pubkeys[i] = k.GetPubKey();
++        msgs[i] = Hash(strprintf("bench schnorr msg %zu", i));
++        bool ok = k.SignSchnorr(msgs[i], sigs[i]);
++        assert(ok);
++    }
++    bench.batch(N).unit("sig").run([&] {
++        for (size_t i = 0; i < N; ++i) {
++            bool ok = pubkeys[i].VerifySchnorr(msgs[i], sigs[i]);
++            assert(ok);
++        }
++    });
++}
++
++static void VerifySchnorrBatch64(benchmark::Bench &bench) {
++    BasicTestingSetup test_setup;
++    constexpr size_t N = 64;
++    lotus::v2::BatchSigCollector collector;
++    for (size_t i = 0; i < N; ++i) {
++        CKey k;
++        k.MakeNewKey(true);
++        CPubKey pk = k.GetPubKey();
++        uint256 msg = Hash(strprintf("bench schnorr msg %zu", i));
++        std::vector<uint8_t> sig;
++        bool ok = k.SignSchnorr(msg, sig);
++        assert(ok);
++        collector.AddLegacySchnorr(
++            std::span<const uint8_t>(pk.data(), pk.size()),
++            std::span<const uint8_t>(sig.data(), sig.size()), msg.begin());
++    }
++    bench.batch(N).unit("sig").run([&] {
++        bool ok = collector.VerifyAll();
++        assert(ok);
++    });
++}
++
++static void SigCacheTlsHit(benchmark::Bench &bench) {
++    BasicTestingSetup test_setup;
++    SignatureCache sigcache{DEFAULT_SIGNATURE_CACHE_BYTES};
++    CKey k;
++    k.MakeNewKey(true);
++    CPubKey pk = k.GetPubKey();
++    uint256 msg = Hash(std::string("tls sigcache bench"));
++    std::vector<uint8_t> sig;
++    bool ok = k.SignSchnorr(msg, sig);
++    assert(ok);
++    uint256 entry;
++    sigcache.ComputeEntry(entry, msg, sig, pk);
++    sigcache.Set(entry);
++    bench.unit("lookup").run([&] {
++        bool hit = sigcache.Get(entry, /*erase=*/false);
++        assert(hit);
++    });
++}
++
+ BENCHMARK(VerifyNestedIfScript);
++BENCHMARK(VerifySchnorrIndividual64);
++BENCHMARK(VerifySchnorrBatch64);
++BENCHMARK(SigCacheTlsHit);
+diff --git a/src/lotus_v2/CMakeLists.txt b/src/lotus_v2/CMakeLists.txt
+new file mode 100644
+index 0000000000..3a24e4c62c
+--- /dev/null
++++ b/src/lotus_v2/CMakeLists.txt
+@@ -0,0 +1,26 @@
++# V2 candidate components; the explicit development command links validation.
++# These targets do not activate a network or change the mainnet chain path.
++if(NOT TARGET Boost::headers)
++    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.30)
++        cmake_policy(SET CMP0167 OLD)
++    endif()
++    find_package(Boost 1.64 REQUIRED)
++endif()
++
++add_library(lotus_v2_header STATIC
++    header.cpp
++    tagged_hash.cpp
++    commitment.cpp
++    output.cpp
++    transaction.cpp
++    signing.cpp
++)
++target_include_directories(lotus_v2_header PUBLIC
++    "${CMAKE_CURRENT_SOURCE_DIR}"
++    ..
++)
++target_link_libraries(lotus_v2_header PUBLIC
++    secp256k1
++    crypto
++    Boost::headers
++)
+diff --git a/src/lotus_v2/commitment.cpp b/src/lotus_v2/commitment.cpp
+new file mode 100644
+index 0000000000..b11dd1d0a4
+--- /dev/null
++++ b/src/lotus_v2/commitment.cpp
+@@ -0,0 +1,249 @@
++#include "commitment.h"
++
++#include "tagged_hash.h"
++
++#include <algorithm>
++#include <limits>
++#include <vector>
++
++#include <future>
++
++namespace lotus::v2 {
++namespace {
++
++std::vector<uint8_t> EncodeBytes(std::span<const uint8_t> bytes) {
++    const uint64_t n = bytes.size();
++    std::vector<uint8_t> out;
++    out.reserve(bytes.size() + 9);
++    if (n < 253) {
++        out.push_back(static_cast<uint8_t>(n));
++    } else if (n <= 0xffff) {
++        out.push_back(253);
++        out.push_back(static_cast<uint8_t>(n));
++        out.push_back(static_cast<uint8_t>(n >> 8));
++    } else if (n <= 0xffffffffU) {
++        out.push_back(254);
++        for (unsigned i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(n >> (8 * i)));
++    } else {
++        out.push_back(255);
++        for (unsigned i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(n >> (8 * i)));
++    }
++    out.insert(out.end(), bytes.begin(), bytes.end());
++    return out;
++}
++
++bool LessLittleEndian(const Hash &a, const Hash &b) {
++    for (int i = 31; i >= 0; --i) {
++        if (a[i] != b[i]) return a[i] < b[i];
++    }
++    return false;
++}
++
++bool TxKeyBit(const Hash &tx_id, unsigned depth) {
++    return (tx_id[depth / 8] >> (depth % 8)) & 1;
++}
++
++Hash EmptyTxRoot() {
++    return TaggedHash(HashDomain::TxRoot, std::array<uint8_t, 1>{2});
++}
++
++Hash TxLeaf(const TxIdentityPair &tx) {
++    std::array<uint8_t, 65> input{};
++    input[0] = 0;
++    std::copy(tx.tx_id.begin(), tx.tx_id.end(), input.begin() + 1);
++    std::copy(tx.tx_hash.begin(), tx.tx_hash.end(), input.begin() + 33);
++    return TaggedHash(HashDomain::TxRoot, input);
++}
++
++Hash TxNodeAtDepth(unsigned depth, const Hash &left, const Hash &right) {
++    std::array<uint8_t, 67> input{};
++    input[0] = 1;
++    input[1] = static_cast<uint8_t>(depth);
++    input[2] = static_cast<uint8_t>(depth >> 8);
++    std::copy(left.begin(), left.end(), input.begin() + 3);
++    std::copy(right.begin(), right.end(), input.begin() + 35);
++    return TaggedHash(HashDomain::TxRoot, input);
++}
++
++Hash TransactionSubtreeA(const std::vector<const TxIdentityPair *> &entries,
++                         unsigned depth) {
++    if (entries.empty()) return EmptyTxRoot();
++    if (entries.size() == 1) return TxLeaf(*entries[0]);
++    std::vector<const TxIdentityPair *> left, right;
++    left.reserve(entries.size());
++    right.reserve(entries.size());
++    for (const TxIdentityPair *entry : entries) {
++        (TxKeyBit(entry->tx_id, depth) ? right : left).push_back(entry);
++    }
++    if (depth < 4 && entries.size() >= 64 && !left.empty() && !right.empty()) {
++        auto left_future = std::async(std::launch::async, [&left, depth]() {
++            return TransactionSubtreeA(left, depth + 1);
++        });
++        const Hash right_hash = TransactionSubtreeA(right, depth + 1);
++        return TxNodeAtDepth(depth, left_future.get(), right_hash);
++    }
++    return TxNodeAtDepth(depth, TransactionSubtreeA(left, depth + 1),
++                         TransactionSubtreeA(right, depth + 1));
++}
++
++Hash TransactionIdentity(HashDomain domain, const ChainId &chain_id,
++                         const TxHeaderCore &header_core, const Hash &input_root,
++                         const Hash &output_root) {
++    std::array<uint8_t, 112> input{};
++    std::copy(chain_id.begin(), chain_id.end(), input.begin());
++    std::copy(header_core.begin(), header_core.end(), input.begin() + 32);
++    std::copy(input_root.begin(), input_root.end(), input.begin() + 48);
++    std::copy(output_root.begin(), output_root.end(), input.begin() + 80);
++    return TaggedHash(domain, input);
++}
++
++} // namespace
++
++Hash InputCoreLeaf(std::span<const uint8_t> encoded_input_core) {
++    return TaggedHash(HashDomain::InputCore, encoded_input_core);
++}
++Hash InputFullLeaf(std::span<const uint8_t> encoded_input) {
++    return TaggedHash(HashDomain::InputFull, encoded_input);
++}
++Hash OutputLeaf(std::span<const uint8_t> serialized_output) {
++    return TaggedHash(HashDomain::Output, EncodeBytes(serialized_output));
++}
++Hash CoinEntryLeaf(std::span<const uint8_t> serialized_resolved_output) {
++    return TaggedHash(HashDomain::CoinEntry, EncodeBytes(serialized_resolved_output));
++}
++Hash BranchLeaf(std::span<const uint8_t> script) {
++    const auto bytes = EncodeBytes(script);
++    std::vector<uint8_t> input;
++    input.reserve(1 + bytes.size());
++    input.push_back(0);
++    input.insert(input.end(), bytes.begin(), bytes.end());
++    return TaggedHash(HashDomain::Branch, input);
++}
++Hash BranchNode(const Hash &a, const Hash &b) {
++    std::array<uint8_t, 65> input{};
++    const Hash &low = LessLittleEndian(a, b) ? a : b;
++    const Hash &high = LessLittleEndian(a, b) ? b : a;
++    input[0] = 1;
++    std::copy(low.begin(), low.end(), input.begin() + 1);
++    std::copy(high.begin(), high.end(), input.begin() + 33);
++    return TaggedHash(HashDomain::Branch, input);
++}
++Hash BranchProofRoot(const Hash &leaf, std::span<const Hash> bottom_up_siblings) {
++    Hash root = leaf;
++    for (const Hash &sibling : bottom_up_siblings) root = BranchNode(root, sibling);
++    return root;
++}
++Hash IndexedNode(uint16_t layer, const Hash &left, const Hash &right) {
++    std::array<uint8_t, 67> input{};
++    input[0] = 1;
++    input[1] = static_cast<uint8_t>(layer);
++    input[2] = static_cast<uint8_t>(layer >> 8);
++    std::copy(left.begin(), left.end(), input.begin() + 3);
++    std::copy(right.begin(), right.end(), input.begin() + 35);
++    return TaggedHash(HashDomain::MerkleIndex, input);
++}
++Hash IndexedTreeRoot(std::span<const Hash> leaves) {
++    if (leaves.empty()) return TaggedHash(HashDomain::MerkleIndex, std::array<uint8_t, 1>{2});
++    if (leaves.size() == 1) return leaves[0];
++    std::vector<Hash> cur(leaves.begin(), leaves.end());
++    uint16_t layer = 0;
++    while (cur.size() > 1) {
++        if (cur.size() & 1) cur.push_back(Hash{});
++        std::vector<Hash> next;
++        next.reserve(cur.size() / 2);
++        for (size_t i = 0; i < cur.size(); i += 2) {
++            next.push_back(IndexedNode(layer, cur[i], cur[i + 1]));
++        }
++        cur = std::move(next);
++        ++layer;
++    }
++    return cur[0];
++}
++bool IndexedProofRoot(const Hash &leaf, uint32_t index, uint32_t count,
++                      std::span<const Hash> siblings, Hash &out) {
++    if (count == 0 || index >= count) return false;
++    uint32_t width = count;
++    uint32_t offset = index;
++    size_t layer = 0;
++    Hash root = leaf;
++    while (width > 1) {
++        if (layer >= siblings.size()) return false;
++        const Hash &sibling = siblings[layer];
++        if ((offset & 1) == 0 && offset + 1 == width && sibling != Hash{}) return false;
++        root = (offset & 1) ? IndexedNode(layer, sibling, root)
++                            : IndexedNode(layer, root, sibling);
++        offset >>= 1;
++        width = width / 2 + (width & 1);
++        ++layer;
++    }
++    if (layer != siblings.size()) return false;
++    out = root;
++    return true;
++}
++Hash TransactionId(const ChainId &chain_id, const TxHeaderCore &header_core,
++                   const Hash &inputs_root, const Hash &outputs_root) {
++    return TransactionIdentity(HashDomain::TxId, chain_id, header_core, inputs_root, outputs_root);
++}
++Hash TransactionHash(const ChainId &chain_id, const TxHeaderCore &header_core,
++                     const Hash &full_inputs_root, const Hash &outputs_root) {
++    return TransactionIdentity(HashDomain::TxHash, chain_id, header_core, full_inputs_root, outputs_root);
++}
++bool TransactionRoot(std::span<const TxIdentityPair> transactions, Hash &out) {
++    if (transactions.size() > std::numeric_limits<uint32_t>::max()) return false;
++    if (transactions.empty()) {
++        out = EmptyTxRoot();
++        return true;
++    }
++    if (transactions.size() > 1) {
++        std::vector<const Hash *> ids;
++        ids.reserve(transactions.size());
++        for (const auto &tx : transactions) {
++            ids.push_back(&tx.tx_id);
++        }
++        std::sort(ids.begin(), ids.end(),
++                  [](const Hash *a, const Hash *b) { return *a < *b; });
++        for (size_t i = 1; i < ids.size(); ++i) {
++            if (*ids[i - 1] == *ids[i]) return false;
++        }
++    }
++    std::vector<const TxIdentityPair *> entries;
++    entries.reserve(transactions.size() - 1);
++    for (size_t i = 1; i < transactions.size(); ++i) {
++        entries.push_back(&transactions[i]);
++    }
++    const Hash subtree_a = TransactionSubtreeA(entries, 0);
++    out = TransactionRootFromSubtreeA(transactions[0], subtree_a);
++    return true;
++}
++
++Hash TransactionSubtreeARoot(
++    std::span<const TxIdentityPair> non_coinbase_transactions) {
++    std::vector<const TxIdentityPair *> entries;
++    entries.reserve(non_coinbase_transactions.size());
++    for (const auto &tx : non_coinbase_transactions) {
++        entries.push_back(&tx);
++    }
++    return TransactionSubtreeA(entries, 0);
++}
++
++Hash TransactionRootFromSubtreeA(const TxIdentityPair &coinbase_tx,
++                                 const Hash &subtree_a_root) {
++    const Hash coinbase_leaf = TxLeaf(coinbase_tx);
++    std::array<uint8_t, 65> input{};
++    input[0] = 3;
++    std::copy(coinbase_leaf.begin(), coinbase_leaf.end(), input.begin() + 1);
++    std::copy(subtree_a_root.begin(), subtree_a_root.end(), input.begin() + 33);
++    return TaggedHash(HashDomain::TxRoot, input);
++}
++
++Hash BuildTxSubtreeA(
++    std::span<const TxIdentityPair> non_coinbase_transactions) {
++    return TransactionSubtreeARoot(non_coinbase_transactions);
++}
++
++Hash CombineCoinbaseAndSubtreeA(const TxIdentityPair &coinbase_tx,
++                                const Hash &subtree_a_root) {
++    return TransactionRootFromSubtreeA(coinbase_tx, subtree_a_root);
++}
++
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/commitment.h b/src/lotus_v2/commitment.h
+new file mode 100644
+index 0000000000..954b0a0c21
+--- /dev/null
++++ b/src/lotus_v2/commitment.h
+@@ -0,0 +1,60 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_COMMITMENT_H
++#define LOTUS_V2_COMMITMENT_H
++
++#include "header.h"
++
++#include <array>
++#include <cstdint>
++#include <span>
++
++namespace lotus::v2 {
++
++// Inputs are canonical serialized P01 components supplied by the transaction
++// codec. These functions hash bytes; they do not validate their grammar.
++Hash InputCoreLeaf(std::span<const uint8_t> encoded_input_core);
++Hash InputFullLeaf(std::span<const uint8_t> encoded_input);
++Hash OutputLeaf(std::span<const uint8_t> serialized_output);
++Hash CoinEntryLeaf(std::span<const uint8_t> serialized_resolved_output);
++Hash BranchLeaf(std::span<const uint8_t> script);
++Hash BranchNode(const Hash &a, const Hash &b);
++Hash BranchProofRoot(const Hash &leaf, std::span<const Hash> bottom_up_siblings);
++
++Hash IndexedNode(uint16_t layer, const Hash &left, const Hash &right);
++Hash IndexedTreeRoot(std::span<const Hash> leaves);
++// Proof contains one sibling per layer. Missing right children must be zero.
++bool IndexedProofRoot(const Hash &leaf, uint32_t index, uint32_t count,
++                      std::span<const Hash> bottom_up_siblings, Hash &out);
++
++using TxHeaderCore = std::array<uint8_t, 16>;
++Hash TransactionId(const ChainId &chain_id, const TxHeaderCore &header_core,
++                   const Hash &inputs_root, const Hash &outputs_root);
++Hash TransactionHash(const ChainId &chain_id, const TxHeaderCore &header_core,
++                     const Hash &full_inputs_root, const Hash &outputs_root);
++
++struct TxIdentityPair {
++    Hash tx_hash;
++    Hash tx_id;
++};
++// Defined for the empty vector as a tool primitive. Block validity requires
++// a coinbase and imposes its own transaction-count limit.
++bool TransactionRoot(std::span<const TxIdentityPair> transactions, Hash &out);
++// Optimization (rolled into initial commitment primitives): expose O(1)
++// Subtree A root and coinbase-combining helpers so block assembly, sealed
++// header relay (sealedheader), and RCU mining snapshots reuse precomputed
++// non-coinbase Subtree A roots without O(N) transaction tree rebuilds.
++Hash TransactionSubtreeARoot(
++    std::span<const TxIdentityPair> non_coinbase_transactions);
++Hash TransactionRootFromSubtreeA(const TxIdentityPair &coinbase_tx,
++                                 const Hash &subtree_a_root);
++
++// Precompute the depth-0 SubtreeA Merklix root over non-coinbase transactions.
++Hash BuildTxSubtreeA(std::span<const TxIdentityPair> non_coinbase_transactions);
++
++// Combine a coinbase transaction identity pair with a precomputed SubtreeA root
++// in O(1) (single tagged SHA-256 leaf + root hash).
++Hash CombineCoinbaseAndSubtreeA(const TxIdentityPair &coinbase_tx,
++                                const Hash &subtree_a_root);
++
++} // namespace lotus::v2
++#endif
+diff --git a/src/lotus_v2/header.cpp b/src/lotus_v2/header.cpp
+new file mode 100644
+index 0000000000..662d63aaa9
+--- /dev/null
++++ b/src/lotus_v2/header.cpp
+@@ -0,0 +1,138 @@
++#include "header.h"
++#include "tagged_hash.h"
++
++#include <algorithm>
++#include <array>
++
++namespace lotus::v2 {
++namespace {
++
++template <size_t N> void PutLE(std::array<uint8_t, N> &out, size_t pos,
++                              uint64_t value, size_t bytes) {
++    for (size_t i = 0; i < bytes; ++i) {
++        out[pos + i] = static_cast<uint8_t>(value >> (8 * i));
++    }
++}
++
++uint64_t ReadLE(const uint8_t *data, size_t bytes) {
++    uint64_t value = 0;
++    for (size_t i = 0; i < bytes; ++i) {
++        value |= uint64_t{data[i]} << (8 * i);
++    }
++    return value;
++}
++
++uint32_t EncodeTarget(const Hash &target) {
++    int top = 31;
++    while (top >= 0 && target[top] == 0) {
++        --top;
++    }
++    if (top < 0) return 0;
++    uint32_t exponent = static_cast<uint32_t>(top + 1);
++    uint32_t mantissa = 0;
++    if (exponent <= 3) {
++        for (int i = top; i >= 0; --i) mantissa = (mantissa << 8) | target[i];
++        mantissa <<= 8 * (3 - exponent);
++    } else {
++        mantissa = (uint32_t{target[top]} << 16) |
++                   (uint32_t{target[top - 1]} << 8) | target[top - 2];
++    }
++    if (mantissa & 0x00800000U) {
++        mantissa >>= 8;
++        ++exponent;
++    }
++    return (exponent << 24) | mantissa;
++}
++
++} // namespace
++
++bool SerializeHeader(const Header &h, std::array<uint8_t, HEADER_SIZE> &out) {
++    if (h.time > MAX_TIME) return false;
++    std::copy(h.prev_id.begin(), h.prev_id.end(), out.begin());
++    PutLE(out, 32, h.bits, 4);
++    PutLE(out, 36, h.time, 6);
++    PutLE(out, 42, h.nonce, 8);
++    PutLE(out, 50, h.version, 4);
++    PutLE(out, 54, h.size, 8);
++    PutLE(out, 62, h.height, 8);
++    std::copy(h.tx_root.begin(), h.tx_root.end(), out.begin() + 70);
++    std::copy(h.state_root.begin(), h.state_root.end(), out.begin() + 102);
++    return true;
++}
++
++bool ParseHeader(const uint8_t *data, size_t size, Header &out) {
++    if (data == nullptr || size != HEADER_SIZE) return false;
++    Header parsed;
++    std::copy_n(data, 32, parsed.prev_id.begin());
++    parsed.bits = static_cast<uint32_t>(ReadLE(data + 32, 4));
++    parsed.time = ReadLE(data + 36, 6);
++    parsed.nonce = ReadLE(data + 42, 8);
++    parsed.version = static_cast<uint32_t>(ReadLE(data + 50, 4));
++    parsed.size = ReadLE(data + 54, 8);
++    parsed.height = ReadLE(data + 62, 8);
++    std::copy_n(data + 70, 32, parsed.tx_root.begin());
++    std::copy_n(data + 102, 32, parsed.state_root.begin());
++    out = parsed;
++    return true;
++}
++
++Hash BodyHash(const ChainId &chain_id, const Header &header) {
++    std::array<uint8_t, 116> body{};
++    std::copy(chain_id.begin(), chain_id.end(), body.begin());
++    PutLE(body, 32, header.version, 4);
++    PutLE(body, 36, header.size, 8);
++    PutLE(body, 44, header.height, 8);
++    std::copy(header.tx_root.begin(), header.tx_root.end(), body.begin() + 52);
++    std::copy(header.state_root.begin(), header.state_root.end(), body.begin() + 84);
++    return TaggedHash(HashDomain::HeaderBody, body);
++}
++
++bool WorkHash(const ChainId &chain_id, const Header &header, Hash &out) {
++    if (header.time > MAX_TIME) return false;
++    std::array<uint8_t, 50> work{};
++    PutLE(work, 0, header.bits, 4);
++    PutLE(work, 4, header.time, 6);
++    PutLE(work, 10, header.nonce, 8);
++    const Hash body_hash = BodyHash(chain_id, header);
++    std::copy(body_hash.begin(), body_hash.end(), work.begin() + 18);
++    out = TaggedHash(HashDomain::HeaderWork, work);
++    return true;
++}
++
++bool BlockId(const ChainId &chain_id, const Header &header, Hash &out) {
++    if (header.time > MAX_TIME) return false;
++    std::array<uint8_t, 64> input{};
++    std::copy(header.prev_id.begin(), header.prev_id.end(), input.begin());
++    Hash work_hash;
++    WorkHash(chain_id, header, work_hash);
++    std::copy(work_hash.begin(), work_hash.end(), input.begin() + 32);
++    out = TaggedHash(HashDomain::BlockId, input);
++    return true;
++}
++
++bool MeetsTarget(const Hash &block_id, const Hash &target) {
++    for (int i = 31; i >= 0; --i) {
++        if (block_id[i] < target[i]) return true;
++        if (block_id[i] > target[i]) return false;
++    }
++    return true;
++}
++
++bool DecodeTarget(uint32_t bits, const Hash &pow_limit, Hash &target) {
++    const uint32_t exponent = bits >> 24;
++    const uint32_t mantissa = bits & 0x007fffffU;
++    if ((bits & 0x00800000U) || mantissa == 0) return false;
++    Hash decoded{};
++    for (unsigned i = 0; i < 3; ++i) {
++        const int position = static_cast<int>(exponent) - 3 + static_cast<int>(i);
++        const uint8_t byte = static_cast<uint8_t>(mantissa >> (8 * i));
++        if (position >= 32 && byte != 0) return false;
++        if (position >= 0 && position < 32) decoded[position] = byte;
++    }
++    if (std::all_of(decoded.begin(), decoded.end(), [](uint8_t b) { return b == 0; })) return false;
++    if (EncodeTarget(decoded) != bits || !MeetsTarget(decoded, pow_limit)) return false;
++    target = decoded;
++    return true;
++}
++
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/header.h b/src/lotus_v2/header.h
+new file mode 100644
+index 0000000000..fadef5388c
+--- /dev/null
++++ b/src/lotus_v2/header.h
+@@ -0,0 +1,48 @@
++// Copyright (c) 2026 The Lotus developers
++// Candidate V2 header primitives. No legacy block type depends on this file.
++#ifndef LOTUS_V2_HEADER_H
++#define LOTUS_V2_HEADER_H
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++
++namespace lotus::v2 {
++
++using Hash = std::array<uint8_t, 32>;
++using ChainId = Hash;
++constexpr size_t HEADER_SIZE = 134;
++constexpr uint64_t MAX_TIME = (uint64_t{1} << 48) - 1;
++constexpr uint32_t kHeaderVersion = 2;
++
++struct Header {
++    Hash prev_id{};
++    uint32_t bits{};
++    uint64_t time{};
++    uint64_t nonce{};
++    uint32_t version{};
++    uint64_t size{};
++    uint64_t height{};
++    Hash tx_root{};
++    Hash state_root{};
++};
++
++// Hash byte arrays retain digest order. Interpret them as little-endian
++// unsigned integers only for PoW target comparison.
++bool SerializeHeader(const Header &header, std::array<uint8_t, HEADER_SIZE> &out);
++// Structural parse only. Caller validates version, height, target, size,
++// roots, time eligibility and parent against its chain manifest and context.
++bool ParseHeader(const uint8_t *data, size_t size, Header &out);
++Hash BodyHash(const ChainId &chain_id, const Header &header);
++bool WorkHash(const ChainId &chain_id, const Header &header, Hash &out);
++bool BlockId(const ChainId &chain_id, const Header &header, Hash &out);
++
++// Decode only canonical positive compact targets at or below pow_limit.
++// pow_limit is a 32-byte little-endian unsigned integer. Failure leaves
++// target unchanged. The parser and work/block hash functions likewise leave
++// their outputs unchanged on failure.
++bool DecodeTarget(uint32_t bits, const Hash &pow_limit, Hash &target);
++bool MeetsTarget(const Hash &block_id, const Hash &target);
++
++} // namespace lotus::v2
++#endif
+diff --git a/src/lotus_v2/output.cpp b/src/lotus_v2/output.cpp
+new file mode 100644
+index 0000000000..af20524be5
+--- /dev/null
++++ b/src/lotus_v2/output.cpp
+@@ -0,0 +1,270 @@
++#include "output.h"
++
++#include <algorithm>
++#include <limits>
++#include <utility>
++
++namespace lotus::v2 {
++namespace {
++
++    class Reader {
++    public:
++        explicit Reader(const std::vector<uint8_t> &bytes) : bytes_(bytes) {}
++
++        size_t Remaining() const { return bytes_.size() - offset_; }
++        bool Finished() const { return Remaining() == 0; }
++
++        bool Take(size_t count, const uint8_t *&start) {
++            if (count > Remaining()) return false;
++            start = bytes_.data() + offset_;
++            offset_ += count;
++            return true;
++        }
++
++        bool Integer(size_t width, uint64_t &value) {
++            if (width == 0 || width > 8) return false;
++            const uint8_t *start = nullptr;
++            if (!Take(width, start)) return false;
++            value = 0;
++            for (size_t i = 0; i < width; ++i)
++                value |= uint64_t(start[i]) << (8 * i);
++            return true;
++        }
++
++        bool CompactSize(uint64_t cap, uint64_t &value) {
++            uint64_t lead;
++            if (!Integer(1, lead)) return false;
++            if (lead < 253)
++                value = lead;
++            else {
++                size_t width = lead == 253 ? 2 : lead == 254 ? 4 : 8;
++                if (!Integer(width, value)) return false;
++                if (value < (width == 2   ? 253ULL
++                             : width == 4 ? 65536ULL
++                                          : 4294967296ULL))
++                    return false;
++            }
++            return value <= cap;
++        }
++
++    private:
++        const std::vector<uint8_t> &bytes_;
++        size_t offset_ = 0;
++    };
++
++    void AppendInteger(uint64_t value, size_t width,
++                       std::vector<uint8_t> &out) {
++        for (size_t i = 0; i < width; ++i)
++            out.push_back(uint8_t(value >> (8 * i)));
++    }
++
++    void AppendCompactSize(uint64_t value, std::vector<uint8_t> &out) {
++        if (value < 253)
++            AppendInteger(value, 1, out);
++        else if (value <= 65535) {
++            out.push_back(253);
++            AppendInteger(value, 2, out);
++        } else if (value <= 4294967295ULL) {
++            out.push_back(254);
++            AppendInteger(value, 4, out);
++        } else {
++            out.push_back(255);
++            AppendInteger(value, 8, out);
++        }
++    }
++
++    bool Valid(const Output &output, std::string &error) {
++        if (output.flags & 0xfc) {
++            error = "flags";
++            return false;
++        }
++        if (output.HasToken()) {
++            if (output.token_id == Hash32{}) {
++                error = "zero token";
++                return false;
++            }
++        } else if (output.token_id != Hash32{}) {
++            error = "native token field";
++            return false;
++        }
++        if (output.branches.empty() ||
++            output.branches.size() > MAX_OUTPUT_BRANCHES) {
++            error = "branch count";
++            return false;
++        }
++        for (size_t i = 0; i < output.branches.size(); ++i) {
++            for (size_t j = 0; j < i; ++j) {
++                if (output.branches[i] == output.branches[j]) {
++                    error = "duplicate branch";
++                    return false;
++                }
++            }
++        }
++        if (output.IsBurn()) {
++            if (!output.paths.empty()) {
++                error = "burn paths";
++                return false;
++            }
++        } else if (output.paths.empty() ||
++                   output.paths.size() > MAX_OUTPUT_PATHS) {
++            error = "path count";
++            return false;
++        }
++        for (size_t p = 0; p < output.paths.size(); ++p) {
++            const auto &path = output.paths[p];
++            if (path.empty() || path.size() > output.branches.size()) {
++                error = "path length";
++                return false;
++            }
++            for (size_t i = 0; i < path.size(); ++i) {
++                if (path[i] >= output.branches.size() ||
++                    (i && path[i - 1] >= path[i])) {
++                    error = "path index";
++                    return false;
++                }
++            }
++            if (p && !(output.paths[p - 1] < path)) {
++                error = "path order";
++                return false;
++            }
++        }
++        return true;
++    }
++
++} // namespace
++
++bool DecodeOutput(const std::vector<uint8_t> &frame, Output &result,
++                  std::string &error) {
++    if (frame.size() > MAX_OUTPUT_BYTES) {
++        error = "output bytes";
++        return false;
++    }
++    Reader reader(frame);
++    Output parsed;
++    uint64_t value;
++    if (!reader.Integer(1, value)) {
++        error = "truncated flags";
++        return false;
++    }
++    parsed.flags = uint8_t(value);
++    if (parsed.flags & 0xfc) {
++        error = "flags";
++        return false;
++    }
++    if (!reader.Integer(8, parsed.value)) {
++        error = "truncated value";
++        return false;
++    }
++    if (parsed.HasToken()) {
++        const uint8_t *token;
++        if (!reader.Take(32, token)) {
++            error = "truncated token";
++            return false;
++        }
++        std::copy_n(token, 32, parsed.token_id.begin());
++    }
++    uint64_t count;
++    if (!reader.CompactSize(MAX_OUTPUT_BRANCHES, count)) {
++        error = "branch count";
++        return false;
++    }
++    // Division avoids host-width multiplication overflow before reserving
++    // storage.
++    if (count > reader.Remaining() / 32) {
++        error = "truncated branches";
++        return false;
++    }
++    parsed.branches.reserve(size_t(count));
++    for (uint64_t i = 0; i < count; ++i) {
++        const uint8_t *branch;
++        if (!reader.Take(32, branch)) {
++            error = "truncated branches";
++            return false;
++        }
++        Hash32 root;
++        std::copy_n(branch, 32, root.begin());
++        parsed.branches.push_back(root);
++    }
++    if (!reader.CompactSize(MAX_OUTPUT_PATHS, count)) {
++        error = "path count";
++        return false;
++    }
++    if (count > reader.Remaining()) {
++        error = "truncated paths";
++        return false;
++    }
++    parsed.paths.reserve(size_t(count));
++    for (uint64_t p = 0; p < count; ++p) {
++        uint64_t length;
++        if (!reader.CompactSize(MAX_OUTPUT_BRANCHES, length)) {
++            error = "path length";
++            return false;
++        }
++        if (length > reader.Remaining()) {
++            error = "truncated path";
++            return false;
++        }
++        std::vector<uint8_t> path;
++        path.reserve(size_t(length));
++        for (uint64_t i = 0; i < length; ++i) {
++            uint64_t index;
++            if (!reader.CompactSize(MAX_OUTPUT_BRANCHES - 1, index)) {
++                error = "path index";
++                return false;
++            }
++            path.push_back(uint8_t(index));
++        }
++        parsed.paths.push_back(std::move(path));
++    }
++    if (!reader.Finished()) {
++        error = "trailing bytes";
++        return false;
++    }
++    if (!Valid(parsed, error)) return false;
++    result = std::move(parsed);
++    error.clear();
++    return true;
++}
++
++bool ComputeOutputSerializedSize(const Output &output, size_t &size,
++                                 std::string &error) {
++    if (!Valid(output, error)) return false;
++    size_t total = 1 + 8 + (output.HasToken() ? 32 : 0) + 1 +
++                   output.branches.size() * 32 + 1;
++    for (const auto &path : output.paths) {
++        total += 1 + path.size();
++    }
++    if (total > MAX_OUTPUT_BYTES) {
++        error = "output bytes";
++        return false;
++    }
++    size = total;
++    error.clear();
++    return true;
++}
++
++bool EncodeOutput(const Output &output, std::vector<uint8_t> &result,
++                  std::string &error) {
++    size_t exact_size = 0;
++    if (!ComputeOutputSerializedSize(output, exact_size, error)) return false;
++    result.clear();
++    result.reserve(exact_size);
++    result.push_back(output.flags);
++    AppendInteger(output.value, 8, result);
++    if (output.HasToken())
++        result.insert(result.end(), output.token_id.begin(),
++                      output.token_id.end());
++    AppendCompactSize(output.branches.size(), result);
++    for (const auto &branch : output.branches)
++        result.insert(result.end(), branch.begin(), branch.end());
++    AppendCompactSize(output.paths.size(), result);
++    for (const auto &path : output.paths) {
++        AppendCompactSize(path.size(), result);
++        for (uint8_t index : path)
++            AppendCompactSize(index, result);
++    }
++    error.clear();
++    return true;
++}
++
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/output.h b/src/lotus_v2/output.h
+new file mode 100644
+index 0000000000..98819170f5
+--- /dev/null
++++ b/src/lotus_v2/output.h
+@@ -0,0 +1,43 @@
++// Candidate Lotus V2 output wire codec. No transaction validation is implied.
++#ifndef LOTUS_V2_OUTPUT_H
++#define LOTUS_V2_OUTPUT_H
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace lotus::v2 {
++
++using Hash32 = std::array<uint8_t, 32>;
++
++// P01 hard bounds. Any stricter deployment profile must be checked by its
++// caller.
++constexpr size_t MAX_OUTPUT_BRANCHES = 16;
++constexpr size_t MAX_OUTPUT_PATHS = 16;
++constexpr size_t MAX_OUTPUT_BYTES = 812;
++
++struct Output {
++    uint8_t flags = 0;
++    uint64_t value = 0;
++    Hash32 token_id{};
++    std::vector<Hash32> branches;
++    std::vector<std::vector<uint8_t>> paths;
++
++    bool HasToken() const { return (flags & 1) != 0; }
++    bool IsBurn() const { return (flags & 2) != 0; }
++};
++
++// Decode consumes exactly one output frame; any trailing byte is invalid.
++// On failure, result is unchanged and error gives a stable category string.
++bool DecodeOutput(const std::vector<uint8_t> &frame, Output &result,
++                  std::string &error);
++bool EncodeOutput(const Output &output, std::vector<uint8_t> &result,
++                  std::string &error);
++bool ComputeOutputSerializedSize(const Output &output, size_t &size,
++                                 std::string &error);
++
++} // namespace lotus::v2
++
++#endif
+diff --git a/src/lotus_v2/signing.cpp b/src/lotus_v2/signing.cpp
+new file mode 100644
+index 0000000000..8fdcfc2026
+--- /dev/null
++++ b/src/lotus_v2/signing.cpp
+@@ -0,0 +1,995 @@
++#include "signing.h"
++
++#include "tagged_hash.h"
++#include <crypto/sha256.h>
++
++#include "../support/cleanse.h"
++
++#include <secp256k1.h>
++#include <secp256k1_extrakeys.h>
++#include <secp256k1_schnorr.h>
++#include <secp256k1_schnorrsig.h>
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstring>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <thread>
++
++namespace lotus::v2 {
++namespace {
++
++    void Integer(uint64_t value, size_t width, std::vector<uint8_t> &out) {
++        for (size_t i = 0; i < width; ++i)
++            out.push_back(uint8_t(value >> (8 * i)));
++    }
++
++    void CompactSize(uint64_t value, std::vector<uint8_t> &out) {
++        if (value < 253)
++            Integer(value, 1, out);
++        else if (value <= 65535) {
++            out.push_back(253);
++            Integer(value, 2, out);
++        } else if (value <= 4294967295ULL) {
++            out.push_back(254);
++            Integer(value, 4, out);
++        } else {
++            out.push_back(255);
++            Integer(value, 8, out);
++        }
++    }
++
++    bool OutputBytes(const Output &output, std::vector<uint8_t> &out,
++                     std::string &error) {
++        return EncodeOutput(output, out, error);
++    }
++
++    bool ResolvedValid(const Transaction &tx, const ResolvedCoins &resolved,
++                       std::string &error) {
++        if (resolved.size() != tx.inputs.size()) {
++            error = "resolved count";
++            return false;
++        }
++        for (size_t i = 0; i < tx.inputs.size(); ++i) {
++            if (tx.inputs[i].flags != 1 && tx.inputs[i].flags != 3) {
++                error = "unsupported input kind for signing";
++                return false;
++            }
++            if (tx.inputs[i].flags == 1 &&
++                (!resolved[i] || resolved[i]->IsBurn())) {
++                error = "spend resolved coin";
++                return false;
++            }
++            if (tx.inputs[i].flags == 3 && resolved[i]) {
++                error = "mint resolved coin";
++                return false;
++            }
++        }
++        return true;
++    }
++
++    bool NonzeroDelta(const PositiveDelta &delta) {
++        return std::any_of(delta.begin(), delta.end(),
++                           [](uint8_t byte) { return byte != 0; });
++    }
++
++    bool OwnInputHashFromCoinWire(const Input &input, const TxProfile &profile,
++                                  const std::vector<uint8_t> &coin_wire,
++                                  std::vector<uint8_t> &core, Hash &result,
++                                  std::string &error) {
++        core.clear();
++        if (!EncodeInputCore(input, profile, core, error))
++            return false;
++        CompactSize(coin_wire.size(), core);
++        core.insert(core.end(), coin_wire.begin(), coin_wire.end());
++        result = TaggedHash(HashDomain::OwnInput, core);
++        error.clear();
++        return true;
++    }
++
++    bool OwnInputHashOf(const Input &input, const TxProfile &profile,
++                        const Output &coin, Hash &result, std::string &error) {
++        std::vector<uint8_t> core, wire;
++        if (!OutputBytes(coin, wire, error))
++            return false;
++        return OwnInputHashFromCoinWire(input, profile, wire, core, result,
++                                        error);
++    }
++
++    bool WitnessIsPureMode0Checksig(const BranchWitness &w) noexcept {
++        return w.script.size() == 34 && w.script[0] == 0x20 &&
++               (w.script[33] == 0xbb || w.script[33] == 0xbc) &&
++               w.arguments.size() == 1 &&
++               (w.arguments[0].size() == 64 ||
++                (w.arguments[0].size() == 65 && w.arguments[0][64] == 0));
++    }
++
++    bool WitnessIsMode0Or1Checksig(const BranchWitness &w) noexcept {
++        return w.script.size() == 34 && w.script[0] == 0x20 &&
++               (w.script[33] == 0xbb || w.script[33] == 0xbc) &&
++               w.arguments.size() == 1 &&
++               (w.arguments[0].size() == 64 ||
++                (w.arguments[0].size() == 65 && w.arguments[0][64] <= 1));
++    }
++
++    bool InputIsPureMode0Checksig(const Input &input) noexcept {
++        if (input.flags != 1 || input.witnesses.empty()) return false;
++        for (const auto &w : input.witnesses) {
++            if (!WitnessIsPureMode0Checksig(w)) return false;
++        }
++        return true;
++    }
++
++    bool InputMayUseMode2(const Input &input) noexcept {
++        if (input.flags != 1 || input.witnesses.empty()) return false;
++        for (const auto &w : input.witnesses) {
++            if (!WitnessIsMode0Or1Checksig(w)) return true;
++        }
++        return false;
++    }
++
++    bool TxIsPureMode0Checksig(const Transaction &tx) noexcept {
++        if (tx.inputs.empty()) return false;
++        for (const auto &in : tx.inputs) {
++            if (!InputIsPureMode0Checksig(in)) return false;
++        }
++        return true;
++    }
++
++} // namespace
++
++bool ComputeIdentitiesValidated(const Transaction &tx,
++                                const TxProfile &profile,
++                                const ChainId &chain_id,
++                                IdentityDigests &result, std::string &error) {
++    std::vector<Hash> core_leaves, full_leaves;
++    core_leaves.reserve(tx.inputs.size());
++    full_leaves.reserve(tx.inputs.size());
++    std::vector<uint8_t> core, full;
++    for (const auto &input : tx.inputs) {
++        core.clear();
++        full.clear();
++        if (!EncodeInputCore(input, profile, core, error) ||
++            !EncodeInputFull(input, profile, full, error))
++            return false;
++        core_leaves.push_back(InputCoreLeaf(core));
++        full_leaves.push_back(InputFullLeaf(full));
++    }
++    IdentityDigests computed;
++    computed.inputs_root = IndexedTreeRoot(core_leaves);
++    computed.full_inputs_root = IndexedTreeRoot(full_leaves);
++    computed.output_leaves.reserve(tx.outputs.size());
++    std::vector<uint8_t> wire;
++    for (const auto &output : tx.outputs) {
++        wire.clear();
++        if (!OutputBytes(output, wire, error)) return false;
++        computed.output_leaves.push_back(OutputLeaf(wire));
++    }
++    computed.outputs_root = IndexedTreeRoot(computed.output_leaves);
++    TxHeaderCore header{};
++    header[0] = 7;
++    for (size_t i = 0; i < 8; ++i)
++        header[4 + i] = uint8_t(tx.lock >> (8 * i));
++    header[12] = uint8_t(tx.inputs.size());
++    header[13] = uint8_t(tx.inputs.size() >> 8);
++    header[14] = uint8_t(tx.outputs.size());
++    header[15] = uint8_t(tx.outputs.size() >> 8);
++    computed.txid = TransactionId(chain_id, header, computed.inputs_root,
++                                  computed.outputs_root);
++    computed.txhash = TransactionHash(
++        chain_id, header, computed.full_inputs_root, computed.outputs_root);
++    result = std::move(computed);
++    error.clear();
++    return true;
++}
++
++bool ComputeOutputIdentitiesOnly(const Transaction &tx, const Hash &known_txid,
++                                 const Hash &known_txhash,
++                                 IdentityDigests &result, std::string &error) {
++    IdentityDigests computed{};
++    computed.txid = known_txid;
++    computed.txhash = known_txhash;
++    if (!TxIsPureMode0Checksig(tx)) {
++        computed.output_leaves.reserve(tx.outputs.size());
++        std::vector<uint8_t> wire;
++        for (const auto &output : tx.outputs) {
++            wire.clear();
++            if (!OutputBytes(output, wire, error)) return false;
++            computed.output_leaves.push_back(OutputLeaf(wire));
++        }
++        computed.outputs_root = IndexedTreeRoot(computed.output_leaves);
++    }
++    result = std::move(computed);
++    error.clear();
++    return true;
++}
++
++bool ComputeIdentities(const Transaction &tx, const TxProfile &profile,
++                       const ChainId &chain_id, IdentityDigests &result,
++                       std::string &error) {
++    std::vector<uint8_t> validated_wire;
++    if (!EncodeTransaction(tx, profile, validated_wire, error)) return false;
++    return ComputeIdentitiesValidated(tx, profile, chain_id, result, error);
++}
++
++bool ComputeCoinsRoot(const Transaction &tx, const ResolvedCoins &resolved,
++                      Hash &result, std::string &error) {
++    if (!ResolvedValid(tx, resolved, error)) return false;
++    std::vector<Hash> leaves;
++    leaves.reserve(tx.inputs.size());
++    std::vector<uint8_t> wire;
++    for (size_t i = 0; i < tx.inputs.size(); ++i) {
++        if (tx.inputs[i].flags == 3)
++            leaves.push_back(CoinEntryLeaf({}));
++        else {
++            wire.clear();
++            if (!OutputBytes(*resolved[i], wire, error)) return false;
++            leaves.push_back(CoinEntryLeaf(wire));
++        }
++    }
++    result = IndexedTreeRoot(leaves);
++    error.clear();
++    return true;
++}
++
++bool ComputeOwnInputHash(const Transaction &tx, const TxProfile &profile,
++                         const ResolvedCoins &resolved, size_t input_index,
++                         Hash &result, std::string &error) {
++    if (!ResolvedValid(tx, resolved, error) ||
++        input_index >= tx.inputs.size() || tx.inputs[input_index].flags != 1) {
++        error = "own input spend";
++        return false;
++    }
++    return OwnInputHashOf(tx.inputs[input_index], profile,
++                          *resolved[input_index], result, error);
++}
++
++SigningPreparationStatus PrepareSigningContextChecked(
++    const Transaction &tx, const TxProfile &profile, const ChainId &chain_id,
++    const ResolvedCoins &resolved, PreparedSigningContext &result,
++    std::string &error, const IdentityDigests *precomputed_identities) {
++    try {
++        IdentityDigests computed_ids;
++        const IdentityDigests *ids = precomputed_identities;
++        if (ids == nullptr) {
++            if (!ComputeIdentities(tx, profile, chain_id, computed_ids, error))
++                return SigningPreparationStatus::OperationalError;
++            ids = &computed_ids;
++        }
++        if (!ResolvedValid(tx, resolved, error))
++            return SigningPreparationStatus::OperationalError;
++
++        PreparedSigningContext prepared;
++        prepared.chain_id_ = chain_id;
++        prepared.lock_ = tx.lock;
++        prepared.identities_ = *ids;
++        prepared.txid_ = ids->txid;
++        prepared.outputs_root_ = ids->outputs_root;
++        prepared.output_leaves_ = ids->output_leaves;
++        prepared.own_input_hashes_.resize(tx.inputs.size());
++        prepared.invocations_.resize(tx.inputs.size());
++
++        std::vector<Hash> coin_leaves;
++        coin_leaves.reserve(tx.inputs.size());
++        std::vector<uint8_t> coin_wire, core;
++
++        for (size_t i = 0; i < tx.inputs.size(); ++i) {
++            const Input &input = tx.inputs[i];
++            auto &invocations = prepared.invocations_[i];
++            if (input.flags == 1) {
++                const Output &coin = *resolved[i];
++                if (input.path_index >= coin.paths.size() ||
++                    input.witnesses.size() !=
++                        coin.paths[input.path_index].size()) {
++                    error = "positional witness count/index";
++                    return SigningPreparationStatus::InvalidWitness;
++                }
++                coin_wire.clear();
++                if (!OutputBytes(coin, coin_wire, error))
++                    return SigningPreparationStatus::OperationalError;
++                coin_leaves.push_back(CoinEntryLeaf(coin_wire));
++                if (precomputed_identities == nullptr ||
++                    !InputIsPureMode0Checksig(input)) {
++                    if (!OwnInputHashFromCoinWire(
++                            input, profile, coin_wire, core,
++                            prepared.own_input_hashes_[i].emplace(), error))
++                        return SigningPreparationStatus::OperationalError;
++                    if (i < tx.outputs.size() &&
++                        ids->output_leaves.empty() &&
++                        InputMayUseMode2(input)) {
++                        if (prepared.output_leaves_.empty()) {
++                            prepared.output_leaves_.resize(tx.outputs.size());
++                        }
++                        core.clear();
++                        if (!OutputBytes(tx.outputs[i], core, error))
++                            return SigningPreparationStatus::OperationalError;
++                        prepared.output_leaves_[i] = OutputLeaf(core);
++                    }
++                }
++                const auto &path = coin.paths[input.path_index];
++                invocations.reserve(path.size());
++                for (size_t j = 0; j < path.size(); ++j) {
++                    const uint8_t branch_index = path[j];
++                    const BranchWitness &witness = input.witnesses[j];
++                    const Hash leaf = BranchLeaf(witness.script);
++                    if (branch_index >= coin.branches.size() ||
++                        BranchProofRoot(leaf, witness.siblings) !=
++                            coin.branches[branch_index]) {
++                        error = "branch membership";
++                        return SigningPreparationStatus::InvalidWitness;
++                    }
++                    PreparedSigningContext::Invocation invocation;
++                    invocation.kind = 1;
++                    invocation.selector.reserve(41);
++                    invocation.selector.push_back(1);
++                    Integer(i, 4, invocation.selector);
++                    Integer(branch_index, 4, invocation.selector);
++                    invocation.selector.insert(invocation.selector.end(),
++                                               leaf.begin(), leaf.end());
++                    invocations.push_back(std::move(invocation));
++                }
++            } else if (input.flags == 3) {
++                coin_leaves.push_back(CoinEntryLeaf({}));
++                const BranchWitness &witness = input.witnesses[0];
++                const Hash leaf = BranchLeaf(witness.script);
++                if (BranchProofRoot(leaf, witness.siblings) !=
++                    input.prev_txid) {
++                    error = "mint root";
++                    return SigningPreparationStatus::InvalidWitness;
++                }
++                PreparedSigningContext::Invocation invocation;
++                invocation.kind = 3;
++                invocation.selector.reserve(81);
++                invocation.selector.push_back(3);
++                invocation.selector.insert(invocation.selector.end(),
++                                           input.prev_txid.begin(),
++                                           input.prev_txid.end());
++                invocation.selector.insert(invocation.selector.end(), 16, 0);
++                invocation.selector.insert(invocation.selector.end(),
++                                           leaf.begin(), leaf.end());
++                invocations.push_back(std::move(invocation));
++            }
++        }
++        prepared.coins_root_ = IndexedTreeRoot(coin_leaves);
++        prepared.ready_ = true;
++        result = std::move(prepared);
++        error.clear();
++        return SigningPreparationStatus::Ready;
++    } catch (const std::exception &exception) {
++        error = exception.what();
++        return SigningPreparationStatus::OperationalError;
++    }
++}
++
++bool PrepareSigningContext(const Transaction &tx, const TxProfile &profile,
++                           const ChainId &chain, const ResolvedCoins &coins,
++                           PreparedSigningContext &result, std::string &error) {
++    return PrepareSigningContextChecked(tx, profile, chain, coins, result,
++                                        error) ==
++           SigningPreparationStatus::Ready;
++}
++
++bool SigningMessage(const PreparedSigningContext &prepared, size_t input_index,
++                    size_t witness_index, uint8_t mode,
++                    const std::optional<PositiveDelta> &positive_delta,
++                    Hash &result, std::string &error) {
++    if (!prepared.ready_ || mode > 2 ||
++        input_index >= prepared.invocations_.size() ||
++        witness_index >= prepared.invocations_[input_index].size()) {
++        error = "signing mode or invocation index";
++        return false;
++    }
++    const auto &invocation =
++        prepared.invocations_[input_index][witness_index];
++    if (invocation.kind == 1 && positive_delta) {
++        error = "spend delta";
++        return false;
++    }
++    if (invocation.kind == 3 &&
++        (mode != 0 || !positive_delta || !NonzeroDelta(*positive_delta))) {
++        error = "mint selector delta/mode";
++        return false;
++    }
++    if (mode == 2 && input_index >= prepared.output_leaves_.size()) {
++        error = "partial mode unavailable";
++        return false;
++    }
++    const size_t expected_len =
++        invocation.kind == 3 ? 178 : mode == 0 ? 138 : 150;
++    std::array<uint8_t, 178> preimage{};
++    uint8_t *dst = preimage.data();
++    std::memcpy(dst, prepared.chain_id_.data(), 32);
++    dst += 32;
++    *dst++ = mode;
++    if (mode == 0) {
++        std::memcpy(dst, prepared.txid_.data(), 32);
++        dst += 32;
++        std::memcpy(dst, prepared.coins_root_.data(), 32);
++        dst += 32;
++    } else {
++        if (!prepared.own_input_hashes_[input_index].has_value()) {
++            error = "own input hash unavailable";
++            return false;
++        }
++        dst[0] = 7;
++        dst[1] = 0;
++        dst[2] = 0;
++        dst[3] = 0;
++        dst += 4;
++        for (size_t i = 0; i < 8; ++i) {
++            dst[i] = uint8_t(prepared.lock_ >> (8 * i));
++        }
++        dst += 8;
++        const Hash &own = *prepared.own_input_hashes_[input_index];
++        std::memcpy(dst, own.data(), 32);
++        dst += 32;
++        const Hash &output_commitment = mode == 1
++            ? prepared.outputs_root_ : prepared.output_leaves_[input_index];
++        std::memcpy(dst, output_commitment.data(), 32);
++        dst += 32;
++    }
++    if (invocation.kind == 3) {
++        if (invocation.selector.size() != 81) {
++            error = "sighash preimage width";
++            return false;
++        }
++        std::memcpy(dst, invocation.selector.data(), 33);
++        dst += 33;
++        std::memcpy(dst, positive_delta->data(), 16);
++        dst += 16;
++        std::memcpy(dst, invocation.selector.data() + 49, 32);
++        dst += 32;
++    } else {
++        if (invocation.selector.size() != 41) {
++            error = "sighash preimage width";
++            return false;
++        }
++        std::memcpy(dst, invocation.selector.data(), 41);
++        dst += 41;
++    }
++    if (static_cast<size_t>(dst - preimage.data()) != expected_len) {
++        error = "sighash preimage width";
++        return false;
++    }
++    result = TaggedHash(HashDomain::Sighash,
++                        std::span<const uint8_t>(preimage.data(), expected_len));
++    error.clear();
++    return true;
++}
++
++bool SigningMessage(const Transaction &tx, const TxProfile &profile,
++                    const ChainId &chain_id, const ResolvedCoins &resolved,
++                    size_t input_index, size_t witness_index, uint8_t mode,
++                    const std::optional<PositiveDelta> &positive_delta,
++                    Hash &result, std::string &error) {
++    PreparedSigningContext prepared;
++    if (!PrepareSigningContext(tx, profile, chain_id, resolved, prepared,
++                               error))
++        return false;
++    return SigningMessage(prepared, input_index, witness_index, mode,
++                          positive_delta, result, error);
++}
++
++SignatureStatus VerifyBip340Signature(std::span<const uint8_t> public_key,
++                                      std::span<const uint8_t> signature,
++                                      const Hash &message, bool mint) {
++    if (!((signature.size() == 64) ||
++          (signature.size() == 65 && !mint &&
++           (signature[64] == 1 || signature[64] == 2)))) {
++        return SignatureStatus::InvalidEncoding;
++    }
++    if (public_key.size() != 32) return SignatureStatus::InvalidPublicKey;
++    secp256k1_xonly_pubkey parsed;
++    if (!secp256k1_xonly_pubkey_parse(secp256k1_context_static, &parsed,
++                                      public_key.data())) {
++        return SignatureStatus::InvalidPublicKey;
++    }
++    return secp256k1_schnorrsig_verify(secp256k1_context_static,
++                                       signature.data(), message.data(),
++                                       message.size(), &parsed)
++               ? SignatureStatus::Valid
++               : SignatureStatus::InvalidSignature;
++}
++
++bool SignBip340Message(const std::array<uint8_t, 32> &secret_key,
++                       const Hash &message, uint8_t mode,
++                       const std::array<uint8_t, 32> &aux_randomness,
++                       std::vector<uint8_t> &result, std::string &error) {
++    if (mode > 2) {
++        error = "signing mode";
++        return false;
++    }
++    using ContextPtr = std::unique_ptr<secp256k1_context,
++                                       decltype(&secp256k1_context_destroy)>;
++    ContextPtr ctx(secp256k1_context_create(SECP256K1_CONTEXT_SIGN),
++                   secp256k1_context_destroy);
++    if (!ctx) {
++        error = "secp256k1 context";
++        return false;
++    }
++    // The keypair embeds the private scalar. Keep cleanup attached to its
++    // lifetime, including invalid-key/signing failures and allocation throws.
++    struct ScopedKeypair {
++        secp256k1_keypair value{};
++        ScopedKeypair() = default;
++        ScopedKeypair(const ScopedKeypair &) = delete;
++        ScopedKeypair &operator=(const ScopedKeypair &) = delete;
++        ~ScopedKeypair() { memory_cleanse(&value, sizeof(value)); }
++    } pair;
++    if (!secp256k1_keypair_create(ctx.get(), &pair.value, secret_key.data())) {
++        error = "invalid secret key";
++        return false;
++    }
++    std::vector<uint8_t> sig(64);
++    if (!secp256k1_schnorrsig_sign32(ctx.get(), sig.data(), message.data(),
++                                     &pair.value, aux_randomness.data())) {
++        error = "BIP340 signing failed";
++        return false;
++    }
++    if (mode) sig.push_back(mode);
++    result = std::move(sig);
++    error.clear();
++    return true;
++}
++
++namespace {
++bool VerifyBatchSlice(std::span<const BatchSigItem> slice) {
++    if (slice.empty()) return true;
++    if (slice.size() == 1) {
++        return secp256k1_schnorrsig_verify(
++                   secp256k1_context_static, slice[0].sig.data(),
++                   slice[0].msg.data(), slice[0].msg.size(),
++                   reinterpret_cast<const secp256k1_xonly_pubkey *>(
++                       slice[0].parsed_pubkey.data())) == 1;
++    }
++    const size_t n = slice.size();
++    std::vector<const unsigned char *> sigs(n);
++    std::vector<const unsigned char *> msgs(n);
++    std::vector<const secp256k1_xonly_pubkey *> pubkeys(n);
++
++    static std::atomic<uint64_t> batch_nonce{1};
++    const uint64_t nonce_val =
++        batch_nonce.fetch_add(1, std::memory_order_relaxed);
++    const uint64_t clock_val = static_cast<uint64_t>(
++        std::chrono::steady_clock::now().time_since_epoch().count());
++    const uintptr_t addr_val = reinterpret_cast<uintptr_t>(slice.data());
++
++    CSHA256 hasher;
++    constexpr char domain[] = "Lotus/v2/schnorr-batch-randomizer";
++    hasher.Write(reinterpret_cast<const uint8_t *>(domain), sizeof(domain));
++    hasher.Write(reinterpret_cast<const uint8_t *>(&nonce_val),
++                 sizeof(nonce_val));
++    hasher.Write(reinterpret_cast<const uint8_t *>(&clock_val),
++                 sizeof(clock_val));
++    hasher.Write(reinterpret_cast<const uint8_t *>(&addr_val),
++                 sizeof(addr_val));
++
++    for (size_t i = 0; i < n; ++i) {
++        sigs[i] = slice[i].sig.data();
++        msgs[i] = slice[i].msg.data();
++        pubkeys[i] = reinterpret_cast<const secp256k1_xonly_pubkey *>(
++            slice[i].parsed_pubkey.data());
++        hasher.Write(slice[i].pubkey.data(), slice[i].pubkey.size());
++        hasher.Write(slice[i].sig.data(), slice[i].sig.size());
++        hasher.Write(slice[i].msg.data(), slice[i].msg.size());
++    }
++
++    uint8_t seed[CSHA256::OUTPUT_SIZE];
++    hasher.Finalize(seed);
++
++    CSHA256 expand_base;
++    expand_base.Write(seed, CSHA256::OUTPUT_SIZE);
++    expand_base.Write(seed, CSHA256::OUTPUT_SIZE);
++
++    std::vector<unsigned char> rand32(32 * n, 0);
++    for (size_t i = 1; i < n; ++i) {
++        const uint64_t ctr = static_cast<uint64_t>(i);
++        CSHA256 h = expand_base;
++        h.Write(reinterpret_cast<const uint8_t *>(&ctr), sizeof(ctr));
++        h.Finalize(rand32.data() + 32 * i);
++    }
++
++    return secp256k1_schnorrsig_verify_batch(
++               secp256k1_context_static, sigs.data(), msgs.data(),
++               pubkeys.data(), rand32.data(), n) == 1;
++}
++
++bool VerifyLegacyBatchSlice(std::span<const LegacyBatchSigItem> slice) {
++    if (slice.empty()) return true;
++    if (slice.size() == 1) {
++        return secp256k1_schnorr_verify(
++                   secp256k1_context_static, slice[0].sig.data(),
++                   slice[0].msg.data(),
++                   reinterpret_cast<const secp256k1_pubkey *>(
++                       slice[0].parsed_pubkey.data())) == 1;
++    }
++    const size_t n = slice.size();
++    std::vector<const unsigned char *> sigs(n);
++    std::vector<const unsigned char *> msgs(n);
++    std::vector<const secp256k1_pubkey *> pubkeys(n);
++
++    static std::atomic<uint64_t> batch_nonce{1};
++    const uint64_t nonce_val =
++        batch_nonce.fetch_add(1, std::memory_order_relaxed);
++    const uint64_t clock_val = static_cast<uint64_t>(
++        std::chrono::steady_clock::now().time_since_epoch().count());
++    const uintptr_t addr_val = reinterpret_cast<uintptr_t>(slice.data());
++
++    CSHA256 hasher;
++    constexpr char domain[] = "Lotus/v2/legacy-schnorr-batch-randomizer";
++    hasher.Write(reinterpret_cast<const uint8_t *>(domain), sizeof(domain));
++    hasher.Write(reinterpret_cast<const uint8_t *>(&nonce_val),
++                 sizeof(nonce_val));
++    hasher.Write(reinterpret_cast<const uint8_t *>(&clock_val),
++                 sizeof(clock_val));
++    hasher.Write(reinterpret_cast<const uint8_t *>(&addr_val),
++                 sizeof(addr_val));
++
++    for (size_t i = 0; i < n; ++i) {
++        sigs[i] = slice[i].sig.data();
++        msgs[i] = slice[i].msg.data();
++        pubkeys[i] = reinterpret_cast<const secp256k1_pubkey *>(
++            slice[i].parsed_pubkey.data());
++        hasher.Write(slice[i].parsed_pubkey.data(),
++                     slice[i].parsed_pubkey.size());
++        hasher.Write(slice[i].sig.data(), slice[i].sig.size());
++        hasher.Write(slice[i].msg.data(), slice[i].msg.size());
++    }
++
++    uint8_t seed[CSHA256::OUTPUT_SIZE];
++    hasher.Finalize(seed);
++
++    CSHA256 expand_base;
++    expand_base.Write(seed, CSHA256::OUTPUT_SIZE);
++    expand_base.Write(seed, CSHA256::OUTPUT_SIZE);
++
++    std::vector<unsigned char> rand32(32 * n, 0);
++    for (size_t i = 1; i < n; ++i) {
++        const uint64_t ctr = static_cast<uint64_t>(i);
++        CSHA256 h = expand_base;
++        h.Write(reinterpret_cast<const uint8_t *>(&ctr), sizeof(ctr));
++        h.Finalize(rand32.data() + 32 * i);
++    }
++
++    return secp256k1_schnorr_verify_batch(
++               secp256k1_context_static, sigs.data(), msgs.data(),
++               pubkeys.data(), rand32.data(), n) == 1;
++}
++
++std::optional<size_t> BisectBatchSlice(std::span<const BatchSigItem> slice,
++                                       size_t base_offset) {
++    if (slice.empty()) return std::nullopt;
++    if (VerifyBatchSlice(slice)) return std::nullopt;
++    if (slice.size() == 1) return base_offset;
++    const size_t mid = slice.size() / 2;
++    if (auto left = BisectBatchSlice(slice.subspan(0, mid), base_offset)) {
++        return left;
++    }
++    return BisectBatchSlice(slice.subspan(mid), base_offset + mid);
++}
++
++std::optional<size_t>
++BisectLegacyBatchSlice(std::span<const LegacyBatchSigItem> slice,
++                       size_t base_offset) {
++    if (slice.empty()) return std::nullopt;
++    if (VerifyLegacyBatchSlice(slice)) return std::nullopt;
++    if (slice.size() == 1) return base_offset;
++    const size_t mid = slice.size() / 2;
++    if (auto left =
++            BisectLegacyBatchSlice(slice.subspan(0, mid), base_offset)) {
++        return left;
++    }
++    return BisectLegacyBatchSlice(slice.subspan(mid), base_offset + mid);
++}
++
++class SigningWorkerPool {
++public:
++    static SigningWorkerPool &Instance() {
++        static SigningWorkerPool pool;
++        return pool;
++    }
++
++    template <typename Fn>
++    void Run(size_t num_workers, Fn &&fn) {
++        if (num_workers <= 1) {
++            fn(0);
++            return;
++        }
++        std::function<void(size_t)> task_fn(std::forward<Fn>(fn));
++        std::unique_lock<std::mutex> dispatch_lock(m_dispatch_mutex);
++        EnsureWorkers(num_workers - 1);
++        const size_t active = std::min(num_workers - 1, m_threads.size());
++        if (active == 0) {
++            dispatch_lock.unlock();
++            task_fn(0);
++            return;
++        }
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            m_task = &task_fn;
++            m_active_workers = active;
++            m_remaining.store(active, std::memory_order_release);
++            ++m_generation;
++        }
++        m_cv_start.notify_all();
++        task_fn(0);
++        {
++            std::unique_lock<std::mutex> lock(m_mutex);
++            m_cv_done.wait(lock, [this]() {
++                return m_remaining.load(std::memory_order_acquire) == 0;
++            });
++            m_task = nullptr;
++        }
++    }
++
++private:
++    SigningWorkerPool() = default;
++    ~SigningWorkerPool() {
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            m_stop = true;
++            ++m_generation;
++        }
++        m_cv_start.notify_all();
++        for (auto &t : m_threads) {
++            if (t.joinable()) {
++                t.join();
++            }
++        }
++    }
++
++    void EnsureWorkers(size_t count) {
++        while (m_threads.size() < count) {
++            const size_t worker_id = m_threads.size() + 1;
++            m_threads.emplace_back([this, worker_id]() {
++                uint64_t seen_gen = 0;
++                while (true) {
++                    const std::function<void(size_t)> *fn = nullptr;
++                    {
++                        std::unique_lock<std::mutex> lock(m_mutex);
++                        m_cv_start.wait(lock, [this, &seen_gen]() {
++                            return m_stop || m_generation != seen_gen;
++                        });
++                        if (m_stop) {
++                            return;
++                        }
++                        seen_gen = m_generation;
++                        if (worker_id <= m_active_workers) {
++                            fn = m_task;
++                        }
++                    }
++                    if (fn != nullptr) {
++                        (*fn)(worker_id);
++                        if (m_remaining.fetch_sub(
++                                1, std::memory_order_acq_rel) == 1) {
++                            std::lock_guard<std::mutex> lock(m_mutex);
++                            m_cv_done.notify_one();
++                        }
++                    }
++                }
++            });
++        }
++    }
++
++    std::mutex m_dispatch_mutex;
++    std::mutex m_mutex;
++    std::condition_variable m_cv_start;
++    std::condition_variable m_cv_done;
++    std::vector<std::thread> m_threads;
++    const std::function<void(size_t)> *m_task{nullptr};
++    size_t m_active_workers{0};
++    std::atomic<size_t> m_remaining{0};
++    uint64_t m_generation{0};
++    bool m_stop{false};
++};
++
++size_t EffectiveBatchThreads(size_t total_items, size_t requested_threads) {
++    if (total_items < 32) return 1;
++    size_t hw = requested_threads;
++    if (hw == 0) {
++        hw = std::min<size_t>(
++            std::max<size_t>(std::thread::hardware_concurrency(), 1), 16);
++    }
++    return std::min<size_t>(hw, (total_items + 15) / 16);
++}
++} // namespace
++
++bool BatchSigCollector::Add(std::span<const uint8_t> pubkey,
++                            std::span<const uint8_t> sig, const Hash &msg) {
++    if (pubkey.size() != 32 || sig.size() < 64) return false;
++    secp256k1_xonly_pubkey parsed;
++    if (!secp256k1_xonly_pubkey_parse(secp256k1_context_static, &parsed,
++                                      pubkey.data())) {
++        return false;
++    }
++    BatchSigItem item;
++    std::memcpy(item.pubkey.data(), pubkey.data(), 32);
++    std::memcpy(item.parsed_pubkey.data(), parsed.data, 64);
++    std::memcpy(item.sig.data(), sig.data(), 64);
++    item.msg = msg;
++    items_.push_back(item);
++    return true;
++}
++
++bool BatchSigCollector::AddLegacySchnorr(std::span<const uint8_t> pubkey,
++                                         std::span<const uint8_t> sig64,
++                                         const uint8_t *msg32,
++                                         const uint8_t *cache_entry32,
++                                         bool store_in_cache) {
++    if (sig64.size() != 64 || msg32 == nullptr ||
++        (pubkey.size() != 33 && pubkey.size() != 65)) {
++        return false;
++    }
++    secp256k1_pubkey parsed;
++    if (!secp256k1_ec_pubkey_parse(secp256k1_context_static, &parsed,
++                                   pubkey.data(), pubkey.size())) {
++        return false;
++    }
++    LegacyBatchSigItem item;
++    std::memcpy(item.parsed_pubkey.data(), parsed.data, 64);
++    std::memcpy(item.sig.data(), sig64.data(), 64);
++    std::memcpy(item.msg.data(), msg32, 32);
++    if (store_in_cache && cache_entry32 != nullptr) {
++        std::memcpy(item.cache_entry.data(), cache_entry32, 32);
++        item.store_in_cache = true;
++    }
++    legacy_items_.push_back(item);
++    return true;
++}
++
++void BatchSigCollector::Merge(const BatchSigCollector &other) {
++    if (!other.items_.empty()) {
++        items_.insert(items_.end(), other.items_.begin(), other.items_.end());
++    }
++    if (!other.legacy_items_.empty()) {
++        legacy_items_.insert(legacy_items_.end(), other.legacy_items_.begin(),
++                             other.legacy_items_.end());
++    }
++}
++
++void BatchSigCollector::Merge(BatchSigCollector &&other) {
++    if (!other.items_.empty()) {
++        if (items_.empty()) {
++            items_ = std::move(other.items_);
++        } else {
++            items_.insert(items_.end(), other.items_.begin(),
++                          other.items_.end());
++            other.items_.clear();
++        }
++    }
++    if (!other.legacy_items_.empty()) {
++        if (legacy_items_.empty()) {
++            legacy_items_ = std::move(other.legacy_items_);
++        } else {
++            legacy_items_.insert(legacy_items_.end(),
++                                 other.legacy_items_.begin(),
++                                 other.legacy_items_.end());
++            other.legacy_items_.clear();
++        }
++    }
++}
++
++bool BatchSigCollector::VerifyAll(size_t num_threads) const {
++    if (!items_.empty()) {
++        const size_t threads = EffectiveBatchThreads(items_.size(), num_threads);
++        const std::span<const BatchSigItem> all(items_.data(), items_.size());
++        if (threads <= 1) {
++            if (!VerifyBatchSlice(all)) return false;
++        } else {
++            std::atomic<bool> all_valid{true};
++            auto run_chunk = [&](size_t t) {
++                const size_t begin = (items_.size() * t) / threads;
++                const size_t end = (items_.size() * (t + 1)) / threads;
++                if (begin >= end || !all_valid.load(std::memory_order_relaxed))
++                    return;
++                if (!VerifyBatchSlice(all.subspan(begin, end - begin))) {
++                    all_valid.store(false, std::memory_order_relaxed);
++                }
++            };
++            SigningWorkerPool::Instance().Run(threads, run_chunk);
++            if (!all_valid.load(std::memory_order_relaxed)) return false;
++        }
++    }
++
++    if (!legacy_items_.empty()) {
++        const size_t threads =
++            EffectiveBatchThreads(legacy_items_.size(), num_threads);
++        const std::span<const LegacyBatchSigItem> all(legacy_items_.data(),
++                                                      legacy_items_.size());
++        if (threads <= 1) {
++            if (!VerifyLegacyBatchSlice(all)) return false;
++        } else {
++            std::atomic<bool> all_valid{true};
++            auto run_chunk = [&](size_t t) {
++                const size_t begin = (legacy_items_.size() * t) / threads;
++                const size_t end = (legacy_items_.size() * (t + 1)) / threads;
++                if (begin >= end || !all_valid.load(std::memory_order_relaxed))
++                    return;
++                if (!VerifyLegacyBatchSlice(all.subspan(begin, end - begin))) {
++                    all_valid.store(false, std::memory_order_relaxed);
++                }
++            };
++            SigningWorkerPool::Instance().Run(threads, run_chunk);
++            if (!all_valid.load(std::memory_order_relaxed)) return false;
++        }
++    }
++
++    return true;
++}
++
++std::optional<size_t>
++BatchSigCollector::FirstFailingIndex(size_t num_threads) const {
++    if (!items_.empty()) {
++        const size_t threads = EffectiveBatchThreads(items_.size(), num_threads);
++        const std::span<const BatchSigItem> all(items_.data(), items_.size());
++        if (threads <= 1) {
++            if (auto fail = BisectBatchSlice(all, 0)) {
++                return fail;
++            }
++        } else {
++            std::vector<uint8_t> chunk_ok(threads, 1);
++            auto check_chunk = [&](size_t t) {
++                const size_t begin = (items_.size() * t) / threads;
++                const size_t end = (items_.size() * (t + 1)) / threads;
++                if (begin < end &&
++                    !VerifyBatchSlice(all.subspan(begin, end - begin))) {
++                    chunk_ok[t] = 0;
++                }
++            };
++            SigningWorkerPool::Instance().Run(threads, check_chunk);
++            for (size_t t = 0; t < threads; ++t) {
++                if (chunk_ok[t] == 0) {
++                    const size_t begin = (items_.size() * t) / threads;
++                    const size_t end = (items_.size() * (t + 1)) / threads;
++                    if (auto fail = BisectBatchSlice(
++                            all.subspan(begin, end - begin), begin)) {
++                        return fail;
++                    }
++                }
++            }
++        }
++    }
++
++    if (!legacy_items_.empty()) {
++        const size_t base = items_.size();
++        const size_t threads =
++            EffectiveBatchThreads(legacy_items_.size(), num_threads);
++        const std::span<const LegacyBatchSigItem> all(legacy_items_.data(),
++                                                      legacy_items_.size());
++        if (threads <= 1) {
++            if (auto fail = BisectLegacyBatchSlice(all, base)) {
++                return fail;
++            }
++        } else {
++            std::vector<uint8_t> chunk_ok(threads, 1);
++            auto check_chunk = [&](size_t t) {
++                const size_t begin = (legacy_items_.size() * t) / threads;
++                const size_t end = (legacy_items_.size() * (t + 1)) / threads;
++                if (begin < end &&
++                    !VerifyLegacyBatchSlice(all.subspan(begin, end - begin))) {
++                    chunk_ok[t] = 0;
++                }
++            };
++            SigningWorkerPool::Instance().Run(threads, check_chunk);
++            for (size_t t = 0; t < threads; ++t) {
++                if (chunk_ok[t] == 0) {
++                    const size_t begin = (legacy_items_.size() * t) / threads;
++                    const size_t end = (legacy_items_.size() * (t + 1)) / threads;
++                    if (auto fail = BisectLegacyBatchSlice(
++                            all.subspan(begin, end - begin), base + begin)) {
++                        return fail;
++                    }
++                }
++            }
++        }
++    }
++
++    return std::nullopt;
++}
++
++} // namespace lotus::v2
++
+diff --git a/src/lotus_v2/signing.h b/src/lotus_v2/signing.h
+new file mode 100644
+index 0000000000..e9f3cd7b55
+--- /dev/null
++++ b/src/lotus_v2/signing.h
+@@ -0,0 +1,220 @@
++// Copyright (c) 2026 The Lotus developers
++// Candidate P01 identity/signing bytes; no VM or full transaction validity.
++#ifndef LOTUS_V2_SIGNING_H
++#define LOTUS_V2_SIGNING_H
++
++#include "commitment.h"
++#include "transaction.h"
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <span>
++#include <string>
++#include <vector>
++
++namespace lotus::v2 {
++
++struct IdentityDigests {
++    Hash txid;
++    Hash txhash;
++    Hash inputs_root;
++    Hash full_inputs_root;
++    Hash outputs_root;
++    std::vector<Hash> output_leaves;
++};
++
++using ResolvedCoins = std::vector<std::optional<Output>>;
++using PositiveDelta = std::array<uint8_t, 16>; // u128 little-endian, nonzero
++
++// Immutable snapshot for repeated CHECKSIG/SIGHASH calls on one validated
++// transaction. Rebuild it if the transaction or resolved coins change.
++enum class SigningPreparationStatus {
++    Ready,
++    InvalidWitness,
++    Unsupported,
++    OperationalError
++};
++
++class PreparedSigningContext {
++public:
++    PreparedSigningContext() = default;
++    const IdentityDigests &Identities() const { return identities_; }
++
++private:
++    struct Invocation {
++        uint8_t kind{};
++        std::vector<uint8_t> selector; // 41-byte spend or 81-byte mint form.
++    };
++    IdentityDigests identities_;
++    ChainId chain_id_{};
++    uint64_t lock_{};
++    Hash txid_{};
++    Hash coins_root_{};
++    Hash outputs_root_{};
++    std::vector<Hash> output_leaves_;
++    std::vector<std::optional<Hash>> own_input_hashes_;
++    std::vector<std::vector<Invocation>> invocations_;
++    bool ready_ = false;
++
++    friend SigningPreparationStatus
++    PrepareSigningContextChecked(const Transaction &, const TxProfile &,
++                                 const ChainId &, const ResolvedCoins &,
++                                 PreparedSigningContext &, std::string &,
++                                 const IdentityDigests *);
++    friend bool PrepareSigningContext(
++        const Transaction &, const TxProfile &, const ChainId &,
++        const ResolvedCoins &, PreparedSigningContext &, std::string &);
++    friend bool SigningMessage(const PreparedSigningContext &, size_t, size_t,
++                               uint8_t, const std::optional<PositiveDelta> &,
++                               Hash &, std::string &);
++};
++
++SigningPreparationStatus PrepareSigningContextChecked(
++    const Transaction &tx, const TxProfile &profile, const ChainId &chain_id,
++    const ResolvedCoins &resolved, PreparedSigningContext &result,
++    std::string &error,
++    const IdentityDigests *precomputed_identities = nullptr);
++
++bool PrepareSigningContext(const Transaction &tx, const TxProfile &profile,
++                           const ChainId &chain_id,
++                           const ResolvedCoins &resolved,
++                           PreparedSigningContext &result,
++                           std::string &error);
++// After preparation this hashes one fixed-width signing preimage. No input,
++// output, witness, or coin collection is traversed per invocation.
++bool SigningMessage(const PreparedSigningContext &prepared, size_t input_index,
++                    size_t witness_index, uint8_t mode,
++                    const std::optional<PositiveDelta> &positive_delta,
++                    Hash &result, std::string &error);
++
++bool ComputeIdentities(const Transaction &tx, const TxProfile &profile,
++                       const ChainId &chain_id, IdentityDigests &result,
++                       std::string &error);
++// Computes identities for a transaction whose canonical wire framing has
++// already been validated against `profile`.
++bool ComputeIdentitiesValidated(const Transaction &tx,
++                                const TxProfile &profile,
++                                const ChainId &chain_id,
++                                IdentityDigests &result, std::string &error);
++// Fast path when canonical wire framing has been validated and txid/txhash are
++// already known: populates txid/txhash and computes output commitments only
++// when non-mode-0 sighashes may be requested.
++bool ComputeOutputIdentitiesOnly(const Transaction &tx, const Hash &known_txid,
++                                 const Hash &known_txhash,
++                                 IdentityDigests &result, std::string &error);
++bool ComputeCoinsRoot(const Transaction &tx, const ResolvedCoins &resolved,
++                      Hash &result, std::string &error);
++bool ComputeOwnInputHash(const Transaction &tx, const TxProfile &profile,
++                         const ResolvedCoins &resolved, size_t input_index,
++                         Hash &result, std::string &error);
++
++// One-off convenience wrapper. Repeated invocations must use the prepared
++// overload to avoid rebuilding roots on every signature. Resolved coins and
++// positive mint delta come from a separate validated accounting/state layer.
++bool SigningMessage(const Transaction &tx, const TxProfile &profile,
++                    const ChainId &chain_id, const ResolvedCoins &resolved,
++                    size_t input_index, size_t witness_index, uint8_t mode,
++                    const std::optional<PositiveDelta> &positive_delta,
++                    Hash &result, std::string &error);
++
++enum class SignatureStatus {
++    Valid,
++    InvalidSignature, // correct wire form and key, BIP340 check failed
++    InvalidEncoding,  // wrong 64/65-byte mode form
++    InvalidPublicKey, // wrong length or invalid x-only point
++};
++
++SignatureStatus VerifyBip340Signature(std::span<const uint8_t> public_key,
++                                      std::span<const uint8_t> signature,
++                                      const Hash &message, bool mint);
++
++struct BatchSigItem {
++    std::array<uint8_t, 32> pubkey{};
++    std::array<uint8_t, 64> parsed_pubkey{};
++    std::array<uint8_t, 64> sig{};
++    Hash msg{};
++};
++
++struct LegacyBatchSigItem {
++    std::array<uint8_t, 64> parsed_pubkey{};
++    std::array<uint8_t, 64> sig{};
++    Hash msg{};
++    std::array<uint8_t, 32> cache_entry{};
++    bool store_in_cache{false};
++};
++
++// Collects BIP340 Schnorr and legacy 64-byte Schnorr (pubkey, sig64, msg32)
++// tuples during NULLFAIL script execution for deferred multi-scalar
++// multiplication batch verification (Strauss / Pippenger via
++// secp256k1_schnorrsig_verify_batch and secp256k1_schnorr_verify_batch) and
++// bisection fallback to pinpoint the exact failing signature index.
++class BatchSigCollector {
++public:
++    BatchSigCollector() = default;
++
++    // Validates that `pubkey` is a canonical 32-byte x-only secp256k1 key and
++    // `sig` has at least 64 bytes (using the 64-byte R||s prefix), then records
++    // the tuple for deferred batch verification. Returns false if `pubkey` or
++    // `sig` encoding is invalid.
++    bool Add(std::span<const uint8_t> pubkey, std::span<const uint8_t> sig,
++             const Hash &msg);
++
++    // Validates that `pubkey` is a valid 33/65-byte secp256k1 public key and
++    // `sig64` is 64 bytes, then records the tuple for deferred legacy Schnorr
++    // batch verification.
++    bool AddLegacySchnorr(std::span<const uint8_t> pubkey,
++                          std::span<const uint8_t> sig64,
++                          const uint8_t *msg32,
++                          const uint8_t *cache_entry32 = nullptr,
++                          bool store_in_cache = false);
++
++    void Reserve(size_t n) {
++        items_.reserve(n);
++        legacy_items_.reserve(n);
++    }
++    void Clear() noexcept {
++        items_.clear();
++        legacy_items_.clear();
++    }
++    bool Empty() const noexcept {
++        return items_.empty() && legacy_items_.empty();
++    }
++    size_t Size() const noexcept {
++        return items_.size() + legacy_items_.size();
++    }
++    const std::vector<BatchSigItem> &Items() const noexcept { return items_; }
++    const std::vector<LegacyBatchSigItem> &LegacyItems() const noexcept {
++        return legacy_items_;
++    }
++
++    void Merge(const BatchSigCollector &other);
++    void Merge(BatchSigCollector &&other);
++
++    // Verifies all collected signatures in batch using multi-scalar
++    // multiplication. When `num_threads == 0`, automatically partitions large
++    // batches across hardware worker threads.
++    bool VerifyAll(size_t num_threads = 0) const;
++
++    // Returns std::nullopt if all collected signatures are valid, or the
++    // 0-based index of the first invalid signature via batch bisection.
++    std::optional<size_t> FirstFailingIndex(size_t num_threads = 0) const;
++
++private:
++    std::vector<BatchSigItem> items_;
++    std::vector<LegacyBatchSigItem> legacy_items_;
++};
++
++// Test/wallet helper. Caller supplies fresh nonce auxiliary entropy for real
++// signing; deterministic zero auxiliary bytes are used only in fixed vectors.
++// Local keypair storage is cleansed on every exit. Caller-owned secret_key and
++// aux_randomness remain the caller's responsibility; this API retains no copy.
++bool SignBip340Message(const std::array<uint8_t, 32> &secret_key,
++                       const Hash &message, uint8_t mode,
++                       const std::array<uint8_t, 32> &aux_randomness,
++                       std::vector<uint8_t> &result, std::string &error);
++
++} // namespace lotus::v2
++#endif
++
+diff --git a/src/lotus_v2/tagged_hash.cpp b/src/lotus_v2/tagged_hash.cpp
+new file mode 100644
+index 0000000000..bfaae698c4
+--- /dev/null
++++ b/src/lotus_v2/tagged_hash.cpp
+@@ -0,0 +1,75 @@
++#include "tagged_hash.h"
++
++#include <crypto/sha256.h>
++
++#include <array>
++#include <cstdlib>
++#include <cstring>
++#include <string_view>
++
++namespace lotus::v2 {
++namespace {
++constexpr std::string_view TagView(HashDomain domain) noexcept {
++    switch (domain) {
++    case HashDomain::HeaderBody: return "Lotus/v2/header/body";
++    case HashDomain::HeaderWork: return "Lotus/v2/header/work";
++    case HashDomain::BlockId: return "Lotus/v2/blockid";
++    case HashDomain::Branch: return "Lotus/v2/branch";
++    case HashDomain::InputCore: return "Lotus/v2/inputcore";
++    case HashDomain::InputFull: return "Lotus/v2/inputfull";
++    case HashDomain::OwnInput: return "Lotus/v2/owninput";
++    case HashDomain::Sighash: return "Lotus/v2/sighash";
++    case HashDomain::Output: return "Lotus/v2/output";
++    case HashDomain::CoinEntry: return "Lotus/v2/coinentry";
++    case HashDomain::MerkleIndex: return "Lotus/v2/merkleidx";
++    case HashDomain::TxId: return "Lotus/v2/txid";
++    case HashDomain::TxHash: return "Lotus/v2/txhash";
++    case HashDomain::TxRoot: return "Lotus/v2/txroot";
++    case HashDomain::OutpointKey: return "Lotus/v2/outpointkey";
++    case HashDomain::Utxo: return "Lotus/v2/utxo";
++    case HashDomain::State: return "Lotus/v2/state";
++    }
++    std::abort();
++}
++
++constexpr size_t kNumDomains = static_cast<size_t>(HashDomain::State) + 1;
++
++CSHA256 MakeTagMidstate(HashDomain domain) {
++    const std::string_view tag = TagView(domain);
++    uint8_t tag_hash[CSHA256::OUTPUT_SIZE];
++    CSHA256()
++        .Write(reinterpret_cast<const uint8_t *>(tag.data()), tag.size())
++        .Finalize(tag_hash);
++    CSHA256 hasher;
++    hasher.Write(tag_hash, CSHA256::OUTPUT_SIZE);
++    hasher.Write(tag_hash, CSHA256::OUTPUT_SIZE);
++    return hasher;
++}
++
++const std::array<CSHA256, kNumDomains> &GetTagMidstates() {
++    static const std::array<CSHA256, kNumDomains> kMidstates = []() {
++        std::array<CSHA256, kNumDomains> arr{};
++        for (size_t i = 0; i < kNumDomains; ++i) {
++            arr[i] = MakeTagMidstate(static_cast<HashDomain>(i));
++        }
++        return arr;
++    }();
++    return kMidstates;
++}
++} // namespace
++
++Hash TaggedHash(HashDomain domain, std::span<const uint8_t> payload) {
++    const size_t idx = static_cast<size_t>(domain);
++    if (idx >= kNumDomains) {
++        std::abort();
++    }
++    CSHA256 hasher = GetTagMidstates()[idx];
++    if (!payload.empty()) {
++        hasher.Write(payload.data(), payload.size());
++    }
++    Hash result;
++    hasher.Finalize(result.data());
++    return result;
++}
++
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/tagged_hash.h b/src/lotus_v2/tagged_hash.h
+new file mode 100644
+index 0000000000..7783fa8083
+--- /dev/null
++++ b/src/lotus_v2/tagged_hash.h
+@@ -0,0 +1,36 @@
++// Copyright (c) 2026 The Lotus developers
++#ifndef LOTUS_V2_TAGGED_HASH_H
++#define LOTUS_V2_TAGGED_HASH_H
++
++#include "header.h"
++
++#include <span>
++
++namespace lotus::v2 {
++
++enum class HashDomain {
++    HeaderBody,
++    HeaderWork,
++    BlockId,
++    Branch,
++    InputCore,
++    InputFull,
++    OwnInput,
++    Sighash,
++    Output,
++    CoinEntry,
++    MerkleIndex,
++    TxId,
++    TxHash,
++    TxRoot,
++    OutpointKey,
++    Utxo,
++    State,
++};
++
++// Hardware-accelerated BIP-340 style tagged SHA-256:
++// SHA256(SHA256(tag) || SHA256(tag) || payload).
++Hash TaggedHash(HashDomain domain, std::span<const uint8_t> payload);
++
++} // namespace lotus::v2
++#endif
+diff --git a/src/lotus_v2/transaction.cpp b/src/lotus_v2/transaction.cpp
+new file mode 100644
+index 0000000000..72dc974e3d
+--- /dev/null
++++ b/src/lotus_v2/transaction.cpp
+@@ -0,0 +1,550 @@
++#include "transaction.h"
++#include "commitment.h"
++
++#include <algorithm>
++#include <set>
++#include <utility>
++
++namespace lotus::v2 {
++namespace {
++
++    constexpr size_t MAX_WITNESS_ARGUMENT_BYTES = 8192;
++
++    class Reader {
++    public:
++        explicit Reader(const std::vector<uint8_t> &frame) : frame_(frame) {}
++        size_t Offset() const { return offset_; }
++        size_t Remaining() const { return frame_.size() - offset_; }
++        bool Finished() const { return Remaining() == 0; }
++        bool Take(size_t count, const uint8_t *&ptr) {
++            if (count > Remaining()) return false;
++            ptr = frame_.data() + offset_;
++            offset_ += count;
++            return true;
++        }
++        bool Integer(size_t width, uint64_t &value) {
++            const uint8_t *ptr;
++            if (width == 0 || width > 8 || !Take(width, ptr)) return false;
++            value = 0;
++            for (size_t i = 0; i < width; ++i)
++                value |= uint64_t(ptr[i]) << (8 * i);
++            return true;
++        }
++        bool CompactSize(uint64_t cap, uint64_t &value) {
++            uint64_t lead;
++            if (!Integer(1, lead)) return false;
++            if (lead < 253)
++                value = lead;
++            else {
++                const size_t width = lead == 253 ? 2 : lead == 254 ? 4 : 8;
++                if (!Integer(width, value)) return false;
++                if (value < (width == 2   ? 253ULL
++                             : width == 4 ? 65536ULL
++                                          : 4294967296ULL))
++                    return false;
++            }
++            return value <= cap;
++        }
++        bool Bytes(size_t cap, std::vector<uint8_t> &out) {
++            uint64_t count;
++            if (!CompactSize(cap, count) || count > Remaining()) return false;
++            const uint8_t *ptr;
++            if (!Take(size_t(count), ptr)) return false;
++            out.assign(ptr, ptr + count);
++            return true;
++        }
++
++    private:
++        const std::vector<uint8_t> &frame_;
++        size_t offset_ = 0;
++    };
++
++    void Integer(uint64_t value, size_t width, std::vector<uint8_t> &out) {
++        for (size_t i = 0; i < width; ++i)
++            out.push_back(uint8_t(value >> (8 * i)));
++    }
++    void CS(uint64_t value, std::vector<uint8_t> &out) {
++        if (value < 253)
++            Integer(value, 1, out);
++        else if (value <= 65535) {
++            out.push_back(253);
++            Integer(value, 2, out);
++        } else if (value <= 4294967295ULL) {
++            out.push_back(254);
++            Integer(value, 4, out);
++        } else {
++            out.push_back(255);
++            Integer(value, 8, out);
++        }
++    }
++    void Bytes(const std::vector<uint8_t> &value, std::vector<uint8_t> &out) {
++        CS(value.size(), out);
++        out.insert(out.end(), value.begin(), value.end());
++    }
++
++    bool ValidProfile(const TxProfile &p, std::string &error) {
++        if (p.max_inputs == 0 || p.max_inputs > 65535 ||
++            p.max_outputs > 65535 || p.max_mints > p.max_inputs ||
++            p.max_arguments > 65535 ||
++            p.max_argument_bytes > MAX_WITNESS_ARGUMENT_BYTES ||
++            p.max_branch_proof_depth > 64) {
++            error = "profile";
++            return false;
++        }
++        return true;
++    }
++
++    bool WitnessWire(const BranchWitness &w, const TxProfile &p, bool core,
++                     std::vector<uint8_t> &out, std::string &error) {
++        if (w.script.size() > p.max_script_bytes ||
++            w.siblings.size() > p.max_branch_proof_depth ||
++            w.arguments.size() > p.max_arguments) {
++            error = "witness cap";
++            return false;
++        }
++        Bytes(w.script, out);
++        CS(w.siblings.size(), out);
++        for (const auto &hash : w.siblings)
++            out.insert(out.end(), hash.begin(), hash.end());
++        if (!core) {
++            CS(w.arguments.size(), out);
++            for (const auto &arg : w.arguments) {
++                if (arg.size() > p.max_argument_bytes) {
++                    error = "argument cap";
++                    return false;
++                }
++                Bytes(arg, out);
++            }
++        }
++        return true;
++    }
++
++    bool InputWire(const Input &input, const TxProfile &p, bool core,
++                   std::vector<uint8_t> &out, std::string &error) {
++        if (input.flags < 1 || input.flags > 3) {
++            error = "input flags";
++            return false;
++        }
++        out.insert(out.end(), input.prev_txid.begin(), input.prev_txid.end());
++        Integer(input.prev_index, 4, out);
++        Integer(input.sequence, 4, out);
++        out.push_back(input.flags);
++        if (input.flags == 1) {
++            if (input.has_coinbase_data || !input.coinbase_data.empty() ||
++                input.path_index >= MAX_OUTPUT_PATHS ||
++                input.witnesses.empty() ||
++                input.witnesses.size() > MAX_OUTPUT_BRANCHES ||
++                (input.sequence != UINT32_MAX &&
++                 (input.sequence & ~0x40ffffU))) {
++                error = "spend authorization";
++                return false;
++            }
++            CS(input.path_index, out);
++            CS(input.witnesses.size(), out);
++            for (const auto &w : input.witnesses)
++                if (!WitnessWire(w, p, core, out, error)) return false;
++        } else if (input.flags == 2) {
++            if (input.sequence != UINT32_MAX || input.path_index != 0 ||
++                !input.witnesses.empty() ||
++                (input.has_coinbase_data &&
++                 (input.coinbase_data.empty() ||
++                  input.coinbase_data.size() > 8192)) ||
++                (!input.has_coinbase_data && !input.coinbase_data.empty())) {
++                error = "coinbase data";
++                return false;
++            }
++            CS(input.has_coinbase_data ? 1 : 0, out);
++            if (input.has_coinbase_data) Bytes(input.coinbase_data, out);
++        } else {
++            if (input.has_coinbase_data || !input.coinbase_data.empty()) {
++                error = "mint coinbase data";
++                return false;
++            }
++            if (input.prev_txid == Hash32{} || input.prev_index != 0 ||
++                input.sequence != UINT32_MAX || input.path_index != 0 ||
++                input.witnesses.size() != 1) {
++                error = "mint pseudo-outpoint";
++                return false;
++            }
++            if (!WitnessWire(input.witnesses[0], p, core, out, error))
++                return false;
++        }
++        return true;
++    }
++
++    bool ReadWitness(Reader &r, const TxProfile &p, BranchWitness &w,
++                     std::string &error) {
++        if (!r.Bytes(p.max_script_bytes, w.script)) {
++            error = "script bytes";
++            return false;
++        }
++        uint64_t count;
++        if (!r.CompactSize(p.max_branch_proof_depth, count) ||
++            count > r.Remaining() / 32) {
++            error = "sibling count";
++            return false;
++        }
++        w.siblings.reserve(size_t(count));
++        for (uint64_t i = 0; i < count; ++i) {
++            const uint8_t *ptr;
++            if (!r.Take(32, ptr)) {
++                error = "siblings";
++                return false;
++            }
++            Hash32 hash;
++            std::copy_n(ptr, 32, hash.begin());
++            w.siblings.push_back(hash);
++        }
++        if (!r.CompactSize(p.max_arguments, count) || count > r.Remaining()) {
++            error = "argument count";
++            return false;
++        }
++        w.arguments.reserve(size_t(count));
++        for (uint64_t i = 0; i < count; ++i) {
++            std::vector<uint8_t> arg;
++            if (!r.Bytes(p.max_argument_bytes, arg)) {
++                error = "argument bytes";
++                return false;
++            }
++            w.arguments.push_back(std::move(arg));
++        }
++        return true;
++    }
++
++    bool ReadInput(Reader &r, const TxProfile &p, Input &input,
++                   std::string &error) {
++        const uint8_t *ptr;
++        uint64_t value;
++        if (!r.Take(32, ptr)) {
++            error = "prev txid";
++            return false;
++        }
++        std::copy_n(ptr, 32, input.prev_txid.begin());
++        if (!r.Integer(4, value)) {
++            error = "prev index";
++            return false;
++        }
++        input.prev_index = uint32_t(value);
++        if (!r.Integer(4, value)) {
++            error = "sequence";
++            return false;
++        }
++        input.sequence = uint32_t(value);
++        if (!r.Integer(1, value)) {
++            error = "input flags";
++            return false;
++        }
++        input.flags = uint8_t(value);
++        if (input.flags == 1) {
++            if (!r.CompactSize(MAX_OUTPUT_PATHS - 1, value)) {
++                error = "path index";
++                return false;
++            }
++            input.path_index = uint8_t(value);
++            if (!r.CompactSize(MAX_OUTPUT_BRANCHES, value) ||
++                value > r.Remaining() / 3) {
++                error = "witness count";
++                return false;
++            }
++            input.witnesses.reserve(size_t(value));
++            for (uint64_t i = 0; i < value; ++i) {
++                BranchWitness w;
++                if (!ReadWitness(r, p, w, error)) return false;
++                input.witnesses.push_back(std::move(w));
++            }
++        } else if (input.flags == 2) {
++            if (!r.CompactSize(1, value)) {
++                error = "coinbase count";
++                return false;
++            }
++            if (value == 1) {
++                input.has_coinbase_data = true;
++                if (!r.Bytes(8192, input.coinbase_data)) {
++                    error = "coinbase bytes";
++                    return false;
++                }
++            }
++        } else if (input.flags == 3) {
++            BranchWitness w;
++            if (!ReadWitness(r, p, w, error)) return false;
++            input.witnesses.push_back(std::move(w));
++        } else {
++            error = "input flags";
++            return false;
++        }
++        std::vector<uint8_t> check;
++        return InputWire(input, p, false, check, error);
++    }
++
++    bool ReadOutput(Reader &r, const std::vector<uint8_t> &frame,
++                    Output &output, std::string &error) {
++        const size_t begin = r.Offset();
++        uint64_t flags, count, length;
++        const uint8_t *unused;
++        if (!r.Integer(1, flags) || flags > 3 ||
++            !r.Take(8 + ((flags & 1) ? 32 : 0), unused)) {
++            error = "output prefix";
++            return false;
++        }
++        if (!r.CompactSize(MAX_OUTPUT_BRANCHES, count) ||
++            count > r.Remaining() / 32 || !r.Take(size_t(count) * 32, unused)) {
++            error = "output branches";
++            return false;
++        }
++        if (!r.CompactSize(MAX_OUTPUT_PATHS, count) || count > r.Remaining()) {
++            error = "output paths";
++            return false;
++        }
++        for (uint64_t p = 0; p < count; ++p) {
++            if (!r.CompactSize(MAX_OUTPUT_BRANCHES, length) ||
++                length > r.Remaining()) {
++                error = "output path length";
++                return false;
++            }
++            for (uint64_t i = 0; i < length; ++i) {
++                uint64_t index;
++                if (!r.CompactSize(MAX_OUTPUT_BRANCHES - 1, index)) {
++                    error = "output path index";
++                    return false;
++                }
++            }
++        }
++        if (r.Offset() - begin > MAX_OUTPUT_BYTES) {
++            error = "output bytes";
++            return false;
++        }
++        return DecodeOutput({frame.begin() + begin, frame.begin() + r.Offset()},
++                            output, error);
++    }
++
++} // namespace
++
++bool EncodeInputCore(const Input &input, const TxProfile &profile,
++                     std::vector<uint8_t> &result, std::string &error) {
++    if (!ValidProfile(profile, error)) return false;
++    std::vector<uint8_t> encoded;
++    if (!InputWire(input, profile, true, encoded, error)) return false;
++    result = std::move(encoded);
++    error.clear();
++    return true;
++}
++
++bool EncodeInputFull(const Input &input, const TxProfile &profile,
++                     std::vector<uint8_t> &result, std::string &error) {
++    if (!ValidProfile(profile, error)) return false;
++    std::vector<uint8_t> encoded;
++    if (!InputWire(input, profile, false, encoded, error)) return false;
++    result = std::move(encoded);
++    error.clear();
++    return true;
++}
++
++bool EncodeTransaction(const Transaction &tx, const TxProfile &profile,
++                       std::vector<uint8_t> &result, std::string &error) {
++    if (!ValidProfile(profile, error)) return false;
++    if (tx.inputs.empty() || tx.inputs.size() > profile.max_inputs ||
++        tx.outputs.size() > profile.max_outputs || ((tx.lock & 255) > 2) ||
++        ((tx.lock & 255) == 0 && tx.lock != 0)) {
++        error = "transaction header";
++        return false;
++    }
++    size_t mint_count = 0;
++    bool has_spend = false;
++    bool has_coinbase = false;
++    std::set<std::pair<Hash32, uint32_t>> outpoints;
++    for (const auto &input : tx.inputs) {
++        has_spend |= input.flags == 1;
++        has_coinbase |= input.flags == 2;
++        mint_count += input.flags == 3;
++        if (!outpoints.emplace(input.prev_txid, input.prev_index).second) {
++            error = "repeated outpoint";
++            return false;
++        }
++    }
++    if (has_coinbase) {
++        if (tx.inputs.size() != 1 || tx.inputs[0].flags != 2 || tx.lock != 0 ||
++            tx.outputs.empty() ||
++            std::any_of(tx.outputs.begin(), tx.outputs.end(),
++                        [](const Output &o) { return o.HasToken(); })) {
++            error = "coinbase shape";
++            return false;
++        }
++    } else if (!has_spend || mint_count > profile.max_mints) {
++        error = "ordinary input mix";
++        return false;
++    }
++    std::vector<uint8_t> encoded;
++    Integer(7, 4, encoded);
++    Integer(tx.lock, 8, encoded);
++    Integer(tx.inputs.size(), 2, encoded);
++    Integer(tx.outputs.size(), 2, encoded);
++    for (const auto &input : tx.inputs) {
++        if (!InputWire(input, profile, false, encoded, error)) return false;
++    }
++    for (const auto &output : tx.outputs) {
++        std::vector<uint8_t> wire;
++        if (!EncodeOutput(output, wire, error)) return false;
++        encoded.insert(encoded.end(), wire.begin(), wire.end());
++    }
++    result = std::move(encoded);
++    error.clear();
++    return true;
++}
++
++bool DecodeTransaction(const std::vector<uint8_t> &frame,
++                       const TxProfile &profile, Transaction &result,
++                       std::string &error) {
++    if (!ValidProfile(profile, error)) return false;
++    Reader r(frame);
++    uint64_t value, input_count, output_count;
++    if (!r.Integer(4, value) || value != 7 || !r.Integer(8, value)) {
++        error = "version/lock";
++        return false;
++    }
++    Transaction parsed;
++    parsed.lock = value;
++    if (!r.Integer(2, input_count) || !r.Integer(2, output_count) ||
++        input_count == 0 || input_count > profile.max_inputs ||
++        output_count > profile.max_outputs ||
++        input_count > r.Remaining() / 42) {
++        error = "transaction count";
++        return false;
++    }
++    parsed.inputs.reserve(size_t(input_count));
++    for (uint64_t i = 0; i < input_count; ++i) {
++        Input input;
++        if (!ReadInput(r, profile, input, error)) return false;
++        parsed.inputs.push_back(std::move(input));
++    }
++    if (output_count > r.Remaining() / 43) {
++        error = "output count";
++        return false;
++    }
++    parsed.outputs.reserve(size_t(output_count));
++    for (uint64_t i = 0; i < output_count; ++i) {
++        Output output;
++        if (!ReadOutput(r, frame, output, error)) return false;
++        parsed.outputs.push_back(std::move(output));
++    }
++    if (!r.Finished()) {
++        error = "trailing bytes";
++        return false;
++    }
++    std::vector<uint8_t> check;
++    if (!EncodeTransaction(parsed, profile, check, error)) return false;
++    result = std::move(parsed);
++    error.clear();
++    return true;
++}
++
++bool CheckCoinbaseContext(const Transaction &tx, const Hash32 &parent_block_id,
++                          uint64_t height, std::string &error) {
++    if (tx.inputs.size() != 1 || tx.inputs[0].flags != 2 ||
++        height > UINT32_MAX || tx.inputs[0].prev_index != height ||
++        tx.inputs[0].prev_txid != parent_block_id) {
++        error = "coinbase parent/height";
++        return false;
++    }
++    error.clear();
++    return true;
++}
++
++bool ComputeTransactionIdentities(const Transaction &tx,
++                                  const TxProfile &profile,
++                                  const Hash32 &chain_id, Hash32 &txid,
++                                  Hash32 &txhash, std::string &error,
++                                  Hash32 *outputs_root_out) {
++    if (!ValidProfile(profile, error)) return false;
++    if (tx.inputs.empty() || tx.inputs.size() > profile.max_inputs ||
++        tx.outputs.size() > profile.max_outputs || ((tx.lock & 255) > 2) ||
++        ((tx.lock & 255) == 0 && tx.lock != 0)) {
++        error = "transaction header";
++        return false;
++    }
++    size_t mint_count = 0;
++    bool has_spend = false;
++    bool has_coinbase = false;
++    const size_t n_in = tx.inputs.size();
++    if (n_in <= 16) {
++        for (size_t i = 0; i < n_in; ++i) {
++            const auto &input = tx.inputs[i];
++            has_spend |= input.flags == 1;
++            has_coinbase |= input.flags == 2;
++            mint_count += input.flags == 3;
++            for (size_t j = 0; j < i; ++j) {
++                if (tx.inputs[j].prev_index == input.prev_index &&
++                    tx.inputs[j].prev_txid == input.prev_txid) {
++                    error = "repeated outpoint";
++                    return false;
++                }
++            }
++        }
++    } else {
++        std::set<std::pair<Hash32, uint32_t>> outpoints;
++        for (const auto &input : tx.inputs) {
++            has_spend |= input.flags == 1;
++            has_coinbase |= input.flags == 2;
++            mint_count += input.flags == 3;
++            if (!outpoints.emplace(input.prev_txid, input.prev_index).second) {
++                error = "repeated outpoint";
++                return false;
++            }
++        }
++    }
++    if (has_coinbase) {
++        if (n_in != 1 || tx.inputs[0].flags != 2 || tx.lock != 0 ||
++            tx.outputs.empty() ||
++            std::any_of(tx.outputs.begin(), tx.outputs.end(),
++                        [](const Output &o) { return o.HasToken(); })) {
++            error = "coinbase shape";
++            return false;
++        }
++    } else if (!has_spend || mint_count > profile.max_mints) {
++        error = "ordinary input mix";
++        return false;
++    }
++
++    std::vector<Hash> core_leaves, full_leaves;
++    core_leaves.reserve(n_in);
++    full_leaves.reserve(n_in);
++    std::vector<uint8_t> core, full;
++    core.reserve(128);
++    full.reserve(256);
++    for (const auto &input : tx.inputs) {
++        core.clear();
++        full.clear();
++        if (!InputWire(input, profile, true, core, error) ||
++            !InputWire(input, profile, false, full, error))
++            return false;
++        core_leaves.push_back(InputCoreLeaf(core));
++        full_leaves.push_back(InputFullLeaf(full));
++    }
++    const Hash inputs_root = IndexedTreeRoot(core_leaves);
++    const Hash full_inputs_root = IndexedTreeRoot(full_leaves);
++    std::vector<Hash> output_leaves;
++    output_leaves.reserve(tx.outputs.size());
++    std::vector<uint8_t> wire;
++    wire.reserve(64);
++    for (const auto &output : tx.outputs) {
++        if (!EncodeOutput(output, wire, error)) return false;
++        output_leaves.push_back(OutputLeaf(wire));
++    }
++    const Hash outputs_root = IndexedTreeRoot(output_leaves);
++    if (outputs_root_out) {
++        *outputs_root_out = outputs_root;
++    }
++    TxHeaderCore header{};
++    header[0] = 7;
++    for (size_t i = 0; i < 8; ++i)
++        header[4 + i] = uint8_t(tx.lock >> (8 * i));
++    header[12] = uint8_t(n_in);
++    header[13] = uint8_t(n_in >> 8);
++    header[14] = uint8_t(tx.outputs.size());
++    header[15] = uint8_t(tx.outputs.size() >> 8);
++    txid = TransactionId(chain_id, header, inputs_root, outputs_root);
++    txhash = TransactionHash(chain_id, header, full_inputs_root, outputs_root);
++    error.clear();
++    return true;
++}
++
++} // namespace lotus::v2
+diff --git a/src/lotus_v2/transaction.h b/src/lotus_v2/transaction.h
+new file mode 100644
+index 0000000000..44b7ec00ea
+--- /dev/null
++++ b/src/lotus_v2/transaction.h
+@@ -0,0 +1,76 @@
++// Candidate Lotus V2 transaction framing.
++#ifndef LOTUS_V2_TRANSACTION_H
++#define LOTUS_V2_TRANSACTION_H
++
++#include "output.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace lotus::v2 {
++
++struct TxProfile {
++    size_t max_inputs;
++    size_t max_outputs;
++    size_t max_mints;
++    size_t max_script_bytes;
++    size_t max_arguments;
++    size_t max_argument_bytes;
++    size_t max_branch_proof_depth;
++};
++
++struct BranchWitness {
++    std::vector<uint8_t> script;
++    std::vector<Hash32> siblings;
++    std::vector<std::vector<uint8_t>> arguments;
++    bool operator==(const BranchWitness &other) const = default;
++};
++
++struct Input {
++    Hash32 prev_txid{};
++    uint32_t prev_index = 0;
++    uint32_t sequence = 0;
++    uint8_t flags = 0;      // 1 spend, 2 coinbase, 3 mint
++    uint8_t path_index = 0; // meaningful only for spend
++    std::vector<BranchWitness> witnesses;
++    bool has_coinbase_data = false;
++    std::vector<uint8_t> coinbase_data;
++};
++
++struct Transaction {
++    uint64_t lock = 0;
++    std::vector<Input> inputs;
++    std::vector<Output> outputs;
++};
++
++// The profile is required and caller-selected; no production limits are
++// implied. Success consumes exactly the supplied frame and clears error.
++// Failure leaves the result unchanged. Mint-root membership and spend-path
++// resolution are later contextual/crypto checks, outside this framing-only
++// codec.
++bool DecodeTransaction(const std::vector<uint8_t> &frame,
++                       const TxProfile &profile, Transaction &result,
++                       std::string &error);
++bool EncodeTransaction(const Transaction &tx, const TxProfile &profile,
++                       std::vector<uint8_t> &result, std::string &error);
++bool EncodeInputCore(const Input &input, const TxProfile &profile,
++                     std::vector<uint8_t> &result, std::string &error);
++bool EncodeInputFull(const Input &input, const TxProfile &profile,
++                     std::vector<uint8_t> &result, std::string &error);
++bool CheckCoinbaseContext(const Transaction &tx, const Hash32 &parent_block_id,
++                          uint64_t height, std::string &error);
++
++inline constexpr TxProfile DefaultTxProfile{
++    65535, 65535, 65535, 10000, 65535, 8192, 64};
++
++bool ComputeTransactionIdentities(const Transaction &tx,
++                                  const TxProfile &profile,
++                                  const Hash32 &chain_id, Hash32 &txid,
++                                  Hash32 &txhash, std::string &error,
++                                  Hash32 *outputs_root_out = nullptr);
++
++} // namespace lotus::v2
++
++#endif
+diff --git a/src/node/snapshot.h b/src/node/snapshot.h
+index f0ad45bcd2..85a1658424 100644
+--- a/src/node/snapshot.h
++++ b/src/node/snapshot.h
+@@ -9,6 +9,7 @@
+ #include <consensus/params.h>
+ #include <feerate.h>
+ #include <flatfile.h>
++#include <lotus_v2/header.h>
+ #include <primitives/block.h>
+ #include <primitives/blockhash.h>
+ #include <primitives/transaction.h>
+@@ -31,8 +32,6 @@ class ChainstateManager;
+ class CTxMemPool;
+ 
+ namespace lotus::v2 {
+-using Hash = std::array<uint8_t, 32>;
+-static constexpr uint32_t kHeaderVersion = 1;
+ struct SmtNode;
+ struct UtxoOverlayArena;
+ struct MonetaryState {
+diff --git a/src/primitives/transaction.cpp b/src/primitives/transaction.cpp
+index 8da61fc4b9..9f383b5c79 100644
+--- a/src/primitives/transaction.cpp
++++ b/src/primitives/transaction.cpp
+@@ -57,8 +57,25 @@ TxHash CMutableTransaction::GetHash() const {
+     return TxHash(ComputeCMutableTransactionHash(*this));
+ }
+ 
+-uint256 CTransaction::ComputeHash() const {
+-    return (HashWriter{} << *this).GetHash();
++namespace {
++struct CountingHashWriter : public HashWriter {
++    uint32_t m_size{0};
++    void write(Span<const std::byte> src) {
++        m_size += static_cast<uint32_t>(src.size());
++        HashWriter::write(src);
++    }
++    template <typename T> CountingHashWriter &operator<<(const T &obj) {
++        ::Serialize(*this, obj);
++        return *this;
++    }
++};
++} // namespace
++
++uint256 CTransaction::ComputeHash() {
++    CountingHashWriter writer;
++    writer << *this;
++    m_serialize_size = writer.m_size;
++    return writer.GetHash();
+ }
+ 
+ /**
+@@ -67,13 +84,13 @@ uint256 CTransaction::ComputeHash() const {
+  */
+ CTransaction::CTransaction()
+     : vin(), vout(), nVersion(CTransaction::CURRENT_VERSION), nLockTime(0),
+-      hash() {}
++      m_serialize_size(0), hash() {}
+ CTransaction::CTransaction(const CMutableTransaction &tx)
+     : vin(tx.vin), vout(tx.vout), nVersion(tx.nVersion),
+-      nLockTime(tx.nLockTime), hash(ComputeHash()) {}
++      nLockTime(tx.nLockTime), m_serialize_size(0), hash(ComputeHash()) {}
+ CTransaction::CTransaction(CMutableTransaction &&tx)
+     : vin(std::move(tx.vin)), vout(std::move(tx.vout)), nVersion(tx.nVersion),
+-      nLockTime(tx.nLockTime), hash(ComputeHash()) {}
++      nLockTime(tx.nLockTime), m_serialize_size(0), hash(ComputeHash()) {}
+ 
+ Amount CTransaction::GetValueOut() const {
+     Amount nValueOut = Amount::zero();
+@@ -89,10 +106,6 @@ Amount CTransaction::GetValueOut() const {
+     return nValueOut;
+ }
+ 
+-unsigned int CTransaction::GetTotalSize() const {
+-    return ::GetSerializeSize(*this);
+-}
+-
+ std::string CTransaction::ToString() const {
+     std::string str;
+     str += strprintf("CTransaction(txid=%s, ver=%u, vin.size=%u, vout.size=%u, "
+diff --git a/src/primitives/transaction.h b/src/primitives/transaction.h
+index 68d967f384..f2ecffb878 100644
+--- a/src/primitives/transaction.h
++++ b/src/primitives/transaction.h
+@@ -210,9 +210,10 @@ public:
+ 
+ private:
+     /** Memory only. */
++    uint32_t m_serialize_size{0};
+     const uint256 hash;
+ 
+-    uint256 ComputeHash() const;
++    uint256 ComputeHash();
+ 
+ public:
+     /** Construct a CTransaction that qualifies as IsNull() */
+@@ -223,6 +224,13 @@ public:
+     explicit CTransaction(CMutableTransaction &&tx);
+ 
+     template <typename Stream> inline void Serialize(Stream &s) const {
++        if constexpr (std::is_same_v<std::remove_cvref_t<Stream>,
++                                     SizeComputer>) {
++            if (m_serialize_size > 0) {
++                s.seek(m_serialize_size);
++                return;
++            }
++        }
+         SerializeTransaction(*this, s);
+     }
+ 
+@@ -247,7 +255,10 @@ public:
+      * Get the total transaction size in bytes.
+      * @return Total transaction size in bytes
+      */
+-    unsigned int GetTotalSize() const;
++    unsigned int GetTotalSize() const {
++        return m_serialize_size > 0 ? m_serialize_size
++                                    : ::GetSerializeSize(*this);
++    }
+ 
+     bool IsCoinBase() const {
+         return (vin.size() == 1 && vin[0].prevout.IsNull());
+@@ -264,8 +275,8 @@ public:
+     std::string ToString() const;
+ };
+ #if defined(__x86_64__)
+-static_assert(sizeof(CTransaction) == 88,
+-              "sizeof CTransaction is expected to be 88 bytes");
++static_assert(sizeof(CTransaction) == 96,
++              "sizeof CTransaction is expected to be 96 bytes");
+ #endif
+ 
+ /**
+diff --git a/src/script/sigcache.cpp b/src/script/sigcache.cpp
+index f2c834e8ff..6a1d91a658 100644
+--- a/src/script/sigcache.cpp
++++ b/src/script/sigcache.cpp
+@@ -5,18 +5,58 @@
+ 
+ #include <script/sigcache.h>
+ 
++#include <crypto/common.h>
+ #include <crypto/sha256.h>
+ #include <logging.h>
++#include <lotus_v2/signing.h>
+ #include <pubkey.h>
+ #include <random.h>
+ #include <script/interpreter.h>
+ #include <span.h>
+ #include <uint256.h>
+ 
++#include <array>
++#include <cstring>
+ #include <mutex>
+ #include <shared_mutex>
+ #include <vector>
+ 
++namespace {
++struct TlsSigCache {
++    static constexpr size_t kMask = 4095;
++    struct Slot {
++        const SignatureCache *owner{nullptr};
++        uint256 entry{};
++    };
++    std::array<Slot, kMask + 1> slots{};
++
++    static size_t Index(const uint256 &entry) noexcept {
++        return static_cast<size_t>(ReadLE64(entry.begin())) & kMask;
++    }
++
++    bool Contains(const SignatureCache *owner,
++                  const uint256 &entry) const noexcept {
++        const Slot &s = slots[Index(entry)];
++        return s.owner == owner && s.entry == entry;
++    }
++
++    void Insert(const SignatureCache *owner, const uint256 &entry) noexcept {
++        Slot &s = slots[Index(entry)];
++        s.owner = owner;
++        s.entry = entry;
++    }
++
++    void Erase(const SignatureCache *owner, const uint256 &entry) noexcept {
++        Slot &s = slots[Index(entry)];
++        if (s.owner == owner && s.entry == entry) {
++            s.owner = nullptr;
++        }
++    }
++};
++
++thread_local TlsSigCache g_tls_sigcache;
++} // namespace
++
+ SignatureCache::SignatureCache(const size_t max_size_bytes) {
+     uint256 nonce = GetRandHash();
+     // We want the nonce to be 64 bytes long to force the hasher to process
+@@ -25,11 +65,18 @@ SignatureCache::SignatureCache(const size_t max_size_bytes) {
+     m_salted_hasher.Write(nonce.begin(), 32);
+     m_salted_hasher.Write(nonce.begin(), 32);
+ 
+-    const auto [num_elems, approx_size_bytes] =
+-        setValid.setup_bytes(max_size_bytes);
++    const size_t per_shard_bytes = std::max<size_t>(1, max_size_bytes / kNumShards);
++    size_t total_elems = 0;
++    size_t total_approx_bytes = 0;
++    for (auto &shard : m_shards) {
++        const auto [num_elems, approx_size_bytes] =
++            shard.setValid.setup_bytes(per_shard_bytes);
++        total_elems += num_elems;
++        total_approx_bytes += approx_size_bytes;
++    }
+     LogPrintf("Using %zu MiB out of %zu MiB requested for signature cache, "
+               "able to store %zu elements\n",
+-              approx_size_bytes >> 20, max_size_bytes >> 20, num_elems);
++              total_approx_bytes >> 20, max_size_bytes >> 20, total_elems);
+ }
+ 
+ void SignatureCache::ComputeEntry(uint256 &entry, const uint256 &hash,
+@@ -43,13 +90,70 @@ void SignatureCache::ComputeEntry(uint256 &entry, const uint256 &hash,
+ }
+ 
+ bool SignatureCache::Get(const uint256 &entry, const bool erase) {
+-    std::shared_lock<std::shared_mutex> lock(cs_sigcache);
+-    return setValid.contains(entry, erase);
++    if (!erase && g_tls_sigcache.Contains(this, entry)) {
++        return true;
++    }
++    if (erase) {
++        g_tls_sigcache.Erase(this, entry);
++    }
++    Shard &shard =
++        m_shards[static_cast<size_t>(ReadLE64(entry.begin())) & (kNumShards - 1)];
++    if (!shard.has_entries.load(std::memory_order_acquire)) {
++        return false;
++    }
++    std::shared_lock<std::shared_mutex> lock(shard.mutex);
++    const bool found = shard.setValid.contains(entry, erase);
++    if (found && !erase) {
++        g_tls_sigcache.Insert(this, entry);
++    }
++    return found;
+ }
+ 
+ void SignatureCache::Set(const uint256 &entry) {
+-    std::unique_lock<std::shared_mutex> lock(cs_sigcache);
+-    setValid.insert(entry);
++    g_tls_sigcache.Insert(this, entry);
++    Shard &shard =
++        m_shards[static_cast<size_t>(ReadLE64(entry.begin())) & (kNumShards - 1)];
++    std::unique_lock<std::shared_mutex> lock(shard.mutex);
++    shard.setValid.insert(entry);
++    shard.has_entries.store(true, std::memory_order_release);
++}
++
++void SignatureCache::SetBatch(const lotus::v2::BatchSigCollector &collector) {
++    const auto &items = collector.LegacyItems();
++    uint32_t touched_mask = 0;
++    for (const auto &item : items) {
++        if (item.store_in_cache) {
++            const size_t s = static_cast<size_t>(ReadLE64(item.cache_entry.data())) &
++                             (kNumShards - 1);
++            touched_mask |= (uint32_t{1} << s);
++        }
++    }
++    if (touched_mask == 0) {
++        return;
++    }
++    uint256 entry;
++    for (size_t s = 0; s < kNumShards; ++s) {
++        if ((touched_mask & (uint32_t{1} << s)) == 0) {
++            continue;
++        }
++        Shard &shard = m_shards[s];
++        std::unique_lock<std::shared_mutex> lock(shard.mutex);
++        for (const auto &item : items) {
++            if (!item.store_in_cache) {
++                continue;
++            }
++            const size_t item_s =
++                static_cast<size_t>(ReadLE64(item.cache_entry.data())) &
++                (kNumShards - 1);
++            if (item_s != s) {
++                continue;
++            }
++            std::memcpy(entry.begin(), item.cache_entry.data(), 32);
++            g_tls_sigcache.Insert(this, entry);
++            shard.setValid.insert(entry);
++        }
++        shard.has_entries.store(true, std::memory_order_release);
++    }
+ }
+ 
+ template <typename F>
+@@ -80,6 +184,20 @@ bool CachingTransactionSignatureChecker::IsCached(
+ bool CachingTransactionSignatureChecker::VerifySignature(
+     const std::vector<uint8_t> &vchSig, const CPubKey &pubkey,
+     const uint256 &sighash) const {
++    if (m_sig_collector != nullptr && vchSig.size() == 64) {
++        if (!pubkey.IsValid()) {
++            return false;
++        }
++        uint256 entry;
++        m_signature_cache.ComputeEntry(entry, sighash, vchSig, pubkey);
++        if (m_signature_cache.Get(entry, !store)) {
++            return true;
++        }
++        return m_sig_collector->AddLegacySchnorr(
++            std::span<const uint8_t>(pubkey.data(), pubkey.size()),
++            std::span<const uint8_t>(vchSig.data(), vchSig.size()),
++            sighash.begin(), entry.begin(), store);
++    }
+     return RunMemoizedCheck(
+         m_signature_cache, vchSig, pubkey, sighash, store, [&] {
+             return TransactionSignatureChecker::VerifySignature(vchSig, pubkey,
+diff --git a/src/script/sigcache.h b/src/script/sigcache.h
+index b9c038e90e..d4d8d701db 100644
+--- a/src/script/sigcache.h
++++ b/src/script/sigcache.h
+@@ -20,6 +20,10 @@
+ class CPubKey;
+ class CTransaction;
+ 
++namespace lotus::v2 {
++class BatchSigCollector;
++} // namespace lotus::v2
++
+ // DoS prevention: limit cache size to 32MiB (over 1000000 entries on 64-bit
+ // systems). Due to how we count cache size, actual memory usage is slightly
+ // more (~32.25 MiB)
+@@ -32,13 +36,18 @@ static constexpr size_t DEFAULT_SIGNATURE_CACHE_BYTES{32 << 20};
+  */
+ class SignatureCache {
+ private:
++    static constexpr size_t kNumShards = 16;
+     //! Entries are SHA256(nonce || signature hash || public key || signature):
+     CSHA256 m_salted_hasher;
+     typedef CuckooCache::cache<CuckooCache::KeyOnly<uint256>,
+                                SignatureCacheHasher>
+         map_type;
+-    map_type setValid;
+-    std::shared_mutex cs_sigcache;
++    struct alignas(64) Shard {
++        std::shared_mutex mutex;
++        map_type setValid;
++        std::atomic<bool> has_entries{false};
++    };
++    std::array<Shard, kNumShards> m_shards;
+ 
+ public:
+     SignatureCache(size_t max_size_bytes);
+@@ -53,24 +62,28 @@ public:
+     bool Get(const uint256 &entry, const bool erase);
+ 
+     void Set(const uint256 &entry);
++
++    void SetBatch(const lotus::v2::BatchSigCollector &collector);
+ };
+ 
+ class CachingTransactionSignatureChecker : public TransactionSignatureChecker {
+ private:
+     bool store;
+     SignatureCache &m_signature_cache;
++    lotus::v2::BatchSigCollector *m_sig_collector{nullptr};
+ 
+     bool IsCached(const std::vector<uint8_t> &vchSig, const CPubKey &vchPubKey,
+                   const uint256 &sighash) const;
+ 
+ public:
+-    CachingTransactionSignatureChecker(const CTransaction *txToIn,
+-                                       unsigned int nInIn,
+-                                       const Amount amountIn, bool storeIn,
+-                                       SignatureCache &signature_cache,
+-                                       PrecomputedTransactionData &txdataIn)
++    CachingTransactionSignatureChecker(
++        const CTransaction *txToIn, unsigned int nInIn, const Amount amountIn,
++        bool storeIn, SignatureCache &signature_cache,
++        PrecomputedTransactionData &txdataIn,
++        lotus::v2::BatchSigCollector *sig_collector = nullptr)
+         : TransactionSignatureChecker(txToIn, nInIn, amountIn, txdataIn),
+-          store(storeIn), m_signature_cache(signature_cache) {}
++          store(storeIn), m_signature_cache(signature_cache),
++          m_sig_collector(sig_collector) {}
+ 
+     bool VerifySignature(const std::vector<uint8_t> &vchSig,
+                          const CPubKey &vchPubKey,
+diff --git a/src/secp256k1/include/secp256k1_schnorr.h b/src/secp256k1/include/secp256k1_schnorr.h
+index f0b74eafd8..486eb4b183 100644
+--- a/src/secp256k1/include/secp256k1_schnorr.h
++++ b/src/secp256k1/include/secp256k1_schnorr.h
+@@ -54,6 +54,15 @@ SECP256K1_API int secp256k1_schnorr_sign(
+   const void *ndata
+ ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4);
+ 
++SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_schnorr_verify_batch(
++  const secp256k1_context *ctx,
++  const unsigned char * const *sig64,
++  const unsigned char * const *msghash32,
++  const secp256k1_pubkey * const *pubkey,
++  const unsigned char *rand32,
++  size_t n_sigs
++) SECP256K1_ARG_NONNULL(1);
++
+ # ifdef __cplusplus
+ }
+ # endif
+diff --git a/src/secp256k1/include/secp256k1_schnorrsig.h b/src/secp256k1/include/secp256k1_schnorrsig.h
+index 72b874f246..fb3b192867 100644
+--- a/src/secp256k1/include/secp256k1_schnorrsig.h
++++ b/src/secp256k1/include/secp256k1_schnorrsig.h
+@@ -179,6 +179,29 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_schnorrsig_verify(
+     const secp256k1_xonly_pubkey *pubkey
+ ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(5);
+ 
++/** Verify a batch of BIP-340 Schnorr signatures over 32-byte messages using
++ *  randomized linear combinations and multi-scalar multiplication
++ *  (Strauss / Pippenger).
++ *
++ *  Returns: 1: all n_sigs signatures are valid
++ *           0: at least one signature is invalid (or scratch allocation failed)
++ *  Args:    ctx: pointer to a context object.
++ *  In:    sig64: array of n_sigs pointers to 64-byte signatures.
++ *         msg32: array of n_sigs pointers to 32-byte messages.
++ *        pubkey: array of n_sigs pointers to x-only public keys.
++ *        rand32: pointer to 32 * n_sigs random bytes for linear combination
++ *                weights (may be NULL when n_sigs <= 1).
++ *        n_sigs: number of signatures in the batch.
++ */
++SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_schnorrsig_verify_batch(
++    const secp256k1_context *ctx,
++    const unsigned char * const *sig64,
++    const unsigned char * const *msg32,
++    const secp256k1_xonly_pubkey * const *pubkey,
++    const unsigned char *rand32,
++    size_t n_sigs
++) SECP256K1_ARG_NONNULL(1);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/secp256k1/src/modules/schnorr/main_impl.h b/src/secp256k1/src/modules/schnorr/main_impl.h
+index 5e0e422176..0e0958ebd7 100644
+--- a/src/secp256k1/src/modules/schnorr/main_impl.h
++++ b/src/secp256k1/src/modules/schnorr/main_impl.h
+@@ -73,4 +73,122 @@ int secp256k1_schnorr_sign(
+     return !!ret & !overflow;
+ }
+ 
++typedef struct {
++    const secp256k1_context *ctx;
++    const unsigned char * const *sig64;
++    const unsigned char * const *msghash32;
++    const secp256k1_pubkey * const *pubkey;
++    const unsigned char *rand32;
++} secp256k1_schnorr_batch_data;
++
++static void secp256k1_schnorr_batch_z(secp256k1_scalar *z, const unsigned char *rand32, size_t sig_idx) {
++    if (sig_idx == 0) {
++        *z = secp256k1_scalar_one;
++    } else {
++        int overflow = 0;
++        secp256k1_scalar_set_b32(z, rand32 + 32 * sig_idx, &overflow);
++        if (overflow || secp256k1_scalar_is_zero(z)) {
++            *z = secp256k1_scalar_one;
++        }
++    }
++}
++
++static int secp256k1_schnorr_batch_ecmult_cb(secp256k1_scalar *sc, secp256k1_ge *pt, size_t idx, void *data) {
++    const secp256k1_schnorr_batch_data *bdata = (const secp256k1_schnorr_batch_data *)data;
++    const size_t sig_idx = idx >> 1;
++    secp256k1_scalar z;
++    secp256k1_schnorr_batch_z(&z, bdata->rand32, sig_idx);
++
++    if ((idx & 1) == 0) {
++        secp256k1_fe rx;
++        if (!secp256k1_fe_set_b32_limit(&rx, &bdata->sig64[sig_idx][0])) {
++            return 0;
++        }
++        if (!secp256k1_ge_set_xquad(pt, &rx)) {
++            return 0;
++        }
++        secp256k1_ge_neg(pt, pt);
++        *sc = z;
++        return 1;
++    } else {
++        if (!secp256k1_pubkey_load(bdata->ctx, pt, bdata->pubkey[sig_idx])) {
++            return 0;
++        }
++        if (secp256k1_ge_is_infinity(pt)) {
++            return 0;
++        }
++        if (!secp256k1_schnorr_compute_e(sc, &bdata->sig64[sig_idx][0], pt, bdata->msghash32[sig_idx])) {
++            return 0;
++        }
++        secp256k1_scalar_mul(sc, sc, &z);
++        secp256k1_ge_neg(pt, pt);
++        return 1;
++    }
++}
++
++int secp256k1_schnorr_verify_batch(
++    const secp256k1_context *ctx,
++    const unsigned char * const *sig64,
++    const unsigned char * const *msghash32,
++    const secp256k1_pubkey * const *pubkey,
++    const unsigned char *rand32,
++    size_t n_sigs
++) {
++    secp256k1_schnorr_batch_data bdata;
++    secp256k1_scalar g_sc;
++    secp256k1_gej rj;
++    secp256k1_scratch *scratch;
++    size_t i;
++    size_t n_points;
++    size_t scratch_size;
++    int ret;
++
++    VERIFY_CHECK(ctx != NULL);
++    if (n_sigs == 0) {
++        return 1;
++    }
++    ARG_CHECK(sig64 != NULL);
++    ARG_CHECK(msghash32 != NULL);
++    ARG_CHECK(pubkey != NULL);
++    if (n_sigs == 1) {
++        return secp256k1_schnorr_verify(ctx, sig64[0], msghash32[0], pubkey[0]);
++    }
++    ARG_CHECK(rand32 != NULL);
++
++    secp256k1_scalar_clear(&g_sc);
++    for (i = 0; i < n_sigs; i++) {
++        secp256k1_scalar s;
++        secp256k1_scalar z;
++        int overflow = 0;
++        if (sig64[i] == NULL || msghash32[i] == NULL || pubkey[i] == NULL) {
++            return 0;
++        }
++        secp256k1_scalar_set_b32(&s, &sig64[i][32], &overflow);
++        if (overflow) {
++            return 0;
++        }
++        secp256k1_schnorr_batch_z(&z, rand32, i);
++        secp256k1_scalar_mul(&s, &s, &z);
++        secp256k1_scalar_add(&g_sc, &g_sc, &s);
++    }
++
++    bdata.ctx = ctx;
++    bdata.sig64 = sig64;
++    bdata.msghash32 = msghash32;
++    bdata.pubkey = pubkey;
++    bdata.rand32 = rand32;
++
++    n_points = 2 * n_sigs;
++    if (n_points >= ECMULT_PIPPENGER_THRESHOLD) {
++        int bucket_window = secp256k1_pippenger_bucket_window(n_points);
++        scratch_size = secp256k1_pippenger_scratch_size(n_points, bucket_window) + PIPPENGER_SCRATCH_OBJECTS * 16;
++    } else {
++        scratch_size = secp256k1_strauss_scratch_size(n_points) + STRAUSS_SCRATCH_OBJECTS * 16;
++    }
++    scratch = secp256k1_scratch_create(&ctx->error_callback, scratch_size);
++    ret = secp256k1_ecmult_multi_var(&ctx->error_callback, scratch, &rj, &g_sc, secp256k1_schnorr_batch_ecmult_cb, &bdata, n_points);
++    secp256k1_scratch_destroy(&ctx->error_callback, scratch);
++    return ret && secp256k1_gej_is_infinity(&rj);
++}
++
+ #endif
+diff --git a/src/secp256k1/src/modules/schnorrsig/main_impl.h b/src/secp256k1/src/modules/schnorrsig/main_impl.h
+index 57f7eadd3c..e1ec2027bb 100644
+--- a/src/secp256k1/src/modules/schnorrsig/main_impl.h
++++ b/src/secp256k1/src/modules/schnorrsig/main_impl.h
+@@ -264,4 +264,112 @@ int secp256k1_schnorrsig_verify(const secp256k1_context* ctx, const unsigned cha
+            secp256k1_fe_equal(&rx, &r.x);
+ }
+ 
++typedef struct {
++    const secp256k1_context *ctx;
++    const unsigned char * const *sig64;
++    const unsigned char * const *msg32;
++    const secp256k1_xonly_pubkey * const *pubkey;
++    const unsigned char *rand32;
++} secp256k1_schnorrsig_batch_data;
++
++static void secp256k1_schnorrsig_batch_z(secp256k1_scalar *z, const unsigned char *rand32, size_t sig_idx) {
++    if (sig_idx == 0) {
++        *z = secp256k1_scalar_one;
++    } else {
++        int overflow = 0;
++        secp256k1_scalar_set_b32(z, rand32 + 32 * sig_idx, &overflow);
++        if (overflow || secp256k1_scalar_is_zero(z)) {
++            *z = secp256k1_scalar_one;
++        }
++    }
++}
++
++static int secp256k1_schnorrsig_batch_ecmult_cb(secp256k1_scalar *sc, secp256k1_ge *pt, size_t idx, void *data) {
++    const secp256k1_schnorrsig_batch_data *bdata = (const secp256k1_schnorrsig_batch_data *)data;
++    const size_t sig_idx = idx >> 1;
++    secp256k1_scalar z;
++    secp256k1_schnorrsig_batch_z(&z, bdata->rand32, sig_idx);
++
++    if ((idx & 1) == 0) {
++        secp256k1_fe rx;
++        if (!secp256k1_fe_set_b32_limit(&rx, &bdata->sig64[sig_idx][0])) {
++            return 0;
++        }
++        if (!secp256k1_ge_set_xo_var(pt, &rx, 0)) {
++            return 0;
++        }
++        secp256k1_ge_neg(pt, pt);
++        *sc = z;
++        return 1;
++    } else {
++        unsigned char pk_buf[32];
++        if (!secp256k1_xonly_pubkey_load(bdata->ctx, pt, bdata->pubkey[sig_idx])) {
++            return 0;
++        }
++        secp256k1_fe_get_b32(pk_buf, &pt->x);
++        secp256k1_schnorrsig_challenge(sc, &bdata->sig64[sig_idx][0], bdata->msg32[sig_idx], 32, pk_buf);
++        secp256k1_scalar_mul(sc, sc, &z);
++        secp256k1_ge_neg(pt, pt);
++        return 1;
++    }
++}
++
++int secp256k1_schnorrsig_verify_batch(const secp256k1_context* ctx, const unsigned char * const *sig64, const unsigned char * const *msg32, const secp256k1_xonly_pubkey * const *pubkey, const unsigned char *rand32, size_t n_sigs) {
++    secp256k1_schnorrsig_batch_data bdata;
++    secp256k1_scalar g_sc;
++    secp256k1_gej rj;
++    secp256k1_scratch *scratch;
++    size_t i;
++    size_t n_points;
++    size_t scratch_size;
++    int ret;
++
++    VERIFY_CHECK(ctx != NULL);
++    if (n_sigs == 0) {
++        return 1;
++    }
++    ARG_CHECK(sig64 != NULL);
++    ARG_CHECK(msg32 != NULL);
++    ARG_CHECK(pubkey != NULL);
++    if (n_sigs == 1) {
++        return secp256k1_schnorrsig_verify(ctx, sig64[0], msg32[0], 32, pubkey[0]);
++    }
++    ARG_CHECK(rand32 != NULL);
++
++    secp256k1_scalar_clear(&g_sc);
++    for (i = 0; i < n_sigs; i++) {
++        secp256k1_scalar s;
++        secp256k1_scalar z;
++        int overflow = 0;
++        if (sig64[i] == NULL || msg32[i] == NULL || pubkey[i] == NULL) {
++            return 0;
++        }
++        secp256k1_scalar_set_b32(&s, &sig64[i][32], &overflow);
++        if (overflow) {
++            return 0;
++        }
++        secp256k1_schnorrsig_batch_z(&z, rand32, i);
++        secp256k1_scalar_mul(&s, &s, &z);
++        secp256k1_scalar_add(&g_sc, &g_sc, &s);
++    }
++
++    bdata.ctx = ctx;
++    bdata.sig64 = sig64;
++    bdata.msg32 = msg32;
++    bdata.pubkey = pubkey;
++    bdata.rand32 = rand32;
++
++    n_points = 2 * n_sigs;
++    if (n_points >= ECMULT_PIPPENGER_THRESHOLD) {
++        int bucket_window = secp256k1_pippenger_bucket_window(n_points);
++        scratch_size = secp256k1_pippenger_scratch_size(n_points, bucket_window) + PIPPENGER_SCRATCH_OBJECTS * 16;
++    } else {
++        scratch_size = secp256k1_strauss_scratch_size(n_points) + STRAUSS_SCRATCH_OBJECTS * 16;
++    }
++    scratch = secp256k1_scratch_create(&ctx->error_callback, scratch_size);
++    ret = secp256k1_ecmult_multi_var(&ctx->error_callback, scratch, &rj, &g_sc, secp256k1_schnorrsig_batch_ecmult_cb, &bdata, n_points);
++    secp256k1_scratch_destroy(&ctx->error_callback, scratch);
++    return ret && secp256k1_gej_is_infinity(&rj);
++}
++
+ #endif
+diff --git a/src/test/sigcache_tests.cpp b/src/test/sigcache_tests.cpp
+index af950ac85f..51941f0cbd 100644
+--- a/src/test/sigcache_tests.cpp
++++ b/src/test/sigcache_tests.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <key.h>
+ #include <key_io.h>
++#include <lotus_v2/signing.h>
+ #include <streams.h>
+ #include <tinyformat.h>
+ #include <util/strencodings.h>
+@@ -114,4 +115,51 @@ BOOST_AUTO_TEST_CASE(sig_pubkey_hash_variations) {
+     }
+ }
+ 
++BOOST_AUTO_TEST_CASE(schnorr_batch_and_tls_sigcache) {
++    DataStream stream{ParseHex(
++        "010000000122739e70fbee987a8be1788395a2f2e6ad18ccb7ff611cd798071539"
++        "dde3c38e000000000151ffffffff010000000000000000016a00000000")};
++    CTransaction dummyTx(deserialize, stream);
++    BOOST_CHECK_EQUAL(dummyTx.GetTotalSize(), GetSerializeSize(dummyTx));
++
++    PrecomputedTransactionData txdata(dummyTx);
++    SignatureCache signature_cache{DEFAULT_SIGNATURE_CACHE_BYTES};
++    lotus::v2::BatchSigCollector collector;
++    CachingTransactionSignatureChecker batchChecker(
++        &dummyTx, 0, 0 * SATOSHI, true, signature_cache, txdata, &collector);
++
++    CKey key;
++    key.MakeNewKey(true);
++    CPubKey pubkey = key.GetPubKey();
++
++    std::vector<std::vector<uint8_t>> sigs(32);
++    std::vector<uint256> hashes(32);
++    for (int i = 0; i < 32; ++i) {
++        hashes[i] = Hash(strprintf("Schnorr batch msg %d", i));
++        BOOST_CHECK(key.SignSchnorr(hashes[i], sigs[i]));
++        BOOST_CHECK(batchChecker.VerifySignature(sigs[i], pubkey, hashes[i]));
++    }
++    BOOST_CHECK_EQUAL(collector.LegacyItems().size(), 32U);
++    BOOST_CHECK(collector.VerifyAll());
++
++    // Batch insert into signature cache and verify TLS + global cache hits.
++    signature_cache.SetBatch(collector);
++    CachingTransactionSignatureChecker checkCached(
++        &dummyTx, 0, 0 * SATOSHI, false, signature_cache, txdata);
++    TestCachingTransactionSignatureChecker testCached(checkCached);
++    for (int i = 0; i < 32; ++i) {
++        BOOST_CHECK(testCached.IsCached(sigs[i], pubkey, hashes[i]));
++    }
++
++    // Corrupting one signature in a batch must cause VerifyAll() to fail.
++    lotus::v2::BatchSigCollector bad_collector = collector;
++    std::vector<uint8_t> bad_sig = sigs[0];
++    bad_sig[10] ^= 0x01;
++    BOOST_CHECK(bad_collector.AddLegacySchnorr(
++        std::span<const uint8_t>(pubkey.data(), pubkey.size()),
++        std::span<const uint8_t>(bad_sig.data(), bad_sig.size()),
++        hashes[0].begin()));
++    BOOST_CHECK(!bad_collector.VerifyAll());
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 6746384798..64f7a48822 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -30,6 +30,7 @@
+ #include <kernel/notifications_interface.h>
+ #include <logging.h>
+ #include <logging/timer.h>
++#include <lotus_v2/signing.h>
+ #include <minerfund.h>
+ #include <node/blockstorage.h>
+ #include <node/snapshot.h>
+@@ -69,7 +70,10 @@
+ #include <atomic>
+ #include <cassert>
+ #include <chrono>
++#include <condition_variable>
+ #include <deque>
++#include <functional>
++#include <mutex>
+ #include <numeric>
+ #include <optional>
+ #include <string>
+@@ -281,6 +285,161 @@ static bool CheckInputsFromMempoolAndCache(
+ 
+ namespace {
+ 
++struct ParallelTxScriptError {
++    TxValidationResult result{TxValidationResult::TX_CONSENSUS};
++    ScriptError script_err{ScriptError::UNKNOWN};
++    std::string reject_reason;
++    std::string debug_message;
++};
++
++std::optional<ParallelTxScriptError> VerifyTxScriptsFromResolvedCoins(
++    const CTransaction &tx, const std::vector<Coin> &resolved_inputs,
++    const uint32_t flags, bool sigCacheStore,
++    const PrecomputedTransactionData &txdata, SignatureCache &signature_cache,
++    int &nSigChecksOut, TxSigCheckLimiter &txLimitSigChecks,
++    CheckInputsLimiter *pBlockLimitSigChecks,
++    lotus::v2::BatchSigCollector *sig_collector) {
++    assert(!tx.IsCoinBase());
++    assert(resolved_inputs.size() == tx.vin.size());
++
++    int nSigChecksTotal = 0;
++    for (size_t i = 0; i < tx.vin.size(); i++) {
++        assert(!resolved_inputs[i].IsSpent());
++        const CTxOut &prev_txout = resolved_inputs[i].GetTxOut();
++
++        CScriptCheck check(prev_txout, tx, signature_cache, i, flags,
++                           sigCacheStore, txdata, &txLimitSigChecks,
++                           pBlockLimitSigChecks, sig_collector);
++        if (auto result = check(); result.has_value()) {
++            uint32_t mandatoryFlags =
++                flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS;
++            if (flags != mandatoryFlags) {
++                CScriptCheck check2(prev_txout, tx, signature_cache, i,
++                                    mandatoryFlags, sigCacheStore, txdata,
++                                    nullptr, nullptr, nullptr);
++                auto mandatory_result = check2();
++                if (!mandatory_result.has_value()) {
++                    return ParallelTxScriptError{
++                        TxValidationResult::TX_NOT_STANDARD, result->first,
++                        strprintf("non-mandatory-script-verify-flag (%s)",
++                                  ScriptErrorString(result->first)),
++                        result->second};
++                }
++                result = mandatory_result;
++            }
++            return ParallelTxScriptError{
++                TxValidationResult::TX_CONSENSUS, result->first,
++                strprintf("mandatory-script-verify-flag-failed (%s)",
++                          ScriptErrorString(result->first)),
++                result->second};
++        }
++        nSigChecksTotal += check.GetScriptExecutionMetrics().nSigChecks;
++    }
++    nSigChecksOut = nSigChecksTotal;
++    return std::nullopt;
++}
++
++class ParallelScriptWorkerPool {
++public:
++    static ParallelScriptWorkerPool &Instance() {
++        static ParallelScriptWorkerPool pool;
++        return pool;
++    }
++
++    template <typename Fn>
++    void Run(size_t num_workers, Fn &&fn) {
++        if (num_workers <= 1) {
++            fn(0);
++            return;
++        }
++        std::function<void(size_t)> task_fn(std::forward<Fn>(fn));
++        std::unique_lock<std::mutex> dispatch_lock(m_dispatch_mutex);
++        EnsureWorkers(num_workers - 1);
++        const size_t active = std::min(num_workers - 1, m_threads.size());
++        if (active == 0) {
++            dispatch_lock.unlock();
++            task_fn(0);
++            return;
++        }
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            m_task = &task_fn;
++            m_active_workers = active;
++            m_remaining.store(active, std::memory_order_release);
++            ++m_generation;
++        }
++        m_cv_start.notify_all();
++        task_fn(0);
++        {
++            std::unique_lock<std::mutex> lock(m_mutex);
++            m_cv_done.wait(lock, [this]() {
++                return m_remaining.load(std::memory_order_acquire) == 0;
++            });
++            m_task = nullptr;
++        }
++    }
++
++private:
++    ParallelScriptWorkerPool() = default;
++    ~ParallelScriptWorkerPool() {
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            m_stop = true;
++            ++m_generation;
++        }
++        m_cv_start.notify_all();
++        for (auto &t : m_threads) {
++            if (t.joinable()) {
++                t.join();
++            }
++        }
++    }
++
++    void EnsureWorkers(size_t count) {
++        while (m_threads.size() < count) {
++            const size_t worker_id = m_threads.size() + 1;
++            m_threads.emplace_back([this, worker_id]() {
++                uint64_t seen_gen = 0;
++                while (true) {
++                    const std::function<void(size_t)> *fn = nullptr;
++                    {
++                        std::unique_lock<std::mutex> lock(m_mutex);
++                        m_cv_start.wait(lock, [this, &seen_gen]() {
++                            return m_stop || m_generation != seen_gen;
++                        });
++                        if (m_stop) {
++                            return;
++                        }
++                        seen_gen = m_generation;
++                        if (worker_id <= m_active_workers) {
++                            fn = m_task;
++                        }
++                    }
++                    if (fn != nullptr) {
++                        (*fn)(worker_id);
++                        if (m_remaining.fetch_sub(
++                                1, std::memory_order_acq_rel) == 1) {
++                            std::lock_guard<std::mutex> lock(m_mutex);
++                            m_cv_done.notify_one();
++                        }
++                    }
++                }
++            });
++        }
++    }
++
++    std::mutex m_dispatch_mutex;
++    std::mutex m_mutex;
++    std::condition_variable m_cv_start;
++    std::condition_variable m_cv_done;
++    std::vector<std::thread> m_threads;
++    const std::function<void(size_t)> *m_task{nullptr};
++    size_t m_active_workers{0};
++    std::atomic<size_t> m_remaining{0};
++    uint64_t m_generation{0};
++    bool m_stop{false};
++};
++
+ class MemPoolAccept {
+ public:
+     MemPoolAccept(CTxMemPool &mempool, Chainstate &active_chainstate)
+@@ -1755,7 +1914,10 @@ std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
+     if (!VerifyScript(scriptSig, m_tx_out.scriptPubKey, nFlags,
+                       CachingTransactionSignatureChecker(
+                           ptxTo, nIn, m_tx_out.nValue, cacheStore,
+-                          *m_signature_cache, txdata),
++                          *m_signature_cache, txdata,
++                          ((nFlags & SCRIPT_VERIFY_NULLFAIL) != 0)
++                              ? m_sig_collector
++                              : nullptr),
+                       metrics, &error)) {
+         return std::make_pair(error, std::move(debug_str));
+     }
+@@ -2385,10 +2547,21 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+                              "tx-duplicate", "tried to overwrite transaction");
+     }
+ 
++    struct PendingBlockTxCheck {
++        size_t tx_index;
++        ScriptCacheKey cache_key;
++    };
++    std::vector<PendingBlockTxCheck> pending_script_txs;
++    if (fScriptChecks && block.vtx.size() > 1) {
++        pending_script_txs.reserve(block.vtx.size() - 1);
++    }
++
+     size_t txIndex = 0;
+     // nSigChecksRet may be accurate (found in cache) or 0 (checks were
+-    // deferred into vChecks).
+-    int nSigChecksRet;
++    // deferred into Pass 2).
++    int nSigChecksRet = 0;
++    const bool fCacheResults = fJustCheck;
++    const bool fEnforceSigCheck = flags & SCRIPT_ENFORCE_SIGCHECKS;
+     for (const auto &ptx : block.vtx) {
+         const CTransaction &tx = *ptx;
+         const bool isCoinBase = tx.IsCoinBase();
+@@ -2439,11 +2612,6 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+             break;
+         }
+ 
+-        // Don't cache results if we're actually connecting blocks (still
+-        // consult the cache, though).
+-        bool fCacheResults = fJustCheck;
+-
+-        const bool fEnforceSigCheck = flags & SCRIPT_ENFORCE_SIGCHECKS;
+         if (!fEnforceSigCheck) {
+             // Historically, there has been transactions with a very high
+             // sigcheck count, so we need to disable this check for such
+@@ -2451,31 +2619,32 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+             nSigChecksTxLimiters[txIndex] = TxSigCheckLimiter::getDisabled();
+         }
+ 
+-        std::vector<CScriptCheck> vChecks;
+-        TxValidationState tx_state;
+-        if (fScriptChecks &&
+-            !CheckInputScripts(tx, tx_state, view, flags, fCacheResults,
+-                               fCacheResults, PrecomputedTransactionData(tx),
+-                               m_chainman.m_validation_cache, nSigChecksRet,
+-                               nSigChecksTxLimiters[txIndex],
+-                               &nSigChecksBlockLimiter, &vChecks)) {
+-            // Any transaction validation failure in ConnectBlock is a block
+-            // consensus failure
+-            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+-                          tx_state.GetRejectReason(),
+-                          tx_state.GetDebugMessage());
+-            break;
+-        }
+-
+-        if (control) {
+-            control->Add(std::move(vChecks));
++        if (fScriptChecks) {
++            ScriptCacheKey hashCacheEntry(
++                tx, flags,
++                m_chainman.m_validation_cache.ScriptExecutionCacheHasher());
++            ScriptCacheElement elem(hashCacheEntry, 0);
++            if (m_chainman.m_validation_cache.m_script_execution_cache.get(
++                    elem, /*erase=*/!fCacheResults)) {
++                nSigChecksRet = elem.nSigChecks;
++                if (!nSigChecksTxLimiters[txIndex].consume_and_check(
++                        nSigChecksRet) ||
++                    !nSigChecksBlockLimiter.consume_and_check(nSigChecksRet)) {
++                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                                  "too-many-sigchecks", "");
++                    break;
++                }
++            } else {
++                nSigChecksRet = 0;
++                pending_script_txs.push_back({txIndex, hashCacheEntry});
++            }
+         }
+ 
+         // Note: this must execute in the same iteration as CheckTxInputs (not
+-        // in a separate loop) in order to detect double spends. However,
+-        // this does not prevent double-spending by duplicated transaction
+-        // inputs in the same transaction (cf. CVE-2018-17144) -- that check is
+-        // done in CheckBlock (CheckRegularTransaction).
++        // in a separate loop) in order to detect double spends. SpendCoins
++        // also snapshots the exact spent Coin for each input into
++        // blockundo.vtxundo[txIndex].vprevout, forming the static UTXO
++        // dependency snapshot for Pass 2 parallel script verification.
+         SpendCoins(view, tx, blockundo.vtxundo.at(txIndex), pindex->nHeight);
+         txIndex++;
+     }
+@@ -2506,15 +2675,130 @@ bool Chainstate::ConnectBlock(const CBlock &block, BlockValidationState &state,
+     if (blockFees) {
+         *blockFees = nFees;
+     }
+-    if (control) {
+-        auto parallel_result = control->Complete();
+-        if (parallel_result.has_value() && state.IsValid()) {
+-            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+-                          strprintf("mandatory-script-verify-flag-failed (%s)",
+-                                    ScriptErrorString(parallel_result->first)),
+-                          parallel_result->second);
++
++    // Pass 2: Static UTXO Dependency-Graph Multi-Core Parallel Script &
++    // Batch Schnorr Signature Verification using blockundo.vtxundo[txIndex].
++    if (fScriptChecks && state.IsValid() && !pending_script_txs.empty()) {
++        const size_t n_pending = pending_script_txs.size();
++        const unsigned int hw_threads =
++            std::max(1u, std::thread::hardware_concurrency());
++        const size_t num_workers =
++            (n_pending >= 2)
++                ? std::min<size_t>(n_pending, static_cast<size_t>(hw_threads))
++                : 1;
++        std::vector<std::optional<ParallelTxScriptError>> tx_errors(n_pending);
++        std::vector<int> tx_sigchecks(n_pending, 0);
++        std::vector<lotus::v2::BatchSigCollector> worker_collectors(
++            num_workers);
++        std::atomic<size_t> next_k{0};
++        std::atomic<size_t> min_failed_k{n_pending};
++
++        auto worker_fn = [&](size_t tid) {
++            lotus::v2::BatchSigCollector &local_sigs = worker_collectors[tid];
++            while (true) {
++                const size_t k = next_k.fetch_add(1, std::memory_order_relaxed);
++                if (k >= n_pending ||
++                    k > min_failed_k.load(std::memory_order_relaxed)) {
++                    break;
++                }
++                const size_t t_idx = pending_script_txs[k].tx_index;
++                const CTransaction &tx = *block.vtx[t_idx + 1];
++                const std::vector<Coin> &resolved_inputs =
++                    blockundo.vtxundo[t_idx].vprevout;
++                PrecomputedTransactionData txdata(tx);
++                auto err = VerifyTxScriptsFromResolvedCoins(
++                    tx, resolved_inputs, flags, fCacheResults, txdata,
++                    m_chainman.m_validation_cache.m_signature_cache,
++                    tx_sigchecks[k], nSigChecksTxLimiters[t_idx],
++                    &nSigChecksBlockLimiter, &local_sigs);
++                if (err.has_value()) {
++                    tx_errors[k] = std::move(err);
++                    size_t prev = min_failed_k.load(std::memory_order_relaxed);
++                    while (k < prev &&
++                           !min_failed_k.compare_exchange_weak(
++                               prev, k, std::memory_order_relaxed)) {
++                    }
++                }
++            }
++        };
++
++        ParallelScriptWorkerPool::Instance().Run(num_workers, worker_fn);
++
++        for (size_t k = 0; k < n_pending; ++k) {
++            if (tx_errors[k].has_value()) {
++                if (tx_errors[k]->script_err ==
++                    ScriptError::SIGCHECKS_LIMIT_EXCEEDED) {
++                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
++                                  "too-many-sigchecks",
++                                  tx_errors[k]->debug_message);
++                } else {
++                    state.Invalid(
++                        BlockValidationResult::BLOCK_CONSENSUS,
++                        strprintf("mandatory-script-verify-flag-failed (%s)",
++                                  ScriptErrorString(tx_errors[k]->script_err)),
++                        tx_errors[k]->debug_message);
++                }
++                break;
++            }
++        }
++
++        if (state.IsValid()) {
++            lotus::v2::BatchSigCollector combined_sigs;
++            for (const auto &wc : worker_collectors) {
++                combined_sigs.Merge(wc);
++            }
++            if (!combined_sigs.Empty() && !combined_sigs.VerifyAll()) {
++                for (size_t k = 0; k < n_pending; ++k) {
++                    const size_t t_idx = pending_script_txs[k].tx_index;
++                    const CTransaction &tx = *block.vtx[t_idx + 1];
++                    const std::vector<Coin> &resolved_inputs =
++                        blockundo.vtxundo[t_idx].vprevout;
++                    PrecomputedTransactionData txdata(tx);
++                    int dummy_sigchecks = 0;
++                    TxSigCheckLimiter dummy_tx_limiter =
++                        TxSigCheckLimiter::getDisabled();
++                    TxSigCheckLimiter dummy_block_limiter =
++                        TxSigCheckLimiter::getDisabled();
++                    auto err = VerifyTxScriptsFromResolvedCoins(
++                        tx, resolved_inputs, flags, /*cache_results=*/false,
++                        txdata,
++                        m_chainman.m_validation_cache.m_signature_cache,
++                        dummy_sigchecks, dummy_tx_limiter,
++                        &dummy_block_limiter, /*sig_collector=*/nullptr);
++                    if (err.has_value()) {
++                        state.Invalid(
++                            BlockValidationResult::BLOCK_CONSENSUS,
++                            strprintf(
++                                "mandatory-script-verify-flag-failed (%s)",
++                                ScriptErrorString(err->script_err)),
++                            err->debug_message);
++                        break;
++                    }
++                }
++                if (state.IsValid()) {
++                    state.Invalid(
++                        BlockValidationResult::BLOCK_CONSENSUS,
++                        strprintf("mandatory-script-verify-flag-failed (%s)",
++                                  ScriptErrorString(ScriptError::EVAL_FALSE)),
++                        "Batch signature verification failed");
++                }
++            } else if (fCacheResults) {
++                m_chainman.m_validation_cache.m_signature_cache.SetBatch(
++                    combined_sigs);
++            }
++        }
++
++        if (state.IsValid() && fCacheResults) {
++            for (size_t k = 0; k < n_pending; ++k) {
++                m_chainman.m_validation_cache.m_script_execution_cache.insert(
++                    ScriptCacheElement{pending_script_txs[k].cache_key,
++                                       tx_sigchecks[k]});
++            }
+         }
+     }
++    if (control) {
++        (void)control->Complete();
++    }
+     if (!state.IsValid()) {
+         LogInfo("Block validation error: %s\n", state.ToString());
+         return false;
+diff --git a/src/validation.h b/src/validation.h
+index 3e4f03567b..c9f255cf68 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -540,6 +540,10 @@ std::optional<LockPoints> CalculateLockPointsAtTip(CBlockIndex *tip,
+  */
+ bool CheckSequenceLocksAtTip(CBlockIndex *tip, const LockPoints &lock_points);
+ 
++namespace lotus::v2 {
++class BatchSigCollector;
++} // namespace lotus::v2
++
+ /**
+  * Closure representing one script verification.
+  * Note that this stores references to the spending transaction.
+@@ -559,6 +563,7 @@ private:
+     SignatureCache *m_signature_cache;
+     TxSigCheckLimiter *pTxLimitSigChecks;
+     CheckInputsLimiter *pBlockLimitSigChecks;
++    lotus::v2::BatchSigCollector *m_sig_collector{nullptr};
+ 
+ public:
+     CScriptCheck(const CTxOut &outIn, const CTransaction &txToIn,
+@@ -566,12 +571,14 @@ public:
+                  uint32_t nFlagsIn, bool cacheIn,
+                  const PrecomputedTransactionData &txdataIn,
+                  TxSigCheckLimiter *pTxLimitSigChecksIn = nullptr,
+-                 CheckInputsLimiter *pBlockLimitSigChecksIn = nullptr)
++                 CheckInputsLimiter *pBlockLimitSigChecksIn = nullptr,
++                 lotus::v2::BatchSigCollector *sigCollectorIn = nullptr)
+         : m_tx_out(outIn), ptxTo(&txToIn), nIn(nInIn), nFlags(nFlagsIn),
+           cacheStore(cacheIn), txdata(txdataIn),
+           m_signature_cache(&signature_cache),
+           pTxLimitSigChecks(pTxLimitSigChecksIn),
+-          pBlockLimitSigChecks(pBlockLimitSigChecksIn) {}
++          pBlockLimitSigChecks(pBlockLimitSigChecksIn),
++          m_sig_collector(sigCollectorIn) {}
+ 
+     CScriptCheck(const CScriptCheck &) = delete;
+     CScriptCheck &operator=(const CScriptCheck &) = delete;

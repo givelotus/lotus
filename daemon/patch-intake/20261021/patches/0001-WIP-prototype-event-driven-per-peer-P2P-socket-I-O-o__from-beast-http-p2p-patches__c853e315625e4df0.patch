@@ -1,0 +1,1106 @@
+From 9909abbd96861e50f4910cdcbdea0f82d3a9b9f0 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@gmail.com>
+Date: Mon, 19 Oct 2026 00:42:20 -0700
+Subject: [PATCH 1/2] WIP/prototype: event-driven per-peer P2P socket I/O on an
+ asio strand
+
+Prototype, not merge-ready. A small io_context thread pool (-p2piothreads,
+default 2, 0 = poll loop only) watches each peer's native descriptor on a
+per-peer strand. Receive (recv, TLS, WebSocket deframing, zstd,
+deserialization into the process queue) and send-queue flushing run on the
+peer's strand as soon as the socket is ready, instead of after the socket
+thread's next poll (up to 50 ms for peers added while it sleeps). Message
+processing is unchanged and stays on the message handler thread, one
+message per peer at a time.
+
+The socket thread keeps listening sockets, peers without a real descriptor
+(test mocks), disconnection, inactivity checks and inflight throttling.
+Readiness waits are armed only after an operation would block, as Asio's
+reactors are edge-triggered. NodeIo holds a CNode reference and a Sock
+reference until the descriptor is deregistered, so neither the CNode nor
+the descriptor number can be released while a handler may run.
+---
+ src/CMakeLists.txt     |   1 +
+ src/init.cpp           |   9 ++
+ src/net.cpp            | 195 ++++++++++++++++++------
+ src/net.h              |  39 +++++
+ src/net_eventio.cpp    | 336 +++++++++++++++++++++++++++++++++++++++++
+ src/net_eventio.h      |  78 ++++++++++
+ src/test/net_tests.cpp | 171 +++++++++++++++++++++
+ src/test/util/net.h    |  13 ++
+ src/util/sock.h        |   6 +
+ 9 files changed, 803 insertions(+), 45 deletions(-)
+ create mode 100644 src/net_eventio.cpp
+ create mode 100644 src/net_eventio.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index e969b3cc35..37b2f4ac61 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -654,6 +654,7 @@ add_library(server
+ 	mempool_args.cpp
+ 	minerfund.cpp
+ 	net.cpp
++	net_eventio.cpp
+ 	net_processing.cpp
+ 	net_websocket.cpp
+ 	net_websocket_codec.cpp
+diff --git a/src/init.cpp b/src/init.cpp
+index 78732bb05b..d98cc3098f 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -1083,6 +1083,13 @@ void SetupServerArgs(NodeContext &node) {
+                   "the specified value (default: %u)",
+                   DEFAULT_MAX_PEER_CONNECTIONS),
+         ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
++    argsman.AddArg(
++        "-p2piothreads=<n>",
++        strprintf("PROTOTYPE: threads running event-driven P2P socket I/O; "
++                  "0 keeps the poll loop for every peer (default: %d)",
++                  DEFAULT_P2P_IO_THREADS),
++        ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY,
++        OptionsCategory::CONNECTION);
+     argsman.AddArg("-maxreceivebuffer=<n>",
+                    strprintf("Maximum per-connection receive buffer, <n>*1000 "
+                              "bytes (default: %u)",
+@@ -3305,6 +3312,8 @@ bool AppInitMain(Config &config, RPCServer &rpcServer,
+         1000 * args.GetIntArg("-maxsendbuffer", DEFAULT_MAXSENDBUFFER);
+     connOptions.nReceiveFloodSize =
+         1000 * args.GetIntArg("-maxreceivebuffer", DEFAULT_MAXRECEIVEBUFFER);
++    connOptions.m_p2p_io_threads = std::clamp<int64_t>(
++        args.GetIntArg("-p2piothreads", DEFAULT_P2P_IO_THREADS), 0, 64);
+     connOptions.m_added_nodes = args.GetArgs("-addnode");
+ 
+     connOptions.nMaxOutboundLimit =
+diff --git a/src/net.cpp b/src/net.cpp
+index c5827c694b..aa6e398ed3 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -620,6 +620,11 @@ void CNode::CloseSocketDisconnect() {
+         m_sock.reset();
+     }
+     m_i2p_sam_session.reset();
++    if (m_io) {
++        // Deregisters the descriptor, then drops the event loop's Sock and
++        // CNode references (asynchronously, on the peer's strand).
++        m_io->Close();
++    }
+ }
+ 
+ void CConnman::AddWhitelistPermissionFlags(
+@@ -726,6 +731,10 @@ void CNode::pauseRecv(bool pause) {
+         m_last_recv = std::chrono::duration_cast<std::chrono::seconds>(time);
+         m_last_msg_start =
+             std::chrono::duration_cast<std::chrono::seconds>(time);
++        if (m_io) {
++            // The event loop stopped reading while paused.
++            m_io->RequestRead();
++        }
+     }
+ }
+ 
+@@ -1490,6 +1499,7 @@ void CConnman::CreateNodeFromAcceptedSocket(
+              addr.ToStringAddrPort(),
+              pnode->m_websocket_info ? " (WebSocket)" : "");
+ 
++    AttachNodeIo(*pnode);
+     {
+         LOCK(m_nodes_mutex);
+         m_nodes.push_back(pnode);
+@@ -1700,9 +1710,16 @@ Sock::EventsPerSock CConnman::GenerateWaitSockets(Span<CNode *const> nodes) {
+         // Stop receiving if the peer is paused, or if we have enough inflight
+         // data to process already in wich case we limit to outbounds and up to
+         // 3 inbounds.
+-        bool select_recv = !pnode->fPauseRecv &&
+-                           (!inflight_throttle || !pnode->IsInboundConn() ||
+-                            inbound_candidates <= 3);
++        const bool throttled{inflight_throttle && pnode->IsInboundConn() &&
++                             inbound_candidates > 3};
++        if (pnode->m_io) {
++            // Serviced by the event loop; only maintain throttling here.
++            if (pnode->m_io_recv_throttled.exchange(throttled) && !throttled) {
++                pnode->m_io->RequestRead();
++            }
++            continue;
++        }
++        bool select_recv = !pnode->fPauseRecv && !throttled;
+         bool select_send =
+             WITH_LOCK(pnode->cs_vSend, return !pnode->vSendMsg.empty());
+ 
+@@ -1833,47 +1850,8 @@ void CConnman::SocketHandlerConnected(
+         }
+ 
+         if (recvSet || errorSet) {
+-            // typical socket buffer is 8K-64K
+-            uint8_t pchBuf[0x10000];
+-            int32_t nBytes = 0;
+-            {
+-                LOCK(pnode->m_sock_mutex);
+-                if (!pnode->m_sock) {
+-                    continue;
+-                }
+-                nBytes =
+-                    pnode->m_sock->Recv(pchBuf, sizeof(pchBuf), MSG_DONTWAIT);
+-            }
+-            if (nBytes > 0) {
+-                bool notify = false;
+-                if (!pnode->ReceiveMsgBytes(*config, {pchBuf, (size_t)nBytes},
+-                                            notify)) {
+-                    pnode->CloseSocketDisconnect();
+-                }
+-                RecordBytesRecv(nBytes);
+-                if (notify) {
+-                    pnode->MarkReceivedMsgsForProcessing();
+-                    WakeMessageHandler();
+-                }
+-            } else if (nBytes == 0) {
+-                // socket closed gracefully
+-                if (!pnode->fDisconnect) {
+-                    LogDebug(BCLog::NET, "socket closed for peer=%d\n",
+-                             pnode->GetId());
+-                }
+-                pnode->CloseSocketDisconnect();
+-            } else if (nBytes < 0) {
+-                // error
+-                int nErr = WSAGetLastError();
+-                if (nErr != WSAEWOULDBLOCK && nErr != WSAEMSGSIZE &&
+-                    nErr != WSAEINTR && nErr != WSAEINPROGRESS) {
+-                    if (!pnode->fDisconnect) {
+-                        LogDebug(BCLog::NET,
+-                                 "socket recv error for peer=%d: %s\n",
+-                                 pnode->GetId(), NetworkErrorString(nErr));
+-                    }
+-                    pnode->CloseSocketDisconnect();
+-                }
++            if (IoRecvOnce(*pnode) == IoRecvResult::CLOSED) {
++                continue;
+             }
+         }
+ 
+@@ -1893,6 +1871,113 @@ void CConnman::SocketHandlerConnected(
+     }
+ }
+ 
++CConnman::IoRecvResult CConnman::IoRecvOnce(CNode &node) {
++    // typical socket buffer is 8K-64K
++    uint8_t pchBuf[0x10000];
++    int32_t nBytes = 0;
++    int nErr = 0;
++    {
++        LOCK(node.m_sock_mutex);
++        if (!node.m_sock) {
++            return IoRecvResult::CLOSED;
++        }
++        nBytes = node.m_sock->Recv(pchBuf, sizeof(pchBuf), MSG_DONTWAIT);
++        if (nBytes < 0) {
++            nErr = WSAGetLastError();
++        }
++    }
++    if (nBytes > 0) {
++        bool notify = false;
++        if (!node.ReceiveMsgBytes(*config, {pchBuf, (size_t)nBytes}, notify)) {
++            node.CloseSocketDisconnect();
++        }
++        RecordBytesRecv(nBytes);
++        if (notify) {
++            node.MarkReceivedMsgsForProcessing();
++            WakeMessageHandler();
++        }
++        return node.fDisconnect ? IoRecvResult::CLOSED : IoRecvResult::DATA;
++    }
++    if (nBytes == 0) {
++        // socket closed gracefully
++        if (!node.fDisconnect) {
++            LogDebug(BCLog::NET, "socket closed for peer=%d\n", node.GetId());
++        }
++        node.CloseSocketDisconnect();
++        return IoRecvResult::CLOSED;
++    }
++    // error
++    if (nErr != WSAEWOULDBLOCK && nErr != WSAEMSGSIZE && nErr != WSAEINTR &&
++        nErr != WSAEINPROGRESS) {
++        if (!node.fDisconnect) {
++            LogDebug(BCLog::NET, "socket recv error for peer=%d: %s\n",
++                     node.GetId(), NetworkErrorString(nErr));
++        }
++        node.CloseSocketDisconnect();
++        return IoRecvResult::CLOSED;
++    }
++    return IoRecvResult::WOULD_BLOCK;
++}
++
++bool CConnman::IoWantRecv(const CNode &node) const {
++    return !node.fPauseRecv && !node.m_io_recv_throttled && !node.fDisconnect;
++}
++
++bool CConnman::IoWantSend(CNode &node) {
++    if (WITH_LOCK(node.cs_vSend, return !node.vSendMsg.empty())) {
++        return true;
++    }
++    LOCK(node.m_sock_mutex);
++    return node.m_sock && (node.m_sock->PendingEvents() & Sock::SEND);
++}
++
++bool CConnman::IoFlushPending(CNode &node) {
++    bool ok{true};
++    {
++        LOCK(node.m_sock_mutex);
++        if (!node.m_sock) {
++            return false;
++        }
++        if (node.m_sock->PendingEvents()) {
++            ok = node.m_sock->FlushPending();
++        }
++    }
++    if (!ok) {
++        node.CloseSocketDisconnect();
++    }
++    return ok;
++}
++
++std::pair<size_t, bool> CConnman::IoSend(CNode &node) {
++    if (!IoFlushPending(node)) {
++        return {0, false};
++    }
++    auto [bytes_sent, data_left] =
++        WITH_LOCK(node.cs_vSend, return SocketSendData(node));
++    if (bytes_sent) {
++        RecordBytesSent(bytes_sent);
++    }
++    if (!data_left) {
++        LOCK(node.m_sock_mutex);
++        data_left = node.m_sock && (node.m_sock->PendingEvents() & Sock::SEND);
++    }
++    return {bytes_sent, data_left};
++}
++
++void CConnman::AttachNodeIo(CNode &node) {
++    if (!m_event_loop) {
++        return;
++    }
++    std::shared_ptr<Sock> sock{WITH_LOCK(node.m_sock_mutex, return node.m_sock)};
++    if (!sock) {
++        return;
++    }
++    node.m_io = NodeIo::Attach(*m_event_loop, *this, node, std::move(sock));
++    if (node.m_io) {
++        node.m_io->Start();
++    }
++}
++
+ void CConnman::SocketHandlerListening(
+     const Sock::EventsPerSock &events_per_sock) {
+     for (const ListenSocket &listen_socket : vhListenSocket) {
+@@ -2659,6 +2744,7 @@ void CConnman::OpenNetworkConnection(const CAddress &addrConnect,
+                 for (auto interface : m_msgproc) {
+                     interface->InitializeNode(*config, *pnode, nLocalServices);
+                 }
++                AttachNodeIo(*pnode);
+                 LOCK(m_nodes_mutex);
+                 m_nodes.push_back(pnode);
+             } else if (pnode) {
+@@ -3068,6 +3154,12 @@ bool CConnman::Start(CScheduler &scheduler, const Options &connOptions) {
+         fMsgProcWake = false;
+     }
+ 
++    // PROTOTYPE: event-driven per-peer socket I/O
++    if (m_p2p_io_threads > 0) {
++        m_event_loop = std::make_unique<P2PEventLoop>(m_p2p_io_threads);
++        m_event_loop->Start();
++    }
++
+     // Send and receive from sockets, accept connections
+     threadSocketHandler = std::thread(&util::TraceThread, "net",
+                                       [this] { ThreadSocketHandler(); });
+@@ -3181,6 +3273,10 @@ void CConnman::StopThreads() {
+     if (threadSocketHandler.joinable()) {
+         threadSocketHandler.join();
+     }
++    // After this no event handler runs; StopNodes() may delete nodes.
++    if (m_event_loop) {
++        m_event_loop->Stop();
++    }
+ }
+ 
+ void CConnman::StopNodes() {
+@@ -3622,6 +3718,8 @@ void CConnman::PushMessage(CNode *pnode, CSerializedNetMsg &&msg) {
+     size_t nTotalSize = nMessageSize + serializedHeader.size();
+ 
+     size_t nBytesSent = 0;
++    // Non-optimistic: the queue was already being flushed.
++    bool data_left{true};
+     {
+         LOCK(pnode->cs_vSend);
+         bool optimisticSend(pnode->vSendMsg.empty());
+@@ -3639,7 +3737,6 @@ void CConnman::PushMessage(CNode *pnode, CSerializedNetMsg &&msg) {
+         }
+ 
+         // If write queue empty, attempt "optimistic write"
+-        bool data_left;
+         if (optimisticSend) {
+             std::tie(nBytesSent, data_left) = SocketSendData(*pnode);
+         }
+@@ -3647,6 +3744,14 @@ void CConnman::PushMessage(CNode *pnode, CSerializedNetMsg &&msg) {
+     if (nBytesSent) {
+         RecordBytesSent(nBytesSent);
+     }
++    if (pnode->m_io &&
++        (data_left || WITH_LOCK(pnode->m_sock_mutex,
++                                return pnode->m_sock &&
++                                       pnode->m_sock->PendingEvents()))) {
++        // Socket buffer full or a write already pending: flush from the
++        // event loop when the socket is writable.
++        pnode->m_io->RequestWrite();
++    }
+ }
+ 
+ bool CConnman::ForNode(NodeId id, std::function<bool(CNode *pnode)> func) {
+diff --git a/src/net.h b/src/net.h
+index 3a40caae57..008ec65ef6 100644
+--- a/src/net.h
++++ b/src/net.h
+@@ -18,6 +18,7 @@
+ #include <i2p.h>
+ #include <kernel/cs_main.h>
+ #include <logging.h>
++#include <net_eventio.h>
+ #include <net_permissions.h>
+ #include <net_websocket.h>
+ #include <netaddress.h>
+@@ -106,6 +107,8 @@ static const int NUM_FDS_MESSAGE_CAPTURE = 1;
+ static const bool DEFAULT_FORCEDNSSEED = false;
+ static const bool DEFAULT_DNSSEED = true;
+ static const bool DEFAULT_FIXEDSEEDS = true;
++/** PROTOTYPE: default number of event-driven P2P I/O threads */
++static constexpr int DEFAULT_P2P_IO_THREADS{2};
+ static const size_t DEFAULT_MAXRECEIVEBUFFER = 5 * 1000;
+ static const size_t DEFAULT_MAXSENDBUFFER = 1 * 1000;
+ static const size_t DEFAULT_MAXINFLIGHTBUFFER = 1 * 1000 * 1000;
+@@ -471,6 +474,16 @@ public:
+     std::atomic_bool fPauseRecv{false};
+     std::atomic_bool fPauseSend{false};
+ 
++    /**
++     * PROTOTYPE event-driven I/O (net_eventio.h). Set once before the node
++     * is published in m_nodes, never changed afterwards; null when the peer
++     * is serviced by the poll loop (mocked sockets, Windows, disabled).
++     */
++    std::shared_ptr<NodeIo> m_io;
++    //! Inflight throttling for event-driven peers, maintained by the socket
++    //! thread like the poll loop's select_recv.
++    std::atomic_bool m_io_recv_throttled{false};
++
+     const ConnectionType m_conn_type;
+ 
+     /**
+@@ -861,6 +874,8 @@ public:
+         BanMan *m_banman = nullptr;
+         unsigned int nSendBufferMaxSize = 0;
+         unsigned int nReceiveFloodSize = 0;
++        //! PROTOTYPE: event-driven socket I/O threads (0: poll loop only)
++        int m_p2p_io_threads = 0;
+         uint64_t nMaxOutboundLimit = 0;
+         int64_t m_peer_connect_timeout = DEFAULT_PEER_CONNECT_TIMEOUT;
+         std::vector<std::string> vSeedNodes;
+@@ -909,6 +924,7 @@ public:
+         m_msgproc = connOptions.m_msgproc;
+         nSendBufferMaxSize = connOptions.nSendBufferMaxSize;
+         nReceiveFloodSize = connOptions.nReceiveFloodSize;
++        m_p2p_io_threads = connOptions.m_p2p_io_threads;
+         m_peer_connect_timeout =
+             std::chrono::seconds{connOptions.m_peer_connect_timeout};
+         {
+@@ -942,6 +958,9 @@ public:
+     void Stop() {
+         StopThreads();
+         StopNodes();
++        // Pending event-loop handlers may still reference NodeIo objects;
++        // their descriptors are deregistered here.
++        m_event_loop.reset();
+     };
+ 
+     void Interrupt() EXCLUSIVE_LOCKS_REQUIRED(!mutexMsgProc);
+@@ -1285,6 +1304,26 @@ private:
+ 
+     unsigned int nSendBufferMaxSize{0};
+     unsigned int nReceiveFloodSize{0};
++    int m_p2p_io_threads{0};
++    std::unique_ptr<P2PEventLoop> m_event_loop;
++
++    // PROTOTYPE event-driven I/O entry points, used by NodeIo on the peer's
++    // strand (net_eventio.cpp). Same locking as the poll loop.
++    friend class NodeIoImpl;
++    enum class IoRecvResult { DATA, WOULD_BLOCK, CLOSED };
++    /** One recv() into the peer's deserializer (the poll loop's receive). */
++    IoRecvResult IoRecvOnce(CNode &node) EXCLUSIVE_LOCKS_REQUIRED(!mutexMsgProc);
++    /** Whether the peer may read now (fPauseRecv, inflight throttling). */
++    bool IoWantRecv(const CNode &node) const;
++    /** Whether vSendMsg or the socket's own buffer holds unsent data. */
++    bool IoWantSend(CNode &node) EXCLUSIVE_LOCKS_REQUIRED(!node.cs_vSend);
++    /** Flush socket-internal pending data; false if the peer was closed. */
++    bool IoFlushPending(CNode &node);
++    /** Flush pending data and the send queue: {bytes sent, data left}. */
++    std::pair<size_t, bool> IoSend(CNode &node)
++        EXCLUSIVE_LOCKS_REQUIRED(!node.cs_vSend);
++    /** Give a new node to the event loop (before it is published). */
++    void AttachNodeIo(CNode &node);
+ 
+     std::vector<ListenSocket> vhListenSocket;
+     std::atomic<bool> fNetworkActive{true};
+diff --git a/src/net_eventio.cpp b/src/net_eventio.cpp
+new file mode 100644
+index 0000000000..0ef974a4d9
+--- /dev/null
++++ b/src/net_eventio.cpp
+@@ -0,0 +1,336 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <net_eventio.h>
++
++#include <logging.h>
++#include <net.h>
++#include <sync.h>
++#include <tinyformat.h>
++#include <util/sock.h>
++#include <util/thread.h>
++#include <util/threadnames.h>
++
++#include <boost/asio/bind_executor.hpp>
++#include <boost/asio/executor_work_guard.hpp>
++#include <boost/asio/io_context.hpp>
++#include <boost/asio/post.hpp>
++#include <boost/asio/strand.hpp>
++#if defined(BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR) && !defined(WIN32)
++#include <boost/asio/posix/stream_descriptor.hpp>
++#define P2P_EVENTIO_SUPPORTED 1
++#endif
++
++#include <atomic>
++#include <optional>
++#include <thread>
++#include <vector>
++
++namespace asio = boost::asio;
++
++class NodeIoImpl;
++
++struct P2PEventLoop::Impl {
++    explicit Impl(int threads) : m_threads{std::max(1, threads)} {}
++
++    const int m_threads;
++    asio::io_context m_io;
++    std::optional<asio::executor_work_guard<asio::io_context::executor_type>>
++        m_work;
++    std::vector<std::thread> m_thread_handles;
++
++    Mutex m_registry_mutex;
++    //! Every NodeIo created on this loop, to deregister descriptors before
++    //! the io_context is destroyed.
++    std::vector<std::weak_ptr<NodeIoImpl>>
++        m_registry GUARDED_BY(m_registry_mutex);
++};
++
++#ifdef P2P_EVENTIO_SUPPORTED
++
++/**
++ * Readiness is edge-like on both kqueue (EV_CLEAR) and epoll (EPOLLET) in
++ * Asio's reactors: a wait only completes on a new readiness transition. So
++ * the rule throughout is "try first, wait only after EAGAIN": whenever a
++ * peer becomes eligible for reading or writing again, attempt the
++ * operation; only arm async_wait once the operation would block.
++ */
++class NodeIoImpl final : public NodeIo,
++                         public std::enable_shared_from_this<NodeIoImpl> {
++public:
++    NodeIoImpl(asio::io_context &io, CConnman &connman, CNode &node,
++               std::shared_ptr<Sock> sock)
++        : m_connman{connman}, m_node{node}, m_strand{asio::make_strand(io)},
++          m_desc{io}, m_sock{std::move(sock)} {}
++
++    ~NodeIoImpl() override { Deregister(); }
++
++    bool Assign() {
++        boost::system::error_code ec;
++        m_desc.assign(m_sock->NativeHandle(), ec);
++        return !ec;
++    }
++
++    void Start() override {
++        asio::post(m_strand, [self = shared_from_this()] {
++            self->TryRead();
++            self->TryWrite();
++        });
++    }
++
++    void RequestRead() override {
++        if (m_read_requested.exchange(true)) {
++            return;
++        }
++        asio::post(m_strand, [self = shared_from_this()] {
++            self->m_read_requested = false;
++            self->TryRead();
++        });
++    }
++
++    void RequestWrite() override {
++        if (m_write_requested.exchange(true)) {
++            return;
++        }
++        asio::post(m_strand, [self = shared_from_this()] {
++            self->m_write_requested = false;
++            self->TryWrite();
++        });
++    }
++
++    void Close() override {
++        if (m_close_requested.exchange(true)) {
++            return;
++        }
++        // Always deferred (never inline), so a handler that triggered the
++        // close finishes before the CNode reference is dropped.
++        asio::post(m_strand, [self = shared_from_this()] { self->DoClose(); });
++    }
++
++    //! Only once no handler can run (loop stopped) or on the strand.
++    void Deregister() {
++        if (m_desc.is_open()) {
++            boost::system::error_code ec;
++            m_desc.cancel(ec);
++            (void)m_desc.release();
++        }
++        m_sock.reset();
++    }
++
++private:
++    // All members below are only touched on m_strand (or after the loop
++    // stopped), except the atomics.
++    void DoClose() {
++        if (m_closed) {
++            return;
++        }
++        m_closed = true;
++        // Deregister before the descriptor can be closed (we hold the last
++        // or one of the last Sock references), so a reused descriptor
++        // number is never confused with this one.
++        Deregister();
++        m_node.Release();
++    }
++
++    /** Read until EAGAIN (or a budget / pause), then wait for readability */
++    void TryRead() {
++        if (m_closed || m_read_waiting || m_read_scheduled) {
++            return;
++        }
++        const bool want_read{m_connman.IoWantRecv(m_node)};
++        // Socket-internal pending output waiting for RECV (TLS) must make
++        // progress even while paused.
++        const bool flush_on_recv{(m_sock->PendingEvents() & Sock::RECV) != 0};
++        if (!want_read && !flush_on_recv) {
++            return;
++        }
++        if (flush_on_recv && !m_connman.IoFlushPending(m_node)) {
++            return;
++        }
++        if (want_read) {
++            // Bounded batch per handler run so that peers sharing threads
++            // are serviced fairly.
++            for (int i = 0; i < 16; ++i) {
++                const auto res{m_connman.IoRecvOnce(m_node)};
++                if (res == CConnman::IoRecvResult::CLOSED) {
++                    return;
++                }
++                if (res == CConnman::IoRecvResult::WOULD_BLOCK) {
++                    ArmReadWait();
++                    TryWrite();
++                    return;
++                }
++                if (!m_connman.IoWantRecv(m_node)) {
++                    // Paused (flood protection) or throttled: the bytes stay
++                    // in the kernel; RequestRead() resumes with a read.
++                    TryWrite();
++                    return;
++                }
++            }
++            // Budget exhausted with data possibly left: continue later.
++            m_read_scheduled = true;
++            asio::post(m_strand, [self = shared_from_this()] {
++                self->m_read_scheduled = false;
++                self->TryRead();
++            });
++            TryWrite();
++            return;
++        }
++        ArmReadWait();
++    }
++
++    void ArmReadWait() {
++        if (m_closed || m_read_waiting) {
++            return;
++        }
++        m_read_waiting = true;
++        m_desc.async_wait(
++            asio::posix::stream_descriptor::wait_read,
++            asio::bind_executor(m_strand,
++                                [self = shared_from_this()](
++                                    const boost::system::error_code &ec) {
++                                    self->m_read_waiting = false;
++                                    if (ec == asio::error::operation_aborted ||
++                                        self->m_closed) {
++                                        return;
++                                    }
++                                    // On other errors let recv() report it.
++                                    self->TryRead();
++                                }));
++    }
++
++    void TryWrite() {
++        if (m_closed || m_write_waiting) {
++            return;
++        }
++        if (!m_connman.IoWantSend(m_node)) {
++            return;
++        }
++        const auto [bytes_sent, data_left] = m_connman.IoSend(m_node);
++        if (m_closed) {
++            return;
++        }
++        // Unlike the poll loop, reading is not skipped after a partial send:
++        // there it only deferred the read by one iteration (the socket is
++        // then not writable), and holding it off until the queue drains
++        // deadlocks two peers sending each other large messages
++        // (p2p_net_deadlock.py). A slow reader is still throttled: with
++        // fPauseSend set its messages are not processed, so its receive
++        // queue fills and fPauseRecv stops reading.
++        (void)bytes_sent;
++        if (data_left) {
++            m_write_waiting = true;
++            m_desc.async_wait(
++                asio::posix::stream_descriptor::wait_write,
++                asio::bind_executor(m_strand,
++                                    [self = shared_from_this()](
++                                        const boost::system::error_code &ec) {
++                                        self->m_write_waiting = false;
++                                        if (ec ==
++                                                asio::error::operation_aborted ||
++                                            self->m_closed) {
++                                            return;
++                                        }
++                                        self->TryWrite();
++                                    }));
++        }
++    }
++
++    CConnman &m_connman;
++    CNode &m_node;
++    asio::strand<asio::io_context::executor_type> m_strand;
++    asio::posix::stream_descriptor m_desc;
++    //! Keeps the descriptor open until it is deregistered.
++    std::shared_ptr<Sock> m_sock;
++
++    bool m_closed{false};
++    bool m_read_waiting{false};
++    bool m_read_scheduled{false};
++    bool m_write_waiting{false};
++
++    std::atomic<bool> m_read_requested{false};
++    std::atomic<bool> m_write_requested{false};
++    std::atomic<bool> m_close_requested{false};
++};
++
++std::shared_ptr<NodeIo> NodeIo::Attach(P2PEventLoop &loop, CConnman &connman,
++                                       CNode &node,
++                                       std::shared_ptr<Sock> sock) {
++    if (!sock || sock->NativeHandle() == INVALID_SOCKET) {
++        return nullptr;
++    }
++    auto &impl{loop.GetImpl()};
++    auto io{
++        std::make_shared<NodeIoImpl>(impl.m_io, connman, node, std::move(sock))};
++    if (!io->Assign()) {
++        LogDebug(BCLog::NET,
++                 "event I/O unavailable for peer=%d, using the poll loop\n",
++                 node.GetId());
++        return nullptr;
++    }
++    // Released by DoClose() once the descriptor is deregistered.
++    node.AddRef();
++    {
++        LOCK(impl.m_registry_mutex);
++        // Drop expired entries now and then.
++        if (impl.m_registry.size() > 64) {
++            std::erase_if(impl.m_registry,
++                          [](const auto &w) { return w.expired(); });
++        }
++        impl.m_registry.push_back(io);
++    }
++    return io;
++}
++
++#else // P2P_EVENTIO_SUPPORTED
++
++std::shared_ptr<NodeIo> NodeIo::Attach(P2PEventLoop &, CConnman &, CNode &,
++                                       std::shared_ptr<Sock>) {
++    return nullptr;
++}
++
++#endif // P2P_EVENTIO_SUPPORTED
++
++P2PEventLoop::P2PEventLoop(int threads)
++    : m_impl{std::make_unique<Impl>(threads)} {}
++
++P2PEventLoop::~P2PEventLoop() {
++    Stop();
++#ifdef P2P_EVENTIO_SUPPORTED
++    // No handler runs any more. Deregister every descriptor while the
++    // reactor is still alive, before pending handlers (holding NodeIo
++    // references) are destroyed with the io_context.
++    std::vector<std::weak_ptr<NodeIoImpl>> registry;
++    WITH_LOCK(m_impl->m_registry_mutex, registry.swap(m_impl->m_registry));
++    for (const auto &weak : registry) {
++        if (auto io{weak.lock()}) {
++            io->Deregister();
++        }
++    }
++#endif
++}
++
++void P2PEventLoop::Start() {
++    auto &impl{*m_impl};
++    impl.m_io.restart();
++    impl.m_work.emplace(impl.m_io.get_executor());
++    for (int i = 0; i < impl.m_threads; ++i) {
++        impl.m_thread_handles.emplace_back(
++            &util::TraceThread, strprintf("p2pio.%d", i), [&impl] {
++                impl.m_io.run();
++            });
++    }
++}
++
++void P2PEventLoop::Stop() {
++    auto &impl{*m_impl};
++    impl.m_work.reset();
++    impl.m_io.stop();
++    for (auto &t : impl.m_thread_handles) {
++        if (t.joinable()) {
++            t.join();
++        }
++    }
++    impl.m_thread_handles.clear();
++}
+diff --git a/src/net_eventio.h b/src/net_eventio.h
+new file mode 100644
+index 0000000000..b04e63cc16
+--- /dev/null
++++ b/src/net_eventio.h
+@@ -0,0 +1,78 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_NET_EVENTIO_H
++#define BITCOIN_NET_EVENTIO_H
++
++#include <memory>
++
++class CConnman;
++class CNode;
++class Sock;
++
++/**
++ * PROTOTYPE: event-driven socket I/O for CConnman.
++ *
++ * A small pool of threads runs a Boost.Asio io_context. Each attached peer
++ * gets one strand and a readiness watch on its native socket descriptor.
++ * Readiness handlers run on the peer's strand, so all byte-level work for
++ * one peer (recv, TLS, WebSocket deframing, decompression, P2P message
++ * deserialization into vRecvMsg/m_msg_process_queue, flushing the send
++ * queue) is serialized per peer while different peers proceed in parallel.
++ *
++ * Message *processing* is untouched: it stays on ThreadMessageHandler,
++ * which is woken exactly as before. CConnman's socket thread keeps the
++ * listening sockets, peers whose Sock has no real descriptor (unit/fuzz
++ * test mocks), disconnection, inactivity checks and inflight throttling.
++ */
++class P2PEventLoop {
++public:
++    explicit P2PEventLoop(int threads);
++    ~P2PEventLoop();
++
++    P2PEventLoop(const P2PEventLoop &) = delete;
++    P2PEventLoop &operator=(const P2PEventLoop &) = delete;
++
++    void Start();
++    /** Stop running handlers and join the threads. No handler runs after
++     * this returns; pending ones are destroyed with the loop. */
++    void Stop();
++
++    struct Impl;
++    Impl &GetImpl() { return *m_impl; }
++
++private:
++    std::unique_ptr<Impl> m_impl;
++};
++
++/**
++ * Per-peer event-driven I/O state. Created by CConnman for peers whose
++ * socket has a native descriptor; owned by the CNode (m_io) and by pending
++ * handlers. Holds a reference on the CNode until Close() has deregistered
++ * the descriptor, so DisconnectNodes() cannot delete the CNode while a
++ * handler may still run.
++ */
++class NodeIo {
++public:
++    /** Returns nullptr if the descriptor cannot be watched (e.g. a mock). */
++    static std::shared_ptr<NodeIo> Attach(P2PEventLoop &loop,
++                                          CConnman &connman, CNode &node,
++                                          std::shared_ptr<Sock> sock);
++    virtual ~NodeIo() = default;
++
++    /** Thread-safe: (re)consider waiting for readability, e.g. after
++     * fPauseRecv was cleared or inflight throttling ended. */
++    virtual void RequestRead() = 0;
++    /** Thread-safe: the send queue or the socket's own pending data needs
++     * flushing when the socket becomes writable. */
++    virtual void RequestWrite() = 0;
++    /** Thread-safe, idempotent: stop watching the descriptor, drop the
++     * socket reference and the CNode reference (asynchronously, on the
++     * strand). Called from CNode::CloseSocketDisconnect(). */
++    virtual void Close() = 0;
++    /** Start the first read wait. */
++    virtual void Start() = 0;
++};
++
++#endif // BITCOIN_NET_EVENTIO_H
+diff --git a/src/test/net_tests.cpp b/src/test/net_tests.cpp
+index 9edf791521..cc41a7e04c 100644
+--- a/src/test/net_tests.cpp
++++ b/src/test/net_tests.cpp
+@@ -46,6 +46,7 @@
+ #include <functional>
+ #include <ios>
+ #include <memory>
++#include <thread>
+ #include <string>
+ 
+ using namespace std::literals;
+@@ -1975,4 +1976,174 @@ BOOST_AUTO_TEST_CASE(sock_buffered_data_hooks) {
+     close(sv[1]);
+ }
+ 
++namespace {
++template <typename Pred> bool WaitFor(Pred pred) {
++    for (int i = 0; i < 5000; ++i) {
++        if (pred()) {
++            return true;
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds{1});
++    }
++    return pred();
++}
++
++std::vector<uint8_t> SerializeForWire(const Config &config, CNode &node,
++                                      CSerializedNetMsg &&msg) {
++    std::vector<uint8_t> header;
++    node.m_serializer->prepareForTransport(config, msg, header);
++    header.insert(header.end(), msg.data.begin(), msg.data.end());
++    return header;
++}
++
++void WriteAll(int fd, const std::vector<uint8_t> &bytes) {
++    size_t off{0};
++    while (off < bytes.size()) {
++        const ssize_t n{::write(fd, bytes.data() + off, bytes.size() - off)};
++        BOOST_REQUIRE(n > 0);
++        off += n;
++    }
++}
++} // namespace
++
++// PROTOTYPE: a real descriptor serviced by the event loop, without the
++// socket thread: receive, flood-protection pause/resume, send, close.
++BOOST_AUTO_TEST_CASE(eventio_socketpair) {
++    int sv[2];
++    BOOST_REQUIRE_EQUAL(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
++    const Config &config{m_node.chainman->GetConfig()};
++    ConnmanTestMsg connman{config, 0x1337, 0x1337, *m_node.addrman};
++    connman.StartEventLoopForTest(2);
++    auto sock{std::make_shared<Sock>(SOCKET(sv[0]))};
++    BOOST_REQUIRE(sock->SetNonBlocking());
++    CNode *node = new CNode{/*id=*/0,
++                            sock,
++                            CAddress{},
++                            /*nKeyedNetGroupIn=*/0,
++                            /*nLocalHostNonceIn=*/0,
++                            /*nLocalExtraEntropyIn=*/0,
++                            CAddress{},
++                            /*addrNameIn=*/"",
++                            ConnectionType::INBOUND,
++                            /*inbound_onion=*/false,
++                            CNodeOptions{.recv_flood_size = 1}};
++    sock.reset();
++    connman.AttachNodeIoForTest(*node);
++    BOOST_REQUIRE(node->m_io);
++    BOOST_CHECK_EQUAL(node->GetRefCount(), 1);
++
++    // Two pings: with a 1-byte flood limit the first pauses receiving, so
++    // the second stays in the kernel until the first is polled.
++    auto ping1{SerializeForWire(config, *node,
++                                NetMsg::Make(NetMsgType::PING, uint64_t{1}))};
++    auto ping2{SerializeForWire(config, *node,
++                                NetMsg::Make(NetMsgType::PING, uint64_t{2}))};
++    WriteAll(sv[1], ping1);
++    BOOST_REQUIRE(WaitFor([&] { return node->fPauseRecv.load(); }));
++    WriteAll(sv[1], ping2);
++    std::this_thread::sleep_for(std::chrono::milliseconds{50});
++    auto msg{node->PollMessage()};
++    BOOST_REQUIRE(msg);
++    BOOST_CHECK_EQUAL(msg->first.m_type, NetMsgType::PING);
++    // Nothing else had been read while paused.
++    BOOST_CHECK(!msg->second);
++    // Polling unpaused the peer: the event loop resumes reading.
++    std::optional<std::pair<CNetMessage, bool>> msg2;
++    BOOST_REQUIRE(WaitFor([&] {
++        msg2 = node->PollMessage();
++        return msg2.has_value();
++    }));
++    BOOST_CHECK_EQUAL(msg2->first.m_type, NetMsgType::PING);
++
++    // Sending: PushMessage writes optimistically; a large message that
++    // does not fit the socket buffer is finished by the event loop.
++    std::vector<uint8_t> big(4 * 1024 * 1024, 0x42);
++    CSerializedNetMsg big_msg;
++    big_msg.m_type = "big";
++    big_msg.data = big;
++    connman.PushMessage(node, std::move(big_msg));
++    size_t received{0};
++    const size_t expected{big.size() + CMessageHeader::HEADER_SIZE};
++    std::vector<uint8_t> buf(1 << 16);
++    BOOST_REQUIRE(WaitFor([&] {
++        ssize_t n;
++        while ((n = ::recv(sv[1], buf.data(), buf.size(), MSG_DONTWAIT)) >
++               0) {
++            received += n;
++        }
++        return received == expected;
++    }));
++    BOOST_CHECK(WITH_LOCK(node->cs_vSend, return node->vSendMsg.empty()));
++
++    // Disconnect: the descriptor is deregistered and the event loop's node
++    // reference dropped; the peer then sees EOF.
++    node->CloseSocketDisconnect();
++    BOOST_REQUIRE(WaitFor([&] { return node->GetRefCount() == 0; }));
++    BOOST_REQUIRE(WaitFor([&] {
++        return ::recv(sv[1], buf.data(), buf.size(), MSG_DONTWAIT) == 0;
++    }));
++
++    connman.StopEventLoopForTest();
++    delete node;
++    connman.DestroyEventLoopForTest();
++    close(sv[1]);
++}
++
++// PROTOTYPE: a peer that only closes is noticed without the socket thread.
++BOOST_AUTO_TEST_CASE(eventio_peer_eof) {
++    int sv[2];
++    BOOST_REQUIRE_EQUAL(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
++    const Config &config{m_node.chainman->GetConfig()};
++    ConnmanTestMsg connman{config, 0x1337, 0x1337, *m_node.addrman};
++    connman.StartEventLoopForTest(1);
++    auto sock{std::make_shared<Sock>(SOCKET(sv[0]))};
++    BOOST_REQUIRE(sock->SetNonBlocking());
++    CNode *node = new CNode{/*id=*/0,
++                            std::move(sock),
++                            CAddress{},
++                            /*nKeyedNetGroupIn=*/0,
++                            /*nLocalHostNonceIn=*/0,
++                            /*nLocalExtraEntropyIn=*/0,
++                            CAddress{},
++                            /*addrNameIn=*/"",
++                            ConnectionType::INBOUND,
++                            /*inbound_onion=*/false};
++    connman.AttachNodeIoForTest(*node);
++    BOOST_REQUIRE(node->m_io);
++    close(sv[1]);
++    BOOST_REQUIRE(WaitFor([&] { return node->fDisconnect.load(); }));
++    BOOST_REQUIRE(WaitFor([&] { return node->GetRefCount() == 0; }));
++    connman.StopEventLoopForTest();
++    delete node;
++    connman.DestroyEventLoopForTest();
++}
++
++// PROTOTYPE: shutting down with the node still attached (as StopNodes()
++// does after StopThreads()) deregisters cleanly.
++BOOST_AUTO_TEST_CASE(eventio_shutdown_attached) {
++    int sv[2];
++    BOOST_REQUIRE_EQUAL(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
++    const Config &config{m_node.chainman->GetConfig()};
++    ConnmanTestMsg connman{config, 0x1337, 0x1337, *m_node.addrman};
++    connman.StartEventLoopForTest(2);
++    CNode *node = new CNode{/*id=*/0,
++                            std::make_shared<Sock>(SOCKET(sv[0])),
++                            CAddress{},
++                            /*nKeyedNetGroupIn=*/0,
++                            /*nLocalHostNonceIn=*/0,
++                            /*nLocalExtraEntropyIn=*/0,
++                            CAddress{},
++                            /*addrNameIn=*/"",
++                            ConnectionType::INBOUND,
++                            /*inbound_onion=*/false};
++    connman.AttachNodeIoForTest(*node);
++    BOOST_REQUIRE(node->m_io);
++    connman.StopEventLoopForTest();
++    node->CloseSocketDisconnect();
++    delete node;
++    connman.DestroyEventLoopForTest();
++    char c;
++    BOOST_CHECK_EQUAL(::recv(sv[1], &c, 1, 0), 0);
++    close(sv[1]);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/test/util/net.h b/src/test/util/net.h
+index a41222ac20..01eaf47925 100644
+--- a/src/test/util/net.h
++++ b/src/test/util/net.h
+@@ -45,6 +45,19 @@ struct ConnmanTestMsg : public CConnman {
+     }
+     void SocketHandlerForTest() { SocketHandler(); }
+ 
++    // PROTOTYPE event-driven I/O
++    void StartEventLoopForTest(int threads) {
++        m_event_loop = std::make_unique<P2PEventLoop>(threads);
++        m_event_loop->Start();
++    }
++    void StopEventLoopForTest() {
++        if (m_event_loop) {
++            m_event_loop->Stop();
++        }
++    }
++    void DestroyEventLoopForTest() { m_event_loop.reset(); }
++    void AttachNodeIoForTest(CNode &node) { AttachNodeIo(node); }
++
+     void ProcessMessagesOnce(CNode &node)
+         EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
+         for (auto interface : m_msgproc) {
+diff --git a/src/util/sock.h b/src/util/sock.h
+index 59741264c7..66406ee544 100644
+--- a/src/util/sock.h
++++ b/src/util/sock.h
+@@ -150,6 +150,12 @@ public:
+      */
+     [[nodiscard]] virtual bool IsSelectable() const;
+ 
++    /**
++     * The native descriptor, for registering with an event loop (PROTOTYPE,
++     * net_eventio). INVALID_SOCKET for mocks; never close it.
++     */
++    [[nodiscard]] SOCKET NativeHandle() const { return m_socket; }
++
+     using Event = uint8_t;
+ 
+     /**
+-- 
+2.50.1 (Apple Git-155)
+

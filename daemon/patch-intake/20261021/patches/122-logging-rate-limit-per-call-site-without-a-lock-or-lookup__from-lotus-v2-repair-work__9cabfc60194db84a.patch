@@ -1,0 +1,604 @@
+From 0b0ffa81f9703c0ce3c6a5086f4dc51e2b5f34f2 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 01:34:50 -0700
+Subject: [PATCH] logging: rate limit per call site without a lock or lookup
+
+The quota of unconditional logging per source location was kept in an
+unordered_map keyed by std::source_location, behind a mutex: every
+rate-limited log line hashed its file name and took that lock, on
+whatever thread logged (validation, message handling, network).
+
+Each log macro expansion now owns its quota: a constant-initialized
+static (LogSiteLimit) created by the macro itself. Its window, its
+suppressed flag and the bytes left are packed in one atomic word, so a
+check is a load and a compare-and-swap on that site's own cache line;
+concurrent threads on one site let exactly the quota through. A site
+over quota pushes itself on its limiter's lock-free list of suppressed
+sites, which the periodic reset walks to log the "Restarting logging"
+notices, as before. Windows are numbered across limiters, so a site last
+used by another limiter (tests) starts afresh.
+
+Semantics are unchanged: a per-location byte quota per window, counted
+by message length, the "Excessive logging" notice when a site starts
+being suppressed, the "[*]" marker while any is, and a notice of the
+dropped bytes when the window resets. The quota is capped at 16 MiB
+(the default is 1 MiB).
+
+(cherry picked from commit 93dfb0511f17a5dae71b2e953e7d82939a19c374)
+
+N3-Source-Commit: 93dfb0511f17a5dae71b2e953e7d82939a19c374
+N3-Source-Export: 0014
+---
+ src/logging.cpp            | 118 +++++++++++++++++++-------------
+ src/logging.h              | 134 ++++++++++++++++++++-----------------
+ src/test/logging_tests.cpp | 106 ++++++++++++++++-------------
+ 3 files changed, 205 insertions(+), 153 deletions(-)
+
+diff --git a/src/logging.cpp b/src/logging.cpp
+index 9c0032643f..d282fd0312 100644
+--- a/src/logging.cpp
++++ b/src/logging.cpp
+@@ -87,7 +87,7 @@ bool BCLog::Logger::StartLogging() {
+                 "Early logging buffer overflowed, %d log lines discarded.\n",
+                 m_buffer_lines_discarded),
+             std::source_location::current(), BCLog::ALL, Level::Info,
+-            /*should_ratelimit=*/false);
++            /*site=*/nullptr);
+     }
+     while (!m_msgs_before_open.empty()) {
+         const auto &buflog = m_msgs_before_open.front();
+@@ -618,9 +618,15 @@ static size_t MemUsage(const BCLog::Logger::BufferedLog &buflog) {
+                sizeof(memusage::list_node<BCLog::Logger::BufferedLog>));
+ }
+ 
++//! Source of rate limiting windows (epochs), unique across limiters. Sites
++//! start at epoch 0, which no window uses.
++static std::atomic<uint64_t> g_next_ratelimit_epoch{1};
++
+ BCLog::LogRateLimiter::LogRateLimiter(uint64_t max_bytes,
+                                       std::chrono::seconds reset_window)
+-    : m_max_bytes{max_bytes}, m_reset_window{reset_window} {}
++    : m_epoch{g_next_ratelimit_epoch.fetch_add(1)},
++      m_max_bytes{std::min(max_bytes, LogSiteLimit::AVAILABLE_MASK)},
++      m_reset_window{reset_window} {}
+ 
+ std::shared_ptr<BCLog::LogRateLimiter>
+ BCLog::LogRateLimiter::Create(SchedulerFunction &&scheduler_func,
+@@ -639,21 +645,45 @@ BCLog::LogRateLimiter::Create(SchedulerFunction &&scheduler_func,
+     return limiter;
+ }
+ 
+-BCLog::LogRateLimiter::Status
+-BCLog::LogRateLimiter::Consume(const std::source_location &source_loc,
+-                               std::string_view str) {
+-    StdLockGuard scoped_lock(m_mutex);
+-    auto &stats{
+-        m_source_locations.try_emplace(source_loc, m_max_bytes).first->second};
+-    Status status{stats.m_dropped_bytes > 0 ? Status::STILL_SUPPRESSED
+-                                            : Status::UNSUPPRESSED};
+-
+-    if (!stats.Consume(str.size()) && status == Status::UNSUPPRESSED) {
+-        status = Status::NEWLY_SUPPRESSED;
+-        m_suppression_active = true;
++BCLog::LogRateLimiter::Status BCLog::LogRateLimiter::Consume(
++    LogSiteLimit &site, const std::source_location &loc, uint64_t bytes) {
++    constexpr auto relaxed{std::memory_order_relaxed};
++    using S = LogSiteLimit;
++    const uint64_t epoch{m_epoch.load(std::memory_order_acquire)};
++    uint64_t state{site.state.load(relaxed)};
++    while (true) {
++        // A site not used yet in this window (or by this limiter) starts
++        // with the full quota.
++        const bool fresh{state >> S::EPOCH_SHIFT != epoch};
++        if (!fresh && (state & S::SUPPRESSED)) {
++            site.dropped.fetch_add(bytes, relaxed);
++            return Status::STILL_SUPPRESSED;
++        }
++        const uint64_t available{fresh ? m_max_bytes
++                                       : state & S::AVAILABLE_MASK};
++        const bool fits{bytes <= available};
++        const uint64_t next{(epoch << S::EPOCH_SHIFT) |
++                            (fits ? available - bytes : S::SUPPRESSED)};
++        if (!site.state.compare_exchange_weak(state, next, relaxed)) {
++            continue;
++        }
++        if (fits) {
++            return Status::UNSUPPRESSED;
++        }
++        break;
+     }
+-
+-    return status;
++    // This call suppressed the site for the rest of the window.
++    site.dropped.store(bytes, relaxed);
++    if (site.listed_epoch.exchange(epoch, relaxed) != epoch) {
++        site.loc = loc;
++        LogSiteLimit *head{m_suppressed.load(relaxed)};
++        do {
++            site.next = head;
++        } while (!m_suppressed.compare_exchange_weak(
++            head, &site, std::memory_order_release, relaxed));
++    }
++    m_suppression_active = true;
++    return Status::NEWLY_SUPPRESSED;
+ }
+ 
+ void BCLog::Logger::FormatLogStrInPlace(
+@@ -679,16 +709,15 @@ void BCLog::Logger::FormatLogStrInPlace(
+ void BCLog::Logger::LogPrintStr(std::string_view str,
+                                 std::source_location &&source_loc,
+                                 BCLog::LogFlags category, BCLog::Level level,
+-                                bool should_ratelimit) {
++                                LogSiteLimit *site) {
+     StdLockGuard scoped_lock(m_cs);
+-    return LogPrintStr_(str, std::move(source_loc), category, level,
+-                        should_ratelimit);
++    return LogPrintStr_(str, std::move(source_loc), category, level, site);
+ }
+ 
+ void BCLog::Logger::LogPrintStr_(std::string_view str,
+                                  std::source_location &&source_loc,
+                                  BCLog::LogFlags category, BCLog::Level level,
+-                                 bool should_ratelimit) {
++                                 LogSiteLimit *site) {
+     const bool starts_new_line = m_started_new_line;
+     m_started_new_line = !str.empty() && str[str.size() - 1] == '\n';
+ 
+@@ -756,14 +785,14 @@ void BCLog::Logger::LogPrintStr_(std::string_view str,
+                             threadname, now, mocktime);
+     }
+     bool ratelimit{false};
+-    if (should_ratelimit && m_limiter) {
++    if (site && m_limiter) {
+         // The quota counts the message (as passed to the logger, before
+         // any prefix or JSON wrapping), so that a limit means the same in
+         // both formats.
+-        auto status{m_limiter->Consume(source_loc, str)};
++        auto status{m_limiter->Consume(*site, source_loc, str.size())};
+         if (status == LogRateLimiter::Status::NEWLY_SUPPRESSED) {
+-            // with should_ratelimit=false, this cannot lead to infinit
+-            // recursion
++            // without a site (not rate limited), this cannot lead to
++            // infinite recursion
+             // NOLINTNEXTLINE(misc-no-recursion)
+             LogPrintStr_(
+                 strprintf(
+@@ -777,7 +806,7 @@ void BCLog::Logger::LogPrintStr_(std::string_view str,
+                     source_loc.function_name(), m_limiter->m_max_bytes,
+                     Ticks<std::chrono::seconds>(m_limiter->m_reset_window)),
+                 std::source_location::current(), LogFlags::ALL, Level::Warning,
+-                /*should_ratelimit=*/false);
++                /*site=*/nullptr);
+         } else if (status == LogRateLimiter::Status::STILL_SUPPRESSED) {
+             ratelimit = true;
+         }
+@@ -929,37 +958,34 @@ bool BCLog::Logger::DefaultShrinkDebugFile() const {
+ }
+ 
+ void BCLog::LogRateLimiter::Reset() {
+-    decltype(m_source_locations) source_locations;
+-    {
+-        StdLockGuard scoped_lock(m_mutex);
+-        source_locations.swap(m_source_locations);
+-        m_suppression_active = false;
+-    }
+-    for (const auto &[source_loc, stats] : source_locations) {
+-        if (stats.m_dropped_bytes == 0) {
++    // Take the suppressed sites, then start a new window. A site suppressed
++    // in between is noticed in the next window (one notice late).
++    LogSiteLimit *site{
++        m_suppressed.exchange(nullptr, std::memory_order_acquire)};
++    struct Dropped {
++        std::source_location loc;
++        uint64_t bytes;
++    };
++    std::vector<Dropped> dropped;
++    for (; site; site = site->next) {
++        dropped.push_back({site->loc, site->dropped.load()});
++    }
++    m_suppression_active = false;
++    m_epoch.store(g_next_ratelimit_epoch.fetch_add(1),
++                  std::memory_order_release);
++    for (const auto &[loc, bytes] : dropped) {
++        if (bytes == 0) {
+             continue;
+         }
+         LogPrintLevel_(LogFlags::ALL, Level::Warning,
+                        /*should_ratelimit=*/false,
+                        "Restarting logging from %s:%d (%s): %d bytes were "
+                        "dropped during the last %ss.\n",
+-                       source_loc.file_name(), source_loc.line(),
+-                       source_loc.function_name(), stats.m_dropped_bytes,
++                       loc.file_name(), loc.line(), loc.function_name(), bytes,
+                        Ticks<std::chrono::seconds>(m_reset_window));
+     }
+ }
+ 
+-bool BCLog::LogRateLimiter::Stats::Consume(uint64_t bytes) {
+-    if (bytes > m_available_bytes) {
+-        m_dropped_bytes += bytes;
+-        m_available_bytes = 0;
+-        return false;
+-    }
+-
+-    m_available_bytes -= bytes;
+-    return true;
+-}
+-
+ bool BCLog::Logger::SetLogLevel(std::string_view level_str) {
+     const auto level = GetLogLevel(level_str);
+     if (!level.has_value() || level.value() > MAX_USER_SETABLE_SEVERITY_LEVEL) {
+diff --git a/src/logging.h b/src/logging.h
+index 21814867e9..99c07c7d23 100644
+--- a/src/logging.h
++++ b/src/logging.h
+@@ -7,7 +7,6 @@
+ #ifndef BITCOIN_LOGGING_H
+ #define BITCOIN_LOGGING_H
+ 
+-#include <crypto/siphash.h>
+ #include <span.h>
+ #include <threadsafety.h>
+ #include <tinyformat.h>
+@@ -41,25 +40,6 @@ static constexpr const char *DEFAULT_LOGFORMAT = "text";
+ extern bool fLogIPs;
+ extern const char *const DEFAULT_DEBUGLOGFILE;
+ 
+-struct SourceLocationEqual {
+-    bool operator()(const std::source_location &lhs,
+-                    const std::source_location &rhs) const noexcept {
+-        return lhs.line() == rhs.line() &&
+-               std::string_view(lhs.file_name()) ==
+-                   std::string_view(rhs.file_name());
+-    }
+-};
+-
+-struct SourceLocationHasher {
+-    size_t operator()(const std::source_location &s) const noexcept {
+-        // Use CSipHasher(0, 0) as a simple way to get uniform distribution.
+-        return size_t(CSipHasher(0, 0)
+-                          .Write(s.line())
+-                          .Write(MakeUCharSpan(std::string_view{s.file_name()}))
+-                          .Finalize());
+-    }
+-};
+-
+ struct LogCategory {
+     std::string category;
+     bool active;
+@@ -143,33 +123,48 @@ std::optional<LogFormat> ParseLogFormat(std::string_view str);
+  */
+ void AppendJsonEscaped(std::string &out, std::string_view str);
+ 
++class LogRateLimiter;
++
++/**
++ * Rate limiting state of one log call site. Every log macro expansion owns
++ * one (a function-local static, constant-initialized), so checking the
++ * quota is a few relaxed atomic operations on that site's own state: no
++ * lock and no lookup by source location.
++ */
++struct LogSiteLimit {
++    /**
++     * Window, suppression and remaining quota, packed in one word so that
++     * they change together: epoch (bits 25..63), suppressed (bit 24) and
++     * bytes still allowed in that window (bits 0..23).
++     */
++    std::atomic<uint64_t> state{0};
++    //! Bytes of messages suppressed in the window the site is suppressed in
++    std::atomic<uint64_t> dropped{0};
++    //! Epoch in which this site was put on its limiter's suppressed list
++    std::atomic<uint64_t> listed_epoch{0};
++    //! Next suppressed site (list owned by the limiter)
++    LogSiteLimit *next{nullptr};
++    //! Where the site is, for the suppression notices
++    std::source_location loc;
++
++    static constexpr int AVAILABLE_BITS{24};
++    static constexpr uint64_t AVAILABLE_MASK{(uint64_t{1} << AVAILABLE_BITS) -
++                                             1};
++    static constexpr uint64_t SUPPRESSED{uint64_t{1} << AVAILABLE_BITS};
++    static constexpr int EPOCH_SHIFT{AVAILABLE_BITS + 1};
++    //! Bytes still allowed (for tests)
++    uint64_t Available() const { return state.load() & AVAILABLE_MASK; }
++};
++
+ //! Fixed window rate limiter for logging.
+ class LogRateLimiter {
+-public:
+-    //! Keeps track of an individual source location and how many available
+-    //! bytes are left for logging from it.
+-    struct Stats {
+-        //! Remaining bytes
+-        uint64_t m_available_bytes;
+-        //! Number of bytes that were consumed but didn't fit in the available
+-        //! bytes.
+-        uint64_t m_dropped_bytes{0};
+-
+-        Stats(uint64_t max_bytes) : m_available_bytes{max_bytes} {}
+-        //! Updates internal accounting and returns true if enough
+-        //! available_bytes were remaining
+-        bool Consume(uint64_t bytes);
+-    };
+-
+ private:
+-    mutable StdMutex m_mutex;
+-
+-    //! Stats for each source location that has attempted to log something.
+-    std::unordered_map<std::source_location, Stats, SourceLocationHasher,
+-                       SourceLocationEqual>
+-        m_source_locations GUARDED_BY(m_mutex);
++    //! Current window. Unique across limiters, so that sites last used by
++    //! another limiter start afresh.
++    std::atomic<uint64_t> m_epoch;
++    //! Sites suppressed in the current window (lock-free stack)
++    std::atomic<LogSiteLimit *> m_suppressed{nullptr};
+     //! Whether any log locations are suppressed.
+-    //! Cached view on m_source_locations for performance reasons.
+     std::atomic<bool> m_suppression_active{false};
+     LogRateLimiter(uint64_t max_bytes, std::chrono::seconds reset_window);
+ 
+@@ -188,7 +183,8 @@ public:
+     static std::shared_ptr<LogRateLimiter>
+     Create(SchedulerFunction &&scheduler_func, uint64_t max_bytes,
+            std::chrono::seconds reset_window);
+-    //! Maximum number of bytes logged per location per window.
++    //! Maximum number of bytes logged per location per window (at most
++    //! LogSiteLimit::AVAILABLE_MASK, 16 MiB).
+     const uint64_t m_max_bytes;
+     //! Interval after which the window is reset.
+     const std::chrono::seconds m_reset_window;
+@@ -201,14 +197,17 @@ public:
+         // suppression is still ongoing
+         STILL_SUPPRESSED,
+     };
+-    //! Consumes `source_loc`'s available bytes corresponding to the size of the
+-    //! message `str` (without log prefixes or JSON wrapping) and returns its
+-    //! status.
+-    [[nodiscard]] Status Consume(const std::source_location &source_loc,
+-                                 std::string_view str)
+-        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+-    //! Resets all usage to zero. Called periodically by the scheduler.
+-    void Reset() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    /**
++     * Consume `bytes` (the message's length, without log prefixes or JSON
++     * wrapping) of `site`'s quota and return its status. Lock-free.
++     */
++    [[nodiscard]] Status Consume(LogSiteLimit &site,
++                                 const std::source_location &loc,
++                                 uint64_t bytes);
++    //! Starts a new window: logs a notice for each site whose messages were
++    //! dropped, and lifts all suppressions. Called periodically by the
++    //! scheduler.
++    void Reset();
+     //! Returns true if any log locations are currently being suppressed.
+     bool SuppressionsActive() const { return m_suppression_active; }
+ };
+@@ -280,7 +279,7 @@ private:
+     /** Send a string to the log output (internal) */
+     void LogPrintStr_(std::string_view str, std::source_location &&source_loc,
+                       BCLog::LogFlags category, BCLog::Level level,
+-                      bool should_ratelimit) EXCLUSIVE_LOCKS_REQUIRED(m_cs);
++                      LogSiteLimit *site) EXCLUSIVE_LOCKS_REQUIRED(m_cs);
+ 
+ public:
+     bool m_print_to_console = false;
+@@ -326,10 +325,13 @@ public:
+ 
+     ~Logger();
+ 
+-    /** Send a string to the log output */
++    /**
++     * Send a string to the log output. With a site, unconditional logging
++     * is rate limited by that call site's quota (see LogSiteLimit).
++     */
+     void LogPrintStr(std::string_view str, std::source_location &&source_loc,
+                      BCLog::LogFlags category, BCLog::Level level,
+-                     bool should_ratelimit);
++                     LogSiteLimit *site);
+ 
+     /** Returns whether logs will be written to any output */
+     bool Enabled() const EXCLUSIVE_LOCKS_REQUIRED(!m_cs) {
+@@ -442,9 +444,9 @@ bool GetLogCategory(BCLog::LogFlags &flag, std::string_view str);
+ // peer can fill up a user's disk with debug.log entries.
+ template <typename... Args>
+ static inline void LogPrintf_(std::source_location &&source_loc,
+-                              BCLog::LogFlags flag, BCLog::Level level,
+-                              bool should_ratelimit, const char *fmt,
+-                              const Args &...args) {
++                              BCLog::LogSiteLimit *site, BCLog::LogFlags flag,
++                              BCLog::Level level, bool should_ratelimit,
++                              const char *fmt, const Args &...args) {
+     if (LogInstance().Enabled()) {
+         std::string log_msg;
+         try {
+@@ -457,13 +459,23 @@ static inline void LogPrintf_(std::source_location &&source_loc,
+                       "\" while formatting log message: " + fmt;
+         }
+         LogInstance().LogPrintStr(log_msg, std::move(source_loc), flag, level,
+-                                  should_ratelimit);
++                                  should_ratelimit ? site : nullptr);
+     }
+ }
+ 
++/**
++ * The rate limiting state of the call site this is expanded at: a lambda's
++ * function-local static, unique to each macro expansion.
++ */
++#define LOG_SITE_LIMIT_                                                        \
++    ([]() -> BCLog::LogSiteLimit & {                                           \
++        static constinit BCLog::LogSiteLimit site_limit;                       \
++        return site_limit;                                                     \
++    }())
++
+ #define LogPrintLevel_(category, level, should_ratelimit, ...)                 \
+-    LogPrintf_(std::source_location::current(), category, level,               \
+-               should_ratelimit, __VA_ARGS__)
++    LogPrintf_(std::source_location::current(), &LOG_SITE_LIMIT_, category,    \
++               level, should_ratelimit, __VA_ARGS__)
+ 
+ // Log unconditionally. Uses basic rate limiting to mitigate disk filling
+ // attacks.
+diff --git a/src/test/logging_tests.cpp b/src/test/logging_tests.cpp
+index 913fbb5007..6258c9ef12 100644
+--- a/src/test/logging_tests.cpp
++++ b/src/test/logging_tests.cpp
+@@ -153,7 +153,7 @@ BOOST_FIXTURE_TEST_CASE(logging_LogPrintf_, LogSetup) {
+         // trailing \n. This will be backported in PR #30929, for now we add it
+         // manually.
+         LogInstance().LogPrintStr(msg + "\n", std::move(loc), category, level,
+-                                  /*should_ratelimit=*/false);
++                                  /*site=*/nullptr);
+     }
+ 
+     flush_debug_log();
+@@ -357,8 +357,9 @@ BOOST_AUTO_TEST_CASE(logging_log_rate_limiter) {
+     auto &limiter{*Assert(limiter_)};
+ 
+     using Status = BCLog::LogRateLimiter::Status;
+-    auto source_loc_1{std::source_location::current()};
+-    auto source_loc_2{std::source_location::current()};
++    BCLog::LogSiteLimit site_1, site_2;
++    auto loc_1{std::source_location::current()};
++    auto loc_2{std::source_location::current()};
+ 
+     // A fresh limiter should not have any suppressions
+     BOOST_CHECK(!limiter.SuppressionsActive());
+@@ -368,23 +369,23 @@ BOOST_AUTO_TEST_CASE(logging_log_rate_limiter) {
+     BOOST_CHECK(!limiter.SuppressionsActive());
+ 
+     // No suppression should happen until more than max_bytes have been consumed
+-    BOOST_CHECK_EQUAL(
+-        limiter.Consume(source_loc_1, std::string(max_bytes - 1, 'a')),
+-        Status::UNSUPPRESSED);
+-    BOOST_CHECK_EQUAL(limiter.Consume(source_loc_1, "a"), Status::UNSUPPRESSED);
++    BOOST_CHECK_EQUAL(limiter.Consume(site_1, loc_1, max_bytes - 1),
++                      Status::UNSUPPRESSED);
++    BOOST_CHECK_EQUAL(limiter.Consume(site_1, loc_1, 1), Status::UNSUPPRESSED);
+     BOOST_CHECK(!limiter.SuppressionsActive());
+-    BOOST_CHECK_EQUAL(limiter.Consume(source_loc_1, "a"),
++    BOOST_CHECK_EQUAL(limiter.Consume(site_1, loc_1, 1),
+                       Status::NEWLY_SUPPRESSED);
+     BOOST_CHECK(limiter.SuppressionsActive());
+-    BOOST_CHECK_EQUAL(limiter.Consume(source_loc_1, "a"),
++    BOOST_CHECK_EQUAL(limiter.Consume(site_1, loc_1, 1),
+                       Status::STILL_SUPPRESSED);
+     BOOST_CHECK(limiter.SuppressionsActive());
++    BOOST_CHECK_EQUAL(site_1.dropped.load(), 2U);
++    BOOST_CHECK_EQUAL(site_1.Available(), 0U);
+ 
+-    // Location 2  should not be affected by location 1's suppression
+-    BOOST_CHECK_EQUAL(
+-        limiter.Consume(source_loc_2, std::string(max_bytes, 'a')),
+-        Status::UNSUPPRESSED);
+-    BOOST_CHECK_EQUAL(limiter.Consume(source_loc_2, "a"),
++    // Location 2 should not be affected by location 1's suppression
++    BOOST_CHECK_EQUAL(limiter.Consume(site_2, loc_2, max_bytes),
++                      Status::UNSUPPRESSED);
++    BOOST_CHECK_EQUAL(limiter.Consume(site_2, loc_2, 1),
+                       Status::NEWLY_SUPPRESSED);
+     BOOST_CHECK(limiter.SuppressionsActive());
+ 
+@@ -392,37 +393,50 @@ BOOST_AUTO_TEST_CASE(logging_log_rate_limiter) {
+     scheduler.MockForwardAndSync(reset_window);
+ 
+     BOOST_CHECK(!limiter.SuppressionsActive());
+-    BOOST_CHECK_EQUAL(
+-        limiter.Consume(source_loc_1, std::string(max_bytes, 'a')),
+-        Status::UNSUPPRESSED);
+-    BOOST_CHECK_EQUAL(
+-        limiter.Consume(source_loc_2, std::string(max_bytes, 'a')),
+-        Status::UNSUPPRESSED);
++    BOOST_CHECK_EQUAL(limiter.Consume(site_1, loc_1, max_bytes),
++                      Status::UNSUPPRESSED);
++    BOOST_CHECK_EQUAL(limiter.Consume(site_2, loc_2, max_bytes),
++                      Status::UNSUPPRESSED);
++
++    // A site last used by another limiter starts with a full quota.
++    auto other{scheduler.GetLimiter(max_bytes, reset_window)};
++    BOOST_CHECK_EQUAL(other->Consume(site_1, loc_1, max_bytes),
++                      Status::UNSUPPRESSED);
+ }
+ 
+-BOOST_AUTO_TEST_CASE(logging_log_limit_stats) {
+-    BCLog::LogRateLimiter::Stats stats(BCLog::RATELIMIT_MAX_BYTES);
+-
+-    // Check that stats gets initialized correctly.
+-    BOOST_CHECK_EQUAL(stats.m_available_bytes, BCLog::RATELIMIT_MAX_BYTES);
+-    BOOST_CHECK_EQUAL(stats.m_dropped_bytes, uint64_t{0});
+-
+-    const uint64_t MESSAGE_SIZE{BCLog::RATELIMIT_MAX_BYTES / 2};
+-    BOOST_CHECK(stats.Consume(MESSAGE_SIZE));
+-    BOOST_CHECK_EQUAL(stats.m_available_bytes,
+-                      BCLog::RATELIMIT_MAX_BYTES - MESSAGE_SIZE);
+-    BOOST_CHECK_EQUAL(stats.m_dropped_bytes, uint64_t{0});
+-
+-    BOOST_CHECK(stats.Consume(MESSAGE_SIZE));
+-    BOOST_CHECK_EQUAL(stats.m_available_bytes,
+-                      BCLog::RATELIMIT_MAX_BYTES - MESSAGE_SIZE * 2);
+-    BOOST_CHECK_EQUAL(stats.m_dropped_bytes, uint64_t{0});
+-
+-    // Consuming more bytes after already having consumed RATELIMIT_MAX_BYTES
+-    // should fail.
+-    BOOST_CHECK(!stats.Consume(500));
+-    BOOST_CHECK_EQUAL(stats.m_available_bytes, uint64_t{0});
+-    BOOST_CHECK_EQUAL(stats.m_dropped_bytes, uint64_t{500});
++BOOST_AUTO_TEST_CASE(logging_log_rate_limiter_threads) {
++    // Many threads on one site: exactly the quota is let through, every
++    // other byte is counted as dropped, and one thread sees the start of
++    // the suppression.
++    constexpr uint64_t MAX_BYTES{100'000};
++    ScopedScheduler scheduler{};
++    auto limiter{scheduler.GetLimiter(MAX_BYTES, 1h)};
++    BCLog::LogSiteLimit site;
++    const auto loc{std::source_location::current()};
++    std::atomic<uint64_t> passed{0}, newly{0};
++    std::vector<std::thread> threads;
++    for (int t = 0; t < 8; ++t) {
++        threads.emplace_back([&] {
++            for (int i = 0; i < 10'000; ++i) {
++                switch (limiter->Consume(site, loc, 10)) {
++                    case BCLog::LogRateLimiter::Status::UNSUPPRESSED:
++                        passed += 10;
++                        break;
++                    case BCLog::LogRateLimiter::Status::NEWLY_SUPPRESSED:
++                        ++newly;
++                        break;
++                    case BCLog::LogRateLimiter::Status::STILL_SUPPRESSED:
++                        break;
++                }
++            }
++        });
++    }
++    for (auto &t : threads) {
++        t.join();
++    }
++    BOOST_CHECK_EQUAL(passed.load(), MAX_BYTES);
++    BOOST_CHECK_EQUAL(newly.load(), 1U);
++    BOOST_CHECK_EQUAL(site.dropped.load(), 8U * 10'000 * 10 - MAX_BYTES);
+ }
+ 
+ namespace {
+@@ -643,16 +657,16 @@ BOOST_FIXTURE_TEST_CASE(logging_json_format, LogSetup) {
+     const auto loc{std::source_location::current()};
+     LogInstance().LogPrintStr("hello \"world\"\n", std::source_location{loc},
+                               BCLog::NET, BCLog::Level::Debug,
+-                              /*should_ratelimit=*/false);
++                              /*site=*/nullptr);
+     LogInfo("two\nlines\n");
+     LogWarning("bad byte \xff and tab\t\n");
+     // A message without trailing newline, then its continuation
+     LogInstance().LogPrintStr("partial ", std::source_location{loc}, BCLog::NET,
+                               BCLog::Level::Debug,
+-                              /*should_ratelimit=*/false);
++                              /*site=*/nullptr);
+     LogInstance().LogPrintStr("rest\n", std::source_location{loc}, BCLog::NET,
+                               BCLog::Level::Debug,
+-                              /*should_ratelimit=*/false);
++                              /*site=*/nullptr);
+     LogInstance().m_log_sourcelocations = true;
+     LogDebug(BCLog::NET, "with function\n");
+     LogInstance().m_log_timestamps = false;
+-- 
+2.50.1 (Apple Git-155)
+

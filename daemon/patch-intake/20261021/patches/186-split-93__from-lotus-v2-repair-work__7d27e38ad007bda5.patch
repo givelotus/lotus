@@ -1,0 +1,1289 @@
+From d07f2dd50b87279ea5df333b8721cff490555bee Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:30 -0700
+Subject: [PATCH] v2: implement signing identities and Schnorr signing tests
+
+Extract this concern so its mechanism can be reviewed and measured independently.
+No source semantics are added or removed by this history operation.
+
+Original patch rationale (describes the unsplit source, not every extracted part):
+Add the Lotus V2 v7 transaction wire codec, 3-branch Taproot/Merklix outputs,
+and BIP340 Schnorr signing context machinery.
+
+Original-Commit: bc4e13111406025fdb7a5adaa1c484ea2c075fa9
+Original-Patch: v2/009
+Split-Concern: signing
+
+Historical compilation prerequisites are tracked separately in daemon/patch-audit;
+this provenance-preserving split does not imply standalone build validation.
+
+(cherry picked from commit 1fc39c52a5ed9d67d5020d26525f80e0820919e3)
+
+Canonical-Source-Commit: 1fc39c52a5ed9d67d5020d26525f80e0820919e3
+---
+ src/lotus_v2/signing.cpp                   | 633 ++++++++++++++++++++-
+ src/lotus_v2/signing.h                     | 143 ++++-
+ src/lotus_v2/signing_test/CMakeLists.txt   |  38 ++
+ src/lotus_v2/signing_test/test_cleanup.cpp |  69 +++
+ src/lotus_v2/test_signing.cpp              | 299 ++++++++++
+ 5 files changed, 1179 insertions(+), 3 deletions(-)
+ create mode 100644 src/lotus_v2/signing_test/CMakeLists.txt
+ create mode 100644 src/lotus_v2/signing_test/test_cleanup.cpp
+ create mode 100644 src/lotus_v2/test_signing.cpp
+
+diff --git a/src/lotus_v2/signing.cpp b/src/lotus_v2/signing.cpp
+index 4f76b5f0876f4559d07bd3d1a4620fe63ef8a5bf..6de2bdf7b61df4f98e24a2599e61084c332df3b5 100644
+--- a/src/lotus_v2/signing.cpp
++++ b/src/lotus_v2/signing.cpp
+@@ -1,8 +1,11 @@
+-// Copyright (c) 2026 The Lotus developers
+ #include "signing.h"
+ #include "batch_randomizers.h"
+ 
+-#include <crypto/sha256.h>
++#include "tagged_hash.h"
++#include "vendor/blake3/blake3.h"
++
++#include "../support/cleanse.h"
++
+ #include <secp256k1.h>
+ #include <secp256k1_extrakeys.h>
+ #include <secp256k1_schnorr.h>
+@@ -14,10 +17,608 @@
+ #include <condition_variable>
+ #include <cstring>
+ #include <functional>
++#include <memory>
+ #include <mutex>
+ #include <thread>
+ 
+ namespace lotus::v2 {
++namespace {
++
++    void Integer(uint64_t value, size_t width, std::vector<uint8_t> &out) {
++        for (size_t i = 0; i < width; ++i)
++            out.push_back(uint8_t(value >> (8 * i)));
++    }
++
++    void CompactSize(uint64_t value, std::vector<uint8_t> &out) {
++        if (value < 253)
++            Integer(value, 1, out);
++        else if (value <= 65535) {
++            out.push_back(253);
++            Integer(value, 2, out);
++        } else if (value <= 4294967295ULL) {
++            out.push_back(254);
++            Integer(value, 4, out);
++        } else {
++            out.push_back(255);
++            Integer(value, 8, out);
++        }
++    }
++
++    bool OutputBytes(const Output &output, std::vector<uint8_t> &out,
++                     std::string &error) {
++        return EncodeOutput(output, out, error);
++    }
++
++    bool ResolvedValid(const Transaction &tx, const ResolvedCoins &resolved,
++                       std::string &error) {
++        if (resolved.size() != tx.inputs.size()) {
++            error = "resolved count";
++            return false;
++        }
++        for (size_t i = 0; i < tx.inputs.size(); ++i) {
++            if (tx.inputs[i].flags != 1 && tx.inputs[i].flags != 3) {
++                error = "unsupported input kind for signing";
++                return false;
++            }
++            if (tx.inputs[i].flags == 1 &&
++                (!resolved[i] || resolved[i]->IsBurn())) {
++                error = "spend resolved coin";
++                return false;
++            }
++            if (tx.inputs[i].flags == 3 && resolved[i]) {
++                error = "mint resolved coin";
++                return false;
++            }
++        }
++        return true;
++    }
++
++    bool NonzeroDelta(const PositiveDelta &delta) {
++        return std::any_of(delta.begin(), delta.end(),
++                           [](uint8_t byte) { return byte != 0; });
++    }
++
++    bool OwnInputHashFromCoinWire(const Input &input, const TxProfile &profile,
++                                  const std::vector<uint8_t> &coin_wire,
++                                  std::vector<uint8_t> &core, Hash &result,
++                                  std::string &error) {
++        core.clear();
++        if (!EncodeInputCore(input, profile, core, error))
++            return false;
++        CompactSize(coin_wire.size(), core);
++        core.insert(core.end(), coin_wire.begin(), coin_wire.end());
++        result = TaggedHash(HashDomain::OwnInput, core);
++        error.clear();
++        return true;
++    }
++
++    bool OwnInputHashOf(const Input &input, const TxProfile &profile,
++                        const Output &coin, Hash &result, std::string &error) {
++        std::vector<uint8_t> core, wire;
++        if (!OutputBytes(coin, wire, error))
++            return false;
++        return OwnInputHashFromCoinWire(input, profile, wire, core, result,
++                                        error);
++    }
++
++    bool WitnessIsAutomaticSuccess(const BranchWitness &w) noexcept {
++        return w.script.size() == 1 && w.script[0] == 0x4e;
++    }
++
++    bool WitnessIsPureMode0Checksig(const BranchWitness &w) noexcept {
++        if (WitnessIsAutomaticSuccess(w)) return true;
++        return w.script.size() == 34 && w.script[0] == 0x20 &&
++               (w.script[33] == 0xbb || w.script[33] == 0xbc) &&
++               w.arguments.size() == 1 &&
++               (w.arguments[0].size() == 64 ||
++                (w.arguments[0].size() == 65 && w.arguments[0][64] == 0));
++    }
++
++    bool WitnessIsMode0Or1Checksig(const BranchWitness &w) noexcept {
++        if (WitnessIsAutomaticSuccess(w)) return true;
++        return w.script.size() == 34 && w.script[0] == 0x20 &&
++               (w.script[33] == 0xbb || w.script[33] == 0xbc) &&
++               w.arguments.size() == 1 &&
++               (w.arguments[0].size() == 64 ||
++                (w.arguments[0].size() == 65 && w.arguments[0][64] <= 1));
++    }
++
++    bool InputIsPureMode0Checksig(const Input &input) noexcept {
++        if (input.flags != 1 || input.witnesses.empty()) return false;
++        for (const auto &w : input.witnesses) {
++            if (!WitnessIsPureMode0Checksig(w)) return false;
++        }
++        return true;
++    }
++
++    bool InputMayUseMode2(const Input &input) noexcept {
++        if (input.flags != 1 || input.witnesses.empty()) return false;
++        for (const auto &w : input.witnesses) {
++            if (!WitnessIsMode0Or1Checksig(w)) return true;
++        }
++        return false;
++    }
++
++    bool TxIsPureMode0Checksig(const Transaction &tx) noexcept {
++        if (tx.inputs.empty()) return false;
++        for (const auto &in : tx.inputs) {
++            if (!InputIsPureMode0Checksig(in)) return false;
++        }
++        return true;
++    }
++
++    bool TxIsAllAutomaticSuccess(const Transaction &tx) noexcept {
++        if (tx.inputs.empty()) return false;
++        for (const auto &in : tx.inputs) {
++            if (in.flags != 1 || in.witnesses.empty()) return false;
++            for (const auto &w : in.witnesses) {
++                if (!WitnessIsAutomaticSuccess(w)) return false;
++            }
++        }
++        return true;
++    }
++
++} // namespace
++
++bool ComputeIdentitiesValidated(const Transaction &tx,
++                                const TxProfile &profile,
++                                const ChainId &chain_id,
++                                IdentityDigests &result, std::string &error) {
++    std::vector<Hash> core_leaves, full_leaves;
++    core_leaves.reserve(tx.inputs.size());
++    full_leaves.reserve(tx.inputs.size());
++    std::vector<uint8_t> core, full;
++    for (const auto &input : tx.inputs) {
++        core.clear();
++        full.clear();
++        if (!EncodeInputCore(input, profile, core, error) ||
++            !EncodeInputFull(input, profile, full, error))
++            return false;
++        core_leaves.push_back(InputCoreLeaf(core));
++        full_leaves.push_back(InputFullLeaf(full));
++    }
++    IdentityDigests computed;
++    computed.inputs_root = IndexedTreeRoot(core_leaves);
++    computed.full_inputs_root = IndexedTreeRoot(full_leaves);
++    computed.output_leaves.reserve(tx.outputs.size());
++    std::vector<uint8_t> wire;
++    for (const auto &output : tx.outputs) {
++        wire.clear();
++        if (!OutputBytes(output, wire, error)) return false;
++        computed.output_leaves.push_back(OutputLeaf(wire));
++    }
++    computed.outputs_root = IndexedTreeRoot(computed.output_leaves);
++    TxHeaderCore header{};
++    header[0] = 7;
++    for (size_t i = 0; i < 8; ++i)
++        header[4 + i] = uint8_t(tx.lock >> (8 * i));
++    header[12] = uint8_t(tx.inputs.size());
++    header[13] = uint8_t(tx.inputs.size() >> 8);
++    header[14] = uint8_t(tx.outputs.size());
++    header[15] = uint8_t(tx.outputs.size() >> 8);
++    computed.txid = TransactionId(chain_id, header, computed.inputs_root,
++                                  computed.outputs_root);
++    computed.txhash = TransactionHash(
++        chain_id, header, computed.full_inputs_root, computed.outputs_root);
++    result = std::move(computed);
++    error.clear();
++    return true;
++}
++
++bool ComputeOutputIdentitiesOnly(const Transaction &tx, const Hash &known_txid,
++                                 const Hash &known_txhash,
++                                 IdentityDigests &result, std::string &error) {
++    IdentityDigests computed{};
++    computed.txid = known_txid;
++    computed.txhash = known_txhash;
++    if (!TxIsPureMode0Checksig(tx)) {
++        computed.output_leaves.reserve(tx.outputs.size());
++        std::vector<uint8_t> wire;
++        for (const auto &output : tx.outputs) {
++            wire.clear();
++            if (!OutputBytes(output, wire, error)) return false;
++            computed.output_leaves.push_back(OutputLeaf(wire));
++        }
++        computed.outputs_root = IndexedTreeRoot(computed.output_leaves);
++    }
++    result = std::move(computed);
++    error.clear();
++    return true;
++}
++
++bool ComputeIdentities(const Transaction &tx, const TxProfile &profile,
++                       const ChainId &chain_id, IdentityDigests &result,
++                       std::string &error) {
++    std::vector<uint8_t> validated_wire;
++    if (!EncodeTransaction(tx, profile, validated_wire, error)) return false;
++    return ComputeIdentitiesValidated(tx, profile, chain_id, result, error);
++}
++
++bool ComputeCoinsRoot(const Transaction &tx, const ResolvedCoins &resolved,
++                      Hash &result, std::string &error) {
++    if (!ResolvedValid(tx, resolved, error)) return false;
++    std::vector<Hash> leaves;
++    leaves.reserve(tx.inputs.size());
++    std::vector<uint8_t> wire;
++    for (size_t i = 0; i < tx.inputs.size(); ++i) {
++        if (tx.inputs[i].flags == 3)
++            leaves.push_back(CoinEntryLeaf({}));
++        else {
++            wire.clear();
++            if (!OutputBytes(*resolved[i], wire, error)) return false;
++            leaves.push_back(CoinEntryLeaf(wire));
++        }
++    }
++    result = IndexedTreeRoot(leaves);
++    error.clear();
++    return true;
++}
++
++bool ComputeOwnInputHash(const Transaction &tx, const TxProfile &profile,
++                         const ResolvedCoins &resolved, size_t input_index,
++                         Hash &result, std::string &error) {
++    if (!ResolvedValid(tx, resolved, error) ||
++        input_index >= tx.inputs.size() || tx.inputs[input_index].flags != 1) {
++        error = "own input spend";
++        return false;
++    }
++    return OwnInputHashOf(tx.inputs[input_index], profile,
++                          *resolved[input_index], result, error);
++}
++
++SigningPreparationStatus PrepareSigningContextChecked(
++    const Transaction &tx, const TxProfile &profile, const ChainId &chain_id,
++    const ResolvedCoins &resolved, PreparedSigningContext &result,
++    std::string &error, const IdentityDigests *precomputed_identities) {
++    try {
++        IdentityDigests computed_ids;
++        const IdentityDigests *ids = precomputed_identities;
++        if (ids == nullptr) {
++            if (!ComputeIdentities(tx, profile, chain_id, computed_ids, error))
++                return SigningPreparationStatus::OperationalError;
++            ids = &computed_ids;
++        }
++        if (!ResolvedValid(tx, resolved, error))
++            return SigningPreparationStatus::OperationalError;
++
++        PreparedSigningContext prepared;
++        prepared.chain_id_ = chain_id;
++        prepared.lock_ = tx.lock;
++        prepared.identities_ = *ids;
++        prepared.txid_ = ids->txid;
++        prepared.outputs_root_ = ids->outputs_root;
++        prepared.output_leaves_ = ids->output_leaves;
++        prepared.own_input_hashes_.resize(tx.inputs.size());
++        prepared.invocations_.resize(tx.inputs.size());
++
++        static const Hash kOpTrueBranchLeaf = []() {
++            const std::array<uint8_t, 1> s{0x4e};
++            return BranchLeaf(s);
++        }();
++
++        if (precomputed_identities != nullptr && TxIsAllAutomaticSuccess(tx)) {
++            for (size_t i = 0; i < tx.inputs.size(); ++i) {
++                const Input &input = tx.inputs[i];
++                const Output &coin = *resolved[i];
++                if (input.path_index >= coin.paths.size() ||
++                    input.witnesses.size() !=
++                        coin.paths[input.path_index].size()) {
++                    error = "positional witness count/index";
++                    return SigningPreparationStatus::InvalidWitness;
++                }
++                const auto &path = coin.paths[input.path_index];
++                auto &invocations = prepared.invocations_[i];
++                invocations.resize(path.size());
++                for (size_t j = 0; j < path.size(); ++j) {
++                    const uint8_t branch_index = path[j];
++                    const BranchWitness &witness = input.witnesses[j];
++                    if (branch_index >= coin.branches.size() ||
++                        (witness.siblings.empty()
++                             ? coin.branches[branch_index] != kOpTrueBranchLeaf
++                             : BranchProofRoot(kOpTrueBranchLeaf,
++                                               witness.siblings) !=
++                                   coin.branches[branch_index])) {
++                        error = "branch membership";
++                        return SigningPreparationStatus::InvalidWitness;
++                    }
++                    invocations[j].kind = 1;
++                }
++            }
++            prepared.ready_ = true;
++            result = std::move(prepared);
++            error.clear();
++            return SigningPreparationStatus::Ready;
++        }
++
++        std::vector<Hash> coin_leaves;
++        coin_leaves.reserve(tx.inputs.size());
++        std::vector<uint8_t> coin_wire, core;
++
++        for (size_t i = 0; i < tx.inputs.size(); ++i) {
++            const Input &input = tx.inputs[i];
++            auto &invocations = prepared.invocations_[i];
++            if (input.flags == 1) {
++                const Output &coin = *resolved[i];
++                if (input.path_index >= coin.paths.size() ||
++                    input.witnesses.size() !=
++                        coin.paths[input.path_index].size()) {
++                    error = "positional witness count/index";
++                    return SigningPreparationStatus::InvalidWitness;
++                }
++                coin_wire.clear();
++                if (!OutputBytes(coin, coin_wire, error))
++                    return SigningPreparationStatus::OperationalError;
++                coin_leaves.push_back(CoinEntryLeaf(coin_wire));
++                if (precomputed_identities == nullptr ||
++                    !InputIsPureMode0Checksig(input)) {
++                    if (!OwnInputHashFromCoinWire(
++                            input, profile, coin_wire, core,
++                            prepared.own_input_hashes_[i].emplace(), error))
++                        return SigningPreparationStatus::OperationalError;
++                    if (i < tx.outputs.size() &&
++                        ids->output_leaves.empty() &&
++                        InputMayUseMode2(input)) {
++                        if (prepared.output_leaves_.empty()) {
++                            prepared.output_leaves_.resize(tx.outputs.size());
++                        }
++                        core.clear();
++                        if (!OutputBytes(tx.outputs[i], core, error))
++                            return SigningPreparationStatus::OperationalError;
++                        prepared.output_leaves_[i] = OutputLeaf(core);
++                    }
++                }
++                const auto &path = coin.paths[input.path_index];
++                invocations.reserve(path.size());
++                for (size_t j = 0; j < path.size(); ++j) {
++                    const uint8_t branch_index = path[j];
++                    const BranchWitness &witness = input.witnesses[j];
++                    const Hash leaf = WitnessIsAutomaticSuccess(witness)
++                                          ? kOpTrueBranchLeaf
++                                          : BranchLeaf(witness.script);
++                    if (branch_index >= coin.branches.size() ||
++                        BranchProofRoot(leaf, witness.siblings) !=
++                            coin.branches[branch_index]) {
++                        error = "branch membership";
++                        return SigningPreparationStatus::InvalidWitness;
++                    }
++                    PreparedSigningContext::Invocation invocation;
++                    invocation.kind = 1;
++                    invocation.selector.reserve(41);
++                    invocation.selector.push_back(1);
++                    Integer(i, 4, invocation.selector);
++                    Integer(branch_index, 4, invocation.selector);
++                    invocation.selector.insert(invocation.selector.end(),
++                                               leaf.begin(), leaf.end());
++                    invocations.push_back(std::move(invocation));
++                }
++            } else if (input.flags == 3) {
++                coin_leaves.push_back(CoinEntryLeaf({}));
++                const BranchWitness &witness = input.witnesses[0];
++                const Hash leaf = BranchLeaf(witness.script);
++                if (BranchProofRoot(leaf, witness.siblings) !=
++                    input.prev_txid) {
++                    error = "mint root";
++                    return SigningPreparationStatus::InvalidWitness;
++                }
++                PreparedSigningContext::Invocation invocation;
++                invocation.kind = 3;
++                invocation.selector.reserve(81);
++                invocation.selector.push_back(3);
++                invocation.selector.insert(invocation.selector.end(),
++                                           input.prev_txid.begin(),
++                                           input.prev_txid.end());
++                invocation.selector.insert(invocation.selector.end(), 16, 0);
++                invocation.selector.insert(invocation.selector.end(),
++                                           leaf.begin(), leaf.end());
++                invocations.push_back(std::move(invocation));
++            }
++        }
++        prepared.coins_root_ = IndexedTreeRoot(coin_leaves);
++        prepared.ready_ = true;
++        result = std::move(prepared);
++        error.clear();
++        return SigningPreparationStatus::Ready;
++    } catch (const std::exception &exception) {
++        error = exception.what();
++        return SigningPreparationStatus::OperationalError;
++    }
++}
++
++bool PrepareSigningContext(const Transaction &tx, const TxProfile &profile,
++                           const ChainId &chain, const ResolvedCoins &coins,
++                           PreparedSigningContext &result, std::string &error) {
++    return PrepareSigningContextChecked(tx, profile, chain, coins, result,
++                                        error) ==
++           SigningPreparationStatus::Ready;
++}
++
++bool ValidateSigningInvocation(const PreparedSigningContext &prepared,
++                               size_t input_index, size_t witness_index,
++                               const std::optional<PositiveDelta> &positive_delta,
++                               std::string &error) {
++    if (!prepared.ready_ || input_index >= prepared.invocations_.size() ||
++        witness_index >= prepared.invocations_[input_index].size()) {
++        error = "signing mode or invocation index";
++        return false;
++    }
++    const auto &invocation =
++        prepared.invocations_[input_index][witness_index];
++    if (invocation.kind == 1 && positive_delta) {
++        error = "spend delta";
++        return false;
++    }
++    if (invocation.kind == 3 &&
++        (!positive_delta || !NonzeroDelta(*positive_delta))) {
++        error = "mint selector delta/mode";
++        return false;
++    }
++    error.clear();
++    return true;
++}
++
++bool SigningMessage(const PreparedSigningContext &prepared, size_t input_index,
++                    size_t witness_index, uint8_t mode,
++                    const std::optional<PositiveDelta> &positive_delta,
++                    Hash &result, std::string &error) {
++    if (!prepared.ready_ || mode > 2 ||
++        input_index >= prepared.invocations_.size() ||
++        witness_index >= prepared.invocations_[input_index].size()) {
++        error = "signing mode or invocation index";
++        return false;
++    }
++    const auto &invocation =
++        prepared.invocations_[input_index][witness_index];
++    if (invocation.kind == 1 && positive_delta) {
++        error = "spend delta";
++        return false;
++    }
++    if (invocation.kind == 3 &&
++        (mode != 0 || !positive_delta || !NonzeroDelta(*positive_delta))) {
++        error = "mint selector delta/mode";
++        return false;
++    }
++    if (mode == 2 && input_index >= prepared.output_leaves_.size()) {
++        error = "partial mode unavailable";
++        return false;
++    }
++    const size_t expected_len =
++        invocation.kind == 3 ? 178 : mode == 0 ? 138 : 150;
++    std::array<uint8_t, 178> preimage{};
++    uint8_t *dst = preimage.data();
++    std::memcpy(dst, prepared.chain_id_.data(), 32);
++    dst += 32;
++    *dst++ = mode;
++    if (mode == 0) {
++        std::memcpy(dst, prepared.txid_.data(), 32);
++        dst += 32;
++        std::memcpy(dst, prepared.coins_root_.data(), 32);
++        dst += 32;
++    } else {
++        if (!prepared.own_input_hashes_[input_index].has_value()) {
++            error = "own input hash unavailable";
++            return false;
++        }
++        dst[0] = 7;
++        dst[1] = 0;
++        dst[2] = 0;
++        dst[3] = 0;
++        dst += 4;
++        for (size_t i = 0; i < 8; ++i) {
++            dst[i] = uint8_t(prepared.lock_ >> (8 * i));
++        }
++        dst += 8;
++        const Hash &own = *prepared.own_input_hashes_[input_index];
++        std::memcpy(dst, own.data(), 32);
++        dst += 32;
++        const Hash &output_commitment = mode == 1
++            ? prepared.outputs_root_ : prepared.output_leaves_[input_index];
++        std::memcpy(dst, output_commitment.data(), 32);
++        dst += 32;
++    }
++    if (invocation.kind == 3) {
++        if (invocation.selector.size() != 81) {
++            error = "sighash preimage width";
++            return false;
++        }
++        std::memcpy(dst, invocation.selector.data(), 33);
++        dst += 33;
++        std::memcpy(dst, positive_delta->data(), 16);
++        dst += 16;
++        std::memcpy(dst, invocation.selector.data() + 49, 32);
++        dst += 32;
++    } else {
++        if (invocation.selector.size() != 41) {
++            error = "sighash preimage width";
++            return false;
++        }
++        std::memcpy(dst, invocation.selector.data(), 41);
++        dst += 41;
++    }
++    if (static_cast<size_t>(dst - preimage.data()) != expected_len) {
++        error = "sighash preimage width";
++        return false;
++    }
++    result = TaggedHash(HashDomain::Sighash,
++                        std::span<const uint8_t>(preimage.data(), expected_len));
++    error.clear();
++    return true;
++}
++
++bool SigningMessage(const Transaction &tx, const TxProfile &profile,
++                    const ChainId &chain_id, const ResolvedCoins &resolved,
++                    size_t input_index, size_t witness_index, uint8_t mode,
++                    const std::optional<PositiveDelta> &positive_delta,
++                    Hash &result, std::string &error) {
++    PreparedSigningContext prepared;
++    if (!PrepareSigningContext(tx, profile, chain_id, resolved, prepared,
++                               error))
++        return false;
++    return SigningMessage(prepared, input_index, witness_index, mode,
++                          positive_delta, result, error);
++}
++
++SignatureStatus VerifyBip340Signature(std::span<const uint8_t> public_key,
++                                      std::span<const uint8_t> signature,
++                                      const Hash &message, bool mint) {
++    if (!((signature.size() == 64) ||
++          (signature.size() == 65 && !mint &&
++           (signature[64] == 1 || signature[64] == 2)))) {
++        return SignatureStatus::InvalidEncoding;
++    }
++    if (public_key.size() != 32) return SignatureStatus::InvalidPublicKey;
++    secp256k1_xonly_pubkey parsed;
++    if (!secp256k1_xonly_pubkey_parse(secp256k1_context_static, &parsed,
++                                      public_key.data())) {
++        return SignatureStatus::InvalidPublicKey;
++    }
++    return secp256k1_schnorrsig_verify(secp256k1_context_static,
++                                       signature.data(), message.data(),
++                                       message.size(), &parsed)
++               ? SignatureStatus::Valid
++               : SignatureStatus::InvalidSignature;
++}
++
++bool SignBip340Message(const std::array<uint8_t, 32> &secret_key,
++                       const Hash &message, uint8_t mode,
++                       const std::array<uint8_t, 32> &aux_randomness,
++                       std::vector<uint8_t> &result, std::string &error) {
++    if (mode > 2) {
++        error = "signing mode";
++        return false;
++    }
++    using ContextPtr = std::unique_ptr<secp256k1_context,
++                                       decltype(&secp256k1_context_destroy)>;
++    ContextPtr ctx(secp256k1_context_create(SECP256K1_CONTEXT_SIGN),
++                   secp256k1_context_destroy);
++    if (!ctx) {
++        error = "secp256k1 context";
++        return false;
++    }
++    // The keypair embeds the private scalar. Keep cleanup attached to its
++    // lifetime, including invalid-key/signing failures and allocation throws.
++    struct ScopedKeypair {
++        secp256k1_keypair value{};
++        ScopedKeypair() = default;
++        ScopedKeypair(const ScopedKeypair &) = delete;
++        ScopedKeypair &operator=(const ScopedKeypair &) = delete;
++        ~ScopedKeypair() { memory_cleanse(&value, sizeof(value)); }
++    } pair;
++    if (!secp256k1_keypair_create(ctx.get(), &pair.value, secret_key.data())) {
++        error = "invalid secret key";
++        return false;
++    }
++    std::vector<uint8_t> sig(64);
++    if (!secp256k1_schnorrsig_sign32(ctx.get(), sig.data(), message.data(),
++                                     &pair.value, aux_randomness.data())) {
++        error = "BIP340 signing failed";
++        return false;
++    }
++    if (mode) sig.push_back(mode);
++    result = std::move(sig);
++    error.clear();
++    return true;
++}
++
+ namespace {
+ bool VerifyBatchSlice(std::span<const BatchSigItem> slice) {
+     if (slice.empty()) return true;
+@@ -406,5 +1007,33 @@ BatchSigCollector::FirstFailingIndex(size_t num_threads) const {
+     return std::nullopt;
+ }
+ 
++void RunParallelSigningWork(
++    size_t total_items, size_t min_grain,
++    const std::function<void(size_t, size_t)> &fn) {
++    if (total_items == 0) {
++        return;
++    }
++    const size_t grain = std::max<size_t>(min_grain, 1);
++    if (total_items < grain * 2) {
++        fn(0, total_items);
++        return;
++    }
++    const size_t hw = std::min<size_t>(
++        std::max<size_t>(std::thread::hardware_concurrency(), 1), 16);
++    const size_t threads =
++        std::min<size_t>(hw, (total_items + grain - 1) / grain);
++    if (threads <= 1) {
++        fn(0, total_items);
++        return;
++    }
++    SigningWorkerPool::Instance().Run(threads, [&](size_t t) {
++        const size_t begin = (total_items * t) / threads;
++        const size_t end = (total_items * (t + 1)) / threads;
++        if (begin < end) {
++            fn(begin, end);
++        }
++    });
++}
++
+ } // namespace lotus::v2
+ 
+diff --git a/src/lotus_v2/signing.h b/src/lotus_v2/signing.h
+index 2861a22deee192cd5a6398765702bc4051d54425..fecfbd5a240dd036be2cdac51f998625e629b42d 100644
+--- a/src/lotus_v2/signing.h
++++ b/src/lotus_v2/signing.h
+@@ -1,18 +1,145 @@
+ // Copyright (c) 2026 The Lotus developers
++// Candidate P01 identity/signing bytes; no VM or full transaction validity.
+ #ifndef LOTUS_V2_SIGNING_H
+ #define LOTUS_V2_SIGNING_H
+ 
+-#include "tagged_hash.h"
++#include "commitment.h"
++#include "transaction.h"
+ 
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
+ #include <optional>
+ #include <span>
++#include <string>
+ #include <vector>
+ 
+ namespace lotus::v2 {
+ 
++struct IdentityDigests {
++    Hash txid;
++    Hash txhash;
++    Hash inputs_root;
++    Hash full_inputs_root;
++    Hash outputs_root;
++    std::vector<Hash> output_leaves;
++};
++
++using ResolvedCoins = std::vector<std::optional<Output>>;
++using PositiveDelta = std::array<uint8_t, 16>; // u128 little-endian, nonzero
++
++// Immutable snapshot for repeated CHECKSIG/SIGHASH calls on one validated
++// transaction. Rebuild it if the transaction or resolved coins change.
++enum class SigningPreparationStatus {
++    Ready,
++    InvalidWitness,
++    Unsupported,
++    OperationalError
++};
++
++class PreparedSigningContext {
++public:
++    PreparedSigningContext() = default;
++    const IdentityDigests &Identities() const { return identities_; }
++
++private:
++    struct Invocation {
++        uint8_t kind{};
++        std::vector<uint8_t> selector; // 41-byte spend or 81-byte mint form.
++    };
++    IdentityDigests identities_;
++    ChainId chain_id_{};
++    uint64_t lock_{};
++    Hash txid_{};
++    Hash coins_root_{};
++    Hash outputs_root_{};
++    std::vector<Hash> output_leaves_;
++    std::vector<std::optional<Hash>> own_input_hashes_;
++    std::vector<std::vector<Invocation>> invocations_;
++    bool ready_ = false;
++
++    friend SigningPreparationStatus
++    PrepareSigningContextChecked(const Transaction &, const TxProfile &,
++                                 const ChainId &, const ResolvedCoins &,
++                                 PreparedSigningContext &, std::string &,
++                                 const IdentityDigests *);
++    friend bool PrepareSigningContext(
++        const Transaction &, const TxProfile &, const ChainId &,
++        const ResolvedCoins &, PreparedSigningContext &, std::string &);
++    friend bool SigningMessage(const PreparedSigningContext &, size_t, size_t,
++                               uint8_t, const std::optional<PositiveDelta> &,
++                               Hash &, std::string &);
++    friend bool ValidateSigningInvocation(const PreparedSigningContext &,
++                                          size_t, size_t,
++                                          const std::optional<PositiveDelta> &,
++                                          std::string &);
++};
++
++SigningPreparationStatus PrepareSigningContextChecked(
++    const Transaction &tx, const TxProfile &profile, const ChainId &chain_id,
++    const ResolvedCoins &resolved, PreparedSigningContext &result,
++    std::string &error,
++    const IdentityDigests *precomputed_identities = nullptr);
++
++bool PrepareSigningContext(const Transaction &tx, const TxProfile &profile,
++                           const ChainId &chain_id,
++                           const ResolvedCoins &resolved,
++                           PreparedSigningContext &result,
++                           std::string &error);
++// Validates invocation indices and spend/mint delta rules without hashing the
++// signing message preimage (used at VM invocation entry before CHECKSIG).
++bool ValidateSigningInvocation(const PreparedSigningContext &prepared,
++                               size_t input_index, size_t witness_index,
++                               const std::optional<PositiveDelta> &positive_delta,
++                               std::string &error);
++// After preparation this hashes one fixed-width signing preimage. No input,
++// output, witness, or coin collection is traversed per invocation.
++bool SigningMessage(const PreparedSigningContext &prepared, size_t input_index,
++                    size_t witness_index, uint8_t mode,
++                    const std::optional<PositiveDelta> &positive_delta,
++                    Hash &result, std::string &error);
++
++bool ComputeIdentities(const Transaction &tx, const TxProfile &profile,
++                       const ChainId &chain_id, IdentityDigests &result,
++                       std::string &error);
++// Computes identities for a transaction whose canonical wire framing has
++// already been validated against `profile`.
++bool ComputeIdentitiesValidated(const Transaction &tx,
++                                const TxProfile &profile,
++                                const ChainId &chain_id,
++                                IdentityDigests &result, std::string &error);
++// Fast path when canonical wire framing has been validated and txid/txhash are
++// already known: populates txid/txhash and computes output commitments only
++// when non-mode-0 sighashes may be requested.
++bool ComputeOutputIdentitiesOnly(const Transaction &tx, const Hash &known_txid,
++                                 const Hash &known_txhash,
++                                 IdentityDigests &result, std::string &error);
++bool ComputeCoinsRoot(const Transaction &tx, const ResolvedCoins &resolved,
++                      Hash &result, std::string &error);
++bool ComputeOwnInputHash(const Transaction &tx, const TxProfile &profile,
++                         const ResolvedCoins &resolved, size_t input_index,
++                         Hash &result, std::string &error);
++
++// One-off convenience wrapper. Repeated invocations must use the prepared
++// overload to avoid rebuilding roots on every signature. Resolved coins and
++// positive mint delta come from a separate validated accounting/state layer.
++bool SigningMessage(const Transaction &tx, const TxProfile &profile,
++                    const ChainId &chain_id, const ResolvedCoins &resolved,
++                    size_t input_index, size_t witness_index, uint8_t mode,
++                    const std::optional<PositiveDelta> &positive_delta,
++                    Hash &result, std::string &error);
++
++enum class SignatureStatus {
++    Valid,
++    InvalidSignature, // correct wire form and key, BIP340 check failed
++    InvalidEncoding,  // wrong 64/65-byte mode form
++    InvalidPublicKey, // wrong length or invalid x-only point
++};
++
++SignatureStatus VerifyBip340Signature(std::span<const uint8_t> public_key,
++                                      std::span<const uint8_t> signature,
++                                      const Hash &message, bool mint);
++
+ struct BatchSigItem {
+     std::array<uint8_t, 32> pubkey{};
+     std::array<uint8_t, 64> parsed_pubkey{};
+@@ -89,5 +216,19 @@ private:
+     std::vector<LegacyBatchSigItem> legacy_items_;
+ };
+ 
++// Test/wallet helper. Caller supplies fresh nonce auxiliary entropy for real
++// signing; deterministic zero auxiliary bytes are used only in fixed vectors.
++// Local keypair storage is cleansed on every exit. Caller-owned secret_key and
++// aux_randomness remain the caller's responsibility; this API retains no copy.
++bool SignBip340Message(const std::array<uint8_t, 32> &secret_key,
++                       const Hash &message, uint8_t mode,
++                       const std::array<uint8_t, 32> &aux_randomness,
++                       std::vector<uint8_t> &result, std::string &error);
++
++void RunParallelSigningWork(
++    size_t total_items, size_t min_grain,
++    const std::function<void(size_t, size_t)> &fn);
++
+ } // namespace lotus::v2
+ #endif
++
+diff --git a/src/lotus_v2/signing_test/CMakeLists.txt b/src/lotus_v2/signing_test/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..238fb9b65a2ed82ebf37f7159a1a28e186b04f2c
+--- /dev/null
++++ b/src/lotus_v2/signing_test/CMakeLists.txt
+@@ -0,0 +1,38 @@
++# Standalone review target; no production node linkage.
++cmake_minimum_required(VERSION 3.18)
++project(lotus_v2_signing_review LANGUAGES C CXX)
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++get_filename_component(LOTUS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
++if(NOT DEFINED LOTUS_SECP_LIBRARY OR NOT EXISTS "${LOTUS_SECP_LIBRARY}")
++    message(FATAL_ERROR "Set LOTUS_SECP_LIBRARY to a locally built ABC libsecp256k1.a")
++endif()
++add_library(lotus_v2_signing_blake3 STATIC
++    ../vendor/blake3/blake3.c
++    ../vendor/blake3/blake3_dispatch.c
++    ../vendor/blake3/blake3_portable.c)
++target_compile_definitions(lotus_v2_signing_blake3 PRIVATE
++    BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512 BLAKE3_USE_NEON=0)
++add_executable(lotus_v2_signing_test
++    ../output.cpp ../transaction.cpp ../commitment.cpp ../tagged_hash.cpp
++    ../signing.cpp ../test_signing.cpp "${LOTUS_SRC}/support/cleanse.cpp")
++target_include_directories(lotus_v2_signing_test PRIVATE "${LOTUS_SRC}/secp256k1/include" "${LOTUS_SRC}")
++target_link_libraries(lotus_v2_signing_test PRIVATE lotus_v2_signing_blake3 "${LOTUS_SECP_LIBRARY}")
++target_compile_options(lotus_v2_signing_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
++enable_testing()
++add_test(NAME lotus_v2_signing_test COMMAND lotus_v2_signing_test)
++
++# Instrument the cleansing boundary without recording secret contents. The
++# wrapper delegates to the exact ABC primitive and checks zeroed bytes.
++add_library(lotus_v2_test_cleanse OBJECT "${LOTUS_SRC}/support/cleanse.cpp")
++target_include_directories(lotus_v2_test_cleanse PRIVATE "${LOTUS_SRC}")
++target_compile_definitions(lotus_v2_test_cleanse PRIVATE memory_cleanse=lotus_v2_test_real_cleanse)
++add_executable(lotus_v2_signing_cleanup_test
++    test_cleanup.cpp ../output.cpp ../transaction.cpp ../commitment.cpp
++    ../tagged_hash.cpp ../signing.cpp $<TARGET_OBJECTS:lotus_v2_test_cleanse>)
++target_include_directories(lotus_v2_signing_cleanup_test PRIVATE
++    "${LOTUS_SRC}/secp256k1/include" "${LOTUS_SRC}")
++target_link_libraries(lotus_v2_signing_cleanup_test PRIVATE
++    lotus_v2_signing_blake3 "${LOTUS_SECP_LIBRARY}")
++target_compile_options(lotus_v2_signing_cleanup_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
++add_test(NAME lotus_v2_signing_cleanup_test COMMAND lotus_v2_signing_cleanup_test)
+diff --git a/src/lotus_v2/signing_test/test_cleanup.cpp b/src/lotus_v2/signing_test/test_cleanup.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1b798b43320ddd2da589374ddc2537f80b05543
+--- /dev/null
++++ b/src/lotus_v2/signing_test/test_cleanup.cpp
+@@ -0,0 +1,69 @@
++// Public fixture material only. No private bytes are logged or retained here.
++#include "../signing.h"
++#include <secp256k1_extrakeys.h>
++#include <cstdlib>
++#include <iostream>
++#include <new>
++
++namespace {
++size_t cleanups = 0;
++size_t allocations_until_failure = 0;
++void Check(bool condition) { if (!condition) std::abort(); }
++}
++
++// Exercise an exception after keypair creation. Other allocations use the
++// ordinary malloc/free allocation contract for this isolated test executable.
++void *operator new(std::size_t size) {
++    if (allocations_until_failure && --allocations_until_failure == 0) {
++        throw std::bad_alloc();
++    }
++    if (void *result = std::malloc(size ? size : 1)) return result;
++    throw std::bad_alloc();
++}
++void operator delete(void *ptr) noexcept { std::free(ptr); }
++void operator delete(void *ptr, std::size_t) noexcept { std::free(ptr); }
++
++void lotus_v2_test_real_cleanse(void *, size_t);
++void memory_cleanse(void *ptr, size_t size) {
++    Check(size == sizeof(secp256k1_keypair));
++    lotus_v2_test_real_cleanse(ptr, size);
++    const auto *bytes = static_cast<const unsigned char *>(ptr);
++    for (size_t i = 0; i < size; ++i) Check(bytes[i] == 0);
++    ++cleanups;
++}
++
++int main() {
++    using namespace lotus::v2;
++    std::array<uint8_t, 32> secret{};
++    secret.back() = 3; // Public BIP340 fixture key; never real wallet material.
++    const auto original = secret;
++    const Hash message{};
++    const std::array<uint8_t, 32> aux{};
++    std::vector<uint8_t> result;
++    std::string error;
++    for (uint8_t mode = 0; mode <= 2; ++mode) {
++        Check(SignBip340Message(secret, message, mode, aux, result, error));
++        Check(result.size() == (mode ? 65 : 64));
++        Check(!mode || result.back() == mode);
++        Check(cleanups == size_t(mode) + 1 && error.empty());
++        Check(secret == original); // Caller owns its scalar's cleanup.
++    }
++    const auto saved = result;
++    std::array<uint8_t, 32> invalid{};
++    Check(!SignBip340Message(invalid, message, 0, aux, result, error));
++    Check(cleanups == 4 && result == saved && error == "invalid secret key");
++    Check(!SignBip340Message(secret, message, 3, aux, result, error));
++    Check(cleanups == 4 && result == saved && error == "signing mode");
++    for (size_t allocation : {size_t(1), size_t(2)}) {
++        // First allocation creates sig; second grows it for a mode suffix.
++        allocations_until_failure = allocation;
++        try {
++            SignBip340Message(secret, message, allocation == 1 ? 0 : 1, aux, result, error);
++            std::abort();
++        } catch (const std::bad_alloc &) {
++            Check(!allocations_until_failure && result == saved);
++        }
++    }
++    Check(cleanups == 6);
++    std::cout << "Signing keypair cleanup passes success, invalid-key, and allocation exception exits\n";
++}
+diff --git a/src/lotus_v2/test_signing.cpp b/src/lotus_v2/test_signing.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..175451bffd235e59118bed5445dc2ad8db2613a3
+--- /dev/null
++++ b/src/lotus_v2/test_signing.cpp
+@@ -0,0 +1,299 @@
++#include "signing.h"
++
++#include <algorithm>
++#include <iostream>
++#include <stdexcept>
++#include <string>
++
++using namespace lotus::v2;
++
++#define CHECK(condition)                                                       \
++    do {                                                                       \
++        if (!(condition))                                                      \
++            throw std::runtime_error("check failed: " #condition);             \
++    } while (false)
++
++namespace {
++std::vector<uint8_t> Hex(const std::string &hex) {
++    CHECK(hex.size() % 2 == 0);
++    auto digit = [](char c) -> uint8_t {
++        if (c >= '0' && c <= '9') return c - '0';
++        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++        throw std::runtime_error("hex");
++    };
++    std::vector<uint8_t> out;
++    for (size_t i = 0; i < hex.size(); i += 2)
++        out.push_back((digit(hex[i]) << 4) | digit(hex[i + 1]));
++    return out;
++}
++Hash HashHex(const std::string &hex) {
++    auto bytes = Hex(hex);
++    CHECK(bytes.size() == 32);
++    Hash result;
++    std::copy(bytes.begin(), bytes.end(), result.begin());
++    return result;
++}
++const TxProfile PROFILE{32, 32, 8, 8192, 16, 8192, 64};
++
++void BIP340OfficialVector() {
++    // bitcoin/bips bip-0340/test-vectors.csv row 0.
++    std::array<uint8_t, 32> secret{};
++    secret[31] = 3;
++    Hash message{};
++    std::array<uint8_t, 32> aux{};
++    const auto pubkey =
++        Hex("f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9");
++    const auto expected =
++        Hex("e907831f80848d1069a5371b402410364bdf1c5f8307b0084c55f1ce2dca8215"
++            "25f66a4a85ea8b71e482a74f382d2ce5ebeee8fdb2172f477df4900d310536c0");
++    std::vector<uint8_t> sig;
++    std::string error;
++    CHECK(SignBip340Message(secret, message, 0, aux, sig, error));
++    CHECK(sig == expected);
++    CHECK(VerifyBip340Signature(pubkey, sig, message, false) ==
++          SignatureStatus::Valid);
++    message[0] = 1;
++    CHECK(VerifyBip340Signature(pubkey, sig, message, false) ==
++          SignatureStatus::InvalidSignature);
++    message[0] = 0;
++    auto bad = sig;
++    bad.push_back(0);
++    CHECK(VerifyBip340Signature(pubkey, bad, message, false) ==
++          SignatureStatus::InvalidEncoding);
++    bad.back() = 3;
++    CHECK(VerifyBip340Signature(pubkey, bad, message, false) ==
++          SignatureStatus::InvalidEncoding);
++    bad.back() = 1;
++    CHECK(VerifyBip340Signature(pubkey, bad, message, true) ==
++          SignatureStatus::InvalidEncoding);
++    auto invalid_key = pubkey;
++    invalid_key.assign(32, 255);
++    CHECK(VerifyBip340Signature(invalid_key, sig, message, false) ==
++          SignatureStatus::InvalidPublicKey);
++    secret.fill(0);
++    CHECK(!SignBip340Message(secret, message, 0, aux, sig, error));
++}
++
++void PaymentFixture() {
++    const auto wire =
++        Hex("07000000000000000000000001000100"
++            "1111111111111111111111111111111111111111111111111111111111111111"
++            "00000000ffffffff0100012220f9308a019258c31049344f85f89d5229b531c845"
++            "836f99b08601f113bce036f9bb000140"
++            "170c710899dd02f994fe139b507662b88c0701019174aafa87329af0b65a9c0b84"
++            "9c421cd740417ddeb4c6f70f4c1f50609b58c00fe8e41f9955a1091d5754aa"
++            "00e80300000000000001d0c0707d9e50c9c3aedc8409e2df04bb920a3d9f669e80"
++            "a36d2f68ea1e3f0d2a010100");
++    const auto coin_wire = Hex("00d00700000000000001d0c0707d9e50c9c3aedc8409e2d"
++                               "f04bb920a3d9f669e80a36d2f68ea1e3f0d2a010100");
++    Transaction tx;
++    Output coin;
++    std::string error;
++    CHECK(DecodeTransaction(wire, PROFILE, tx, error));
++    CHECK(DecodeOutput(coin_wire, coin, error));
++    ResolvedCoins resolved{coin};
++    ChainId chain{};
++    for (size_t i = 0; i < 32; ++i)
++        chain[i] = uint8_t(i);
++    IdentityDigests ids;
++    CHECK(ComputeIdentities(tx, PROFILE, chain, ids, error));
++    CHECK(ids.txid == HashHex("6f097525dfa73f4c9eb428ed6e0e2e70efe63224479b8e0c"
++                              "ede896a7e4caab2c"));
++    CHECK(ids.txhash == HashHex("b27873b6da521172796f7365a8b338e694879bc712d8d2"
++                                "ecabdb22d39378704d"));
++    Hash coins, own;
++    CHECK(ComputeCoinsRoot(tx, resolved, coins, error));
++    CHECK(coins == HashHex("deeba4111737eec866fe0d3998ca43ca4ab84b97afa2cc144e8"
++                           "9e60f6dd3dd21"));
++    CHECK(ComputeOwnInputHash(tx, PROFILE, resolved, 0, own, error));
++    CHECK(own == HashHex("e9c6f915cde3bab2ab260ddc74f007767042c4836b6c638b30d9e"
++                         "7397832e5f8"));
++    const std::array<std::string, 3> expected{
++        "04a85123186ad1a571dc9878c2f2ae8e27329e6f409dcece4e47368428067ecd",
++        "edd48a54efc1c6fb3a548525e570021b14c890bada1c0419a66cbdbd04c31c2a",
++        "45d5a4af0c5a832acab582eb5b6fc5b5fadba6f0b670bd92e36256f6d5fd72e8"};
++    PreparedSigningContext prepared;
++    CHECK(PrepareSigningContext(tx, PROFILE, chain, resolved, prepared, error));
++    CHECK(PrepareSigningContextChecked(tx, PROFILE, chain, resolved, prepared, error) ==
++          SigningPreparationStatus::Ready);
++    const auto saved_txid = prepared.Identities().txid;
++    auto wrong_witness = tx;
++    wrong_witness.inputs[0].witnesses[0].script[0] ^= 1;
++    CHECK(PrepareSigningContextChecked(wrong_witness, PROFILE, chain, resolved, prepared, error) ==
++          SigningPreparationStatus::InvalidWitness);
++    CHECK(prepared.Identities().txid == saved_txid);
++    CHECK(PrepareSigningContextChecked(tx, PROFILE, chain, {}, prepared, error) ==
++          SigningPreparationStatus::OperationalError);
++    auto invalid_profile = PROFILE;
++    invalid_profile.max_inputs = 0;
++    CHECK(PrepareSigningContextChecked(tx, invalid_profile, chain, resolved, prepared, error) ==
++          SigningPreparationStatus::OperationalError);
++    CHECK(prepared.Identities().txid == saved_txid);
++
++    for (uint8_t mode = 0; mode < 3; ++mode) {
++        Hash message;
++        CHECK(SigningMessage(tx, PROFILE, chain, resolved, 0, 0, mode,
++                             std::nullopt, message, error));
++        CHECK(message == HashHex(expected[mode]));
++        Hash cached_message;
++        CHECK(SigningMessage(prepared, 0, 0, mode, std::nullopt,
++                             cached_message, error));
++        CHECK(cached_message == message);
++    }
++    const auto signature = tx.inputs[0].witnesses[0].arguments[0];
++    const auto pubkey =
++        Hex("f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9");
++    Hash message;
++    CHECK(SigningMessage(tx, PROFILE, chain, resolved, 0, 0, 0, std::nullopt,
++                         message, error));
++    CHECK(VerifyBip340Signature(pubkey, signature, message, false) ==
++          SignatureStatus::Valid);
++    ChainId other_chain = chain;
++    other_chain[0] ^= 1;
++    Hash cross_chain_message;
++    CHECK(SigningMessage(tx, PROFILE, other_chain, resolved, 0, 0, 0,
++                         std::nullopt, cross_chain_message, error));
++    CHECK(cross_chain_message != message);
++    CHECK(VerifyBip340Signature(pubkey, signature, cross_chain_message,
++                                false) == SignatureStatus::InvalidSignature);
++    const auto original_id = ids.txid;
++    const auto original_hash = ids.txhash;
++    tx.inputs[0].witnesses[0].arguments[0] = {'x'};
++    CHECK(ComputeIdentities(tx, PROFILE, chain, ids, error));
++    CHECK(ids.txid == original_id && ids.txhash != original_hash);
++    Hash mutated_message;
++    CHECK(SigningMessage(tx, PROFILE, chain, resolved, 0, 0, 0, std::nullopt,
++                         mutated_message, error));
++    CHECK(mutated_message == message);
++    tx.outputs.clear();
++    CHECK(!SigningMessage(tx, PROFILE, chain, resolved, 0, 0, 2, std::nullopt,
++                          mutated_message, error));
++    CHECK(!SigningMessage(tx, PROFILE, chain, resolved, 0, 0, 3, std::nullopt,
++                          mutated_message, error));
++}
++
++void MintMessage() {
++    const auto wire =
++        Hex("07000000000000000000000001000100"
++            "1111111111111111111111111111111111111111111111111111111111111111"
++            "00000000ffffffff0100012220f9308a019258c31049344f85f89d5229b531c845"
++            "836f99b08601f113bce036f9bb000140"
++            "170c710899dd02f994fe139b507662b88c0701019174aafa87329af0b65a9c0b84"
++            "9c421cd740417ddeb4c6f70f4c1f50609b58c00fe8e41f9955a1091d5754aa"
++            "00e80300000000000001d0c0707d9e50c9c3aedc8409e2df04bb920a3d9f669e80"
++            "a36d2f68ea1e3f0d2a010100");
++    const auto coin_wire = Hex("00d00700000000000001d0c0707d9e50c9c3aedc8409e2d"
++                               "f04bb920a3d9f669e80a36d2f68ea1e3f0d2a010100");
++    Transaction tx;
++    Output coin;
++    std::string error;
++    CHECK(DecodeTransaction(wire, PROFILE, tx, error));
++    CHECK(DecodeOutput(coin_wire, coin, error));
++    Input mint;
++    mint.flags = 3;
++    mint.sequence = UINT32_MAX;
++    mint.prev_txid = HashHex(
++        "a88cef369f758aec3e594eaa4e8d08c9f12ef3f11bea972ec53a416a148f0605");
++    mint.witnesses.push_back(BranchWitness{{0x4e}, {}, {{'x'}}});
++    tx.inputs.push_back(mint);
++    ResolvedCoins resolved{coin, std::nullopt};
++    ChainId chain{};
++    for (size_t i = 0; i < 32; ++i)
++        chain[i] = uint8_t(i);
++    PositiveDelta delta{};
++    delta[0] = 1;
++    PreparedSigningContext prepared;
++    CHECK(PrepareSigningContext(tx, PROFILE, chain, resolved, prepared, error));
++    Hash message;
++    CHECK(SigningMessage(tx, PROFILE, chain, resolved, 1, 0, 0, delta, message,
++                         error));
++    CHECK(message == HashHex("e377de4d5eeef48cba47286c47dc88a1a61019c06f6f2f1e4"
++                             "ea2f263d60bb587"));
++    Hash cached_message;
++    CHECK(SigningMessage(prepared, 1, 0, 0, delta, cached_message, error));
++    CHECK(cached_message == message);
++    CHECK(!SigningMessage(prepared, 1, 0, 1, delta, cached_message, error));
++    CHECK(!SigningMessage(prepared, 1, 0, 0, std::nullopt, cached_message,
++                          error));
++    CHECK(!SigningMessage(tx, PROFILE, chain, resolved, 1, 0, 1, delta, message,
++                          error));
++    CHECK(!SigningMessage(tx, PROFILE, chain, resolved, 1, 0, 2, delta, message,
++                          error));
++    delta[0] = 0;
++    CHECK(!SigningMessage(tx, PROFILE, chain, resolved, 1, 0, 0, delta, message,
++                          error));
++    delta[0] = 1;
++    tx.inputs[1].witnesses.clear();
++    CHECK(!SigningMessage(tx, PROFILE, chain, resolved, 1, 0, 0, delta, message,
++                          error));
++    tx.inputs[1].flags = 0;
++    Hash coins;
++    CHECK(!ComputeCoinsRoot(tx, resolved, coins, error));
++}
++
++void BatchSigCollectorVerificationAndBisection() {
++    std::array<uint8_t, 32> secret{};
++    secret[31] = 3;
++    std::array<uint8_t, 32> aux{};
++    const auto pubkey =
++        Hex("f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9");
++
++    constexpr size_t kBatchCount = 256;
++    BatchSigCollector collector;
++    collector.Reserve(kBatchCount);
++    std::vector<Hash> messages(kBatchCount);
++    std::vector<std::vector<uint8_t>> sigs(kBatchCount);
++    std::string error;
++
++    for (size_t i = 0; i < kBatchCount; ++i) {
++        messages[i].fill(0);
++        messages[i][0] = uint8_t(i & 0xff);
++        messages[i][1] = uint8_t((i >> 8) & 0xff);
++        messages[i][2] = 0x5a;
++        aux[0] = uint8_t(i & 0xff);
++        CHECK(SignBip340Message(secret, messages[i], 0, aux, sigs[i], error));
++        CHECK(collector.Add(pubkey, sigs[i], messages[i]));
++    }
++    CHECK(collector.Size() == kBatchCount);
++    CHECK(collector.VerifyAll(1));
++    CHECK(collector.VerifyAll(4));
++    CHECK(!collector.FirstFailingIndex(1).has_value());
++    CHECK(!collector.FirstFailingIndex(4).has_value());
++
++    // Reject malformed public key or short signature in Add()
++    auto bad_key = pubkey;
++    bad_key.assign(32, 0xff);
++    CHECK(!collector.Add(bad_key, sigs[0], messages[0]));
++    CHECK(!collector.Add(pubkey, std::span<const uint8_t>(sigs[0].data(), 63),
++                        messages[0]));
++
++    // Single-bit-flip detection and exact failing index bisection
++    for (size_t bad_idx : {size_t(0), size_t(1), size_t(73), size_t(128),
++                           size_t(255)}) {
++        BatchSigCollector corrupted;
++        corrupted.Reserve(kBatchCount);
++        for (size_t i = 0; i < kBatchCount; ++i) {
++            auto s = sigs[i];
++            if (i == bad_idx) {
++                s[37] ^= (1u << (bad_idx % 8));
++            }
++            CHECK(corrupted.Add(pubkey, s, messages[i]));
++        }
++        CHECK(!corrupted.VerifyAll(1));
++        CHECK(!corrupted.VerifyAll(4));
++        const auto found_st = corrupted.FirstFailingIndex(1);
++        const auto found_mt = corrupted.FirstFailingIndex(4);
++        CHECK(found_st.has_value() && *found_st == bad_idx);
++        CHECK(found_mt.has_value() && *found_mt == bad_idx);
++    }
++}
++} // namespace
++
++int main() {
++    BIP340OfficialVector();
++    PaymentFixture();
++    MintMessage();
++    BatchSigCollectorVerificationAndBisection();
++    std::cout << "Lotus V2 signing identities and BIP340 vectors pass\n";
++}
++

@@ -1,0 +1,282 @@
+From 9f60fa3b735b8cc7fdd8d68f24784b84b8525666 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 23:54:33 -0700
+Subject: [PATCH] net: dial outbound connections without stalling the others
+
+Outbound connections were opened synchronously by the thread wanting
+them (automatic outbound, -addnode, -connect, addconnection). A wss://
+peer takes a TCP connect, a TLS handshake and an HTTP upgrade (up to 5 s
+plus 20 s), so one slow or unresponsive peer held up every connection
+after it.
+
+Each outbound attempt now runs on a thread of its own, and the finished
+node is registered as before. While it is in progress it counts as a
+connection: it keeps its outbound slot (the semaphore grant moves with
+it), its connection type, address and address group are counted when
+choosing what to open next, and the same address or name is not dialed
+twice. It stops counting only once the node is registered (or failed),
+so there is no window in which a peer is neither. Shutdown interrupts
+attempts in flight and joins them before nodes are cleaned up.
+
+addconnection now returns once the attempt has started.
+---
+ src/net.cpp                                 | 108 +++++++++++++++++---
+ src/net.h                                   |  28 +++++
+ test/functional/p2p_websocket_dial_stall.py |  62 +++++++++++
+ 3 files changed, 186 insertions(+), 12 deletions(-)
+ create mode 100755 test/functional/p2p_websocket_dial_stall.py
+
+diff --git a/src/net.cpp b/src/net.cpp
+index 7e2197a727115e0563f401e832838002aa54184e..ee637868438a4a3690ccbb524844f1072b5a8878 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -34,6 +34,7 @@
+ #include <util/sock.h>
+ #include <util/strencodings.h>
+ #include <util/thread.h>
++#include <util/threadnames.h>
+ #include <util/threadinterrupt.h>
+ #include <util/trace.h>
+ #include <util/translation.h>
+@@ -2239,6 +2240,24 @@ void CConnman::ThreadOpenConnections(
+         int nOutboundAvalanche = 0;
+         std::set<std::vector<uint8_t>> setConnected;
+ 
++        {
++            // Connections being established count as made (see
++            // PendingOutbound), so their slots, types and groups are not
++            // dialed twice.
++            LOCK(m_pending_mutex);
++            for (const PendingOutbound &p : m_pending_outbound) {
++                if (p.conn_type == ConnectionType::AVALANCHE_OUTBOUND) {
++                    nOutboundAvalanche++;
++                } else if (p.conn_type == ConnectionType::OUTBOUND_FULL_RELAY) {
++                    nOutboundFullRelay++;
++                } else if (p.conn_type == ConnectionType::BLOCK_RELAY) {
++                    nOutboundBlockRelay++;
++                }
++                if (p.conn_type != ConnectionType::MANUAL && p.addr.IsValid()) {
++                    setConnected.insert(p.addr.GetGroup(addrman.GetAsmap()));
++                }
++            }
++        }
+         {
+             LOCK(m_nodes_mutex);
+             for (const CNode *pnode : m_nodes) {
+@@ -2622,22 +2641,84 @@ void CConnman::OpenNetworkConnection(const CAddress &addrConnect,
+         return;
+     }
+ 
+-    CNode *pnode = ConnectNode(addrConnect, pszDest, fCountFailure, conn_type);
+-
+-    if (!pnode) {
++    const std::string dest{pszDest ? pszDest : ""};
++    if (IsPendingOutbound(addrConnect, dest)) {
+         return;
+     }
+-    if (grantOutbound) {
+-        grantOutbound->MoveTo(pnode->grantOutbound);
+-    }
+-
+-    for (auto interface : m_msgproc) {
+-        interface->InitializeNode(*config, *pnode, nLocalServices);
+-    }
+ 
++    // Dial on a thread of its own: TCP, TLS and the WebSocket upgrade can
++    // take a while, and must not stall the threads opening other
++    // connections. The attempt keeps the outbound slot until it finishes.
++    auto grant{std::make_unique<CSemaphoreGrant>()};
++    if (grantOutbound) {
++        grantOutbound->MoveTo(*grant);
++    }
++    auto done{std::make_shared<std::atomic<bool>>(false)};
++    ReapDialThreads(/*all=*/false);
++    LOCK(m_pending_mutex);
++    const uint64_t id{m_next_pending_id++};
++    m_pending_outbound.push_back({id, addrConnect, dest, conn_type});
++    m_dial_threads.push_back(DialThread{
++        std::thread{[this, id, addrConnect, dest, fCountFailure, conn_type,
++                     grant = std::move(grant), done]() mutable {
++            util::ThreadRename("p2pdial");
++            CNode *pnode{ConnectNode(addrConnect,
++                                     dest.empty() ? nullptr : dest.c_str(),
++                                     fCountFailure, conn_type)};
++            if (pnode && !interruptNet) {
++                grant->MoveTo(pnode->grantOutbound);
++                for (auto interface : m_msgproc) {
++                    interface->InitializeNode(*config, *pnode, nLocalServices);
++                }
++                LOCK(m_nodes_mutex);
++                m_nodes.push_back(pnode);
++            } else if (pnode) {
++                // Shutting down: never handed to the message processors, so
++                // there is nothing to finalize.
++                pnode->CloseSocketDisconnect();
++                delete pnode;
++            }
++            // Only now that the node is in m_nodes (or failed) does the
++            // attempt stop counting as one, so nothing dials it twice.
++            {
++                LOCK(m_pending_mutex);
++                m_pending_outbound.remove_if(
++                    [id](const PendingOutbound &p) { return p.id == id; });
++            }
++            *done = true;
++        }},
++        done});
++}
++
++bool CConnman::IsPendingOutbound(const CAddress &addr,
++                                 const std::string &name) const {
++    LOCK(m_pending_mutex);
++    return std::any_of(m_pending_outbound.begin(), m_pending_outbound.end(),
++                       [&](const PendingOutbound &p) {
++                           return name.empty()
++                                      ? p.addr.IsValid() &&
++                                            static_cast<CService>(p.addr) ==
++                                                static_cast<CService>(addr)
++                                      : p.name == name;
++                       });
++}
++
++void CConnman::ReapDialThreads(bool all) {
++    std::list<DialThread> finished;
+     {
+-        LOCK(m_nodes_mutex);
+-        m_nodes.push_back(pnode);
++        LOCK(m_pending_mutex);
++        for (auto it = m_dial_threads.begin(); it != m_dial_threads.end();) {
++            if (all || *it->done) {
++                finished.splice(finished.end(), m_dial_threads, it++);
++            } else {
++                ++it;
++            }
++        }
++    }
++    for (auto &dial : finished) {
++        if (dial.thread.joinable()) {
++            dial.thread.join();
++        }
+     }
+ }
+ 
+@@ -3090,6 +3171,9 @@ void CConnman::Interrupt() {
+ }
+ 
+ void CConnman::StopThreads() {
++    // Dials in progress end on interruptNet; their nodes are added before
++    // StopNodes() cleans up, or deleted.
++    ReapDialThreads(/*all=*/true);
+     if (threadI2PAcceptIncoming.joinable()) {
+         threadI2PAcceptIncoming.join();
+     }
+diff --git a/src/net.h b/src/net.h
+index 1eefd65cf69bc8bf8eacdbc3e8fdd94fa9542cf8..3a40caae57f948d73049472fb58280d9cea0bbe3 100644
+--- a/src/net.h
++++ b/src/net.h
+@@ -1403,6 +1403,34 @@ private:
+     std::thread threadOpenAddedConnections;
+     std::thread threadOpenConnections;
+     std::thread threadMessageHandler;
++
++    /**
++     * An outbound connection being established. Each is dialed (TCP, TLS,
++     * WebSocket upgrade) on its own thread, so a slow or unresponsive peer
++     * never holds up the threads opening other connections. Until it
++     * finishes it counts as a connection of its type, address and group,
++     * and keeps its outbound slot.
++     */
++    struct PendingOutbound {
++        uint64_t id;
++        CAddress addr;
++        std::string name;
++        ConnectionType conn_type;
++    };
++    struct DialThread {
++        std::thread thread;
++        std::shared_ptr<std::atomic<bool>> done;
++    };
++    mutable Mutex m_pending_mutex;
++    std::list<PendingOutbound> m_pending_outbound GUARDED_BY(m_pending_mutex);
++    std::list<DialThread> m_dial_threads GUARDED_BY(m_pending_mutex);
++    uint64_t m_next_pending_id GUARDED_BY(m_pending_mutex){0};
++
++    /** Whether an outbound attempt to this address or name is in progress */
++    bool IsPendingOutbound(const CAddress &addr, const std::string &name) const
++        EXCLUSIVE_LOCKS_REQUIRED(!m_pending_mutex);
++    /** Join the dial threads that are done (all, with `all`) */
++    void ReapDialThreads(bool all) EXCLUSIVE_LOCKS_REQUIRED(!m_pending_mutex);
+     std::thread threadI2PAcceptIncoming;
+ 
+     /**
+diff --git a/test/functional/p2p_websocket_dial_stall.py b/test/functional/p2p_websocket_dial_stall.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..618877c4d7f240a3ea059f295c19ee212c18f669
+--- /dev/null
++++ b/test/functional/p2p_websocket_dial_stall.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Bitcoin developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Test that an unresponsive WebSocket peer does not stall other dials.
++
++Outbound connections are dialed on threads of their own: a peer that accepts
++TCP and then never answers the WebSocket handshake (up to its 20 s deadline)
++must not delay connections started after it. While it is pending it counts
++as a connection: it is not dialed twice.
++"""
++
++import socket
++import threading
++import time
++
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import p2p_port
++
++
++class P2PWebSocketDialStallTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 2
++        self.setup_clean_chain = True
++
++    def setup_network(self):
++        self.setup_nodes()
++
++    def run_test(self):
++        node0, node1 = self.nodes
++        silent_port = p2p_port(40)
++        silent = socket.create_server(("127.0.0.1", silent_port))
++        accepted = []
++
++        def accept():
++            while True:
++                try:
++                    accepted.append(silent.accept()[0])
++                except OSError:
++                    return
++
++        threading.Thread(target=accept, daemon=True).start()
++        url = f"wss://127.0.0.1:{silent_port}/p2p/ws"
++
++        self.log.info("A silent peer does not delay the next connection")
++        start = time.time()
++        node1.addnode(node=url, command="onetry")
++        self.connect_nodes(1, 0)
++        assert time.time() - start < 10, time.time() - start
++
++        self.log.info("...and is dialed once while pending")
++        node1.addnode(node=url, command="onetry")
++        node1.addnode(node=url, command="onetry")
++        time.sleep(1)
++        assert len(accepted) == 1, len(accepted)
++        silent.close()
++        for s in accepted:
++            s.close()
++
++
++if __name__ == "__main__":
++    P2PWebSocketDialStallTest().main()
+-- 
+2.50.1 (Apple Git-155)
+

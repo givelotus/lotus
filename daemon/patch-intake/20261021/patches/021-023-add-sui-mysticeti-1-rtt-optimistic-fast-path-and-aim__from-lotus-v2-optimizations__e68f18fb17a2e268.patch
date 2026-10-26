@@ -1,0 +1,502 @@
+From 8d8f7a230a11ccf3215a0c8c042daf9ba1aaa981 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:29 -0700
+Subject: [PATCH] avalanche: add Sui Mysticeti 1-RTT optimistic fast-path and
+ AIMD epoch controller
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add the Sui Mysticeti 1-RTT optimistic pre-consensus fast-path when quorum
+peers agree with zero conflicts, paired with an AIMD epoch window controller.
+
+Coalesced prerequisite commits:
+
+ecash/021 — mempool: coalesce RCU snapshot updates in removeForBlock, TrimToSize, and ClearPrioritisation
+Coalesce RCU snapshot publication across bulk mempool removals, TrimToSize,
+and ClearPrioritisation using ScopedSnapshotDefer to eliminate redundant
+O(N) snapshot rebuilds.
+
+ecash/022 — net: add GF(2^64) s5 checksum and Merklix d>=3 sub-bucket overflow bisection
+Add the degree-5 GF(2^64) s5 syndrome checksum to eliminate false-positive
+degree-2 Berlekamp-Massey root decodes and bisect overflowing Merklix
+sub-buckets to depth 12 and 16.
+
+
+Build-prerequisite maintenance:
+- Retain the existing overlay, s5, lazy-snapshot and mempool-queue interfaces removed by 020 while their implementations/callers remain; retain prerequisite filter/fee headers and the optional batch-collector declaration.
+- Retain the reconciliation s5/sub-bucket declarations used by the 020 protocol implementation and restored by 022.
+- Introduce the optional no-op CCoinsView prefetch hint API at its first call in 004; concrete overrides remain in 026.
+- Define the avabatch inventory ID required by the original 012 implementation/tests (0x20000006), preserve it in GetKind, and map its command name.
+- Remove the stale treasury lock annotation until its V2 treasury mutex exists; no runtime treasury code is changed.
+- Declare the existing mempool-batch vote variant and visitors with their 012 definitions; defer the V2-only supply gate until its V2 supply API is present.
+- Provide a no-op backlog telemetry hint for the 014 snapshot caller; adaptive EMA tracking stays in 029.
+- Reorder the V2 circulating-supply integration case to the V2 API introduction; it referenced absent SetV2BlockCirculatingSupplyForTest on L1.
+- Compile the original Avalanche batch hashing helpers and define their avabatch wire command. Vendor/link BLAKE3 for the existing non-consensus batch-ID hash; L1 tagged hashes and block/transaction consensus hashes remain SHA-based.
+- Keep one copy of the adaptive-epoch accessors and freeze API duplicated by 023.
+- Retain the pre-existing multi-depth reconciliation definitions/declarations across the incomplete 020 removal; declare the transaction-processing methods already defined in 020.
+- Restore the missing testrawtxbatch result-lambda binding and removeUnchecked transaction alias, and include declarations used by validation; these are compile repairs to existing expressions.
+- Include the concrete disconnected-transaction type in its native test, and retain the 011 inventory expectations (50/25 ms, 2500 items/s, 350000 retained IDs) across stale 020 test literals.
+- Define peer-known transaction overrides at their first 020 use. The batch fallback calls the scalar operation; the coalesced-lock implementation remains in 035. Retain the existing s5 recovery overload removed by 020.
+- Keep the first copy of each preconsensus batch test; 023 appended duplicate BOOST test definitions already present in 012.
+
+Original-Commit: 112475908d34cebcb922a750376452e701a6aaac
+Original-Commit: 0c506a0c6c6086f9a194e0e85ab5b794d803e603
+Original-Commit: b5763922141d54ca3553925b4edde6e91b97e674
+---
+ .../test/preconsensus_batch_tests.cpp         |   6 +
+ src/net/v2_protocol_handler.cpp               |  77 +++--
+ src/test/snapshot_rcu_tests.cpp               |   1 +
+ src/test/v2_protocol_handler_tests.cpp        | 265 ++++++++++++++++++
+ src/txmempool.cpp                             |   5 +-
+ 5 files changed, 331 insertions(+), 23 deletions(-)
+
+diff --git a/src/avalanche/test/preconsensus_batch_tests.cpp b/src/avalanche/test/preconsensus_batch_tests.cpp
+index 8247c4aa61ac9494c28d32f92424d256a7774af8..5840a84452f8f801e7460ba0970f66f24c014ae8 100644
+--- a/src/avalanche/test/preconsensus_batch_tests.cpp
++++ b/src/avalanche/test/preconsensus_batch_tests.cpp
+@@ -902,4 +902,10 @@ BOOST_FIXTURE_TEST_CASE(
+     BOOST_CHECK(finalizedChain[1] == batch2);
+ }
+ 
++
++
++
++
++
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/net/v2_protocol_handler.cpp b/src/net/v2_protocol_handler.cpp
+index 2ae554f0848c8400ce562d6863eac7cdbf801c7a..70a0e6d199ada76742c69204d8219f85c745a428 100644
+--- a/src/net/v2_protocol_handler.cpp
++++ b/src/net/v2_protocol_handler.cpp
+@@ -26,26 +26,6 @@
+ #include <unordered_set>
+ 
+ namespace lotus::v2::net {
+-std::optional<std::vector<uint64_t>>
+-RecoverGF64Syndromes(uint64_t delta_s1, uint64_t delta_s3,
+-                     uint64_t delta_s5) noexcept {
+-    if (delta_s1 == 0 && delta_s3 == 0 && delta_s5 == 0) {
+-        return std::vector<uint64_t>{};
+-    }
+-    auto roots = RecoverGF64Syndromes(delta_s1, delta_s3);
+-    if (!roots.has_value() || roots->empty()) {
+-        return std::nullopt;
+-    }
+-    uint64_t expected_s5 = 0;
+-    for (uint64_t r : *roots) {
+-        expected_s5 ^= GF64Pow5(r);
+-    }
+-    if (expected_s5 != delta_s5) {
+-        return std::nullopt;
+-    }
+-    return roots;
+-}
+-
+ 
+ namespace {
+ 
+@@ -219,6 +199,26 @@ RecoverGF64Syndromes(uint64_t delta_s1, uint64_t delta_s3) noexcept {
+     return std::vector<uint64_t>{x1, x2};
+ }
+ 
++std::optional<std::vector<uint64_t>>
++RecoverGF64Syndromes(uint64_t delta_s1, uint64_t delta_s3,
++                     uint64_t delta_s5) noexcept {
++    if (delta_s1 == 0 && delta_s3 == 0 && delta_s5 == 0) {
++        return std::vector<uint64_t>{};
++    }
++    auto roots = RecoverGF64Syndromes(delta_s1, delta_s3);
++    if (!roots.has_value() || roots->empty()) {
++        return std::nullopt;
++    }
++    uint64_t expected_s5 = 0;
++    for (uint64_t r : *roots) {
++        expected_s5 ^= GF64Pow5(r);
++    }
++    if (expected_s5 != delta_s5) {
++        return std::nullopt;
++    }
++    return roots;
++}
++
+ uint64_t ComputeMerklixShortId(uint64_t salt_k0, uint64_t salt_k1,
+                                const TxId &txid) noexcept {
+     const uint64_t sid = SipHashUint256(salt_k0, salt_k1, txid);
+@@ -1330,6 +1330,8 @@ void V2PeerProtocolHandler::HandleMerklixSync(
+         buck_req.salt_k0 = summary.salt_k0;
+         buck_req.salt_k1 = summary.salt_k1;
+         buck_req.bucket_mask = diff.mismatched_bucket_mask;
++        buck_req.depth_bits = 4;
++        buck_req.parent_prefix = 0;
+         m_connman.PushMessage(
+             &pfrom, NetMsg::Make(NetMsgType::GETMERKLIXBUCK, buck_req));
+     }
+@@ -1410,7 +1412,11 @@ void V2PeerProtocolHandler::HandleMerklixBuck(
+         return;
+     }
+ 
+-    if (!IsValidReconScope(sub.scope) || sub.parent_bucket >= 16) {
++    const uint8_t depth_bits = sub.depth_bits == 0 ? 8 : sub.depth_bits;
++    if (!IsValidReconScope(sub.scope) || sub.parent_bucket >= 16 ||
++        (depth_bits != 8 && depth_bits != 12 && depth_bits != 16) ||
++        sub.parent_prefix >= (1U << (depth_bits - 4)) ||
++        sub.overflow_short_ids.size() > ShortTxRequest::MAX_SHORT_IDS) {
+         LOCK(m_mutex);
+         ++m_stats.malformed_messages;
+         return;
+@@ -1448,6 +1454,35 @@ void V2PeerProtocolHandler::HandleMerklixBuck(
+         m_connman.PushMessage(&pfrom,
+                               NetMsg::Make(NetMsgType::GETSHORTTX, req));
+     }
++
++    // Multi-depth prefix bisection for d >= 3 sub-bucket overflows:
++    // depth 8 -> request depth 12; depth 12 -> request depth 16.
++    if (!diff.unresolved_sub_buckets.empty() && depth_bits < 16) {
++        uint16_t unresolved_mask = 0;
++        for (const uint8_t sb : diff.unresolved_sub_buckets) {
++            if (sb < 16) {
++                unresolved_mask |= static_cast<uint16_t>(1U << sb);
++            }
++        }
++        if (unresolved_mask != 0) {
++            const uint16_t effective_parent_prefix =
++                (depth_bits == 8 &&
++                 (sub.parent_bucket != 0 || sub.parent_prefix == 0))
++                    ? static_cast<uint16_t>(sub.parent_bucket)
++                    : sub.parent_prefix;
++            MerklixBucketRequest bisected_req;
++            bisected_req.scope = sub.scope;
++            bisected_req.context_id = sub.context_id;
++            bisected_req.salt_k0 = sub.salt_k0;
++            bisected_req.salt_k1 = sub.salt_k1;
++            bisected_req.bucket_mask = unresolved_mask;
++            bisected_req.depth_bits = depth_bits;
++            bisected_req.parent_prefix = effective_parent_prefix;
++            m_connman.PushMessage(
++                &pfrom,
++                NetMsg::Make(NetMsgType::GETMERKLIXBUCK, bisected_req));
++        }
++    }
+ }
+ 
+ void V2PeerProtocolHandler::HandleGetShortTx(
+diff --git a/src/test/snapshot_rcu_tests.cpp b/src/test/snapshot_rcu_tests.cpp
+index 24813f57535ac903d99532b0287ca1848f13a41c..7639fda7eed1992954f0dc0a5ba09894af7c7d2d 100644
+--- a/src/test/snapshot_rcu_tests.cpp
++++ b/src/test/snapshot_rcu_tests.cpp
+@@ -7,6 +7,7 @@
+ #include <consensus/amount.h>
+ #include <consensus/tx_check.h>
+ #include <core_io.h>
++#include <kernel/disconnected_transactions.h>
+ #include <key_io.h>
+ #include <minerfund.h>
+ #include <node/snapshot.h>
+diff --git a/src/test/v2_protocol_handler_tests.cpp b/src/test/v2_protocol_handler_tests.cpp
+index 7c94d51ef52c8dc558b6be343205571efe92c852..ea6f351fc5282729b554b6bc9d0596c4a3bdd13d 100644
+--- a/src/test/v2_protocol_handler_tests.cpp
++++ b/src/test/v2_protocol_handler_tests.cpp
+@@ -856,6 +856,7 @@ BOOST_AUTO_TEST_CASE(adversarial_c1_d1_d2_hardening_gates) {
+         z_sub.sub_buckets[0].s3 = 1;
+         z_sub.sub_buckets[1].s1 ^= 1ULL;
+         z_sub.sub_buckets[1].s3 ^= 1ULL;
++        z_sub.sub_buckets[1].s5 ^= 1ULL;
+         z_sub.sub_buckets[1].count += 10;
+         const auto sub_diff = v2_handler->DiffSubBucketSummary(z_sub);
+         BOOST_CHECK(!sub_diff.unresolved_sub_buckets.empty());
+@@ -1026,6 +1027,7 @@ BOOST_AUTO_TEST_CASE(adversarial_c1_d1_d2_hardening_gates) {
+         sym2_sub.sub_buckets[sb_idx].count = 1;
+         sym2_sub.sub_buckets[sb_idx].s1 = remote_only_sid;
+         sym2_sub.sub_buckets[sb_idx].s3 = GF64Cube(remote_only_sid);
++        sym2_sub.sub_buckets[sb_idx].s5 = GF64Pow5(remote_only_sid);
+         const auto sym2_diff = v2_handler->DiffSubBucketSummary(sym2_sub);
+         BOOST_CHECK_EQUAL(sym2_diff.missing_short_ids.size(), 1U);
+         BOOST_CHECK_EQUAL(sym2_diff.missing_short_ids[0], remote_only_sid);
+@@ -1068,6 +1070,269 @@ BOOST_AUTO_TEST_CASE(adversarial_c1_d1_d2_hardening_gates) {
+     peerman->FinalizeNode(config, peer_node);
+ }
+ 
++BOOST_AUTO_TEST_CASE(
++    merklix_s5_checksum_and_deep_sub_bucket_overflow_bisection) {
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++
++    const Config &config = m_node.chainman->GetConfig();
++    auto connman = std::make_unique<ConnmanTestMsg>(config, 0x466a, 0x466a,
++                                                    *m_node.addrman);
++    auto peerman =
++        PeerManager::make(*connman, *m_node.addrman, nullptr, *m_node.chainman,
++                          *m_node.mempool, /*avalanche=*/nullptr, {});
++
++    CConnman::Options options;
++    options.m_msgproc = {peerman.get()};
++    connman->Init(options);
++
++    CAddress addr(MakeTestIp(0xa0b0c040), NODE_NONE);
++    CNode peer_node(/*id=*/404, /*sock=*/nullptr, addr,
++                    /*nKeyedNetGroupIn=*/0, /*nLocalHostNonceIn=*/0,
++                    /*nLocalExtraEntropyIn=*/0, CAddress(), /*pszDest=*/"",
++                    ConnectionType::OUTBOUND_FULL_RELAY,
++                    /*inbound_onion=*/false);
++    connman->Handshake(
++        /*node=*/peer_node,
++        /*successfully_connected=*/true,
++        /*remote_services=*/ServiceFlags(NODE_NETWORK),
++        /*local_services=*/ServiceFlags(NODE_NETWORK),
++        /*version=*/PROTOCOL_VERSION,
++        /*relay_txs=*/true);
++
++    V2PeerProtocolHandler *local_handler = peerman->GetV2ProtocolHandler();
++    BOOST_REQUIRE(local_handler != nullptr);
++    V2PeerProtocolHandler remote_handler(*m_node.chainman, *m_node.mempool,
++                                         *connman, *peerman);
++
++    FastRandomContext rng(uint256{0x77});
++    std::atomic<bool> interrupt{false};
++    std::chrono::microseconds cur_time{10'000'000};
++
++    // =========================================================================
++    // 1. Sub-bucket with 3 missing + 1 extra transaction (|delta_count| = 2,
++    //    d = 4) where Tr(c) == 0:
++    //    Verify that without s5 the 2-syndrome solver would find 2 bogus roots,
++    //    whereas with s5 = XOR(x_i^5) both RecoverGF64Syndromes(s1, s3, s5) and
++    //    DiffSubBucketSummary deterministically detect overflow (zero false
++    //    positives!).
++    // =========================================================================
++    {
++        const ReconScope scope = ReconScope::BLOCK_RECON;
++        const uint256 ctx_id = rng.rand256();
++        const auto [k0, k1] = DeriveReconSipHashKey(scope, ctx_id, 0);
++
++        // Find 4 transactions in the exact same depth-8 sub-bucket 0x59 such
++        // that the symmetric difference {tx0, tx1, tx2, tx3} has Tr(c) == 0
++        // (i.e. 2-arg RecoverGF64Syndromes(ds1, ds3) returns 2 bogus roots).
++        std::vector<CTransactionRef> pool_59;
++        for (int i = 0; i < 24; ++i) {
++            CTransactionRef tx = MakeNonCoinbaseTx(rng, 0x59);
++            BOOST_REQUIRE(tx != nullptr);
++            FundTxInputInCoinsTip(*m_node.chainman, *tx);
++            pool_59.push_back(tx);
++        }
++
++        std::array<CTransactionRef, 4> chosen{};
++        bool found_tr_zero_quad = false;
++        for (size_t i = 0; i < pool_59.size() && !found_tr_zero_quad; ++i) {
++            for (size_t j = i + 1; j < pool_59.size() && !found_tr_zero_quad;
++                 ++j) {
++                for (size_t k = j + 1;
++                     k < pool_59.size() && !found_tr_zero_quad; ++k) {
++                    for (size_t l = k + 1;
++                         l < pool_59.size() && !found_tr_zero_quad; ++l) {
++                        const uint64_t x0 = ComputeMerklixShortId(
++                            k0, k1, pool_59[i]->GetId());
++                        const uint64_t x1 = ComputeMerklixShortId(
++                            k0, k1, pool_59[j]->GetId());
++                        const uint64_t x2 = ComputeMerklixShortId(
++                            k0, k1, pool_59[k]->GetId());
++                        const uint64_t x3 = ComputeMerklixShortId(
++                            k0, k1, pool_59[l]->GetId());
++                        const uint64_t ds1 = x0 ^ x1 ^ x2 ^ x3;
++                        const uint64_t ds3 = GF64Cube(x0) ^ GF64Cube(x1) ^
++                                             GF64Cube(x2) ^ GF64Cube(x3);
++                        const uint64_t ds5 = GF64Pow5(x0) ^ GF64Pow5(x1) ^
++                                             GF64Pow5(x2) ^ GF64Pow5(x3);
++                        auto bogus_deg2 = RecoverGF64Syndromes(ds1, ds3);
++                        if (bogus_deg2.has_value() &&
++                            bogus_deg2->size() == 2U) {
++                            // 3-syndrome solver with s5 MUST reject these bogus
++                            // roots!
++                            BOOST_CHECK(
++                                !RecoverGF64Syndromes(ds1, ds3, ds5).has_value());
++                            chosen = {pool_59[i], pool_59[j], pool_59[k],
++                                      pool_59[l]};
++                            found_tr_zero_quad = true;
++                        }
++                    }
++                }
++            }
++        }
++        BOOST_REQUIRE(found_tr_zero_quad);
++
++        // Local has 1 extra tx (chosen[3]); Remote has 3 missing txs
++        // (chosen[0], chosen[1], chosen[2]). Count delta is +3 - 1 = +2.
++        local_handler->SetScopedTransactions(scope, ctx_id, {chosen[3]});
++        remote_handler.SetScopedTransactions(
++            scope, ctx_id, {chosen[0], chosen[1], chosen[2]});
++
++        const MerklixSubBucketSummary remote_sub8 =
++            remote_handler.BuildSubBucketSummary(scope, ctx_id, k0, k1, 0x5);
++        const MerklixSubBucketDiffResult diff8 =
++            local_handler->DiffSubBucketSummary(remote_sub8);
++        // Zero false-positive root decodes at depth 8, and sub-bucket 0x9 is
++        // flagged as unresolved!
++        BOOST_CHECK(diff8.missing_short_ids.empty());
++        BOOST_REQUIRE_EQUAL(diff8.unresolved_sub_buckets.size(), 1U);
++        BOOST_CHECK_EQUAL(diff8.unresolved_sub_buckets[0], 0x9);
++    }
++
++    // =========================================================================
++    // 2. Deep Sub-Bucket Overflow Bisection (10 missing transactions in the
++    //    exact same depth-8 sub-bucket 0x59):
++    //    Verify that the full P2P message exchange (MERKLIXSYNC ->
++    //    GETMERKLIXBUCK(depth 4) -> MERKLIXBUCK(depth 8) ->
++    //    GETMERKLIXBUCK(depth 8) -> MERKLIXBUCK(depth 12) [-> depth 16] ->
++    //    GETSHORTTX -> SHORTTX) recovers 100% of the 10 missing transactions!
++    // =========================================================================
++    {
++        const ReconScope scope = ReconScope::BLOCK_RECON;
++        const uint256 ctx_id = rng.rand256();
++        const auto [k0, k1] = DeriveReconSipHashKey(scope, ctx_id, 0);
++
++        CTransactionRef shared_tx = MakeNonCoinbaseTx(rng, 0x12);
++        BOOST_REQUIRE(shared_tx != nullptr);
++        FundTxInputInCoinsTip(*m_node.chainman, *shared_tx);
++
++        std::vector<CTransactionRef> remote_txs{shared_tx};
++        for (int i = 0; i < 10; ++i) {
++            CTransactionRef tx = MakeNonCoinbaseTx(rng, 0x59);
++            BOOST_REQUIRE(tx != nullptr);
++            FundTxInputInCoinsTip(*m_node.chainman, *tx);
++            remote_txs.push_back(tx);
++        }
++
++        local_handler->SetScopedTransactions(scope, ctx_id, {shared_tx});
++        remote_handler.SetScopedTransactions(scope, ctx_id, remote_txs);
++
++        {
++            LOCK(peer_node.cs_vSend);
++            peer_node.vSendMsg.clear();
++        }
++
++        // Start reconciliation: remote sends MERKLIXSYNC to local.
++        const MerklixSyncSummary remote_sync =
++            remote_handler.BuildSyncSummary(scope, ctx_id, k0, k1);
++        {
++            DataStream ss{};
++            ss << remote_sync;
++            peerman->ProcessMessage(config, peer_node, NetMsgType::MERKLIXSYNC,
++                                    ss, cur_time, interrupt);
++        }
++
++        // Pump P2P messages between local_handler (via peerman/peer_node) and
++        // remote_handler until all messages settle.
++        V1TransportDeserializer local_to_remote(config, peer_node.GetId());
++        size_t saw_depth12_buck = 0;
++        for (int round = 0; round < 8; ++round) {
++            cur_time += 2'000'000us;
++            std::vector<std::vector<uint8_t>> outbound_chunks;
++            {
++                LOCK(peer_node.cs_vSend);
++                if (peer_node.vSendMsg.empty()) {
++                    break;
++                }
++                outbound_chunks.assign(peer_node.vSendMsg.begin(),
++                                       peer_node.vSendMsg.end());
++                peer_node.vSendMsg.clear();
++            }
++
++            for (const auto &chunk : outbound_chunks) {
++                Span<const uint8_t> sp{chunk};
++                while (!sp.empty()) {
++                    const int ret = local_to_remote.Read(config, sp);
++                    BOOST_REQUIRE_GE(ret, 0);
++                    if (!local_to_remote.Complete()) {
++                        continue;
++                    }
++                    bool reject = false;
++                    CNetMessage msg =
++                        local_to_remote.GetMessage(0us, reject);
++                    BOOST_REQUIRE(!reject);
++
++                    if (msg.m_type == NetMsgType::GETMERKLIXBUCK) {
++                        MerklixBucketRequest req;
++                        msg.m_recv >> req;
++                        const uint8_t req_depth =
++                            req.depth_bits == 0 ? 4 : req.depth_bits;
++                        for (uint8_t b = 0; b < 16; ++b) {
++                            if ((req.bucket_mask & (1U << b)) == 0) {
++                                continue;
++                            }
++                            const uint8_t child_depth =
++                                req_depth == 16
++                                    ? 16
++                                    : static_cast<uint8_t>(req_depth + 4);
++                            const uint16_t child_prefix =
++                                req_depth == 16
++                                    ? req.parent_prefix
++                                    : static_cast<uint16_t>(
++                                          (req.parent_prefix << 4) | b);
++                            if (child_depth == 12) {
++                                ++saw_depth12_buck;
++                            }
++                            MerklixSubBucketSummary sub =
++                                remote_handler.BuildSubBucketSummary(
++                                    scope, req.context_id, req.salt_k0,
++                                    req.salt_k1, child_prefix, child_depth);
++                            DataStream sub_ss{};
++                            sub_ss << sub;
++                            peerman->ProcessMessage(config, peer_node,
++                                                    NetMsgType::MERKLIXBUCK,
++                                                    sub_ss, cur_time,
++                                                    interrupt);
++                            if (req_depth == 16) {
++                                break;
++                            }
++                        }
++                    } else if (msg.m_type == NetMsgType::GETSHORTTX) {
++                        ShortTxRequest sreq;
++                        msg.m_recv >> sreq;
++                        std::vector<CTransactionRef> resolved =
++                            remote_handler.ResolveShortIds(
++                                scope, sreq.context_id, sreq.salt_k0,
++                                sreq.salt_k1, sreq.short_ids);
++                        BOOST_REQUIRE(!resolved.empty());
++                        ShortTxResponse sresp;
++                        sresp.scope = sreq.scope;
++                        sresp.context_id = sreq.context_id;
++                        sresp.txs = std::move(resolved);
++                        DataStream sresp_ss{};
++                        sresp_ss << sresp;
++                        peerman->ProcessMessage(config, peer_node,
++                                                NetMsgType::SHORTTX, sresp_ss,
++                                                cur_time, interrupt);
++                    }
++                }
++            }
++        }
++
++        BOOST_CHECK_GE(saw_depth12_buck, 1U);
++        const auto reconciled_txs =
++            local_handler->GetScopedTransactions(scope, ctx_id);
++        BOOST_CHECK_EQUAL(reconciled_txs.size(), 11U);
++
++        const MerklixSyncDiffResult final_diff =
++            local_handler->DiffSyncSummary(remote_sync);
++        BOOST_CHECK(final_diff.root_matched);
++        BOOST_CHECK_EQUAL(final_diff.mismatched_bucket_mask, 0U);
++        BOOST_CHECK(final_diff.single_missing_short_ids.empty());
++    }
++
++    peerman->FinalizeNode(config, peer_node);
++}
++
+ 
+ BOOST_AUTO_TEST_CASE(outbound_inv_queue_suppression_window) {
+     LOCK(NetEventsInterface::g_msgproc_mutex);
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index 9ef74fe3d8d958c5934e821936de8c4f02ab5636..5675d10137ceb05bc26915079584b710a508fcc6 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -923,8 +923,9 @@ void CTxMemPool::ApplyDelta(const TxId &txid, Amount &nFeeDelta) const {
+ 
+ void CTxMemPool::ClearPrioritisation(const TxId &txid) {
+     AssertLockHeld(cs);
+-    mapDeltas.erase(txid);
+-    node::PublishMempoolSnapshot(*this);
++    if (mapDeltas.erase(txid) > 0) {
++        node::PublishMempoolSnapshot(*this);
++    }
+ }
+ 
+ CTransactionRef CTxMemPool::GetConflictTx(const COutPoint &prevout) const {

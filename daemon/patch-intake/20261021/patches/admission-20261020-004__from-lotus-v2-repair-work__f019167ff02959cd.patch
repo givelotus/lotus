@@ -1,0 +1,958 @@
+From 9ce72a141ad5bfe13a0dd56d0feb3fff27539578 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@gmail.com>
+Date: Mon, 19 Oct 2026 19:26:17 -0700
+Subject: [PATCH] validation: staged mempool admission with scripts verified
+ outside cs_main
+
+Why: admission verifies input scripts while holding cs_main and the
+mempool lock, so it uses one core and blocks everything else that needs
+cs_main for the whole signature check. Script validity depends only on the
+transaction, the outputs it spends and the verification flags, so it can
+be computed without the locks for many transactions at once, provided the
+locked commit checks that what it relied on still holds.
+
+What: AcceptToMemoryPoolStaged(chainman, txs, options, stats):
+  A. cs_main + mempool lock: look up the outputs each transaction spends
+     (an earlier transaction of this call, the mempool, or the UTXO set),
+     recording coins this pulled into the coins cache. Coinbases,
+     transactions already in the mempool, non-standard ones, and
+     transactions that cannot be resolved or that double-spend the
+     mempool or an earlier transaction of the call skip phase B (their
+     verdict comes from phase C without script work spent on them).
+  B. No locks: ComputeAdmissionChecks for the rest on
+     options.script_threads threads of the existing script worker pool
+     (the one parallel rawtxbatch validation uses; the caller is one of
+     the threads).
+  C. cs_main: for each transaction in order, the ordinary
+     ChainstateManager::ProcessTransaction with its precomputed checks,
+     inside one deferred mempool-snapshot publication; then evict the
+     coins phase A cached for transactions that were not admitted.
+Because phase C is the serial admission code under the locks and reuses
+a script outcome only for identical flags and spent outputs (previous
+commit), its verdicts, reject reasons, mempool changes, overlay updates
+and notifications are those of serial admission in this order at commit
+time. A block connected, a reorg, or any mempool change between A and C,
+including our own earlier commits, is handled by phase C itself: spent
+inputs fail as missing, changed flags or outputs re-run the scripts.
+options.skip_at_commit lets a caller re-apply its own pre-checks (e.g.
+"already have") under cs_main at the commit point; StagedAdmissionStats
+reports the locked and unlocked phase times.
+
+Evidence:
+- mempool_admission_tests:
+  * staged_admission_matches_serial_admission (differential): shuffled
+    scenarios of 120 inputs' worth of valid ECDSA/Schnorr/multi-input
+    spends, dependent chains (some child-first), double spends, bad
+    signatures and their children, orphans, duplicates, zero-fee, dust and
+    non-final transactions; serial vs staged with random batch splits
+    (1-16 and 1-120) at 1, 4 and 8 threads: identical result type,
+    TxValidationResult, reject reason, debug message, vsize, fees and
+    effective feerate for every transaction, and identical final mempool.
+  * staged_double_spend_race_first_in_order_wins: in one batch the first
+    spend wins and the second gets txn-mempool-conflict
+    (TX_AVALANCHE_RECONSIDERABLE) without being verified; two racing
+    callers: exactly one wins, 20 rounds.
+  * staged_chain_in_one_batch_is_not_an_orphan: parent, child, grandchild
+    and sibling in one batch are all admitted; child-before-parent is an
+    orphan exactly as serially; a child of a parent failing its scripts in
+    the same batch is an orphan.
+  * staged_block_between_phases: a block connected while phase B runs
+    spends one input (missing inputs), confirms one transaction
+    (txn-already-known) and its in-batch child (admitted against the
+    confirmed output); an unrelated transaction is admitted.
+  * staged_skip_at_commit; staged_concurrent_callers_and_blocks (three
+    threads admitting overlapping batches with double spends while blocks
+    connect; mempool check() passes, never both sides of a double spend).
+  All pass, and pass under ThreadSanitizer (Debug, -DENABLE_SANITIZERS=
+  thread, 0 reports). mempool_tests, txvalidation_tests,
+  txvalidationcache_tests, txpackage_tests, orphanage_tests pass.
+- bitcoin-bench, 2000 never-seen signed transactions per iteration,
+  -checkmempool=0, shared host (load average 30-60, 18 logical CPUs):
+    MempoolAdmissionSignedSerial     30.3 us/tx
+    MempoolAdmissionSignedStaged1    28.9 us/tx
+    MempoolAdmissionSignedStaged4    17.3 us/tx
+    MempoolAdmissionSignedStaged8    15.2 us/tx
+    MempoolAdmissionSignedStagedAll  16.4 us/tx
+  The locked remainder (phase A plus serial admission without scripts:
+  mempool insertion, notifications, coins-view construction, snapshot
+  publication) is about 13 us/tx and bounds the speedup at about 2x
+  in process; profiled in the README of this series.
+
+How to reproduce:
+    ninja -C build test_bitcoin bitcoin-bench
+    build/src/test/test_bitcoin --run_test=mempool_admission_tests
+    build/src/bench/bitcoin-bench -filter='MempoolAdmissionSigned.*'
+    # ThreadSanitizer
+    cmake -GNinja -B build-tsan -DCMAKE_BUILD_TYPE=Debug \
+        -DENABLE_SANITIZERS=thread -DBUILD_CHRONIK=OFF
+    ninja -C build-tsan test_bitcoin
+    build-tsan/src/test/test_bitcoin --run_test=mempool_admission_tests
+bitcoin-bench prints one nanobench row per benchmark (ns/tx, tx/s).
+
+Not done here: nothing calls the staged path yet (next commit).
+---
+ src/bench/mempool_admission.cpp      |  57 +++-
+ src/test/mempool_admission_tests.cpp | 430 ++++++++++++++++++++++++++-
+ src/validation.cpp                   | 188 +++++++++++-
+ src/validation.h                     |  62 +++-
+ 4 files changed, 729 insertions(+), 8 deletions(-)
+
+diff --git a/src/bench/mempool_admission.cpp b/src/bench/mempool_admission.cpp
+index 084d756284b520b27ce8caee711529793c29bbd6..7039e06ca20fb24b3f20d521f0a0ba7631a8b805 100644
+--- a/src/bench/mempool_admission.cpp
++++ b/src/bench/mempool_admission.cpp
+@@ -11,6 +11,8 @@
+ #include <util/time.h>
+ #include <validation.h>
+ 
++#include <algorithm>
++#include <thread>
+ #include <vector>
+ 
+ /**
+@@ -49,7 +51,9 @@ SignedSets MakeSets(TestChain100Setup &setup) {
+ } // namespace
+ 
+ static void MempoolAdmissionSignedSerial(benchmark::Bench &bench) {
+-    auto setup = MakeNoLogFileContext<TestChain100Setup>();
++    // No per-admission mempool consistency check (regtest defaults to one).
++    auto setup = MakeNoLogFileContext<TestChain100Setup>(ChainType::REGTEST,
++                                                         {"-checkmempool=0"});
+     const SignedSets sets = MakeSets(*setup);
+     Chainstate &chainstate = setup->m_node.chainman->ActiveChainstate();
+     CTxMemPool &mempool = *setup->m_node.mempool;
+@@ -68,4 +72,55 @@ static void MempoolAdmissionSignedSerial(benchmark::Bench &bench) {
+     });
+ }
+ 
++/**
++ * The same sets through AcceptToMemoryPoolStaged in batches of 256: inputs
++ * resolved under cs_main, scripts verified on `threads` threads without
++ * locks, then committed in order. Reports the same per-transaction cost.
++ */
++static void StagedAdmission(benchmark::Bench &bench, size_t threads) {
++    // No per-admission mempool consistency check (regtest defaults to one).
++    auto setup = MakeNoLogFileContext<TestChain100Setup>(ChainType::REGTEST,
++                                                         {"-checkmempool=0"});
++    const SignedSets sets = MakeSets(*setup);
++    CTxMemPool &mempool = *setup->m_node.mempool;
++    StagedAdmissionOptions options;
++    options.script_threads =
++        threads ? threads : std::max(1U, std::thread::hardware_concurrency());
++    size_t next = 0;
++    bench.epochs(SETS).epochIterations(1).batch(TXS_PER_SET).unit("tx");
++    bench.run([&] {
++        const auto &set = sets.sets.at(next++ % SETS);
++        constexpr size_t BATCH = 256;
++        for (size_t pos = 0; pos < set.size(); pos += BATCH) {
++            std::vector<CTransactionRef> batch(
++                set.begin() + pos,
++                set.begin() + std::min(set.size(), pos + BATCH));
++            const auto results = AcceptToMemoryPoolStaged(
++                *setup->m_node.chainman, batch, options);
++            for (const auto &r : results) {
++                Assert(r && r->m_result_type ==
++                                MempoolAcceptResult::ResultType::VALID);
++            }
++        }
++        mempool.clear();
++    });
++}
++
++static void MempoolAdmissionSignedStaged1(benchmark::Bench &bench) {
++    StagedAdmission(bench, 1);
++}
++static void MempoolAdmissionSignedStaged4(benchmark::Bench &bench) {
++    StagedAdmission(bench, 4);
++}
++static void MempoolAdmissionSignedStaged8(benchmark::Bench &bench) {
++    StagedAdmission(bench, 8);
++}
++static void MempoolAdmissionSignedStagedAll(benchmark::Bench &bench) {
++    StagedAdmission(bench, 0);
++}
++
+ BENCHMARK(MempoolAdmissionSignedSerial);
++BENCHMARK(MempoolAdmissionSignedStaged1);
++BENCHMARK(MempoolAdmissionSignedStaged4);
++BENCHMARK(MempoolAdmissionSignedStaged8);
++BENCHMARK(MempoolAdmissionSignedStagedAll);
+diff --git a/src/test/mempool_admission_tests.cpp b/src/test/mempool_admission_tests.cpp
+index 95c27df3de11971aeb83e16e17345f64ef13caa0..8374594473e83f69316ed2770e8d0a4aca5dde50 100644
+--- a/src/test/mempool_admission_tests.cpp
++++ b/src/test/mempool_admission_tests.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include <coins.h>
+ #include <consensus/validation.h>
++#include <random.h>
++#include <script/standard.h>
+ #include <test/util/admission.h>
+ #include <test/util/setup_common.h>
+ #include <txmempool.h>
+@@ -12,7 +14,10 @@
+ 
+ #include <boost/test/unit_test.hpp>
+ 
++#include <algorithm>
++#include <atomic>
+ #include <string>
++#include <thread>
+ #include <vector>
+ 
+ using admission_test::SignedSpend;
+@@ -22,7 +27,7 @@ namespace {
+ 
+ struct AdmissionSetup : public TestChain100Setup {
+     Wallet wallet{admission_test::MakeWallet()};
+-    AdmissionSetup() { admission_test::FundWallet(*this, wallet, 64); }
++    AdmissionSetup() { admission_test::FundWallet(*this, wallet, 512); }
+ 
+     Chainstate &Active() { return m_node.chainman->ActiveChainstate(); }
+ 
+@@ -76,6 +81,133 @@ void CheckSameResult(const MempoolAcceptResult &a,
+     BOOST_CHECK(a.m_base_fees == b.m_base_fees);
+ }
+ 
++/** A P2PKH spend with full control over amounts, locktime and sequence. */
++CTransactionRef
++BuildSpend(const Wallet &wallet,
++           const std::vector<admission_test::SpendableOutput> &inputs,
++           const std::vector<Amount> &output_amounts, bool schnorr,
++           uint32_t locktime = 0, uint32_t sequence = CTxIn::SEQUENCE_FINAL) {
++    CMutableTransaction tx;
++    tx.nVersion = 2;
++    tx.nLockTime = locktime;
++    std::vector<Amount> spent;
++    for (const auto &in : inputs) {
++        tx.vin.emplace_back(in.outpoint, CScript(), sequence);
++        spent.push_back(in.amount);
++    }
++    for (const Amount &a : output_amounts) {
++        tx.vout.emplace_back(a, wallet.script_pub_key);
++    }
++    admission_test::SignP2PKH(tx, wallet, spent, schnorr);
++    return MakeTransactionRef(std::move(tx));
++}
++
++/**
++ * A shuffled mix of everything admission has to decide: valid ECDSA,
++ * Schnorr and multi-input spends, dependent chains (sometimes child first),
++ * double spends, bad signatures, orphans, duplicates, transactions below
++ * the relay fee, with dust outputs, not yet final, and children of invalid
++ * parents. Uses each wallet output at most once (double spends excepted).
++ */
++std::vector<CTransactionRef> MakeScenario(FastRandomContext &rng,
++                                          const Wallet &wallet, size_t first,
++                                          size_t count, int tip_height) {
++    std::vector<std::vector<CTransactionRef>> groups;
++    size_t pos = first;
++    auto next = [&]() { return wallet.outputs.at(pos++); };
++    while (pos < first + count - 4) {
++        const bool schnorr = rng.randbool();
++        std::vector<CTransactionRef> g;
++        switch (rng.randrange(11)) {
++            case 0:
++            case 1:
++                g.push_back(SignedSpend(wallet, {next()}, 2, schnorr));
++                break;
++            case 2:
++                g.push_back(
++                    SignedSpend(wallet, {next(), next(), next()}, 1, schnorr));
++                break;
++            case 3: {
++                const auto p = SignedSpend(wallet, {next()}, 1, schnorr);
++                const auto c =
++                    admission_test::SignedChild(wallet, p, 0, rng.randbool());
++                const auto gc =
++                    admission_test::SignedChild(wallet, c, 0, rng.randbool());
++                if (rng.randbool()) {
++                    g = {p, c, gc};
++                } else {
++                    g = {c, p, gc};
++                }
++                break;
++            }
++            case 4: {
++                const auto o = next();
++                g.push_back(SignedSpend(wallet, {o}, 1, schnorr, 1));
++                g.push_back(SignedSpend(wallet, {o}, 2, !schnorr, 2));
++                break;
++            }
++            case 5: {
++                const auto good = SignedSpend(wallet, {next()}, 1, schnorr);
++                const auto bad = WithBadSignature(good);
++                g.push_back(bad);
++                g.push_back(
++                    admission_test::SignedChild(wallet, bad, 0, schnorr));
++                break;
++            }
++            case 6: {
++                const auto unseen = SignedSpend(wallet, {next()}, 1, schnorr);
++                g.push_back(
++                    admission_test::SignedChild(wallet, unseen, 0, schnorr));
++                break;
++            }
++            case 7: {
++                const auto tx = SignedSpend(wallet, {next()}, 1, schnorr);
++                g = {tx, tx};
++                break;
++            }
++            case 8: {
++                const auto o = next();
++                g.push_back(BuildSpend(wallet, {o}, {o.amount}, schnorr));
++                break;
++            }
++            case 9: {
++                const auto o = next();
++                g.push_back(BuildSpend(
++                    wallet, {o}, {100 * SATOSHI, o.amount - 2000 * SATOSHI},
++                    schnorr));
++                break;
++            }
++            case 10: {
++                const auto o = next();
++                g.push_back(BuildSpend(wallet, {o}, {o.amount - 1000 * SATOSHI},
++                                       schnorr, tip_height + 10, 0));
++                break;
++            }
++        }
++        groups.push_back(std::move(g));
++    }
++    Shuffle(groups.begin(), groups.end(), rng);
++    std::vector<CTransactionRef> out;
++    for (auto &g : groups) {
++        for (auto &tx : g) {
++            out.push_back(std::move(tx));
++        }
++    }
++    return out;
++}
++
++void CheckSameResults(
++    const std::vector<MempoolAcceptResult> &serial,
++    const std::vector<std::optional<MempoolAcceptResult>> &staged) {
++    BOOST_REQUIRE_EQUAL(serial.size(), staged.size());
++    for (size_t i = 0; i < serial.size(); ++i) {
++        BOOST_REQUIRE(staged[i].has_value());
++        CheckSameResult(serial[i], *staged[i]);
++        BOOST_CHECK(serial[i].m_effective_feerate ==
++                    staged[i]->m_effective_feerate);
++    }
++}
++
+ } // namespace
+ 
+ BOOST_FIXTURE_TEST_SUITE(mempool_admission_tests, AdmissionSetup)
+@@ -157,4 +289,300 @@ BOOST_AUTO_TEST_CASE(precomputed_checks_used_only_when_they_match) {
+     BOOST_CHECK(r.m_state.GetResult() == TxValidationResult::TX_MISSING_INPUTS);
+ }
+ 
++namespace {
++std::vector<std::pair<TxId, Amount>> MempoolContents(const CTxMemPool &pool) {
++    LOCK(pool.cs);
++    std::vector<std::pair<TxId, Amount>> out;
++    for (const auto &info : pool.infoAll()) {
++        out.emplace_back(info.tx->GetId(), info.fee);
++    }
++    std::sort(out.begin(), out.end());
++    return out;
++}
++} // namespace
++
++BOOST_AUTO_TEST_CASE(staged_admission_matches_serial_admission) {
++    // Differential test: the same shuffled scenario admitted serially, then
++    // (after clearing the mempool) staged with several batch splits and
++    // thread counts, must give identical per-transaction results and the
++    // identical final mempool.
++    FastRandomContext rng(/*fDeterministic=*/true);
++    const int height = WITH_LOCK(cs_main, return Active().m_chain.Height());
++    CTxMemPool &pool = *m_node.mempool;
++    size_t first = 0;
++    for (const size_t threads : {1, 4, 8}) {
++        const auto txs = MakeScenario(rng, wallet, first, 120, height);
++        first += 120;
++
++        pool.clear();
++        std::vector<MempoolAcceptResult> serial;
++        {
++            LOCK(cs_main);
++            for (const auto &tx : txs) {
++                serial.push_back(m_node.chainman->ProcessTransaction(tx));
++            }
++        }
++        const auto serial_pool = MempoolContents(pool);
++        size_t admitted = 0;
++        for (const auto &r : serial) {
++            admitted +=
++                r.m_result_type == MempoolAcceptResult::ResultType::VALID;
++        }
++        BOOST_CHECK(admitted > 20 && admitted < txs.size());
++
++        for (int round = 0; round < 2; ++round) {
++            pool.clear();
++            std::vector<std::optional<MempoolAcceptResult>> staged;
++            size_t precomputed = 0;
++            size_t pos = 0;
++            while (pos < txs.size()) {
++                const size_t len = std::min<size_t>(
++                    txs.size() - pos, 1 + rng.randrange(round ? 120 : 16));
++                std::vector<CTransactionRef> batch(txs.begin() + pos,
++                                                   txs.begin() + pos + len);
++                StagedAdmissionOptions options;
++                options.script_threads = threads;
++                StagedAdmissionStats stats;
++                auto res = AcceptToMemoryPoolStaged(*m_node.chainman, batch,
++                                                    options, &stats);
++                precomputed += stats.precomputed;
++                for (auto &r : res) {
++                    staged.push_back(std::move(r));
++                }
++                pos += len;
++            }
++            BOOST_CHECK(precomputed > admitted / 2);
++            CheckSameResults(serial, staged);
++            BOOST_CHECK(MempoolContents(pool) == serial_pool);
++            WITH_LOCK(cs_main, pool.check(Active().CoinsTip(), height + 1));
++        }
++    }
++}
++
++BOOST_AUTO_TEST_CASE(staged_cheap_rejects_do_not_run_unlocked_scripts) {
++    const auto &out = wallet.outputs[0];
++    const auto free_tx = BuildSpend(wallet, {out}, {out.amount}, true);
++    const int height = WITH_LOCK(cs_main, return Active().m_chain.Height());
++    const auto future_tx = BuildSpend(
++        wallet, {wallet.outputs[1]},
++        {wallet.outputs[1].amount - 10000 * SATOSHI}, false, height + 10, 0);
++    for (const auto &tx : {free_tx, future_tx}) {
++        const auto serial = Admit(tx);
++        StagedAdmissionStats stats;
++        const auto staged =
++            AcceptToMemoryPoolStaged(*m_node.chainman, {tx}, {}, &stats);
++        BOOST_CHECK_EQUAL(stats.precomputed, 0U);
++        CheckSameResult(serial, *staged[0]);
++    }
++
++}
++
++BOOST_AUTO_TEST_CASE(staged_double_spend_race_first_in_order_wins) {
++    const auto o = wallet.outputs[0];
++    const auto a = SignedSpend(wallet, {o}, 1, /*schnorr=*/false, 1);
++    const auto b = SignedSpend(wallet, {o}, 2, /*schnorr=*/true, 2);
++    StagedAdmissionOptions options;
++    options.script_threads = 4;
++    for (const bool a_first : {true, false}) {
++        m_node.mempool->clear();
++        std::vector<CTransactionRef> batch{a, b};
++        if (!a_first) {
++            std::swap(batch[0], batch[1]);
++        }
++        StagedAdmissionStats stats;
++        const auto res =
++            AcceptToMemoryPoolStaged(*m_node.chainman, batch, options, &stats);
++        // The second spend is not even verified: phase A sees the conflict.
++        BOOST_CHECK_EQUAL(stats.precomputed, 1U);
++        BOOST_CHECK(res[0]->m_result_type ==
++                    MempoolAcceptResult::ResultType::VALID);
++        BOOST_CHECK(res[1]->m_state.GetResult() ==
++                    TxValidationResult::TX_AVALANCHE_RECONSIDERABLE);
++        BOOST_CHECK_EQUAL(res[1]->m_state.GetRejectReason(),
++                          "txn-mempool-conflict");
++        BOOST_CHECK(m_node.mempool->exists(batch[0]->GetId()));
++        BOOST_CHECK(!m_node.mempool->exists(batch[1]->GetId()));
++    }
++
++    // Two callers racing with the two spends: exactly one wins, and the
++    // loser gets the serial conflict verdict.
++    for (int round = 0; round < 20; ++round) {
++        m_node.mempool->clear();
++        std::optional<MempoolAcceptResult> ra, rb;
++        std::thread ta([&] {
++            ra.emplace(
++                *AcceptToMemoryPoolStaged(*m_node.chainman, {a}, options)[0]);
++        });
++        std::thread tb([&] {
++            rb.emplace(
++                *AcceptToMemoryPoolStaged(*m_node.chainman, {b}, options)[0]);
++        });
++        ta.join();
++        tb.join();
++        const bool a_won =
++            ra->m_result_type == MempoolAcceptResult::ResultType::VALID;
++        const bool b_won =
++            rb->m_result_type == MempoolAcceptResult::ResultType::VALID;
++        BOOST_CHECK(a_won != b_won);
++        BOOST_CHECK_EQUAL((a_won ? rb : ra)->m_state.GetRejectReason(),
++                          "txn-mempool-conflict");
++    }
++}
++
++BOOST_AUTO_TEST_CASE(staged_chain_in_one_batch_is_not_an_orphan) {
++    const auto p = SignedSpend(wallet, {wallet.outputs[0]}, 2, true);
++    const auto c = admission_test::SignedChild(wallet, p, 0, false);
++    const auto gc = admission_test::SignedChild(wallet, c, 0, true);
++    const auto c2 = admission_test::SignedChild(wallet, p, 1, true);
++    StagedAdmissionOptions options;
++    options.script_threads = 4;
++    StagedAdmissionStats stats;
++    // Children whose parents are only in the same batch (verified in
++    // parallel with them) are resolved from the batch and admitted.
++    const auto res = AcceptToMemoryPoolStaged(*m_node.chainman, {p, c, gc, c2},
++                                              options, &stats);
++    BOOST_CHECK_EQUAL(stats.precomputed, 4U);
++    for (const auto &r : res) {
++        BOOST_CHECK(r->m_result_type == MempoolAcceptResult::ResultType::VALID);
++    }
++
++    // A child ahead of its parent is an orphan, exactly as when admitted
++    // serially in that order; the parent is still admitted.
++    m_node.mempool->clear();
++    const auto res2 =
++        AcceptToMemoryPoolStaged(*m_node.chainman, {c, p}, options, &stats);
++    BOOST_CHECK(res2[0]->m_state.GetResult() ==
++                TxValidationResult::TX_MISSING_INPUTS);
++    BOOST_CHECK(res2[1]->m_result_type ==
++                MempoolAcceptResult::ResultType::VALID);
++
++    // A child of a parent that fails its scripts in the same batch is an
++    // orphan too (the parent never reaches the mempool).
++    m_node.mempool->clear();
++    const auto bad = WithBadSignature(p);
++    const auto bad_child = admission_test::SignedChild(wallet, bad, 0, false);
++    const auto res3 =
++        AcceptToMemoryPoolStaged(*m_node.chainman, {bad, bad_child}, options);
++    BOOST_CHECK(res3[0]->m_state.GetResult() ==
++                TxValidationResult::TX_CONSENSUS);
++    BOOST_CHECK(res3[1]->m_state.GetResult() ==
++                TxValidationResult::TX_MISSING_INPUTS);
++}
++
++BOOST_AUTO_TEST_CASE(staged_block_between_phases) {
++    // A block connected while scripts are being verified outside the locks.
++    const auto keep = SignedSpend(wallet, {wallet.outputs[0]}, 1, false);
++    const auto spent_in_block =
++        SignedSpend(wallet, {wallet.outputs[1]}, 1, true, 1);
++    const auto conflicting =
++        SignedSpend(wallet, {wallet.outputs[1]}, 1, false, 2);
++    const auto mined = SignedSpend(wallet, {wallet.outputs[2]}, 1, true);
++    const auto mined_child =
++        admission_test::SignedChild(wallet, mined, 0, true);
++    StagedAdmissionOptions options;
++    options.script_threads = 4;
++    const int height_before =
++        WITH_LOCK(cs_main, return Active().m_chain.Height());
++    options.test_between_phases = [&] {
++        CreateAndProcessBlock(
++            {CMutableTransaction(*conflicting), CMutableTransaction(*mined)},
++            wallet.script_pub_key);
++    };
++    StagedAdmissionStats stats;
++    const auto res = AcceptToMemoryPoolStaged(
++        *m_node.chainman, {keep, spent_in_block, mined, mined_child}, options,
++        &stats);
++    BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return Active().m_chain.Height()),
++                      height_before + 1);
++    BOOST_CHECK_EQUAL(stats.precomputed, 4U);
++    // Unaffected: admitted on the new tip.
++    BOOST_CHECK(res[0]->m_result_type ==
++                MempoolAcceptResult::ResultType::VALID);
++    // Its input was spent by the block: missing inputs, as serial admission
++    // after the block would say.
++    BOOST_CHECK(res[1]->m_state.GetResult() ==
++                TxValidationResult::TX_MISSING_INPUTS);
++    // Already confirmed.
++    BOOST_CHECK(res[2]->m_result_type !=
++                MempoolAcceptResult::ResultType::VALID);
++    BOOST_CHECK_EQUAL(res[2]->m_state.GetRejectReason(), "txn-already-known");
++    // Its parent was resolved from the batch in phase A but is now
++    // confirmed; the child is admitted against the confirmed output.
++    BOOST_CHECK(res[3]->m_result_type ==
++                MempoolAcceptResult::ResultType::VALID);
++    BOOST_CHECK(m_node.mempool->exists(mined_child->GetId()));
++}
++
++BOOST_AUTO_TEST_CASE(staged_skip_at_commit) {
++    const auto a = SignedSpend(wallet, {wallet.outputs[0]}, 1, false);
++    const auto b = SignedSpend(wallet, {wallet.outputs[1]}, 1, true);
++    StagedAdmissionOptions options;
++    options.skip_at_commit = [&](const CTransactionRef &tx) {
++        AssertLockHeld(cs_main);
++        return tx == a;
++    };
++    const auto res =
++        AcceptToMemoryPoolStaged(*m_node.chainman, {a, b}, options);
++    BOOST_CHECK(!res[0].has_value());
++    BOOST_CHECK(res[1]->m_result_type ==
++                MempoolAcceptResult::ResultType::VALID);
++    BOOST_CHECK(!m_node.mempool->exists(a->GetId()));
++}
++
++BOOST_AUTO_TEST_CASE(staged_concurrent_callers_and_blocks) {
++    // Several threads admit overlapping batches (shared transactions and
++    // double spends) while the main thread connects blocks. Run under
++    // ThreadSanitizer to check the unlocked phase. Afterwards the mempool
++    // must be consistent and hold at most one side of each double spend.
++    FastRandomContext rng(/*fDeterministic=*/true);
++    std::vector<CTransactionRef> pool_txs;
++    std::vector<std::pair<TxId, TxId>> double_spends;
++    for (size_t i = 0; i < 160; ++i) {
++        const auto o = wallet.outputs[i];
++        const auto a = SignedSpend(wallet, {o}, 1, i % 2 == 0, 1);
++        pool_txs.push_back(a);
++        if (i % 4 == 0) {
++            const auto b = SignedSpend(wallet, {o}, 1, i % 2 == 1, 2);
++            pool_txs.push_back(b);
++            double_spends.emplace_back(a->GetId(), b->GetId());
++        }
++        if (i % 5 == 0) {
++            pool_txs.push_back(admission_test::SignedChild(wallet, a, 0, true));
++        }
++    }
++    std::atomic<bool> stop{false};
++    std::vector<std::thread> threads;
++    for (int t = 0; t < 3; ++t) {
++        threads.emplace_back([&, t] {
++            FastRandomContext trng(uint256{uint8_t(t + 1)});
++            StagedAdmissionOptions options;
++            options.script_threads = 1 + t;
++            while (!stop) {
++                std::vector<CTransactionRef> batch;
++                const size_t start = trng.randrange(pool_txs.size());
++                const size_t len = 1 + trng.randrange(32);
++                for (size_t k = 0; k < len; ++k) {
++                    batch.push_back(pool_txs[(start + k) % pool_txs.size()]);
++                }
++                AcceptToMemoryPoolStaged(*m_node.chainman, batch, options);
++            }
++        });
++    }
++    for (int b = 0; b < 4; ++b) {
++        UninterruptibleSleep(std::chrono::milliseconds{50});
++        CreateAndProcessBlock({}, wallet.script_pub_key);
++    }
++    UninterruptibleSleep(std::chrono::milliseconds{50});
++    stop = true;
++    for (auto &th : threads) {
++        th.join();
++    }
++    const int height = WITH_LOCK(cs_main, return Active().m_chain.Height());
++    WITH_LOCK(cs_main, m_node.mempool->check(Active().CoinsTip(), height + 1));
++    for (const auto &[a, b] : double_spends) {
++        BOOST_CHECK(!(m_node.mempool->exists(a) && m_node.mempool->exists(b)));
++    }
++    BOOST_CHECK(m_node.mempool->size() > 0);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/validation.cpp b/src/validation.cpp
+index d567d02ef997fa1c7c0cbd7fa485b05531de82f4..becb0a204f881bbb3fcb1c54f45610157af7b95c 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -891,6 +891,15 @@ private:
+         return true;
+     }
+ 
++public:
++    std::vector<bool>
++    PrepareStaged(const std::vector<CTransactionRef> &txs,
++                  std::vector<PrecomputedAdmissionChecks> &checks,
++                  std::vector<std::vector<COutPoint>> &fetched,
++                  uint32_t script_flags, const MempoolAdmissionLimits &limits)
++        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
++
++private:
+     ValidationCache &GetValidationCache() {
+         return m_active_chainstate.m_chainman.m_validation_cache;
+     }
+@@ -2579,6 +2588,174 @@ ProcessRawTxBatch(
+     return result;
+ }
+ 
++std::vector<bool>
++MemPoolAccept::PrepareStaged(const std::vector<CTransactionRef> &txs,
++                             std::vector<PrecomputedAdmissionChecks> &checks,
++                             std::vector<std::vector<COutPoint>> &fetched,
++                             uint32_t script_flags,
++                             const MempoolAdmissionLimits &limits) {
++    AssertLockHeld(cs_main);
++    LOCK(m_pool.cs);
++    const size_t n = txs.size();
++    std::vector<bool> verify(n, false);
++    // Reuse the ordinary deferred PreChecks: reject cheap invalid
++    // work before it consumes script workers. Phase C still repeats
++    // every check and produces the authoritative verdict.
++    size_t table_size = 1;
++    while (table_size < n * 2) {
++        table_size *= 2;
++    }
++    std::vector<TxIdIndexSlot> table(table_size);
++    for (size_t i = 0; i < n; ++i) {
++        const auto &id = txs[i]->GetId();
++        size_t slot = id.GetUint64(0) & (table_size - 1);
++        while (table[slot].occupied && table[slot].txid != id) {
++            slot = (slot + 1) & (table_size - 1);
++        }
++        if (!table[slot].occupied) {
++            table[slot] = {id, i, true};
++        }
++    }
++    BatchLookupContext context{txs, table, table_size - 1};
++    std::unordered_set<COutPoint, SaltedOutpointHasher> claimed;
++    for (size_t i = 0; i < n; ++i) {
++        const auto &tx = txs[i];
++        if (std::any_of(tx->vin.begin(), tx->vin.end(), [&](const auto &input) {
++                return !claimed.insert(input.prevout).second;
++            })) {
++            continue;
++        }
++        context.current_tx_idx = i;
++        auto args =
++            ATMPArgs::SingleAccept(m_active_chainstate.m_chainman.GetConfig(),
++                                   GetTime(), false, fetched[i], false, 0);
++        Workspace ws(tx, script_flags);
++        if (!PreChecks(args, ws, /*defer_script_checks=*/true, &context)) {
++            continue;
++        }
++        // Serialized-size relay minimum is independent of script
++        // sigchecks. The exact virtual-size minimum, fee limits and
++        // package policy are evaluated again at commit time.
++        if (ws.m_modified_fees <
++                m_pool.m_opts.min_relay_feerate.GetFee(tx->GetTotalSize()) ||
++            (limits.max_fee > Amount::zero() &&
++             ws.m_base_fees > limits.max_fee)) {
++            continue;
++        }
++        auto &spent = checks[i].spent_outputs;
++        spent.reserve(ws.m_resolved_inputs.size());
++        for (const auto &coin : ws.m_resolved_inputs) {
++            spent.push_back(coin.GetTxOut());
++        }
++        verify[i] = true;
++    }
++    return verify;
++}
++
++std::vector<std::optional<MempoolAcceptResult>> AcceptToMemoryPoolStaged(
++    ChainstateManager &chainman, const std::vector<CTransactionRef> &txs,
++    const StagedAdmissionOptions &options, StagedAdmissionStats *stats) {
++    AssertLockNotHeld(cs_main);
++    const size_t n = txs.size();
++    std::vector<std::optional<MempoolAcceptResult>> results(n);
++    if (n == 0) {
++        return results;
++    }
++    StagedAdmissionStats local;
++    std::vector<PrecomputedAdmissionChecks> checks(n);
++    std::vector<bool> verify(n, false);
++    // Coins phase A brought into the coins cache, per transaction, so they
++    // can be evicted again if that transaction is not admitted (as
++    // AcceptToMemoryPool does for the coins it fetches).
++    std::vector<std::vector<COutPoint>> fetched(n);
++    uint32_t script_flags = 0;
++
++    // Phase A: resolve spent outputs under the locks.
++    {
++        const auto start = SteadyClock::now();
++        LOCK(cs_main);
++        Chainstate &chainstate = chainman.ActiveChainstate();
++        CTxMemPool *pool = chainstate.GetMempool();
++        if (pool != nullptr) {
++            script_flags = GetMempoolScriptFlags(chainstate);
++            verify = MemPoolAccept(*pool, chainstate)
++                         .PrepareStaged(txs, checks, fetched, script_flags,
++                                        options.limits);
++        }
++        local.resolve_locked = SteadyClock::now() - start;
++    }
++
++    // Phase B: context-free and script checks, no locks held.
++    std::vector<size_t> work;
++    work.reserve(n);
++    for (size_t i = 0; i < n; ++i) {
++        if (verify[i]) {
++            work.push_back(i);
++        }
++    }
++    local.precomputed = work.size();
++    if (!work.empty()) {
++        const auto start = SteadyClock::now();
++        ValidationCache &validation_cache = chainman.m_validation_cache;
++        std::atomic<size_t> next{0};
++        const size_t threads =
++            std::clamp<size_t>(options.script_threads, 1, work.size());
++        ParallelScriptWorkerPool::Instance().Run(threads, [&](size_t) {
++            for (size_t k = next.fetch_add(1, std::memory_order_relaxed);
++                 k < work.size();
++                 k = next.fetch_add(1, std::memory_order_relaxed)) {
++                const size_t i = work[k];
++                ComputeAdmissionChecks(*txs[i], script_flags, validation_cache,
++                                       checks[i]);
++            }
++        });
++        local.verify_unlocked = SteadyClock::now() - start;
++    }
++
++    if (options.test_between_phases) {
++        options.test_between_phases();
++    }
++
++    // Phase C: ordinary admission, in order, reusing matching checks.
++    {
++        const auto start = SteadyClock::now();
++        LOCK(cs_main);
++        Chainstate &chainstate = chainman.ActiveChainstate();
++        CTxMemPool *pool = chainstate.GetMempool();
++        // Publish one mempool snapshot for the whole batch.
++        std::optional<CTxMemPool::ScopedSnapshotDefer> defer;
++        if (pool != nullptr) {
++            LOCK(pool->cs);
++            defer.emplace(*pool);
++        }
++        for (size_t i = 0; i < n; ++i) {
++            if (options.skip_at_commit && options.skip_at_commit(txs[i])) {
++                continue;
++            }
++            results[i].emplace(chainman.ProcessTransaction(
++                txs[i], /*test_accept=*/false, options.limits,
++                verify[i] ? &checks[i] : nullptr));
++        }
++        for (size_t i = 0; i < n; ++i) {
++            if (!results[i] || results[i]->m_result_type !=
++                                   MempoolAcceptResult::ResultType::VALID) {
++                for (const COutPoint &outpoint : fetched[i]) {
++                    chainstate.CoinsTip().Uncache(outpoint);
++                }
++            }
++        }
++        if (pool != nullptr) {
++            LOCK(pool->cs);
++            defer.reset();
++        }
++        local.commit_locked = SteadyClock::now() - start;
++    }
++    if (stats != nullptr) {
++        *stats = local;
++    }
++    return results;
++}
++
+ Amount GetBlockSubsidy(int nHeight, const Consensus::Params &consensusParams) {
+     int halvings = nHeight / consensusParams.nSubsidyHalvingInterval;
+     // Force block reward to zero when right shift is undefined.
+@@ -6571,10 +6748,10 @@ bool ChainstateManager::ProcessNewBlock(
+     return true;
+ }
+ 
+-MempoolAcceptResult
+-ChainstateManager::ProcessTransaction(const CTransactionRef &tx,
+-                                      bool test_accept,
+-                                      const MempoolAdmissionLimits &limits) {
++MempoolAcceptResult ChainstateManager::ProcessTransaction(
++    const CTransactionRef &tx, bool test_accept,
++    const MempoolAdmissionLimits &limits,
++    const PrecomputedAdmissionChecks *precomputed) {
+     AssertLockHeld(cs_main);
+     Chainstate &active_chainstate = ActiveChainstate();
+     if (!active_chainstate.GetMempool()) {
+@@ -6583,7 +6760,8 @@ ChainstateManager::ProcessTransaction(const CTransactionRef &tx,
+         return MempoolAcceptResult::Failure(state);
+     }
+     auto result = AcceptToMemoryPool(active_chainstate, tx, GetTime(),
+-                                     /*bypass_limits=*/false, test_accept, 0, limits);
++                                     /*bypass_limits=*/false, test_accept, 0,
++                                     limits, precomputed);
+     active_chainstate.GetMempool()->check(
+         active_chainstate.CoinsTip(), active_chainstate.m_chain.Height() + 1);
+     return result;
+diff --git a/src/validation.h b/src/validation.h
+index 835f6164cf857a3adbbaf75f6c4750fc1b0192f5..7a06a905526853524b91b8400785bd7d1cc3275d 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -43,7 +43,9 @@
+ #include <util/translation.h>
+ 
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
++#include <functional>
+ #include <map>
+ #include <memory>
+ #include <optional>
+@@ -473,6 +475,63 @@ ProcessRawTxBatch(
+     const std::vector<PrecomputedBatchTxData> *precomputed_batch = nullptr)
+     EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+ 
++/** Options for AcceptToMemoryPoolStaged. */
++struct StagedAdmissionOptions {
++    /**
++     * Threads verifying scripts in the unlocked phase, including the
++     * calling thread. 1 verifies on the caller only.
++     */
++    size_t script_threads{1};
++    /**
++     * Called for each transaction, in order, with cs_main held, right before
++     * it is admitted. Returning true skips it (no result). Lets a caller
++     * re-apply checks it made before queueing (e.g. "already have") at the
++     * point where the transaction would have been processed serially.
++     */
++    std::function<bool(const CTransactionRef &)> skip_at_commit;
++    MempoolAdmissionLimits limits{};
++    /** Tests: called with no locks held between phases B and C. */
++    std::function<void()> test_between_phases;
++};
++
++/** Where one AcceptToMemoryPoolStaged call spent its time. */
++struct StagedAdmissionStats {
++    /** Transactions whose checks ran in the unlocked phase. */
++    size_t precomputed{0};
++    /** cs_main held while resolving inputs (phase A). */
++    std::chrono::nanoseconds resolve_locked{0};
++    /** Unlocked parallel checks (phase B), wall time. */
++    std::chrono::nanoseconds verify_unlocked{0};
++    /** cs_main held while committing in order (phase C). */
++    std::chrono::nanoseconds commit_locked{0};
++};
++
++/**
++ * Admit transactions in order with script verification outside cs_main.
++ *
++ *  A. With cs_main and the mempool lock: look up the outputs each
++ *     transaction spends (UTXO set, mempool, or an earlier transaction of
++ *     this call). Transactions that cannot be resolved, conflict with the
++ *     mempool or with an earlier transaction of this call, or are not
++ *     standard skip phase B.
++ *  B. Without locks, on `script_threads` threads: ComputeAdmissionChecks.
++ *  C. With cs_main: for each transaction in order,
++ *     ChainstateManager::ProcessTransaction with its precomputed checks.
++ *
++ * Phase C runs the ordinary admission code under the locks, so every
++ * verdict, reject reason, mempool change and notification is the one that
++ * serial admission in this order at commit time would produce; the
++ * precomputed script outcomes are only used where the flags and spent
++ * outputs match what admission resolves (see PrecomputedAdmissionChecks).
++ * A block connected or a mempool change between A and C (including our own
++ * earlier commits) is therefore handled by phase C itself.
++ *
++ * @returns one entry per transaction, nullopt where skip_at_commit said so.
++ */
++std::vector<std::optional<MempoolAcceptResult>> AcceptToMemoryPoolStaged(
++    ChainstateManager &chainman, const std::vector<CTransactionRef> &txs,
++    const StagedAdmissionOptions &options,
++    StagedAdmissionStats *stats = nullptr) LOCKS_EXCLUDED(cs_main);
+ 
+ /**
+  * Simple class for regulating resource usage during CheckInputScripts (and
+@@ -1834,7 +1893,8 @@ public:
+      */
+     [[nodiscard]] MempoolAcceptResult
+     ProcessTransaction(const CTransactionRef &tx, bool test_accept = false,
+-                       const MempoolAdmissionLimits &limits = {})
++                       const MempoolAdmissionLimits &limits = {},
++                       const PrecomputedAdmissionChecks *precomputed = nullptr)
+         EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+ 
+     //! Load the block tree and coins database from disk, initializing state if
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,902 @@
+diff --git a/src/bench/crypto_hash.cpp b/src/bench/crypto_hash.cpp
+index 20651ee1c2..e55528065f 100644
+--- a/src/bench/crypto_hash.cpp
++++ b/src/bench/crypto_hash.cpp
+@@ -13,6 +13,7 @@
+ #include <hash.h>
+ #include <random.h>
+ #include <uint256.h>
++#include <util/hasher.h>
+ 
+ #include <string>
+ 
+@@ -148,3 +149,28 @@ BENCHMARK(MuHashMul);
+ BENCHMARK(MuHashDiv);
+ BENCHMARK(MuHashPrecompute);
+ BENCHMARK(MuHashFinalize);
++
++/** Every coins view and mempool admission constructs a few of these. */
++static void SaltedOutpointHasherConstruct(benchmark::Bench &bench) {
++    uint64_t sink = 0;
++    bench.run([&] {
++        SaltedOutpointHasher hasher;
++        sink += hasher(COutPoint());
++    });
++    ankerl::nanobench::doNotOptimizeAway(sink);
++}
++BENCHMARK(SaltedOutpointHasherConstruct);
++
++/** Reference cost of independently seeding each salt word. */
++static void SaltedOutpointHasherTwoContexts(benchmark::Bench &bench) {
++    uint64_t sink = 0;
++    bench.run([&] {
++        const uint64_t k0 = FastRandomContext().rand64();
++        const uint64_t k1 = FastRandomContext().rand64();
++        const COutPoint outpoint;
++        sink +=
++            SipHashUint256Extra(k0, k1, outpoint.GetTxId(), outpoint.GetN());
++    });
++    ankerl::nanobench::doNotOptimizeAway(sink);
++}
++BENCHMARK(SaltedOutpointHasherTwoContexts);
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 63e350f21b..55662c84fe 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -878,9 +878,9 @@ public:
+     /** Implement PeerManager */
+     void StartScheduledTasks(CScheduler &scheduler) override;
+     void StopTxAdmission() override
+-        EXCLUSIVE_LOCKS_REQUIRED(!m_tx_admission_done_mutex);
++        EXCLUSIVE_LOCKS_REQUIRED(!m_tx_admission_done_mutex, !g_msgproc_mutex);
+     ~PeerManagerImpl() override
+-        EXCLUSIVE_LOCKS_REQUIRED(!m_tx_admission_done_mutex) {
++        EXCLUSIVE_LOCKS_REQUIRED(!m_tx_admission_done_mutex, !g_msgproc_mutex) {
+         StopTxAdmission();
+     }
+     void CheckForStaleTipAndEvictPeers() override;
+@@ -1064,7 +1064,8 @@ private:
+     void ProcessValidTx(NodeId nodeid, const CTransactionRef &tx)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, g_msgproc_mutex, cs_main);
+ 
+-    void ProcessSingleTx(CNode &pfrom, Peer &peer, const CTransactionRef &ptx)
++    void ProcessSingleTx(CNode &pfrom, Peer &peer, const CTransactionRef &ptx,
++                         bool measure_lock = true)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex,
+                                  !m_recent_confirmed_transactions_mutex,
+                                  g_msgproc_mutex);
+@@ -3087,7 +3088,13 @@ void PeerManagerImpl::StopTxAdmission() {
+     if (!m_tx_admission_queue) {
+         return;
+     }
+-    m_tx_admission_running = false;
++    {
++        // Fence producers before draining their CNode references. A message
++        // turn that already observed "running" must finish queueing before
++        // we stop; subsequent turns select the serial path.
++        LOCK(g_msgproc_mutex);
++        m_tx_admission_running = false;
++    }
+     m_tx_admission_queue->Interrupt();
+     if (m_tx_admission_thread.joinable()) {
+         m_tx_admission_thread.join();
+@@ -3132,8 +3139,15 @@ void PeerManagerImpl::ThreadTxAdmission() {
+             if (!sender->node.fDisconnect) {
+                 admitted_index[i] = txs.size();
+                 txs.push_back(items[i].tx);
++            } else if (auto *metrics = node::GetNodeMetrics()) {
++                metrics->mempool_admission_dropped.Inc();
+             }
+         }
++        if (auto *metrics = node::GetNodeMetrics()) {
++            const auto stats = m_tx_admission_queue->GetStats();
++            metrics->mempool_admission_queue_depth.Set(stats.queued);
++            metrics->mempool_admission_queue_bytes.Set(stats.queued_bytes);
++        }
+         std::vector<std::optional<MempoolAcceptResult>> results;
+         if (!txs.empty()) {
+             results = AcceptToMemoryPoolStaged(m_chainman, txs, options);
+@@ -3168,8 +3182,16 @@ bool PeerManagerImpl::QueueTxForAdmission(CNode &pfrom, const PeerRef &peer,
+     AssertLockHeld(g_msgproc_mutex);
+     AssertLockHeld(cs_main);
+     const TxId &txid = ptx->GetId();
+-    if (m_tx_admission_inflight.count(txid) ||
+-        !m_tx_admission_queue->HasRoom(pfrom.GetId(), count_full)) {
++    if (m_tx_admission_inflight.count(txid)) {
++        return false;
++    }
++    if (!m_tx_admission_queue->HasRoom(pfrom.GetId(), ptx->GetTotalSize(),
++                                       count_full)) {
++        if (count_full) {
++            if (auto *metrics = node::GetNodeMetrics()) {
++                metrics->mempool_admission_queue_full.Inc();
++            }
++        }
+         return false;
+     }
+     if (!PrepareTxAdmission(pfrom, ptx)) {
+@@ -3177,9 +3199,12 @@ bool PeerManagerImpl::QueueTxForAdmission(CNode &pfrom, const PeerRef &peer,
+     }
+     m_tx_admission_inflight.insert(txid);
+     ++peer->m_tx_admission_pending;
+-    m_tx_admission_queue->Push(node::TxAdmissionItem{
++    // g_msgproc_mutex serializes every producer; only the consumer can
++    // change queue capacity after HasRoom, and it can only free space.
++    const bool pushed = m_tx_admission_queue->Push(node::TxAdmissionItem{
+         pfrom.GetId(), ptx, SteadyClock::now(),
+         std::make_shared<TxAdmissionSender>(pfrom, peer)});
++    Assume(pushed);
+     return true;
+ }
+ 
+@@ -3193,7 +3218,9 @@ bool PeerManagerImpl::ProcessTxAdmissionDone() {
+     if (done.empty()) {
+         return false;
+     }
++    const auto waiting = SteadyClock::now();
+     LOCK(cs_main);
++    node::AdmissionLockTimer timer(waiting);
+     for (TxAdmissionDone &d : done) {
+         CNode &node = d.sender->node;
+         Peer &peer = *d.sender->peer;
+@@ -4821,14 +4848,17 @@ void PeerManagerImpl::ProcessValidTx(NodeId nodeid, const CTransactionRef &tx) {
+ }
+ 
+ void PeerManagerImpl::ProcessSingleTx(CNode &pfrom, Peer &peer,
+-                                      const CTransactionRef &ptx) {
++                                      const CTransactionRef &ptx,
++                                      bool measure_lock) {
+     AssertLockHeld(g_msgproc_mutex);
+     if (!ptx) {
+         return;
+     }
+     AddKnownTx(peer, ptx->GetId());
+ 
++    const auto waiting = SteadyClock::now();
+     LOCK(cs_main);
++    node::AdmissionLockTimer timer(waiting, measure_lock);
+ 
+     if (!PrepareTxAdmission(pfrom, ptx)) {
+         return;
+@@ -5006,6 +5036,7 @@ void PeerManagerImpl::ProcessTxBatch(
+     if (ptxs.empty()) {
+         return;
+     }
++
+     if (ptxs.size() == 1) {
+         ProcessSingleTx(pfrom, peer, ptxs[0]);
+         return;
+@@ -5016,7 +5047,9 @@ void PeerManagerImpl::ProcessTxBatch(
+     // member otherwise doubles expensive admission work. One pass retains
+     // valid members and gives each transaction the ordinary orphan/reject
+     // handling, while sharing cs_main and deferring snapshot publication.
++    const auto waiting = SteadyClock::now();
+     LOCK(cs_main);
++    node::AdmissionLockTimer timer(waiting);
+     struct PublicationScope {
+         CTxMemPool &pool;
+         std::optional<CTxMemPool::ScopedSnapshotDefer> defer;
+@@ -5031,7 +5064,7 @@ void PeerManagerImpl::ProcessTxBatch(
+     } publication_scope(m_mempool);
+     for (const auto &ptx : ptxs) {
+         if (pfrom.fDisconnect) break;
+-        ProcessSingleTx(pfrom, peer, ptx);
++        ProcessSingleTx(pfrom, peer, ptx, /*measure_lock=*/false);
+     }
+ }
+ 
+@@ -8799,7 +8832,9 @@ bool PeerManagerImpl::ProcessMessages(const Config &config, CNode *pfrom,
+         // Transactions waiting for an earlier copy's verdict or for room in
+         // the admission queue go first, in order.
+         if (!peer->m_tx_admission_held_txs.empty()) {
++            const auto waiting = SteadyClock::now();
+             LOCK(cs_main);
++            node::AdmissionLockTimer timer(waiting);
+             while (!peer->m_tx_admission_held_txs.empty() &&
+                    QueueTxForAdmission(*pfrom, peer,
+                                        peer->m_tx_admission_held_txs.front(),
+@@ -8912,7 +8947,9 @@ bool PeerManagerImpl::ProcessMessages(const Config &config, CNode *pfrom,
+                 AddKnownTx(*peer, ptx->GetId());
+             }
+             {
++                const auto waiting = SteadyClock::now();
+                 LOCK(cs_main);
++                node::AdmissionLockTimer timer(waiting);
+                 for (auto &ptx : received) {
+                     if (!peer->m_tx_admission_held_txs.empty() ||
+                         !QueueTxForAdmission(*pfrom, peer, ptx,
+diff --git a/src/node/metrics.cpp b/src/node/metrics.cpp
+index ab472f5a58..b1fabd5a09 100644
+--- a/src/node/metrics.cpp
++++ b/src/node/metrics.cpp
+@@ -130,7 +130,8 @@ NodeMetrics::NodeMetrics(std::vector<std::string> rpc_methods)
+                        std::vector<LabelDim>{{"type", L::MsgTypes()}})},
+       p2p_message_handling_seconds{Add<EventHistogram>(
+           registry, "lotus_p2p_message_handling_seconds",
+-          "Time to process a received P2P message or coalesced batch, by initial message type. Only "
++          "Time to process a received P2P message or coalesced batch, by "
++          "initial message type. Only "
+           "one dispatch turn in 16 is timed: _count is a sample, use "
+           "lotus_p2p_received_messages_total for totals.",
+           MESSAGE_BUCKETS, /*divisor=*/1e9,
+@@ -170,6 +171,33 @@ NodeMetrics::NodeMetrics(std::vector<std::string> rpc_methods)
+                                       "Transactions in the mempool.")},
+       mempool_bytes{Add<Gauge>(registry, "lotus_mempool_bytes",
+                                "Total size of the mempool's transactions.")},
++      mempool_admission_lock_hold_seconds{Add<EventHistogram>(
++          registry, "lotus_mempool_admission_lock_hold_seconds",
++          "cs_main hold time in admission: input snapshots, commits, P2P "
++          "prepare/verdict handling and synchronous RPC admission.",
++          MESSAGE_BUCKETS, 1e9)},
++      mempool_admission_lock_wait_seconds{Add<EventHistogram>(
++          registry, "lotus_mempool_admission_lock_wait_seconds",
++          "Time waiting for cs_main in staged or serial P2P admission.",
++          MESSAGE_BUCKETS, 1e9)},
++      mempool_admission_verify_seconds{Add<EventHistogram>(
++          registry, "lotus_mempool_admission_verify_seconds",
++          "Unlocked script verification wall time per staged batch.",
++          MESSAGE_BUCKETS, 1e9)},
++      mempool_admission_queue_depth{
++          Add<Gauge>(registry, "lotus_mempool_admission_queue_depth",
++                     "Transactions waiting in the P2P admission queue "
++                     "(excludes active batch).")},
++      mempool_admission_queue_bytes{
++          Add<Gauge>(registry, "lotus_mempool_admission_queue_bytes",
++                     "Serialized bytes waiting in the P2P admission queue.")},
++      mempool_admission_queue_full{
++          Add<Counter>(registry, "lotus_mempool_admission_queue_full_total",
++                       "P2P admission queue backpressure events; no "
++                       "transaction is discarded.")},
++      mempool_admission_dropped{Add<Counter>(
++          registry, "lotus_mempool_admission_dropped_total",
++          "Queued transactions skipped because their peer disconnected.")},
+       http_requests{Add<Counter>(
+           registry, "lotus_http_requests_total",
+           "HTTP requests answered (not WebSocket sessions), by endpoint and "
+diff --git a/src/node/metrics.h b/src/node/metrics.h
+index 1ab2e9e163..93b07dd493 100644
+--- a/src/node/metrics.h
++++ b/src/node/metrics.h
+@@ -81,6 +81,15 @@ struct NodeMetrics {
+     metrics::Gauge &mempool_transactions;
+     metrics::Gauge &mempool_bytes;
+ 
++    // Admission durations are measured per batch, with lock waits separate.
++    metrics::EventHistogram &mempool_admission_lock_hold_seconds;
++    metrics::EventHistogram &mempool_admission_lock_wait_seconds;
++    metrics::EventHistogram &mempool_admission_verify_seconds;
++    metrics::Gauge &mempool_admission_queue_depth;
++    metrics::Gauge &mempool_admission_queue_bytes;
++    metrics::Counter &mempool_admission_queue_full;
++    metrics::Counter &mempool_admission_dropped;
++
+     // HTTP and RPC
+     metrics::Counter &http_requests;
+     metrics::EventHistogram &http_request_seconds;
+@@ -114,6 +123,31 @@ inline NodeMetrics *GetNodeMetrics() noexcept {
+     return detail::g_node_metrics.load(std::memory_order_acquire);
+ }
+ 
++/** Measures a cs_main admission scope; construct immediately after locking. */
++class AdmissionLockTimer {
++public:
++    AdmissionLockTimer(std::chrono::steady_clock::time_point waiting,
++                       bool enabled = true)
++        : m_metrics(enabled ? GetNodeMetrics() : nullptr),
++          m_acquired(m_metrics ? std::chrono::steady_clock::now()
++                               : std::chrono::steady_clock::time_point{}) {
++        if (m_metrics) {
++            m_metrics->mempool_admission_lock_wait_seconds.RecordDuration(
++                m_acquired - waiting);
++        }
++    }
++    ~AdmissionLockTimer() {
++        if (m_metrics) {
++            m_metrics->mempool_admission_lock_hold_seconds.RecordDuration(
++                std::chrono::steady_clock::now() - m_acquired);
++        }
++    }
++
++private:
++    NodeMetrics *m_metrics;
++    std::chrono::steady_clock::time_point m_acquired;
++};
++
+ /**
+  * Create the metrics (once), start the drain thread and give new threads
+  * their rings. rpc_methods: every registered RPC command.
+diff --git a/src/node/transaction.cpp b/src/node/transaction.cpp
+index 65d0370b16..9ceb4e1c56 100644
+--- a/src/node/transaction.cpp
++++ b/src/node/transaction.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <node/transaction.h>
+ 
++#include <common/args.h>
+ #include <config.h>
+ #include <consensus/validation.h>
+ #include <index/txindex.h>
+@@ -12,6 +13,8 @@
+ #include <net_processing.h>
+ #include <node/blockstorage.h>
+ #include <node/context.h>
++#include <node/metrics.h>
++#include <node/txadmission.h>
+ #include <node/types.h>
+ #include <primitives/blockhash.h>
+ #include <primitives/txid.h>
+@@ -51,9 +54,21 @@ TransactionError BroadcastTransaction(const NodeContext &node,
+     std::promise<void> promise;
+     TxId txid = tx->GetId();
+     bool callback_set = false;
++    const MempoolAdmissionLimits limits{max_tx_fee, rpc_fee_hysteresis};
++    std::optional<PrecomputedAdmissionChecks> precomputed;
++    if (wait_callback && node.args &&
++        node.args->GetBoolArg("-parallelmempool", DEFAULT_PARALLEL_MEMPOOL)) {
++        // Synchronous callers guarantee they hold no chain/mempool/wallet
++        // locks. RPC clients can therefore verify concurrently. The existing
++        // critical section below decides every verdict,
++        // fee bound, broadcast marker and notification in the same order.
++        precomputed = PrecomputeMempoolAdmission(*node.chainman, tx, limits);
++    }
+ 
+     {
++        const auto waiting = std::chrono::steady_clock::now();
+         LOCK(cs_main);
++        AdmissionLockTimer timer(waiting);
+ 
+         // If the transaction is already confirmed in the chain, don't do
+         // anything and return early.
+@@ -71,9 +86,10 @@ TransactionError BroadcastTransaction(const NodeContext &node,
+         if (!node.mempool->exists(txid)) {
+             // Transaction is not already in the mempool.
+             // Validate caller fee bounds before insertion in this one ATMP pass.
+-            const MempoolAdmissionLimits limits{max_tx_fee, rpc_fee_hysteresis};
+             const MempoolAcceptResult result =
+-                node.chainman->ProcessTransaction(tx, /*test_accept=*/false, limits);
++                node.chainman->ProcessTransaction(
++                    tx, /*test_accept=*/false, limits,
++                    precomputed ? &*precomputed : nullptr);
+             if (result.m_result_type !=
+                 MempoolAcceptResult::ResultType::VALID) {
+                 if (result.m_state.GetRejectReason() == "max-fee-exceeded") {
+diff --git a/src/node/txadmission.cpp b/src/node/txadmission.cpp
+index 512fcb9210..768b17c919 100644
+--- a/src/node/txadmission.cpp
++++ b/src/node/txadmission.cpp
+@@ -10,12 +10,13 @@
+ 
+ namespace node {
+ 
+-bool TxAdmissionQueue::HasRoom(NodeId peer, bool count_full) {
++bool TxAdmissionQueue::HasRoom(NodeId peer, size_t tx_bytes, bool count_full) {
+     LOCK(m_mutex);
+     const auto it = m_queues.find(peer);
+     const size_t mine = it == m_queues.end() ? 0 : it->second.size();
+     if (mine < m_limits.max_per_peer && m_count < m_limits.max_total &&
+-        m_bytes < m_limits.max_total_bytes) {
++        m_bytes <= m_limits.max_total_bytes &&
++        tx_bytes <= m_limits.max_total_bytes - m_bytes) {
+         return true;
+     }
+     if (count_full) {
+@@ -24,9 +25,18 @@ bool TxAdmissionQueue::HasRoom(NodeId peer, bool count_full) {
+     return false;
+ }
+ 
+-void TxAdmissionQueue::Push(TxAdmissionItem item) {
++bool TxAdmissionQueue::Push(TxAdmissionItem item) {
+     {
+         LOCK(m_mutex);
++        const auto it = m_queues.find(item.peer);
++        const size_t mine = it == m_queues.end() ? 0 : it->second.size();
++        const size_t bytes = item.tx->GetTotalSize();
++        if (mine >= m_limits.max_per_peer || m_count >= m_limits.max_total ||
++            m_bytes > m_limits.max_total_bytes ||
++            bytes > m_limits.max_total_bytes - m_bytes) {
++            ++m_full;
++            return false;
++        }
+         auto &q = m_queues[item.peer];
+         if (q.empty()) {
+             m_order.push_back(item.peer);
+@@ -37,6 +47,7 @@ void TxAdmissionQueue::Push(TxAdmissionItem item) {
+         q.push_back(std::move(item));
+     }
+     m_cv.notify_one();
++    return true;
+ }
+ 
+ std::vector<TxAdmissionItem>
+diff --git a/src/node/txadmission.h b/src/node/txadmission.h
+index 66a051c906..2e5a3e0d62 100644
+--- a/src/node/txadmission.h
++++ b/src/node/txadmission.h
+@@ -75,11 +75,14 @@ public:
+      * Whether `peer` may add one more transaction now. Counts a "full"
+      * event when it may not and count_full is set.
+      */
+-    bool HasRoom(NodeId peer, bool count_full = true)
++    bool HasRoom(NodeId peer, size_t tx_bytes, bool count_full = true)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
+-    /** Append to the peer's FIFO and wake the consumer. */
+-    void Push(TxAdmissionItem item) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    /**
++     * Atomically check bounds and append, waking the consumer on success.
++     * HasRoom is advisory and does not reserve space for concurrent producers.
++     */
++    bool Push(TxAdmissionItem item) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
+     /**
+      * Take up to `max_items`, round-robin over peers, waiting up to `wait`
+diff --git a/src/test/mempool_admission_tests.cpp b/src/test/mempool_admission_tests.cpp
+index f51a413695..1397aae8fc 100644
+--- a/src/test/mempool_admission_tests.cpp
++++ b/src/test/mempool_admission_tests.cpp
+@@ -359,6 +359,31 @@ BOOST_AUTO_TEST_CASE(staged_admission_matches_serial_admission) {
+     }
+ }
+ 
++BOOST_AUTO_TEST_CASE(staged_cheap_rejects_do_not_run_unlocked_scripts) {
++    const auto &out = wallet.outputs[0];
++    const auto free_tx = BuildSpend(wallet, {out}, {out.amount}, true);
++    const int height = WITH_LOCK(cs_main, return Active().m_chain.Height());
++    const auto future_tx = BuildSpend(
++        wallet, {wallet.outputs[1]},
++        {wallet.outputs[1].amount - 10000 * SATOSHI}, false, height + 10, 0);
++    for (const auto &tx : {free_tx, future_tx}) {
++        const auto serial = Admit(tx);
++        StagedAdmissionStats stats;
++        const auto staged =
++            AcceptToMemoryPoolStaged(*m_node.chainman, {tx}, {}, &stats);
++        BOOST_CHECK_EQUAL(stats.precomputed, 0U);
++        CheckSameResult(serial, *staged[0]);
++    }
++    const auto tx = SignedSpend(wallet, {wallet.outputs[2]}, 1, true);
++    MempoolAdmissionLimits limits;
++    limits.max_fee = 1 * SATOSHI;
++    const auto checks =
++        PrecomputeMempoolAdmission(*m_node.chainman, tx, limits);
++    BOOST_CHECK(!checks.standard.ran);
++    // Advisory work cannot insert or skip the caller's authoritative fee check.
++    BOOST_CHECK(!m_node.mempool->exists(tx->GetId()));
++}
++
+ BOOST_AUTO_TEST_CASE(staged_double_spend_race_first_in_order_wins) {
+     const auto o = wallet.outputs[0];
+     const auto a = SignedSpend(wallet, {o}, 1, /*schnorr=*/false, 1);
+diff --git a/src/test/txadmission_queue_tests.cpp b/src/test/txadmission_queue_tests.cpp
+index e2b8d127c7..f618bdbd69 100644
+--- a/src/test/txadmission_queue_tests.cpp
++++ b/src/test/txadmission_queue_tests.cpp
+@@ -68,16 +68,16 @@ BOOST_AUTO_TEST_CASE(bounded_per_peer_total_and_bytes) {
+     limits.max_total_bytes = 1 << 20;
+     TxAdmissionQueue q{limits};
+     for (uint32_t i = 0; i < 3; ++i) {
+-        BOOST_CHECK(q.HasRoom(1));
++        BOOST_CHECK(q.HasRoom(1, MakeTx(0)->GetTotalSize()));
+         q.Push(Item(1, i));
+     }
+-    BOOST_CHECK(!q.HasRoom(1));
+-    BOOST_CHECK(q.HasRoom(2));
++    BOOST_CHECK(!q.HasRoom(1, MakeTx(0)->GetTotalSize()));
++    BOOST_CHECK(q.HasRoom(2, MakeTx(0)->GetTotalSize()));
+     q.Push(Item(2, 10));
+     q.Push(Item(2, 11));
+     // Total reached: nobody has room, including a new peer.
+-    BOOST_CHECK(!q.HasRoom(3));
+-    BOOST_CHECK(!q.HasRoom(2, /*count_full=*/false));
++    BOOST_CHECK(!q.HasRoom(3, MakeTx(0)->GetTotalSize()));
++    BOOST_CHECK(!q.HasRoom(2, MakeTx(0)->GetTotalSize(), /*count_full=*/false));
+     auto stats = q.GetStats();
+     BOOST_CHECK_EQUAL(stats.queued, 5U);
+     BOOST_CHECK_EQUAL(stats.full, 2U);
+@@ -87,10 +87,22 @@ BOOST_AUTO_TEST_CASE(bounded_per_peer_total_and_bytes) {
+     // Bytes bound.
+     limits.max_total_bytes = MakeTx(0)->GetTotalSize() * 2;
+     TxAdmissionQueue small{limits};
++    BOOST_CHECK(!small.HasRoom(1, limits.max_total_bytes + 1));
+     small.Push(Item(1, 0));
+-    BOOST_CHECK(small.HasRoom(2));
++    BOOST_CHECK(!small.HasRoom(2, MakeTx(0)->GetTotalSize() + 1));
++    BOOST_CHECK(small.HasRoom(2, MakeTx(0)->GetTotalSize()));
+     small.Push(Item(2, 1));
+-    BOOST_CHECK(!small.HasRoom(3));
++    BOOST_CHECK(!small.HasRoom(3, MakeTx(0)->GetTotalSize()));
++    BOOST_CHECK(!small.Push(Item(3, 2)));
++    BOOST_CHECK_EQUAL(small.GetStats().queued_bytes, limits.max_total_bytes);
++
++    // A stale positive availability check cannot overfill the queue.
++    TxAdmissionQueue race{{1, 1, 1 << 20}};
++    BOOST_CHECK(race.HasRoom(1, MakeTx(0)->GetTotalSize()));
++    BOOST_CHECK(race.HasRoom(2, MakeTx(0)->GetTotalSize()));
++    BOOST_CHECK(race.Push(Item(1, 0)));
++    BOOST_CHECK(!race.Push(Item(2, 1)));
++    BOOST_CHECK_EQUAL(race.GetStats().queued, 1U);
+ }
+ 
+ BOOST_AUTO_TEST_CASE(drop_peer_take_all_and_interrupt) {
+@@ -134,8 +146,11 @@ BOOST_AUTO_TEST_CASE(concurrent_producers_and_consumer) {
+     for (int p = 0; p < PEERS; ++p) {
+         producers.emplace_back([&, p] {
+             for (uint32_t i = 0; i < PER_PEER;) {
+-                if (q.HasRoom(p, /*count_full=*/false)) {
+-                    q.Push(Item(p, i++));
++                if (q.HasRoom(p, MakeTx(0)->GetTotalSize(),
++                              /*count_full=*/false)) {
++                    if (q.Push(Item(p, i))) {
++                        ++i;
++                    }
+                 } else {
+                     std::this_thread::yield();
+                 }
+diff --git a/src/util/hasher.cpp b/src/util/hasher.cpp
+index 49d94fb20f..976e2b23ae 100644
+--- a/src/util/hasher.cpp
++++ b/src/util/hasher.cpp
+@@ -7,15 +7,30 @@
+ 
+ #include <limits>
+ 
++namespace {
++/**
++ * Two salt words from one freshly seeded random context. Seeding a context
++ * costs a hash of the RNG state under its mutex, which dominated the cost
++ * of constructing a hasher (and so of every coins view and mempool
++ * admission) when each word had its own context.
++ */
++std::array<uint64_t, 2> RandomSalt() {
++    FastRandomContext rng;
++    const uint64_t k0 = rng.rand64();
++    return {k0, rng.rand64()};
++}
++} // namespace
++
+ SaltedUint256Hasher::SaltedUint256Hasher()
+-    : k0{FastRandomContext().rand64()}, k1{FastRandomContext().rand64()} {}
++    : SaltedUint256Hasher(RandomSalt()) {}
+ 
+ SaltedOutpointHasher::SaltedOutpointHasher(bool deterministic)
+-    : k0{deterministic ? 0x8e819f2607a18de6 : FastRandomContext().rand64()},
+-      k1{deterministic ? 0xf4020d2e3983b0eb : FastRandomContext().rand64()} {}
++    : SaltedOutpointHasher(
++          deterministic
++              ? std::array<uint64_t, 2>{0x8e819f2607a18de6, 0xf4020d2e3983b0eb}
++              : RandomSalt()) {}
+ 
+-SaltedSipHasher::SaltedSipHasher()
+-    : m_k0{FastRandomContext().rand64()}, m_k1{FastRandomContext().rand64()} {}
++SaltedSipHasher::SaltedSipHasher() : SaltedSipHasher(RandomSalt()) {}
+ 
+ size_t SaltedSipHasher::operator()(const Span<const uint8_t> &script) const {
+     return CSipHasher(m_k0, m_k1).Write(script).Finalize();
+diff --git a/src/util/hasher.h b/src/util/hasher.h
+index 95c4861bbd..5e022bf648 100644
+--- a/src/util/hasher.h
++++ b/src/util/hasher.h
+@@ -12,11 +12,17 @@
+ #include <script/standard.h>
+ #include <uint256.h>
+ 
++#include <array>
++#include <cstdint>
++
+ class SaltedUint256Hasher {
+ private:
+     /** Salt */
+     const uint64_t k0, k1;
+ 
++    explicit SaltedUint256Hasher(std::array<uint64_t, 2> salt)
++        : k0{salt[0]}, k1{salt[1]} {}
++
+ public:
+     SaltedUint256Hasher();
+ 
+@@ -45,6 +51,9 @@ private:
+     /** Salt */
+     const uint64_t k0, k1;
+ 
++    explicit SaltedOutpointHasher(std::array<uint64_t, 2> salt)
++        : k0{salt[0]}, k1{salt[1]} {}
++
+ public:
+     SaltedOutpointHasher(bool deterministic = false);
+ 
+@@ -106,6 +115,9 @@ private:
+     /** Salt */
+     const uint64_t m_k0, m_k1;
+ 
++    explicit SaltedSipHasher(std::array<uint64_t, 2> salt)
++        : m_k0{salt[0]}, m_k1{salt[1]} {}
++
+ public:
+     SaltedSipHasher();
+ 
+diff --git a/src/validation.cpp b/src/validation.cpp
+index f2c9e2b9f5..a6531a7d75 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -891,6 +891,15 @@ private:
+         return true;
+     }
+ 
++public:
++    std::vector<bool>
++    PrepareStaged(const std::vector<CTransactionRef> &txs,
++                  std::vector<PrecomputedAdmissionChecks> &checks,
++                  std::vector<std::vector<COutPoint>> &fetched,
++                  uint32_t script_flags, const MempoolAdmissionLimits &limits)
++        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
++
++private:
+     ValidationCache &GetValidationCache() {
+         return m_active_chainstate.m_chainman.m_validation_cache;
+     }
+@@ -2579,6 +2588,108 @@ ProcessRawTxBatch(
+     return result;
+ }
+ 
++std::vector<bool>
++MemPoolAccept::PrepareStaged(const std::vector<CTransactionRef> &txs,
++                             std::vector<PrecomputedAdmissionChecks> &checks,
++                             std::vector<std::vector<COutPoint>> &fetched,
++                             uint32_t script_flags,
++                             const MempoolAdmissionLimits &limits) {
++    AssertLockHeld(cs_main);
++    LOCK(m_pool.cs);
++    const size_t n = txs.size();
++    std::vector<bool> verify(n, false);
++    // Reuse the ordinary deferred PreChecks: reject cheap invalid
++    // work before it consumes script workers. Phase C still repeats
++    // every check and produces the authoritative verdict.
++    size_t table_size = 1;
++    while (table_size < n * 2) {
++        table_size *= 2;
++    }
++    std::vector<TxIdIndexSlot> table(table_size);
++    for (size_t i = 0; i < n; ++i) {
++        const auto &id = txs[i]->GetId();
++        size_t slot = id.GetUint64(0) & (table_size - 1);
++        while (table[slot].occupied && table[slot].txid != id) {
++            slot = (slot + 1) & (table_size - 1);
++        }
++        if (!table[slot].occupied) {
++            table[slot] = {id, i, true};
++        }
++    }
++    BatchLookupContext context{txs, table, table_size - 1};
++    std::unordered_set<COutPoint, SaltedOutpointHasher> claimed;
++    for (size_t i = 0; i < n; ++i) {
++        const auto &tx = txs[i];
++        if (std::any_of(tx->vin.begin(), tx->vin.end(), [&](const auto &input) {
++                return !claimed.insert(input.prevout).second;
++            })) {
++            continue;
++        }
++        context.current_tx_idx = i;
++        auto args =
++            ATMPArgs::SingleAccept(m_active_chainstate.m_chainman.GetConfig(),
++                                   GetTime(), false, fetched[i], false, 0);
++        Workspace ws(tx, script_flags);
++        if (!PreChecks(args, ws, /*defer_script_checks=*/true, &context)) {
++            continue;
++        }
++        // Serialized-size relay minimum is independent of script
++        // sigchecks. The exact virtual-size minimum, fee limits and
++        // package policy are evaluated again at commit time.
++        if (ws.m_modified_fees <
++                m_pool.m_opts.min_relay_feerate.GetFee(tx->GetTotalSize()) ||
++            (limits.max_fee > Amount::zero() &&
++             ws.m_base_fees > limits.max_fee)) {
++            continue;
++        }
++        auto &spent = checks[i].spent_outputs;
++        spent.reserve(ws.m_resolved_inputs.size());
++        for (const auto &coin : ws.m_resolved_inputs) {
++            spent.push_back(coin.GetTxOut());
++        }
++        verify[i] = true;
++    }
++    return verify;
++}
++
++PrecomputedAdmissionChecks
++PrecomputeMempoolAdmission(ChainstateManager &chainman,
++                           const CTransactionRef &tx,
++                           const MempoolAdmissionLimits &limits) {
++    AssertLockNotHeld(cs_main);
++    std::vector<PrecomputedAdmissionChecks> checks(1);
++    std::vector<std::vector<COutPoint>> fetched(1);
++    bool verify = false;
++    uint32_t flags = 0;
++    {
++        const auto waiting = SteadyClock::now();
++        LOCK(cs_main);
++        node::AdmissionLockTimer timer(waiting);
++        auto &chainstate = chainman.ActiveChainstate();
++        if (auto *pool = chainstate.GetMempool()) {
++            flags = GetMempoolScriptFlags(chainstate);
++            verify =
++                MemPoolAccept(*pool, chainstate)
++                    .PrepareStaged({tx}, checks, fetched, flags, limits)[0];
++            // No admission owns these cache entries yet. Retain only copied
++            // outputs across the unlocked phase, including for invalid work.
++            for (const auto &outpoint : fetched[0]) {
++                chainstate.CoinsTip().Uncache(outpoint);
++            }
++        }
++    }
++    if (verify) {
++        const auto start = SteadyClock::now();
++        ComputeAdmissionChecks(*tx, flags, chainman.m_validation_cache,
++                               checks[0]);
++        if (auto *metrics = node::GetNodeMetrics()) {
++            metrics->mempool_admission_verify_seconds.RecordDuration(
++                SteadyClock::now() - start);
++        }
++    }
++    return std::move(checks[0]);
++}
++
+ std::vector<std::optional<MempoolAcceptResult>> AcceptToMemoryPoolStaged(
+     ChainstateManager &chainman, const std::vector<CTransactionRef> &txs,
+     const StagedAdmissionOptions &options, StagedAdmissionStats *stats) {
+@@ -2601,80 +2712,17 @@ std::vector<std::optional<MempoolAcceptResult>> AcceptToMemoryPoolStaged(
+     {
+         const auto start = SteadyClock::now();
+         LOCK(cs_main);
++        const auto acquired = SteadyClock::now();
++        local.lock_wait += acquired - start;
+         Chainstate &chainstate = chainman.ActiveChainstate();
+         CTxMemPool *pool = chainstate.GetMempool();
+         if (pool != nullptr) {
+-            LOCK(pool->cs);
+             script_flags = GetMempoolScriptFlags(chainstate);
+-            CCoinsViewCache &coins_tip = chainstate.CoinsTip();
+-            std::unordered_map<TxId, size_t, SaltedTxIdHasher> batch_index;
+-            std::unordered_set<COutPoint, SaltedOutpointHasher> claimed;
+-            batch_index.reserve(n);
+-            std::string reason;
+-            for (size_t i = 0; i < n; ++i) {
+-                const CTransaction &tx = *txs[i];
+-                batch_index.emplace(tx.GetId(), i);
+-                // Only verify what admission would verify: no scripts for a
+-                // coinbase, a transaction already in the mempool, or a
+-                // non-standard one (all rejected before script checks).
+-                if (tx.IsCoinBase() || pool->exists(tx.GetId()) ||
+-                    (pool->m_opts.require_standard &&
+-                     !IsStandardTx(tx, pool->m_opts.max_datacarrier_bytes,
+-                                   pool->m_opts.permit_bare_multisig,
+-                                   pool->m_opts.dust_relay_feerate, reason))) {
+-                    continue;
+-                }
+-                auto &spent = checks[i].spent_outputs;
+-                spent.reserve(tx.vin.size());
+-                bool resolved = true;
+-                for (const CTxIn &in : tx.vin) {
+-                    const COutPoint &prevout = in.prevout;
+-                    // A double spend of the mempool or of an earlier
+-                    // transaction here is decided in phase C, without
+-                    // spending script verification on it now. The spent
+-                    // filter is only a hint (phase C makes the authoritative
+-                    // mapNextTx check): a false positive sends the
+-                    // transaction to the serial path, a false negative
+-                    // costs an unneeded script check.
+-                    if (!claimed.insert(prevout).second ||
+-                        pool->GetUtxoFastFilter().IsSpentInMempool(
+-                            prevout.GetTxId().begin(), prevout.GetN())) {
+-                        resolved = false;
+-                        break;
+-                    }
+-                    if (auto it = batch_index.find(prevout.GetTxId());
+-                        it != batch_index.end() && it->second < i) {
+-                        const CTransaction &parent = *txs[it->second];
+-                        if (prevout.GetN() >= parent.vout.size()) {
+-                            resolved = false;
+-                            break;
+-                        }
+-                        spent.push_back(parent.vout[prevout.GetN()]);
+-                        continue;
+-                    }
+-                    if (const CTransactionRef parent =
+-                            pool->get(prevout.GetTxId())) {
+-                        if (prevout.GetN() >= parent->vout.size()) {
+-                            resolved = false;
+-                            break;
+-                        }
+-                        spent.push_back(parent->vout[prevout.GetN()]);
+-                        continue;
+-                    }
+-                    if (!coins_tip.HaveCoinInCache(prevout)) {
+-                        fetched[i].push_back(prevout);
+-                    }
+-                    const Coin &coin = coins_tip.AccessCoin(prevout);
+-                    if (coin.IsSpent()) {
+-                        resolved = false;
+-                        break;
+-                    }
+-                    spent.push_back(coin.GetTxOut());
+-                }
+-                verify[i] = resolved;
+-            }
++            verify = MemPoolAccept(*pool, chainstate)
++                         .PrepareStaged(txs, checks, fetched, script_flags,
++                                        options.limits);
+         }
+-        local.resolve_locked = SteadyClock::now() - start;
++        local.resolve_locked = SteadyClock::now() - acquired;
+     }
+ 
+     // Phase B: context-free and script checks, no locks held.
+@@ -2712,6 +2760,8 @@ std::vector<std::optional<MempoolAcceptResult>> AcceptToMemoryPoolStaged(
+     {
+         const auto start = SteadyClock::now();
+         LOCK(cs_main);
++        const auto acquired = SteadyClock::now();
++        local.lock_wait += acquired - start;
+         Chainstate &chainstate = chainman.ActiveChainstate();
+         CTxMemPool *pool = chainstate.GetMempool();
+         // Publish one mempool snapshot for the whole batch.
+@@ -2740,7 +2790,15 @@ std::vector<std::optional<MempoolAcceptResult>> AcceptToMemoryPoolStaged(
+             LOCK(pool->cs);
+             defer.reset();
+         }
+-        local.commit_locked = SteadyClock::now() - start;
++        local.commit_locked = SteadyClock::now() - acquired;
++    }
++    if (auto *metrics = node::GetNodeMetrics()) {
++        metrics->mempool_admission_lock_hold_seconds.RecordDuration(
++            local.resolve_locked + local.commit_locked);
++        metrics->mempool_admission_lock_wait_seconds.RecordDuration(
++            local.lock_wait);
++        metrics->mempool_admission_verify_seconds.RecordDuration(
++            local.verify_unlocked);
+     }
+     if (stats != nullptr) {
+         *stats = local;
+diff --git a/src/validation.h b/src/validation.h
+index 7a06a90552..f242edc00c 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -494,12 +494,23 @@ struct StagedAdmissionOptions {
+     std::function<void()> test_between_phases;
+ };
+ 
++/**
++ * Snapshot and verify one transaction for a caller that will admit it later
++ * under cs_main. Cheap checks are advisory; admission repeats them and only
++ * reuses scripts when spent outputs and flags still match. No insertion.
++ */
++PrecomputedAdmissionChecks PrecomputeMempoolAdmission(
++    ChainstateManager &chainman, const CTransactionRef &tx,
++    const MempoolAdmissionLimits &limits) LOCKS_EXCLUDED(cs_main);
++
+ /** Where one AcceptToMemoryPoolStaged call spent its time. */
+ struct StagedAdmissionStats {
+     /** Transactions whose checks ran in the unlocked phase. */
+     size_t precomputed{0};
+     /** cs_main held while resolving inputs (phase A). */
+     std::chrono::nanoseconds resolve_locked{0};
++    /** Time waiting to acquire cs_main across phases A and C. */
++    std::chrono::nanoseconds lock_wait{0};
+     /** Unlocked parallel checks (phase B), wall time. */
+     std::chrono::nanoseconds verify_unlocked{0};
+     /** cs_main held while committing in order (phase C). */
+diff --git a/test/functional/mempool_parallel_admission.py b/test/functional/mempool_parallel_admission.py
+index 670c016113..5813e93c0d 100755
+--- a/test/functional/mempool_parallel_admission.py
++++ b/test/functional/mempool_parallel_admission.py
+@@ -170,6 +170,11 @@ class ParallelAdmissionTest(BitcoinTestFramework):
+             assert tx["txid"] in mempool or tx["txid"] in confirmed
+         assert all(p.is_connected for p in peers)
+ 
++        self.log.info("Shutdown fences admission producers with work in flight")
++        for i in range(40):
++            peers[i % 2].send_without_ping(msg_tx(self.spend()["tx"]))
++        self.stop_node(0)
++
+ 
+ if __name__ == "__main__":
+     ParallelAdmissionTest().main()

@@ -1,0 +1,282 @@
+diff --git a/src/lotus_v2/tx_merklix.cpp b/src/lotus_v2/tx_merklix.cpp
+index 0e8a82133f..0b0dfdf008 100644
+--- a/src/lotus_v2/tx_merklix.cpp
++++ b/src/lotus_v2/tx_merklix.cpp
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <future>
++#include <limits>
+ #include <new>
+ #include <stdexcept>
+ #include <system_error>
+@@ -153,7 +154,6 @@ template <typename T> uint32_t Slab<T>::Allocate(bool &reused) {
+ }
+ 
+ template <typename T> void Slab<T>::Free(uint32_t slot) {
+-    At(slot).generation.fetch_add(1, std::memory_order_release);
+     m_free.push_back(slot);
+ }
+ 
+@@ -204,7 +204,10 @@ NodeId Store::NewLeaf(const Hash &id, const Hash &hash, uint64_t minhash,
+     uint32_t slot;
+     {
+         std::lock_guard<std::mutex> lock(m_alloc_mutex);
++        if (m_next_generation == std::numeric_limits<uint64_t>::max())
++            throw std::length_error("txmerklix generation exhausted");
+         slot = m_leaves.Allocate(reused);
++        m_leaves.At(slot).generation.store(m_next_generation++, std::memory_order_release);
+     }
+     auto &s = Stats();
+     s.leaf_allocs.fetch_add(1, std::memory_order_relaxed);
+@@ -227,7 +230,10 @@ NodeId Store::NewBranch(const Branch &shape) {
+     uint32_t slot;
+     {
+         std::lock_guard<std::mutex> lock(m_alloc_mutex);
++        if (m_next_generation == std::numeric_limits<uint64_t>::max())
++            throw std::length_error("txmerklix generation exhausted");
+         slot = m_branches.Allocate(reused);
++        m_branches.At(slot).generation.store(m_next_generation++, std::memory_order_release);
+     }
+     auto &s = Stats();
+     s.branch_allocs.fetch_add(1, std::memory_order_relaxed);
+@@ -319,13 +325,21 @@ void Store::Release(NodeId n) const noexcept {
+ 
+ Store::WeakRef Store::Weak(NodeId n) const noexcept {
+     if (n == kNull) return {};
+-    const uint32_t gen = IsLeaf(n) ? L(n).generation.load(std::memory_order_acquire)
++    const uint64_t gen = IsLeaf(n) ? L(n).generation.load(std::memory_order_acquire)
+                                    : B(n).generation.load(std::memory_order_acquire);
+     return {n, gen};
+ }
+ 
+ NodeId Store::TryRetain(const WeakRef &weak) const noexcept {
+     if (weak.node == kNull) return kNull;
++    // The family writer lock excludes mutation while a weak owner is added;
++    // allocation lock also excludes slot reuse and slab trimming during lookup.
++    std::lock_guard<std::mutex> lock(m_alloc_mutex);
++    const uint32_t slot = weak.node & ~kLeafBit;
++    if (IsLeaf(weak.node) ? slot >= m_leaves.Constructed()
++                          : (slot == 0 || slot >= m_branches.Constructed())) {
++        return kNull;
++    }
+     auto attempt = [&](auto &node) -> NodeId {
+         if (node.generation.load(std::memory_order_acquire) != weak.generation) return kNull;
+         uint32_t refs = node.refs.load(std::memory_order_relaxed);
+@@ -334,22 +348,10 @@ NodeId Store::TryRetain(const WeakRef &weak) const noexcept {
+         } while (!node.refs.compare_exchange_weak(refs, refs + 1,
+                                                   std::memory_order_acquire,
+                                                   std::memory_order_relaxed));
+-        if (node.generation.load(std::memory_order_acquire) != weak.generation) {
+-            Release(weak.node);
+-            return kNull;
+-        }
+         return weak.node;
+     };
+-    {
+-        std::lock_guard<std::mutex> lock(m_alloc_mutex);
+-        const uint32_t slot = weak.node & ~kLeafBit;
+-        if (IsLeaf(weak.node) ? slot >= m_leaves.Constructed()
+-                              : (slot == 0 || slot >= m_branches.Constructed())) {
+-            return kNull;
+-        }
+-    }
+-    if (IsLeaf(weak.node)) return attempt(m_leaves.At(weak.node & ~kLeafBit));
+-    return attempt(m_branches.At(weak.node));
++    if (IsLeaf(weak.node)) return attempt(m_leaves.At(slot));
++    return attempt(m_branches.At(slot));
+ }
+ 
+ size_t Store::LiveLeaves() const noexcept {
+@@ -737,11 +739,12 @@ Sketch Tree::CurrentSketch() const {
+ }
+ 
+ std::shared_ptr<const Snapshot> Tree::Pin() const {
+-    Sketch sketch = CurrentSketch();
++    const bool rebuild_sketch = m_sketch.NeedsRebuild();
++    Sketch sketch = rebuild_sketch ? Sketch{} : Sketch{m_sketch.Export()};
+     m_store->Retain(m_root);
+     try {
+         auto out = std::make_shared<const Snapshot>(m_store, m_root, m_version,
+-                                                    m_payload_bytes, std::move(sketch));
++                                                    m_payload_bytes, std::move(sketch), rebuild_sketch);
+         Stats().pins.fetch_add(1, std::memory_order_relaxed);
+         return out;
+     } catch (...) {
+@@ -755,12 +758,29 @@ std::shared_ptr<const Snapshot> Tree::Pin() const {
+ // ===========================================================================
+ 
+ Snapshot::Snapshot(std::shared_ptr<Store> store, NodeId root, uint64_t version,
+-                   uint64_t payload_bytes, Sketch sketch)
++                   uint64_t payload_bytes, Sketch sketch, bool rebuild_sketch)
+     : m_store(std::move(store)), m_root(root), m_version(version),
+-      m_payload_bytes(payload_bytes), m_sketch(std::move(sketch)) {}
++      m_payload_bytes(payload_bytes), m_sketch(std::move(sketch)),
++      m_rebuild_sketch(rebuild_sketch) {}
+ 
+ Snapshot::~Snapshot() { m_store->Release(m_root); }
+ 
++const Sketch &Snapshot::GetSketch() const {
++    std::call_once(m_sketch_once, [this] {
++        if (!m_rebuild_sketch) return;
++        std::vector<uint64_t> values;
++        values.reserve(Count());
++        ForEachLeaf([&](const Leaf &leaf) { values.push_back(leaf.minhash); });
++        const size_t members = values.size();
++        minhash::Maintainer rebuilt;
++        rebuilt.Rebuild(std::move(values));
++        m_sketch.values = rebuilt.Export();
++        Stats().sketch_rebuilds.fetch_add(1, std::memory_order_relaxed);
++        Stats().sketch_rebuild_members.fetch_add(members, std::memory_order_relaxed);
++    });
++    return m_sketch;
++}
++
+ Hash Snapshot::RootDigest() const {
+     m_store->Complete(m_root);
+     return m_store->DigestAt(m_root, 0);
+diff --git a/src/lotus_v2/tx_merklix.h b/src/lotus_v2/tx_merklix.h
+index afb912d5be..c8d4ff5afd 100644
+--- a/src/lotus_v2/tx_merklix.h
++++ b/src/lotus_v2/tx_merklix.h
+@@ -41,7 +41,8 @@
+  *    copied. No other thread can raise a refcount without that lock.
+  *  - Snapshots are immutable, thread-safe, and may be read, hashed and released
+  *    on any thread. Pinning a Tree is O(1) (one reference on the root) plus a
+- *    K-value MinHash copy and must happen under the writer lock.
++ *    K-value MinHash copy and must happen under the writer lock. A pending
++ *    sketch refill is computed lazily from the immutable snapshot.
+  *  - Digests are derived caches with an atomic Dirty/Busy/Clean state. Readers
+  *    never need digests; hashing fills caches without changing logical contents.
+  *    Concurrent hashers race through compare-and-swap; a loser uses its own
+@@ -66,7 +67,7 @@ enum HashState : uint8_t { kDirty = 0, kBusy = 1, kClean = 2 };
+ 
+ struct Branch {
+     std::atomic<uint32_t> refs{0};
+-    std::atomic<uint32_t> generation{0};
++    std::atomic<uint64_t> generation{0};
+     std::array<NodeId, 2> child{kNull, kNull};
+     uint32_t count{0};
+     uint16_t split{0};
+@@ -77,7 +78,7 @@ struct Branch {
+ 
+ struct Leaf {
+     std::atomic<uint32_t> refs{0};
+-    std::atomic<uint32_t> generation{0};
++    std::atomic<uint64_t> generation{0};
+     mutable std::atomic<uint8_t> hash_state{kDirty};
+     uint32_t payload_bytes{0};
+     uint64_t minhash{0};
+@@ -161,8 +162,9 @@ public:
+     void Complete(NodeId n) const;
+ 
+     /** Weak reference with ABA protection through slot generations. */
+-    struct WeakRef { NodeId node{kNull}; uint32_t generation{0}; };
++    struct WeakRef { NodeId node{kNull}; uint64_t generation{0}; };
+     WeakRef Weak(NodeId n) const noexcept;
++    //! Caller holds the family writer lock, including against mutation/trim.
+     //! Returns a retained node (caller releases) or kNull if stale.
+     NodeId TryRetain(const WeakRef &weak) const noexcept;
+ 
+@@ -177,6 +179,7 @@ private:
+     void FreeBatch(const NodeId *dead, size_t count) const noexcept;
+     Hash NodeDigestCounted(NodeId n, uint64_t &hashes) const;
+     Hash DigestAtCounted(NodeId n, unsigned depth, uint64_t &hashes) const;
++    uint64_t m_next_generation{1}; // never reset when empty slabs are trimmed
+     mutable std::mutex m_alloc_mutex;
+     mutable Slab<Branch> m_branches;
+     mutable Slab<Leaf> m_leaves;
+@@ -257,7 +260,7 @@ class Snapshot {
+ public:
+     struct Descriptor { uint64_t count{0}; Hash digest{}; };
+     Snapshot(std::shared_ptr<Store> store, NodeId root, uint64_t version,
+-             uint64_t payload_bytes, Sketch sketch);
++             uint64_t payload_bytes, Sketch sketch, bool rebuild_sketch = false);
+     ~Snapshot();
+     Snapshot(const Snapshot &) = delete;
+     Snapshot &operator=(const Snapshot &) = delete;
+@@ -265,7 +268,7 @@ public:
+     size_t Count() const noexcept { return m_store->Count(m_root); }
+     uint64_t Version() const noexcept { return m_version; }
+     uint64_t PayloadBytes() const noexcept { return m_payload_bytes; }
+-    const Sketch &GetSketch() const noexcept { return m_sketch; }
++    const Sketch &GetSketch() const;
+     const Store &GetStore() const noexcept { return *m_store; }
+     NodeId Root() const noexcept { return m_root; }
+ 
+@@ -285,7 +288,9 @@ private:
+     NodeId m_root;
+     uint64_t m_version;
+     uint64_t m_payload_bytes;
+-    Sketch m_sketch;
++    mutable Sketch m_sketch;
++    bool m_rebuild_sketch;
++    mutable std::once_flag m_sketch_once;
+ };
+ 
+ namespace detail {
+diff --git a/src/test/tx_merklix_tests.cpp b/src/test/tx_merklix_tests.cpp
+index 7c51afa1bb..75b96ad318 100644
+--- a/src/test/tx_merklix_tests.cpp
++++ b/src/test/tx_merklix_tests.cpp
+@@ -321,6 +321,40 @@ BOOST_AUTO_TEST_CASE(concurrent_hashers_and_releases_during_writes) {
+     BOOST_CHECK(tree.RootDigest() == Reference(members));
+ }
+ 
++BOOST_AUTO_TEST_CASE(pin_defers_exhausted_sketch_refill_to_immutable_snapshot) {
++    FastRandomContext rng{uint256{0x572}};
++    txm::Tree tree;
++    std::map<V2Hash, V2Hash> members;
++    std::vector<std::pair<uint64_t, V2Hash>> ranked;
++    for (int i = 0; i < 1000; ++i) {
++        const V2Hash id = RandomHash(rng), hash = RandomHash(rng);
++        members.emplace(id, hash);
++        tree.Insert(id, hash);
++        ranked.emplace_back(mh::Value(id, hash), id);
++    }
++    std::sort(ranked.begin(), ranked.end());
++    for (int i = 0; i < 193; ++i) {
++        tree.Erase(ranked[i].second);
++        members.erase(ranked[i].second);
++    }
++    const auto expected = ReferenceSketch(members);
++    const auto before = Counter(txm::Stats().sketch_rebuild_members);
++    const auto pinned = tree.Pin();
++    BOOST_CHECK_EQUAL(Counter(txm::Stats().sketch_rebuild_members), before);
++    tree.Clear(); // refill must use the pinned version, never the live tree
++    std::atomic<int> failures{0};
++    std::vector<std::thread> readers;
++    for (int i = 0; i < 4; ++i) {
++        readers.emplace_back([&] {
++            if (pinned->GetSketch().values != expected) ++failures;
++        });
++    }
++    for (auto &reader : readers) reader.join();
++    BOOST_CHECK_EQUAL(failures.load(), 0);
++    BOOST_CHECK_EQUAL(Counter(txm::Stats().sketch_rebuild_members), before + members.size());
++    BOOST_CHECK(pinned->RootDigest() == Reference(members));
++}
++
+ BOOST_AUTO_TEST_CASE(incremental_minhash_matches_reference_through_deletions) {
+     FastRandomContext rng{uint256{0x56}};
+     txm::Tree tree;
+@@ -443,6 +477,19 @@ BOOST_AUTO_TEST_CASE(reclamation_slot_reuse_and_weak_generations) {
+     BOOST_CHECK_EQUAL(tree.GetStore()->RetainedBytes(), sizeof(txm::Branch));
+ }
+ 
++BOOST_AUTO_TEST_CASE(weak_handle_stays_stale_after_trim_and_reallocation) {
++    FastRandomContext rng{uint256{0x592}};
++    txm::Tree tree;
++    tree.Insert(RandomHash(rng), RandomHash(rng));
++    const auto weak = tree.GetStore()->Weak(tree.Root());
++    tree.Clear(); // sole owner: deallocates the leaf slab
++    tree.Insert(RandomHash(rng), RandomHash(rng));
++    BOOST_CHECK_EQUAL(tree.Root(), weak.node); // same slot, new allocation epoch
++    const auto retained = tree.GetStore()->TryRetain(weak);
++    BOOST_CHECK_EQUAL(retained, txm::kNull);
++    if (retained != txm::kNull) tree.GetStore()->Release(retained);
++}
++
+ BOOST_AUTO_TEST_CASE(overlay_layer_freeze_and_reanchor_share_trees) {
+     FastRandomContext rng{uint256{0x59}};
+     lotus::v2::MerklixOverlayManager manager;

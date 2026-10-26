@@ -1,0 +1,2022 @@
+From ca0a350d41d89a0fc2c37518f99aa29707429419 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:29 -0700
+Subject: [PATCH] rpc: keep HTTP workers available during long-poll requests
+
+Use complete coroutine dispatch for authenticated JSON-RPC and block/template
+long polling. Preserve eCash consensus and ordinary RPC behavior, release chain
+locks before suspension, and keep outstanding requests bounded by the existing
+workqueue-plus-worker capacity.
+
+Serialize timer initiation and cancellation on one strand to prevent lost wakeups
+and concurrent timer mutation. Preserve ABC negative-timeout behavior. Add native
+wake/timeout coverage and a one-worker functional regression with seven long
+polls, ordinary requests, block notification and shutdown. Existing HTTP, RPC,
+authentication and whitelist suites remain unchanged and pass.
+
+Original-Patches: ecash/013, ecash/014, ecash/020
+Source-Split-Ids: 14, 16, 17, 35
+Candidate-Repair: Reunite the missing HTTP implementation and wait conversions
+with their first responsible coroutine feature; retain snapshot reads/templates
+as separate later purposes. The unrelated large-request limit belongs with batch
+RPC. Before/after timeout evidence and source hashes are recorded in the ledger.
+
+Candidate-Repair: Move the original 50-waiter/four-worker native coroutine regression out of the later snapshot foundation and into the complete coroutine owner. Preserve every assertion and register the standalone suite; no snapshot prerequisite is introduced. Clean replay and gates pending for this amended owner.
+---
+ src/httprpc.cpp                           | 125 ++++++++++-
+ src/httprpc.h                             |  11 +
+ src/httpserver.cpp                        | 259 ++++++++++++++++------
+ src/httpserver.h                          |  32 +++
+ src/rpc/async_waiter.h                    | 151 +++++++++++++
+ src/rpc/blockchain.cpp                    |  98 ++++----
+ src/rpc/mining.cpp                        |  77 ++++---
+ src/rpc/server.cpp                        | 143 +++++++++++-
+ src/rpc/server.h                          |  48 +++-
+ src/rpc/util.cpp                          | 155 ++++++++++++-
+ src/rpc/util.h                            |  14 ++
+ src/test/CMakeLists.txt                   |   2 +
+ src/test/rpc_async_waiter_tests.cpp       |  83 +++++++
+ src/test/rpc_coroutine_pool_tests.cpp     | 145 ++++++++++++
+ test/functional/rpc_coroutine_longpoll.py |  60 +++++
+ 15 files changed, 1222 insertions(+), 181 deletions(-)
+ create mode 100644 src/rpc/async_waiter.h
+ create mode 100644 src/test/rpc_async_waiter_tests.cpp
+ create mode 100644 src/test/rpc_coroutine_pool_tests.cpp
+ create mode 100644 test/functional/rpc_coroutine_longpoll.py
+
+diff --git a/src/httprpc.cpp b/src/httprpc.cpp
+index b070c72def7d32c8d480379638542b56f9f6055d..62fff16c4ab7ff86ea1e5e711ff6b57643e5fb93 100644
+--- a/src/httprpc.cpp
++++ b/src/httprpc.cpp
+@@ -13,6 +13,10 @@
+ #include <util/string.h>
+ #include <walletinitinterface.h>
+ 
++#include <boost/asio/redirect_error.hpp>
++#include <boost/asio/steady_timer.hpp>
++#include <boost/asio/use_awaitable.hpp>
++
+ #include <algorithm>
+ #include <cstdio>
+ #include <functional>
+@@ -400,6 +404,112 @@ bool HTTPRPCRequestProcessor::ProcessHTTPRequest(HTTPRequest *req) {
+     return true;
+ }
+ 
++boost::asio::awaitable<bool>
++HTTPRPCRequestProcessor::ProcessHTTPRequestAsync(
++    HTTPRequest *req, boost::asio::any_io_executor executor) {
++    if (checkCORS(req)) {
++        co_return true;
++    }
++
++    if (req->GetRequestMethod() != HTTPRequest::POST) {
++        req->WriteReply(HTTP_BAD_METHOD,
++                        "JSONRPC server handles only POST requests");
++        co_return false;
++    }
++
++    std::pair<bool, std::string> authHeader = req->GetHeader("authorization");
++    if (!authHeader.first) {
++        req->WriteHeader("WWW-Authenticate", WWW_AUTH_HEADER_DATA);
++        req->WriteReply(HTTP_UNAUTHORIZED);
++        co_return false;
++    }
++
++    JSONRPCRequest jreq;
++    jreq.context = context;
++    jreq.peerAddr = req->GetPeer().ToStringAddrPort();
++    if (!RPCAuthorized(authHeader.second, jreq.authUser)) {
++        LogPrintf("ThreadRPCServer incorrect password attempt from %s\n",
++                  jreq.peerAddr);
++
++        boost::asio::steady_timer delay_timer(
++            executor, std::chrono::milliseconds{RPC_AUTH_BRUTE_FORCE_DELAY});
++        boost::system::error_code ec;
++        co_await delay_timer.async_wait(
++            boost::asio::redirect_error(boost::asio::use_awaitable, ec));
++
++        req->WriteHeader("WWW-Authenticate", WWW_AUTH_HEADER_DATA);
++        req->WriteReply(HTTP_UNAUTHORIZED);
++        co_return false;
++    }
++
++    try {
++        UniValue valRequest;
++        if (!valRequest.read(req->ReadBody())) {
++            throw JSONRPCError(RPC_PARSE_ERROR, "Parse error");
++        }
++
++        jreq.URI = req->GetURI();
++
++        std::string strReply;
++        bool user_has_whitelist = g_rpc_whitelist.count(jreq.authUser);
++        if (!user_has_whitelist && g_rpc_whitelist_default) {
++            LogPrintf("RPC User %s not allowed to call any methods\n",
++                      jreq.authUser);
++            req->WriteReply(HTTP_FORBIDDEN);
++            co_return false;
++        } else if (valRequest.isObject()) {
++            jreq.parse(valRequest);
++            if (user_has_whitelist &&
++                !g_rpc_whitelist[jreq.authUser].count(jreq.strMethod)) {
++                LogPrintf("RPC User %s not allowed to call method %s\n",
++                          jreq.authUser, jreq.strMethod);
++                req->WriteReply(HTTP_FORBIDDEN);
++                co_return false;
++            }
++            UniValue result = co_await rpcServer.ExecuteCommandAsync(
++                config, jreq, std::move(executor));
++
++            strReply = JSONRPCReply(result, NullUniValue, jreq.id);
++        } else if (valRequest.isArray()) {
++            if (user_has_whitelist) {
++                for (unsigned int reqIdx = 0; reqIdx < valRequest.size();
++                     reqIdx++) {
++                    if (!valRequest[reqIdx].isObject()) {
++                        throw JSONRPCError(RPC_INVALID_REQUEST,
++                                           "Invalid Request object");
++                    } else {
++                        const UniValue &request = valRequest[reqIdx].get_obj();
++                        std::string strMethod =
++                            request.find_value("method").get_str();
++                        if (!g_rpc_whitelist[jreq.authUser].count(strMethod)) {
++                            LogPrintf(
++                                "RPC User %s not allowed to call method %s\n",
++                                jreq.authUser, strMethod);
++                            req->WriteReply(HTTP_FORBIDDEN);
++                            co_return false;
++                        }
++                    }
++                }
++            }
++            strReply = co_await JSONRPCExecBatchAsync(
++                config, rpcServer, jreq, valRequest.get_array(),
++                std::move(executor));
++        } else {
++            throw JSONRPCError(RPC_PARSE_ERROR, "Top-level object parse error");
++        }
++
++        req->WriteHeader("Content-Type", "application/json");
++        req->WriteReply(HTTP_OK, strReply);
++    } catch (const UniValue &objError) {
++        JSONErrorReply(req, objError, jreq.id);
++        co_return false;
++    } catch (const std::exception &e) {
++        JSONErrorReply(req, JSONRPCError(RPC_PARSE_ERROR, e.what()), jreq.id);
++        co_return false;
++    }
++    co_return true;
++}
++
+ static bool InitRPCAuthentication() {
+     if (gArgs.GetArg("-rpcpassword", "") == "") {
+         LogPrintf("Using random cookie authentication.\n");
+@@ -469,13 +579,16 @@ bool StartHTTPRPC(HTTPRPCRequestProcessor &httpRPCRequestProcessor) {
+         return false;
+     }
+ 
+-    const std::function<bool(Config &, HTTPRequest *, const std::string &)>
+-        &rpcFunction =
+-            std::bind(&HTTPRPCRequestProcessor::DelegateHTTPRequest,
+-                      &httpRPCRequestProcessor, std::placeholders::_2);
+-    RegisterHTTPHandler("/", true, rpcFunction);
++    HTTPAsyncRequestHandler rpcFunction =
++        [&httpRPCRequestProcessor](
++            Config &, HTTPRequest *req, const std::string &,
++            boost::asio::any_io_executor executor) -> boost::asio::awaitable<bool> {
++        co_return co_await HTTPRPCRequestProcessor::DelegateHTTPRequestAsync(
++            &httpRPCRequestProcessor, req, std::move(executor));
++    };
++    RegisterHTTPAsyncHandler("/", true, rpcFunction);
+     if (g_wallet_init_interface.HasWalletSupport()) {
+-        RegisterHTTPHandler("/wallet/", false, rpcFunction);
++        RegisterHTTPAsyncHandler("/wallet/", false, rpcFunction);
+     }
+     struct event_base *eventBase = EventBase();
+     assert(eventBase);
+diff --git a/src/httprpc.h b/src/httprpc.h
+index 27de2b93535f3d501bfea6eb0928038fc4f40e04..93f8aab1223f452271b7fd653057a60e028866a5 100644
+--- a/src/httprpc.h
++++ b/src/httprpc.h
+@@ -18,6 +18,9 @@ private:
+     RPCServer &rpcServer;
+ 
+     bool ProcessHTTPRequest(HTTPRequest *request);
++    boost::asio::awaitable<bool>
++    ProcessHTTPRequestAsync(HTTPRequest *request,
++                            boost::asio::any_io_executor executor);
+ 
+ public:
+     const std::any &context;
+@@ -30,6 +33,14 @@ public:
+                                     HTTPRequest *request) {
+         return requestProcessor->ProcessHTTPRequest(request);
+     }
++
++    static boost::asio::awaitable<bool>
++    DelegateHTTPRequestAsync(HTTPRPCRequestProcessor *requestProcessor,
++                             HTTPRequest *request,
++                             boost::asio::any_io_executor executor) {
++        co_return co_await requestProcessor->ProcessHTTPRequestAsync(
++            request, std::move(executor));
++    }
+ };
+ 
+ /**
+diff --git a/src/httpserver.cpp b/src/httpserver.cpp
+index 1127222f3a36c44219f094bb7d2e8b438caa2ae0..f97e5cea51bbb25b817775bf29d413490a4aef51 100644
+--- a/src/httpserver.cpp
++++ b/src/httpserver.cpp
+@@ -37,6 +37,17 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <rpc/async_waiter.h>
++
++#include <boost/asio/any_io_executor.hpp>
++#include <boost/asio/awaitable.hpp>
++#include <boost/asio/co_spawn.hpp>
++#include <boost/asio/detached.hpp>
++#include <boost/asio/post.hpp>
++#include <boost/asio/strand.hpp>
++#include <boost/asio/thread_pool.hpp>
++
++#include <atomic>
+ #include <deque>
+ #include <memory>
+ #include <unordered_map>
+@@ -54,83 +65,179 @@ static const size_t MIN_SUPPORTED_BODY_SIZE = 0x02000000;
+ class HTTPWorkItem final : public HTTPClosure {
+ public:
+     HTTPWorkItem(Config &_config, std::unique_ptr<HTTPRequest> _req,
+-                 const std::string &_path, const HTTPRequestHandler &_func)
++                 const std::string &_path, const HTTPAsyncRequestHandler &_func)
+         : req(std::move(_req)), path(_path), func(_func), config(&_config) {}
+ 
+-    void operator()() override { func(*config, req.get(), path); }
++    void operator()() override {}
++
++    boost::asio::awaitable<void>
++    ExecuteAsync(boost::asio::any_io_executor executor) {
++        co_await func(*config, req.get(), path, std::move(executor));
++        co_return;
++    }
+ 
+     std::unique_ptr<HTTPRequest> req;
+ 
+ private:
+     std::string path;
+-    HTTPRequestHandler func;
++    HTTPAsyncRequestHandler func;
+     Config *config;
+ };
+ 
+ /**
+- * Simple work queue for distributing work over multiple threads.
+- * Work items are simply callable objects.
++ * Non-blocking Boost.Asio coroutine dispatcher pool for HTTP requests.
++ * Suspended long-polls yield workers, but still count toward the bounded
++ * request capacity: configured workqueue depth plus worker count, matching
++ * the maximum queued/running request count of the upstream dispatcher.
+  */
+-template <typename WorkItem> class WorkQueue {
++class HTTPCoroutinePool {
+ private:
+-    Mutex cs;
+-    std::condition_variable cond GUARDED_BY(cs);
+-    std::deque<std::unique_ptr<WorkItem>> queue GUARDED_BY(cs);
+-    bool running GUARDED_BY(cs){true};
+-    const size_t maxDepth;
++    Mutex m_mutex;
++    std::condition_variable m_cv GUARDED_BY(m_mutex);
++    bool m_running GUARDED_BY(m_mutex){true};
++    size_t m_queued_requests GUARDED_BY(m_mutex){0};
++    size_t m_total_in_flight GUARDED_BY(m_mutex){0};
++    const size_t m_max_depth;
++    size_t m_max_in_flight{0};
++    std::unique_ptr<boost::asio::thread_pool> m_pool;
++    std::atomic<size_t> m_suspended_coroutines{0};
++    std::unordered_map<
++        const evhttp_connection *,
++        std::weak_ptr<boost::asio::strand<boost::asio::any_io_executor>>>
++        m_conn_strands GUARDED_BY(m_mutex);
+ 
+ public:
+-    explicit WorkQueue(size_t _maxDepth) : maxDepth(_maxDepth) {}
+-    /**
+-     * Precondition: worker threads have all stopped (they have all been joined)
+-     */
+-    ~WorkQueue() = default;
++    explicit HTTPCoroutinePool(size_t max_depth) : m_max_depth(max_depth) {}
++    ~HTTPCoroutinePool() { WaitExit(); }
++
++    void Start(int num_threads) {
++        const size_t threads = static_cast<size_t>(std::max(1, num_threads));
++        m_max_in_flight = m_max_depth + threads;
++        m_pool = std::make_unique<boost::asio::thread_pool>(threads);
++        for (size_t i = 0; i < threads; ++i) {
++            boost::asio::post(*m_pool, [i]() {
++                util::ThreadRename(strprintf("httpworker.%zu", i));
++            });
++        }
++    }
+ 
+-    /** Enqueue a work item */
+-    bool Enqueue(WorkItem *item) EXCLUSIVE_LOCKS_REQUIRED(!cs) {
+-        LOCK(cs);
+-        if (!running || queue.size() >= maxDepth) {
+-            return false;
++    boost::asio::any_io_executor GetExecutor() const {
++        if (!m_pool) {
++            return {};
+         }
+-        queue.emplace_back(std::unique_ptr<WorkItem>(item));
+-        cond.notify_one();
+-        return true;
++        return m_pool->get_executor();
+     }
+ 
+-    /** Thread function */
+-    void Run() EXCLUSIVE_LOCKS_REQUIRED(!cs) {
+-        while (true) {
+-            std::unique_ptr<WorkItem> i;
+-            {
+-                WAIT_LOCK(cs, lock);
+-                while (running && queue.empty()) {
+-                    cond.wait(lock);
++    bool Enqueue(const evhttp_connection *conn,
++                 std::unique_ptr<HTTPWorkItem> &item)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) {
++        std::shared_ptr<boost::asio::strand<boost::asio::any_io_executor>>
++            strand;
++        {
++            LOCK(m_mutex);
++            if (!m_running || !m_pool || m_queued_requests >= m_max_depth ||
++                m_total_in_flight >= m_max_in_flight) {
++                return false;
++            }
++            ++m_queued_requests;
++            ++m_total_in_flight;
++
++            if (conn != nullptr) {
++                auto &weak_strand = m_conn_strands[conn];
++                strand = weak_strand.lock();
++                if (!strand) {
++                    strand = std::make_shared<
++                        boost::asio::strand<boost::asio::any_io_executor>>(
++                        m_pool->get_executor());
++                    weak_strand = strand;
+                 }
+-                if (!running && queue.empty()) {
+-                    break;
++                if (m_conn_strands.size() > 256) {
++                    for (auto it = m_conn_strands.begin();
++                         it != m_conn_strands.end();) {
++                        if (it->second.expired()) {
++                            it = m_conn_strands.erase(it);
++                        } else {
++                            ++it;
++                        }
++                    }
+                 }
+-                i = std::move(queue.front());
+-                queue.pop_front();
++            } else {
++                strand = std::make_shared<
++                    boost::asio::strand<boost::asio::any_io_executor>>(
++                    m_pool->get_executor());
+             }
+-            (*i)();
+         }
++
++        HTTPWorkItem *raw_item = item.release();
++        boost::asio::any_io_executor pool_exec = m_pool->get_executor();
++        boost::asio::co_spawn(
++            *strand,
++            [this, strand, raw_item,
++             pool_exec]() -> boost::asio::awaitable<void> {
++                std::unique_ptr<HTTPWorkItem> owned_item(raw_item);
++                {
++                    LOCK(m_mutex);
++                    if (m_queued_requests > 0) {
++                        --m_queued_requests;
++                    }
++                }
++                struct InFlightGuard {
++                    HTTPCoroutinePool *pool;
++                    ~InFlightGuard() {
++                        LOCK(pool->m_mutex);
++                        if (--pool->m_total_in_flight == 0) {
++                            pool->m_cv.notify_all();
++                        }
++                    }
++                } guard{this};
++
++                co_await owned_item->ExecuteAsync(pool_exec);
++                co_return;
++            },
++            boost::asio::detached);
++        return true;
++    }
++
++    void OnSuspend() noexcept {
++        m_suspended_coroutines.fetch_add(1, std::memory_order_relaxed);
+     }
+ 
+-    /** Interrupt and exit loops */
+-    void Interrupt() EXCLUSIVE_LOCKS_REQUIRED(!cs) {
+-        LOCK(cs);
+-        running = false;
+-        cond.notify_all();
++    void OnResume() noexcept {
++        m_suspended_coroutines.fetch_sub(1, std::memory_order_relaxed);
++    }
++
++    void Interrupt() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) {
++        {
++            LOCK(m_mutex);
++            m_running = false;
++        }
++        GetRPCBlockChangeWaiter().NotifyAll();
++    }
++
++    void WaitExit() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) {
++        Interrupt();
++        {
++            WAIT_LOCK(m_mutex, lock);
++            m_cv.wait(lock, [this]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) {
++                return m_total_in_flight == 0;
++            });
++            m_conn_strands.clear();
++        }
++        if (m_pool) {
++            m_pool->join();
++            m_pool.reset();
++        }
+     }
+ };
+ 
+ struct HTTPPathHandler {
+     HTTPPathHandler(std::string _prefix, bool _exactMatch,
+-                    HTTPRequestHandler _handler)
+-        : prefix(_prefix), exactMatch(_exactMatch), handler(_handler) {}
++                    HTTPAsyncRequestHandler _handler)
++        : prefix(std::move(_prefix)), exactMatch(_exactMatch),
++          handler(std::move(_handler)) {}
+     std::string prefix;
+     bool exactMatch;
+-    HTTPRequestHandler handler;
++    HTTPAsyncRequestHandler handler;
+ };
+ 
+ /** HTTP module state */
+@@ -141,8 +248,8 @@ static struct event_base *eventBase = nullptr;
+ static struct evhttp *eventHTTP = nullptr;
+ //! List of subnets to allow RPC connections from
+ static std::vector<CSubNet> rpc_allow_subnets;
+-//! Work queue for handling longer requests off the event loop thread
+-static std::unique_ptr<WorkQueue<HTTPClosure>> g_work_queue{nullptr};
++//! Coroutine pool for handling requests off the event loop thread
++static std::unique_ptr<HTTPCoroutinePool> g_work_queue{nullptr};
+ //! Handlers for (sub)paths
+ static std::vector<HTTPPathHandler> pathHandlers;
+ //! Bound listening sockets
+@@ -351,15 +458,12 @@ static void http_request_cb(struct evhttp_request *req, void *arg) {
+         }
+     }
+ 
+-    // Dispatch to worker thread.
++    // Dispatch to coroutine worker pool.
+     if (i != iend) {
+         std::unique_ptr<HTTPWorkItem> item(
+             new HTTPWorkItem(config, std::move(hreq), path, i->handler));
+         assert(g_work_queue);
+-        if (g_work_queue->Enqueue(item.get())) {
+-            /* if true, queue took ownership */
+-            item.release();
+-        } else {
++        if (!g_work_queue->Enqueue(conn, item)) {
+             LogPrintf("WARNING: request rejected because http work queue depth "
+                       "exceeded, it can be increased with the -rpcworkqueue= "
+                       "setting\n");
+@@ -440,12 +544,6 @@ static bool HTTPBindAddresses(struct evhttp *http) {
+     return !boundSockets.empty();
+ }
+ 
+-/** Simple wrapper to set thread name and run work queue */
+-static void HTTPWorkQueueRun(WorkQueue<HTTPClosure> *queue, int worker_num) {
+-    util::ThreadRename(strprintf("httpworker.%i", worker_num));
+-    queue->Run();
+-}
+-
+ /** libevent event log callback */
+ static void libevent_log_cb(int severity, const char *msg) {
+     BCLog::Level level;
+@@ -515,7 +613,7 @@ bool InitHTTPServer(Config &config) {
+         (long)gArgs.GetIntArg("-rpcworkqueue", DEFAULT_HTTP_WORKQUEUE), 1L);
+     LogDebug(BCLog::HTTP, "creating work queue of depth %d\n", workQueueDepth);
+ 
+-    g_work_queue = std::make_unique<WorkQueue<HTTPClosure>>(workQueueDepth);
++    g_work_queue = std::make_unique<HTTPCoroutinePool>(workQueueDepth);
+     // transfer ownership to eventBase/HTTP via .release()
+     eventBase = base_ctr.release();
+     eventHTTP = http_ctr.release();
+@@ -531,18 +629,15 @@ void UpdateHTTPServerLogging(bool enable) {
+ }
+ 
+ static std::thread g_thread_http;
+-static std::vector<std::thread> g_thread_http_workers;
+ 
+ void StartHTTPServer() {
+     int rpcThreads = std::max(
+         (long)gArgs.GetIntArg("-rpcthreads", DEFAULT_HTTP_THREADS), 1L);
+     LogInfo("Starting HTTP server with %d worker threads\n", rpcThreads);
+-    g_thread_http = std::thread(ThreadHTTP, eventBase);
+-
+-    for (int i = 0; i < rpcThreads; i++) {
+-        g_thread_http_workers.emplace_back(HTTPWorkQueueRun, g_work_queue.get(),
+-                                           i);
++    if (g_work_queue) {
++        g_work_queue->Start(rpcThreads);
+     }
++    g_thread_http = std::thread(ThreadHTTP, eventBase);
+ }
+ 
+ void InterruptHTTPServer() {
+@@ -560,10 +655,7 @@ void StopHTTPServer() {
+     LogDebug(BCLog::HTTP, "Stopping HTTP server\n");
+     if (g_work_queue) {
+         LogDebug(BCLog::HTTP, "Waiting for HTTP worker threads to exit\n");
+-        for (auto &thread : g_thread_http_workers) {
+-            thread.join();
+-        }
+-        g_thread_http_workers.clear();
++        g_work_queue->WaitExit();
+     }
+     // Unlisten sockets, these are what make the event loop running, which means
+     // that after this and all connections are closed the event loop will quit.
+@@ -796,6 +888,16 @@ std::optional<std::string> GetQueryParameterFromUri(const char *uri,
+ }
+ void RegisterHTTPHandler(const std::string &prefix, bool exactMatch,
+                          const HTTPRequestHandler &handler) {
++    RegisterHTTPAsyncHandler(
++        prefix, exactMatch,
++        [handler](Config &config, HTTPRequest *req, const std::string &path,
++                  boost::asio::any_io_executor) -> boost::asio::awaitable<bool> {
++            co_return handler(config, req, path);
++        });
++}
++
++void RegisterHTTPAsyncHandler(const std::string &prefix, bool exactMatch,
++                              const HTTPAsyncRequestHandler &handler) {
+     LogDebug(BCLog::HTTP, "Registering HTTP handler for %s (exactmatch %d)\n",
+              prefix, exactMatch);
+     pathHandlers.push_back(HTTPPathHandler(prefix, exactMatch, handler));
+@@ -816,3 +918,22 @@ void UnregisterHTTPHandler(const std::string &prefix, bool exactMatch) {
+         pathHandlers.erase(i);
+     }
+ }
++
++void HTTPReleaseWorkQueueSlot() noexcept {
++    if (g_work_queue) {
++        g_work_queue->OnSuspend();
++    }
++}
++
++void HTTPAcquireWorkQueueSlot() noexcept {
++    if (g_work_queue) {
++        g_work_queue->OnResume();
++    }
++}
++
++boost::asio::any_io_executor GetHTTPThreadPoolExecutor() {
++    if (g_work_queue) {
++        return g_work_queue->GetExecutor();
++    }
++    return {};
++}
+diff --git a/src/httpserver.h b/src/httpserver.h
+index 08550931e15280cb740b11c8fd9b2e55c5b514e6..3a1e8aeb2ae54d641f2adbe932ea752bb410c36d 100644
+--- a/src/httpserver.h
++++ b/src/httpserver.h
+@@ -6,6 +6,9 @@
+ #ifndef BITCOIN_HTTPSERVER_H
+ #define BITCOIN_HTTPSERVER_H
+ 
++#include <boost/asio/any_io_executor.hpp>
++#include <boost/asio/awaitable.hpp>
++
+ #include <functional>
+ #include <optional>
+ #include <string>
+@@ -48,6 +51,11 @@ typedef std::function<bool(Config &config, HTTPRequest *req,
+                            const std::string &)>
+     HTTPRequestHandler;
+ 
++/** Coroutine handler for requests to a certain HTTP path */
++using HTTPAsyncRequestHandler = std::function<boost::asio::awaitable<bool>(
++    Config &config, HTTPRequest *req, const std::string &,
++    boost::asio::any_io_executor)>;
++
+ /**
+  * Register handler for prefix.
+  * If multiple handlers match a prefix, the first-registered one will
+@@ -56,9 +64,33 @@ typedef std::function<bool(Config &config, HTTPRequest *req,
+ void RegisterHTTPHandler(const std::string &prefix, bool exactMatch,
+                          const HTTPRequestHandler &handler);
+ 
++/**
++ * Register coroutine handler for prefix.
++ * If multiple handlers match a prefix, the first-registered one will
++ * be invoked.
++ */
++void RegisterHTTPAsyncHandler(const std::string &prefix, bool exactMatch,
++                              const HTTPAsyncRequestHandler &handler);
++
+ /** Unregister handler for prefix */
+ void UnregisterHTTPHandler(const std::string &prefix, bool exactMatch);
+ 
++/** Release/reacquire an HTTP workqueue slot while a coroutine is suspended. */
++void HTTPReleaseWorkQueueSlot() noexcept;
++void HTTPAcquireWorkQueueSlot() noexcept;
++
++class HTTPScopedWaitSuspension {
++public:
++    HTTPScopedWaitSuspension() noexcept { HTTPReleaseWorkQueueSlot(); }
++    ~HTTPScopedWaitSuspension() noexcept { HTTPAcquireWorkQueueSlot(); }
++    HTTPScopedWaitSuspension(const HTTPScopedWaitSuspension &) = delete;
++    HTTPScopedWaitSuspension &
++    operator=(const HTTPScopedWaitSuspension &) = delete;
++};
++
++/** Return the HTTP coroutine thread pool executor if running. */
++boost::asio::any_io_executor GetHTTPThreadPoolExecutor();
++
+ /**
+  * Return evhttp event base. This can be used by submodules to
+  * queue timers or custom events.
+diff --git a/src/rpc/async_waiter.h b/src/rpc/async_waiter.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..efb219db3e16371781018c2f55f07d60c58e7ffc
+--- /dev/null
++++ b/src/rpc/async_waiter.h
+@@ -0,0 +1,151 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_RPC_ASYNC_WAITER_H
++#define BITCOIN_RPC_ASYNC_WAITER_H
++
++#include <httpserver.h>
++#include <util/time.h>
++
++#include <boost/asio/any_io_executor.hpp>
++#include <boost/asio/awaitable.hpp>
++#include <boost/asio/co_spawn.hpp>
++#include <boost/asio/post.hpp>
++#include <boost/asio/redirect_error.hpp>
++#include <boost/asio/steady_timer.hpp>
++#include <boost/asio/strand.hpp>
++#include <boost/asio/use_awaitable.hpp>
++
++#include <algorithm>
++#include <chrono>
++#include <memory>
++#include <mutex>
++#include <vector>
++
++/**
++ * Non-blocking coroutine condition waiter for long-polling RPCs
++ * (waitfornewblock, waitforblock, waitforblockheight, getblocktemplate).
++ *
++ * Replaces blocking std::condition_variable::wait_until on OS worker threads
++ * with boost::asio::steady_timer suspension so suspended requests consume
++ * zero OS threads while waiting.
++ */
++class AsyncBlockChangeWaiter {
++private:
++    std::mutex m_mutex;
++    std::vector<std::weak_ptr<boost::asio::steady_timer>> m_timers;
++
++public:
++    AsyncBlockChangeWaiter() = default;
++
++    /**
++     * Wake all currently suspended coroutines by cancelling their timers.
++     * Safe to call from any thread (validation, mempool, or shutdown).
++     */
++    void NotifyAll() {
++        std::vector<std::shared_ptr<boost::asio::steady_timer>> active;
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            for (auto &weak_timer : m_timers) {
++                if (auto timer = weak_timer.lock()) {
++                    active.push_back(std::move(timer));
++                }
++            }
++            m_timers.clear();
++        }
++        for (auto &timer : active) {
++            boost::asio::post(timer->get_executor(), [timer]() {
++                try {
++                    timer->cancel();
++                } catch (...) {
++                }
++            });
++        }
++    }
++
++    size_t WaiterCount() {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        size_t count = 0;
++        for (const auto &weak_timer : m_timers) {
++            if (!weak_timer.expired()) {
++                ++count;
++            }
++        }
++        return count;
++    }
++
++    /**
++     * Suspend the calling coroutine until pred() returns true or deadline is
++     * reached. Re-evaluates pred() under the waiter lock before suspending to
++     * prevent missed wakeups.
++     */
++    template <typename Predicate>
++    boost::asio::awaitable<void>
++    WaitUntilDeadline(boost::asio::any_io_executor executor,
++                      SteadyClock::time_point deadline, Predicate pred) {
++        // Initiation and cancellation share a strand. Cancellation before
++        // async_wait initiation would otherwise be lost, and direct concurrent
++        // timer operations are not safe even when the executor is a strand.
++        auto strand = boost::asio::make_strand(executor);
++        co_await boost::asio::co_spawn(
++            strand, [this, strand, deadline, pred = std::move(pred)]() mutable
++                -> boost::asio::awaitable<void> {
++                while (!pred()) {
++                    const auto now = SteadyClock::now();
++                    if (now >= deadline) {
++                        break;
++                    }
++                    const auto remaining = std::min<SteadyClock::duration>(
++                        deadline - now, std::chrono::hours(24));
++                    auto timer = std::make_shared<boost::asio::steady_timer>(strand);
++                    timer->expires_after(remaining);
++                    {
++                        std::lock_guard<std::mutex> lock(m_mutex);
++                        if (pred()) {
++                            break;
++                        }
++                        std::erase_if(m_timers, [](const auto &weak) { return weak.expired(); });
++                        m_timers.push_back(timer);
++                    }
++                    HTTPScopedWaitSuspension suspend_guard;
++                    boost::system::error_code ec;
++                    co_await timer->async_wait(
++                        boost::asio::redirect_error(boost::asio::use_awaitable, ec));
++                    {
++                        std::lock_guard<std::mutex> lock(m_mutex);
++                        std::erase_if(m_timers, [&timer](const auto &weak) {
++                            auto active = weak.lock();
++                            return !active || active == timer;
++                        });
++                    }
++                }
++                co_return;
++            }, boost::asio::use_awaitable);
++        co_return;
++    }
++
++    /**
++     * Suspend the calling coroutine until pred() returns true or timeout
++     * expires. If timeout == 0, waits indefinitely until pred() is true or
++     * the server stops.
++     */
++    template <typename Predicate>
++    boost::asio::awaitable<void>
++    WaitUntil(boost::asio::any_io_executor executor,
++              std::chrono::milliseconds timeout, Predicate pred) {
++        const SteadyClock::time_point deadline =
++            timeout.count() != 0 ? SteadyClock::now() + timeout
++                                : SteadyClock::time_point::max();
++        co_await WaitUntilDeadline(std::move(executor), deadline,
++                                   std::move(pred));
++    }
++};
++
++/** Global block/mempool change coroutine waiter notified on tip and mempool updates. */
++inline AsyncBlockChangeWaiter &GetRPCBlockChangeWaiter() noexcept {
++    static AsyncBlockChangeWaiter g_waiter;
++    return g_waiter;
++}
++
++#endif // BITCOIN_RPC_ASYNC_WAITER_H
+diff --git a/src/rpc/blockchain.cpp b/src/rpc/blockchain.cpp
+index 7ed320ff9d29ac199b59e3959adbc8104aeb0d55..5e684672e59153316162db3213f04364327be50c 100644
+--- a/src/rpc/blockchain.cpp
++++ b/src/rpc/blockchain.cpp
+@@ -30,6 +30,7 @@
+ #include <node/snapshot.h>
+ #include <node/utxo_snapshot.h>
+ #include <primitives/transaction.h>
++#include <rpc/async_waiter.h>
+ #include <rpc/server.h>
+ #include <rpc/server_util.h>
+ #include <rpc/util.h>
+@@ -284,6 +285,7 @@ void RPCNotifyBlockChange(const CBlockIndex *pindex) {
+         latestblock.height = pindex->nHeight;
+     }
+     cond_blockchange.notify_all();
++    GetRPCBlockChangeWaiter().NotifyAll();
+ }
+ 
+ static RPCHelpMan waitfornewblock() {
+@@ -306,39 +308,37 @@ static RPCHelpMan waitfornewblock() {
+         RPCExamples{HelpExampleCli("waitfornewblock", "1000") +
+                     HelpExampleRpc("waitfornewblock", "1000")},
+         [&](const RPCHelpMan &self, const Config &config,
+-            const JSONRPCRequest &request) -> UniValue {
++            const JSONRPCRequest &request,
++            boost::asio::any_io_executor executor)
++            -> boost::asio::awaitable<UniValue> {
+             int timeout = 0;
+             if (!request.params[0].isNull()) {
+                 timeout = request.params[0].getInt<int>();
+             }
+ 
++            CUpdatedBlock initial_block;
++            {
++                LOCK(cs_blockchange);
++                initial_block = latestblock;
++            }
++
++            co_await GetRPCBlockChangeWaiter().WaitUntil(
++                executor, std::chrono::milliseconds(timeout), [initial_block]() {
++                    LOCK(cs_blockchange);
++                    return latestblock.height != initial_block.height ||
++                           latestblock.hash != initial_block.hash ||
++                           !IsRPCRunning();
++                });
++
+             CUpdatedBlock block;
+             {
+-                WAIT_LOCK(cs_blockchange, lock);
+-                block = latestblock;
+-                if (timeout) {
+-                    cond_blockchange.wait_for(
+-                        lock, std::chrono::milliseconds(timeout),
+-                        [&block]() EXCLUSIVE_LOCKS_REQUIRED(cs_blockchange) {
+-                            return latestblock.height != block.height ||
+-                                   latestblock.hash != block.hash ||
+-                                   !IsRPCRunning();
+-                        });
+-                } else {
+-                    cond_blockchange.wait(
+-                        lock,
+-                        [&block]() EXCLUSIVE_LOCKS_REQUIRED(cs_blockchange) {
+-                            return latestblock.height != block.height ||
+-                                   latestblock.hash != block.hash ||
+-                                   !IsRPCRunning();
+-                        });
+-                }
++                LOCK(cs_blockchange);
+                 block = latestblock;
+             }
+             UniValue ret(UniValue::VOBJ);
+             ret.pushKV("hash", block.hash.GetHex());
+             ret.pushKV("height", block.height);
+-            return ret;
++            co_return ret;
+         },
+     };
+ }
+@@ -369,7 +369,9 @@ static RPCHelpMan waitforblock() {
+                                    "\"0000000000079f8ef3d2c688c244eb7a4570b24c9"
+                                    "ed7b4a8c619eb02596f8862\", 1000")},
+         [&](const RPCHelpMan &self, const Config &config,
+-            const JSONRPCRequest &request) -> UniValue {
++            const JSONRPCRequest &request,
++            boost::asio::any_io_executor executor)
++            -> boost::asio::awaitable<UniValue> {
+             int timeout = 0;
+ 
+             BlockHash hash(ParseHashV(request.params[0], "blockhash"));
+@@ -378,29 +380,22 @@ static RPCHelpMan waitforblock() {
+                 timeout = request.params[1].getInt<int>();
+             }
+ 
++            co_await GetRPCBlockChangeWaiter().WaitUntil(
++                executor, std::chrono::milliseconds(timeout), [hash]() {
++                    LOCK(cs_blockchange);
++                    return latestblock.hash == hash || !IsRPCRunning();
++                });
++
+             CUpdatedBlock block;
+             {
+-                WAIT_LOCK(cs_blockchange, lock);
+-                if (timeout) {
+-                    cond_blockchange.wait_for(
+-                        lock, std::chrono::milliseconds(timeout),
+-                        [&hash]() EXCLUSIVE_LOCKS_REQUIRED(cs_blockchange) {
+-                            return latestblock.hash == hash || !IsRPCRunning();
+-                        });
+-                } else {
+-                    cond_blockchange.wait(
+-                        lock,
+-                        [&hash]() EXCLUSIVE_LOCKS_REQUIRED(cs_blockchange) {
+-                            return latestblock.hash == hash || !IsRPCRunning();
+-                        });
+-                }
++                LOCK(cs_blockchange);
+                 block = latestblock;
+             }
+ 
+             UniValue ret(UniValue::VOBJ);
+             ret.pushKV("hash", block.hash.GetHex());
+             ret.pushKV("height", block.height);
+-            return ret;
++            co_return ret;
+         },
+     };
+ }
+@@ -428,7 +423,9 @@ static RPCHelpMan waitforblockheight() {
+         RPCExamples{HelpExampleCli("waitforblockheight", "100 1000") +
+                     HelpExampleRpc("waitforblockheight", "100, 1000")},
+         [&](const RPCHelpMan &self, const Config &config,
+-            const JSONRPCRequest &request) -> UniValue {
++            const JSONRPCRequest &request,
++            boost::asio::any_io_executor executor)
++            -> boost::asio::awaitable<UniValue> {
+             int timeout = 0;
+ 
+             int height = request.params[0].getInt<int>();
+@@ -437,30 +434,21 @@ static RPCHelpMan waitforblockheight() {
+                 timeout = request.params[1].getInt<int>();
+             }
+ 
++            co_await GetRPCBlockChangeWaiter().WaitUntil(
++                executor, std::chrono::milliseconds(timeout), [height]() {
++                    LOCK(cs_blockchange);
++                    return latestblock.height >= height || !IsRPCRunning();
++                });
++
+             CUpdatedBlock block;
+             {
+-                WAIT_LOCK(cs_blockchange, lock);
+-                if (timeout) {
+-                    cond_blockchange.wait_for(
+-                        lock, std::chrono::milliseconds(timeout),
+-                        [&height]() EXCLUSIVE_LOCKS_REQUIRED(cs_blockchange) {
+-                            return latestblock.height >= height ||
+-                                   !IsRPCRunning();
+-                        });
+-                } else {
+-                    cond_blockchange.wait(
+-                        lock,
+-                        [&height]() EXCLUSIVE_LOCKS_REQUIRED(cs_blockchange) {
+-                            return latestblock.height >= height ||
+-                                   !IsRPCRunning();
+-                        });
+-                }
++                LOCK(cs_blockchange);
+                 block = latestblock;
+             }
+             UniValue ret(UniValue::VOBJ);
+             ret.pushKV("hash", block.hash.GetHex());
+             ret.pushKV("height", block.height);
+-            return ret;
++            co_return ret;
+         },
+     };
+ }
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index ffe47f742408c56169ea3561a8c8de0f9843e7a0..fefd8ad289114b7aa876f01cc01e2bf231679b96 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -32,6 +32,7 @@
+ #include <pow/pow.h>
+ #include <rpc/blockchain.h>
+ #include <rpc/mining.h>
++#include <rpc/async_waiter.h>
+ #include <rpc/server.h>
+ #include <rpc/server_util.h>
+ #include <rpc/util.h>
+@@ -883,11 +884,12 @@ static RPCHelpMan getblocktemplate() {
+         RPCExamples{HelpExampleCli("getblocktemplate", "") +
+                     HelpExampleRpc("getblocktemplate", "")},
+         [&](const RPCHelpMan &self, const Config &config,
+-            const JSONRPCRequest &request) -> UniValue {
++            const JSONRPCRequest &request, boost::asio::any_io_executor executor)
++            -> boost::asio::awaitable<UniValue> {
+             NodeContext &node = EnsureAnyNodeContext(request.context);
+             ChainstateManager &chainman = EnsureChainman(node);
+             ArgsManager &argsman = EnsureArgsman(node);
+-            LOCK(cs_main);
++            WAIT_LOCK(cs_main, main_lock);
+ 
+             const CChainParams &chainparams = config.GetChainParams();
+ 
+@@ -927,19 +929,19 @@ static RPCHelpMan getblocktemplate() {
+                         chainman.m_blockman.LookupBlockIndex(hash);
+                     if (pindex) {
+                         if (pindex->IsValid(BlockValidity::SCRIPTS)) {
+-                            return "duplicate";
++                            co_return "duplicate";
+                         }
+                         if (pindex->nStatus.isInvalid()) {
+-                            return "duplicate-invalid";
++                            co_return "duplicate-invalid";
+                         }
+-                        return "duplicate-inconclusive";
++                        co_return "duplicate-inconclusive";
+                     }
+ 
+                     CBlockIndex *const pindexPrev = active_chain.Tip();
+                     // TestBlockValidity only supports blocks built on the
+                     // current Tip
+                     if (block.hashPrevBlock != pindexPrev->GetBlockHash()) {
+-                        return "inconclusive-not-best-prevblk";
++                        co_return "inconclusive-not-best-prevblk";
+                     }
+                     BlockValidationState state;
+                     TestBlockValidity(state, chainparams, active_chainstate,
+@@ -947,7 +949,7 @@ static RPCHelpMan getblocktemplate() {
+                                       BlockValidationOptions(config)
+                                           .withCheckPoW(false)
+                                           .withCheckMerkleRoot(true));
+-                    return BIP22ValidationResult(config, state);
++                    co_return BIP22ValidationResult(config, state);
+                 }
+             }
+ 
+@@ -999,43 +1001,38 @@ static RPCHelpMan getblocktemplate() {
+                 const auto initialLongpollDelay = isRegtest ? 5s : 1min;
+                 const auto newTxCheckLongpollDelay = isRegtest ? 1s : 10s;
+ 
+-                // Release lock while waiting
+-                LEAVE_CRITICAL_SECTION(cs_main);
+-                {
+-                    checktxtime =
+-                        std::chrono::steady_clock::now() + initialLongpollDelay;
+-
+-                    WAIT_LOCK(g_best_block_mutex, lock);
+-                    while (g_best_block &&
+-                           g_best_block->GetBlockHash() == hashWatchedChain &&
+-                           IsRPCRunning()) {
+-                        if (g_best_block_cv.wait_until(lock, checktxtime) ==
+-                            std::cv_status::timeout) {
+-                            // Timeout: Check transactions for update
+-                            // without holding the mempool look to avoid
+-                            // deadlocks
+-                            if (mempool.GetTransactionsUpdated() !=
+-                                nTransactionsUpdatedLastLP) {
+-                                break;
+-                            }
+-                            checktxtime += newTxCheckLongpollDelay;
++                // A suspended coroutine must own no thread-affine mutex.
++                main_lock.unlock();
++                checktxtime = SteadyClock::now() + initialLongpollDelay;
++                for (;;) {
++                    co_await GetRPCBlockChangeWaiter().WaitUntilDeadline(
++                        executor, checktxtime, [hashWatchedChain]() {
++                            LOCK(g_best_block_mutex);
++                            return !g_best_block ||
++                                   g_best_block->GetBlockHash() != hashWatchedChain ||
++                                   !IsRPCRunning();
++                        });
++                    {
++                        LOCK(g_best_block_mutex);
++                        if (!g_best_block ||
++                            g_best_block->GetBlockHash() != hashWatchedChain ||
++                            !IsRPCRunning()) {
++                            break;
+                         }
+                     }
+-
+-                    if (node.avalanche && IsStakingRewardsActivated(
+-                                              consensusParams, g_best_block)) {
+-                        // At this point the staking reward winner might not be
+-                        // computed yet. Make sure we don't miss the staking
+-                        // reward winner on first return of getblocktemplate
+-                        // after a block is found when using longpoll.
+-                        // Note that if the computation was done already this is
+-                        // a no-op. It can only be done now because we're not
+-                        // holding cs_main, which would cause a lock order issue
+-                        // otherwise.
++                    if (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLastLP) {
++                        break;
++                    }
++                    checktxtime += newTxCheckLongpollDelay;
++                }
++                {
++                    LOCK(g_best_block_mutex);
++                    // Preserve upstream reward computation before reacquiring cs_main.
++                    if (node.avalanche && IsStakingRewardsActivated(consensusParams, g_best_block)) {
+                         node.avalanche->computeStakingReward(g_best_block);
+                     }
+                 }
+-                ENTER_CRITICAL_SECTION(cs_main);
++                main_lock.lock();
+ 
+                 if (!IsRPCRunning()) {
+                     throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED,
+@@ -1276,7 +1273,7 @@ static RPCHelpMan getblocktemplate() {
+                 result.pushKV("rtt", std::move(rtt));
+             }
+ 
+-            return result;
++            co_return result;
+         },
+     };
+ }
+diff --git a/src/rpc/server.cpp b/src/rpc/server.cpp
+index a7cfe295b3d8596ef32c220f32ea27d75d367ee4..625c1d3507d4cddc8e03a80519998e4caaeb410f 100644
+--- a/src/rpc/server.cpp
++++ b/src/rpc/server.cpp
+@@ -9,6 +9,7 @@
+ #include <common/args.h>
+ #include <config.h>
+ #include <logging.h>
++#include <rpc/async_waiter.h>
+ #include <rpc/util.h>
+ #include <shutdown.h>
+ #include <sync.h>
+@@ -31,6 +32,15 @@ using SteadyClock = std::chrono::steady_clock;
+ 
+ static GlobalMutex g_rpc_warmup_mutex;
+ static std::atomic<bool> g_rpc_running{false};
++// Duplicate interrupt/stop calls are idempotent within one RPC lifetime.
++// Keep the guards per lifetime so independent in-process users can restart RPC.
++struct RPCShutdownState {
++    std::once_flag interrupt;
++    std::once_flag stop;
++};
++static GlobalMutex g_rpc_shutdown_mutex;
++static std::shared_ptr<RPCShutdownState> g_rpc_shutdown_state
++    GUARDED_BY(g_rpc_shutdown_mutex) = std::make_shared<RPCShutdownState>();
+ static bool fRPCInWarmup GUARDED_BY(g_rpc_warmup_mutex) = true;
+ static std::string
+     rpcWarmupStatus GUARDED_BY(g_rpc_warmup_mutex) = "RPC server started";
+@@ -43,6 +53,10 @@ static std::map<std::string, std::unique_ptr<RPCTimerBase>>
+ static bool ExecuteCommand(const Config &config, const CRPCCommand &command,
+                            const JSONRPCRequest &request, UniValue &result,
+                            bool last_handler);
++static boost::asio::awaitable<bool>
++ExecuteCommandAsync(const Config &config, const CRPCCommand &command,
++                    const JSONRPCRequest &request, UniValue &result,
++                    bool last_handler, boost::asio::any_io_executor executor);
+ 
+ struct RPCCommandExecutionInfo {
+     std::string method;
+@@ -99,6 +113,30 @@ UniValue RPCServer::ExecuteCommand(const Config &config,
+     return tableRPC.execute(config, request);
+ }
+ 
++boost::asio::awaitable<UniValue>
++RPCServer::ExecuteCommandAsync(const Config &config,
++                               const JSONRPCRequest &request,
++                               boost::asio::any_io_executor executor) const {
++    {
++        LOCK(g_rpc_warmup_mutex);
++        if (fRPCInWarmup) {
++            throw JSONRPCError(RPC_IN_WARMUP, rpcWarmupStatus);
++        }
++    }
++
++    std::string commandName = request.strMethod;
++    {
++        auto commandsReadView = commands.getReadView();
++        auto iter = commandsReadView->find(commandName);
++        if (iter != commandsReadView.end()) {
++            co_return iter->second.get()->Execute(request);
++        }
++    }
++
++    co_return co_await tableRPC.executeAsync(config, request,
++                                             std::move(executor));
++}
++
+ void RPCServer::RegisterCommand(std::unique_ptr<RPCCommand> command) {
+     if (command != nullptr) {
+         const std::string &commandName = command->GetName();
+@@ -350,27 +388,32 @@ bool CRPCTable::removeCommand(const std::string &name,
+ 
+ void StartRPC() {
+     LogDebug(BCLog::RPC, "Starting RPC\n");
++    WITH_LOCK(g_rpc_shutdown_mutex,
++              g_rpc_shutdown_state = std::make_shared<RPCShutdownState>());
+     g_rpc_running = true;
+     g_rpcSignals.Started();
+ }
+ 
+ void InterruptRPC() {
+-    static std::once_flag g_rpc_interrupt_flag;
++    const auto shutdown =
++        WITH_LOCK(g_rpc_shutdown_mutex, return g_rpc_shutdown_state);
+     // This function could be called twice if the GUI has been started with
+     // -server=1.
+-    std::call_once(g_rpc_interrupt_flag, []() {
++    std::call_once(shutdown->interrupt, []() {
+         LogDebug(BCLog::RPC, "Interrupting RPC\n");
+         // Interrupt e.g. running longpolls
+         g_rpc_running = false;
++        GetRPCBlockChangeWaiter().NotifyAll();
+     });
+ }
+ 
+ void StopRPC() {
+-    static std::once_flag g_rpc_stop_flag;
++    const auto shutdown =
++        WITH_LOCK(g_rpc_shutdown_mutex, return g_rpc_shutdown_state);
+     // This function could be called twice if the GUI has been started with
+     // -server=1.
+     assert(!g_rpc_running);
+-    std::call_once(g_rpc_stop_flag, []() {
++    std::call_once(shutdown->stop, []() {
+         LogDebug(BCLog::RPC, "Stopping RPC\n");
+         WITH_LOCK(g_deadline_timers_mutex, deadlineTimers.clear());
+         DeleteAuthCookie();
+@@ -435,6 +478,28 @@ static UniValue JSONRPCExecOne(const Config &config, RPCServer &rpcServer,
+     return rpc_result;
+ }
+ 
++static boost::asio::awaitable<UniValue>
++JSONRPCExecOneAsync(const Config &config, RPCServer &rpcServer,
++                    JSONRPCRequest jreq, const UniValue &req,
++                    boost::asio::any_io_executor executor) {
++    UniValue rpc_result(UniValue::VOBJ);
++
++    try {
++        jreq.parse(req);
++
++        UniValue result = co_await rpcServer.ExecuteCommandAsync(
++            config, jreq, std::move(executor));
++        rpc_result = JSONRPCReplyObj(result, NullUniValue, jreq.id);
++    } catch (const UniValue &objError) {
++        rpc_result = JSONRPCReplyObj(NullUniValue, objError, jreq.id);
++    } catch (const std::exception &e) {
++        rpc_result = JSONRPCReplyObj(
++            NullUniValue, JSONRPCError(RPC_PARSE_ERROR, e.what()), jreq.id);
++    }
++
++    co_return rpc_result;
++}
++
+ std::string JSONRPCExecBatch(const Config &config, RPCServer &rpcServer,
+                              const JSONRPCRequest &jreq, const UniValue &vReq) {
+     UniValue ret(UniValue::VARR);
+@@ -445,6 +510,19 @@ std::string JSONRPCExecBatch(const Config &config, RPCServer &rpcServer,
+     return ret.write() + "\n";
+ }
+ 
++boost::asio::awaitable<std::string>
++JSONRPCExecBatchAsync(const Config &config, RPCServer &rpcServer,
++                      const JSONRPCRequest &jreq, const UniValue &vReq,
++                      boost::asio::any_io_executor executor) {
++    UniValue ret(UniValue::VARR);
++    for (size_t i = 0; i < vReq.size(); i++) {
++        ret.push_back(co_await JSONRPCExecOneAsync(config, rpcServer, jreq,
++                                                   vReq[i], executor));
++    }
++
++    co_return ret.write() + "\n";
++}
++
+ /**
+  * Process named arguments into a vector of positional arguments, based on the
+  * passed-in specification for the RPC call's arguments.
+@@ -582,6 +660,21 @@ static bool ExecuteCommands(const Config &config,
+     return false;
+ }
+ 
++static boost::asio::awaitable<bool>
++ExecuteCommandsAsync(const Config &config,
++                     const std::vector<const CRPCCommand *> &commands,
++                     const JSONRPCRequest &request, UniValue &result,
++                     boost::asio::any_io_executor executor) {
++    for (const auto &command : commands) {
++        if (co_await ExecuteCommandAsync(config, *command, request, result,
++                                         &command == &commands.back(),
++                                         executor)) {
++            co_return true;
++        }
++    }
++    co_return false;
++}
++
+ UniValue CRPCTable::execute(const Config &config,
+                             const JSONRPCRequest &request) const {
+     // Return immediately if in warmup
+@@ -603,6 +696,27 @@ UniValue CRPCTable::execute(const Config &config,
+     throw JSONRPCError(RPC_METHOD_NOT_FOUND, "Method not found");
+ }
+ 
++boost::asio::awaitable<UniValue>
++CRPCTable::executeAsync(const Config &config, const JSONRPCRequest &request,
++                        boost::asio::any_io_executor executor) const {
++    {
++        LOCK(g_rpc_warmup_mutex);
++        if (fRPCInWarmup) {
++            throw JSONRPCError(RPC_IN_WARMUP, rpcWarmupStatus);
++        }
++    }
++
++    auto it = mapCommands.find(request.strMethod);
++    if (it != mapCommands.end()) {
++        UniValue result;
++        if (co_await ExecuteCommandsAsync(config, it->second, request, result,
++                                          std::move(executor))) {
++            co_return result;
++        }
++    }
++    throw JSONRPCError(RPC_METHOD_NOT_FOUND, "Method not found");
++}
++
+ static bool ExecuteCommand(const Config &config, const CRPCCommand &command,
+                            const JSONRPCRequest &request, UniValue &result,
+                            bool last_handler) {
+@@ -623,6 +737,27 @@ static bool ExecuteCommand(const Config &config, const CRPCCommand &command,
+     }
+ }
+ 
++static boost::asio::awaitable<bool>
++ExecuteCommandAsync(const Config &config, const CRPCCommand &command,
++                    const JSONRPCRequest &request, UniValue &result,
++                    bool last_handler, boost::asio::any_io_executor executor) {
++    try {
++        RPCCommandExecution execution(request.strMethod);
++        if (request.params.isObject()) {
++            co_return co_await command.async_actor(
++                config, transformNamedArguments(request, command.argNames),
++                result, last_handler, std::move(executor));
++        } else {
++            co_return co_await command.async_actor(
++                config, request, result, last_handler, std::move(executor));
++        }
++    } catch (const UniValue::type_error &e) {
++        throw JSONRPCError(RPC_TYPE_ERROR, e.what());
++    } catch (const std::exception &e) {
++        throw JSONRPCError(RPC_MISC_ERROR, e.what());
++    }
++}
++
+ std::vector<std::string> CRPCTable::listCommands() const {
+     std::vector<std::string> commandList;
+     commandList.reserve(mapCommands.size());
+diff --git a/src/rpc/server.h b/src/rpc/server.h
+index 42cc3e901ba0994f0ea2a63d54eac00c4bbb62cf..3bfc07f6dffb5ae7c492d2f40af57bc942c58018 100644
+--- a/src/rpc/server.h
++++ b/src/rpc/server.h
+@@ -54,6 +54,10 @@ public:
+     UniValue ExecuteCommand(const Config &config,
+                             const JSONRPCRequest &request) const;
+ 
++    boost::asio::awaitable<UniValue>
++    ExecuteCommandAsync(const Config &config, const JSONRPCRequest &request,
++                        boost::asio::any_io_executor executor) const;
++
+     /**
+      * Register an RPC command.
+      */
+@@ -152,14 +156,33 @@ public:
+     using Actor =
+         std::function<bool(const Config &config, const JSONRPCRequest &request,
+                            UniValue &result, bool last_handler)>;
++    using AsyncActor = std::function<boost::asio::awaitable<bool>(
++        const Config &config, const JSONRPCRequest &request, UniValue &result,
++        bool last_handler, boost::asio::any_io_executor executor)>;
+ 
+     //! Constructor taking Actor callback supporting multiple handlers.
+     CRPCCommand(std::string _category, std::string _name, Actor _actor,
+                 std::vector<std::pair<std::string, bool>> _args,
+                 intptr_t _unique_id)
+         : category(std::move(_category)), name(std::move(_name)),
+-          actor(std::move(_actor)), argNames(std::move(_args)),
+-          unique_id(_unique_id) {}
++          actor(std::move(_actor)),
++          async_actor([actor_fn = this->actor](
++                          const Config &config, const JSONRPCRequest &request,
++                          UniValue &result, bool last_handler,
++                          boost::asio::any_io_executor)
++                          -> boost::asio::awaitable<bool> {
++              co_return actor_fn(config, request, result, last_handler);
++          }),
++          argNames(std::move(_args)), unique_id(_unique_id) {}
++
++    //! Constructor taking both synchronous and coroutine Actor callbacks.
++    CRPCCommand(std::string _category, std::string _name, Actor _actor,
++                AsyncActor _async_actor,
++                std::vector<std::pair<std::string, bool>> _args,
++                intptr_t _unique_id)
++        : category(std::move(_category)), name(std::move(_name)),
++          actor(std::move(_actor)), async_actor(std::move(_async_actor)),
++          argNames(std::move(_args)), unique_id(_unique_id) {}
+ 
+     //! Simplified constructor taking plain RpcMethodFnType function pointer.
+     CRPCCommand(std::string _category, RpcMethodFnType _fn)
+@@ -170,11 +193,21 @@ public:
+                   result = _fn().HandleRequest(config, request);
+                   return true;
+               },
++              [_fn](const Config &config, const JSONRPCRequest &request,
++                    UniValue &result, bool,
++                    boost::asio::any_io_executor executor)
++                  -> boost::asio::awaitable<bool> {
++                  RPCHelpMan help = _fn();
++                  result = co_await help.HandleRequestAsync(
++                      config, request, std::move(executor));
++                  co_return true;
++              },
+               _fn().GetArgNames(), intptr_t(_fn)) {}
+ 
+     std::string category;
+     std::string name;
+     Actor actor;
++    AsyncActor async_actor;
+     //! List of method arguments and whether they are named-only. Incoming RPC
+     //! requests contain a "params" field that can either be an array containing
+     //! unnamed arguments or an object containing named arguments. The
+@@ -208,6 +241,13 @@ public:
+      */
+     UniValue execute(const Config &config, const JSONRPCRequest &request) const;
+ 
++    /**
++     * Execute a method asynchronously as a C++20 coroutine.
++     */
++    boost::asio::awaitable<UniValue>
++    executeAsync(const Config &config, const JSONRPCRequest &request,
++                 boost::asio::any_io_executor executor) const;
++
+     /**
+      * Returns a list of registered commands
+      * @returns List of registered commands.
+@@ -246,5 +286,9 @@ void InterruptRPC();
+ void StopRPC();
+ std::string JSONRPCExecBatch(const Config &config, RPCServer &rpcServer,
+                              const JSONRPCRequest &req, const UniValue &vReq);
++boost::asio::awaitable<std::string>
++JSONRPCExecBatchAsync(const Config &config, RPCServer &rpcServer,
++                      const JSONRPCRequest &req, const UniValue &vReq,
++                      boost::asio::any_io_executor executor);
+ 
+ #endif // BITCOIN_RPC_SERVER_H
+diff --git a/src/rpc/util.cpp b/src/rpc/util.cpp
+index 8f2f2c2c8a719f586c7539a85325c4290240968b..7d6d05481b2ba7b1079a69f24e23b0b5518fac3a 100644
+--- a/src/rpc/util.cpp
++++ b/src/rpc/util.cpp
+@@ -19,6 +19,10 @@
+ #include <util/string.h>
+ #include <util/translation.h>
+ 
++#include <boost/asio/co_spawn.hpp>
++#include <boost/asio/io_context.hpp>
++#include <boost/asio/use_future.hpp>
++
+ #include <algorithm>
+ #include <iterator>
+ #include <string_view>
+@@ -510,13 +514,79 @@ struct Sections {
+ RPCHelpMan::RPCHelpMan(std::string name_, std::string description,
+                        std::vector<RPCArg> args, RPCResults results,
+                        RPCExamples examples)
+-    : RPCHelpMan{std::move(name_),   std::move(description), std::move(args),
+-                 std::move(results), std::move(examples),    nullptr} {}
++    : RPCHelpMan{std::move(name_),   std::move(description),
++                 std::move(args),    std::move(results),
++                 std::move(examples), RPCMethodImpl{nullptr}} {}
++
++RPCHelpMan::RPCHelpMan(std::string name_, std::string description,
++                       std::vector<RPCArg> args, RPCResults results,
++                       RPCExamples examples, AsyncRPCMethodImpl async_fun)
++    : m_name{std::move(name_)}, m_fun{nullptr},
++      m_async_fun{std::move(async_fun)}, m_description{std::move(description)},
++      m_args{std::move(args)}, m_results{std::move(results)},
++      m_examples{std::move(examples)} {
++    enum ParamType { POSITIONAL = 1, NAMED = 2, NAMED_ONLY = 4 };
++    std::map<std::string, int> param_names;
++
++    for (const auto &arg : m_args) {
++        std::vector<std::string> names = SplitString(arg.m_names, '|');
++        for (const std::string &name : names) {
++            auto &param_type = param_names[name];
++            CHECK_NONFATAL(!(param_type & POSITIONAL));
++            CHECK_NONFATAL(!(param_type & NAMED_ONLY));
++            param_type |= POSITIONAL;
++        }
++        if (arg.m_type == RPCArg::Type::OBJ_NAMED_PARAMS) {
++            for (const auto &inner : arg.m_inner) {
++                std::vector<std::string> inner_names =
++                    SplitString(inner.m_names, '|');
++                for (const std::string &inner_name : inner_names) {
++                    auto &param_type = param_names[inner_name];
++                    CHECK_NONFATAL(!(param_type & POSITIONAL) ||
++                                   inner.m_opts.also_positional);
++                    CHECK_NONFATAL(!(param_type & NAMED));
++                    CHECK_NONFATAL(!(param_type & NAMED_ONLY));
++                    param_type |=
++                        inner.m_opts.also_positional ? NAMED : NAMED_ONLY;
++                }
++            }
++        }
++        if (arg.m_fallback.index() == 2) {
++            const RPCArg::Type type = arg.m_type;
++            switch (std::get<RPCArg::Default>(arg.m_fallback).getType()) {
++                case UniValue::VOBJ:
++                    CHECK_NONFATAL(type == RPCArg::Type::OBJ);
++                    break;
++                case UniValue::VARR:
++                    CHECK_NONFATAL(type == RPCArg::Type::ARR);
++                    break;
++                case UniValue::VSTR:
++                    CHECK_NONFATAL(type == RPCArg::Type::STR ||
++                                   type == RPCArg::Type::STR_HEX ||
++                                   type == RPCArg::Type::AMOUNT);
++                    break;
++                case UniValue::VNUM:
++                    CHECK_NONFATAL(type == RPCArg::Type::NUM ||
++                                   type == RPCArg::Type::AMOUNT ||
++                                   type == RPCArg::Type::RANGE);
++                    break;
++                case UniValue::VBOOL:
++                    CHECK_NONFATAL(type == RPCArg::Type::BOOL);
++                    break;
++                case UniValue::VNULL:
++                    break;
++                default:
++                    CHECK_NONFATAL(false);
++                    break;
++            }
++        }
++    }
++}
+ 
+ RPCHelpMan::RPCHelpMan(std::string name_, std::string description,
+                        std::vector<RPCArg> args, RPCResults results,
+                        RPCExamples examples, RPCMethodImpl fun)
+-    : m_name{std::move(name_)}, m_fun{std::move(fun)},
++    : m_name{std::move(name_)}, m_fun{std::move(fun)}, m_async_fun{nullptr},
+       m_description{std::move(description)}, m_args{std::move(args)},
+       m_results{std::move(results)}, m_examples{std::move(examples)} {
+     // Map of parameter names and types just used to check whether the names are
+@@ -636,8 +706,22 @@ UniValue RPCHelpMan::HandleRequest(const Config &config,
+     }
+     CHECK_NONFATAL(m_req == nullptr);
+     m_req = &request;
+-    UniValue ret = m_fun(*this, config, request);
+-    m_req = nullptr;
++    struct ReqGuard {
++        const RPCHelpMan *self;
++        ~ReqGuard() { self->m_req = nullptr; }
++    } req_guard{this};
++
++    UniValue ret;
++    if (m_fun) {
++        ret = m_fun(*this, config, request);
++    } else if (m_async_fun) {
++        boost::asio::io_context ioc;
++        auto fut = boost::asio::co_spawn(
++            ioc, m_async_fun(*this, config, request, ioc.get_executor()),
++            boost::asio::use_future);
++        ioc.run();
++        ret = fut.get();
++    }
+     if (gArgs.GetBoolArg("-rpcdoccheck", DEFAULT_RPC_DOC_CHECK)) {
+         UniValue mismatch{UniValue::VARR};
+         for (const auto &res : m_results.m_results) {
+@@ -662,6 +746,67 @@ UniValue RPCHelpMan::HandleRequest(const Config &config,
+     return ret;
+ }
+ 
++boost::asio::awaitable<UniValue>
++RPCHelpMan::HandleRequestAsync(const Config &config,
++                               const JSONRPCRequest &request,
++                               boost::asio::any_io_executor executor) const {
++    if (!m_async_fun) {
++        co_return HandleRequest(config, request);
++    }
++    if (request.mode == JSONRPCRequest::GET_ARGS) {
++        co_return GetArgMap();
++    }
++    if (request.mode == JSONRPCRequest::GET_HELP ||
++        !IsValidNumArgs(request.params.size())) {
++        throw std::runtime_error(ToString());
++    }
++    UniValue arg_mismatch{UniValue::VOBJ};
++    for (size_t i{0}; i < m_args.size(); ++i) {
++        const auto &arg{m_args.at(i)};
++        UniValue match{arg.MatchesType(request.params[i])};
++        if (!match.isTrue()) {
++            arg_mismatch.pushKV(
++                strprintf("Position %s (%s)", i + 1, arg.m_names),
++                std::move(match));
++        }
++    }
++    if (!arg_mismatch.empty()) {
++        throw JSONRPCError(RPC_TYPE_ERROR, strprintf("Wrong type passed:\n%s",
++                                                     arg_mismatch.write(4)));
++    }
++    CHECK_NONFATAL(m_req == nullptr);
++    m_req = &request;
++    struct ReqGuard {
++        const RPCHelpMan *self;
++        ~ReqGuard() { self->m_req = nullptr; }
++    } req_guard{this};
++
++    UniValue ret = co_await m_async_fun(*this, config, request,
++                                        std::move(executor));
++    if (gArgs.GetBoolArg("-rpcdoccheck", DEFAULT_RPC_DOC_CHECK)) {
++        UniValue mismatch{UniValue::VARR};
++        for (const auto &res : m_results.m_results) {
++            UniValue match{res.MatchesType(ret)};
++            if (match.isTrue()) {
++                mismatch.setNull();
++                break;
++            }
++            mismatch.push_back(std::move(match));
++        }
++        if (!mismatch.isNull()) {
++            std::string explain{mismatch.empty() ? "no possible results defined"
++                                : mismatch.size() == 1 ? mismatch[0].write(4)
++                                                       : mismatch.write(4)};
++            throw std::runtime_error{strprintf(
++                "Internal bug detected: RPC call \"%s\" returned incorrect "
++                "type:\n%s\n%s %s\nPlease report this issue here: %s\n",
++                m_name, explain, PACKAGE_NAME, FormatFullVersion(),
++                PACKAGE_BUGREPORT)};
++        }
++    }
++    co_return ret;
++}
++
+ using CheckFn = void(const RPCArg &);
+ static const UniValue *DetailMaybeArg(CheckFn *check,
+                                       const std::vector<RPCArg> &params,
+diff --git a/src/rpc/util.h b/src/rpc/util.h
+index 4e7d329bea96c6c0e7cccba386d559c76384d064..0751fa0fed8bc50a0f1c219048e23f6bc407e7c0 100644
+--- a/src/rpc/util.h
++++ b/src/rpc/util.h
+@@ -18,6 +18,9 @@
+ #include <univalue.h>
+ #include <util/check.h>
+ 
++#include <boost/asio/any_io_executor.hpp>
++#include <boost/asio/awaitable.hpp>
++
+ #include <cstddef>
+ #include <cstdint>
+ #include <functional>
+@@ -382,12 +385,22 @@ public:
+                RPCExamples examples);
+     using RPCMethodImpl = std::function<UniValue(
+         const RPCHelpMan &, const Config &config, const JSONRPCRequest &)>;
++    using AsyncRPCMethodImpl = std::function<boost::asio::awaitable<UniValue>(
++        const RPCHelpMan &, const Config &config, const JSONRPCRequest &,
++        boost::asio::any_io_executor)>;
+     RPCHelpMan(std::string name, std::string description,
+                std::vector<RPCArg> args, RPCResults results,
+                RPCExamples examples, RPCMethodImpl fun);
++    RPCHelpMan(std::string name, std::string description,
++               std::vector<RPCArg> args, RPCResults results,
++               RPCExamples examples, AsyncRPCMethodImpl async_fun);
+ 
++    bool IsAsync() const { return bool(m_async_fun); }
+     UniValue HandleRequest(const Config &config,
+                            const JSONRPCRequest &request) const;
++    boost::asio::awaitable<UniValue>
++    HandleRequestAsync(const Config &config, const JSONRPCRequest &request,
++                       boost::asio::any_io_executor executor) const;
+     /**
+      * @brief Helper to get a required or default-valued request argument.
+      *
+@@ -481,6 +494,7 @@ public:
+ 
+ private:
+     const RPCMethodImpl m_fun;
++    const AsyncRPCMethodImpl m_async_fun;
+     const std::string m_description;
+     const std::vector<RPCArg> m_args;
+     const RPCResults m_results;
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 372f449f5ebbca817aa279015226154596ac0940..54fff49f0c36d48f3db13c323eab279685bbb363 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -223,6 +223,8 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		reverselock_tests.cpp
+ 		rpc_tests.cpp
+ 		snapshot_rcu_tests.cpp
++		rpc_async_waiter_tests.cpp
++		rpc_coroutine_pool_tests.cpp
+ 		rpc_server_tests.cpp
+ 		rtt_tests.cpp
+ 		rwcollection_tests.cpp
+diff --git a/src/test/rpc_async_waiter_tests.cpp b/src/test/rpc_async_waiter_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a8a1ba23f227a176987879f2bec08ddbf9df6f97
+--- /dev/null
++++ b/src/test/rpc_async_waiter_tests.cpp
+@@ -0,0 +1,83 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <rpc/async_waiter.h>
++#include <test/util/setup_common.h>
++
++#include <boost/asio/co_spawn.hpp>
++#include <boost/asio/thread_pool.hpp>
++#include <boost/asio/use_future.hpp>
++#include <boost/test/unit_test.hpp>
++
++#include <atomic>
++#include <future>
++#include <thread>
++
++using namespace std::chrono_literals;
++
++BOOST_FIXTURE_TEST_SUITE(rpc_async_waiter_tests, BasicTestingSetup)
++
++BOOST_AUTO_TEST_CASE(notify_during_registration_and_worker_availability) {
++    AsyncBlockChangeWaiter waiter;
++    boost::asio::thread_pool pool(2);
++    bool all_ready = true;
++    bool workers_available = true;
++    // Notify as soon as registration is visible, including the interval before
++    // async_wait initiation. Missed cancellation must not wait for the deadline.
++    for (unsigned round = 0; round < 100; ++round) {
++        std::atomic<bool> ready{false};
++        auto waiting = boost::asio::co_spawn(
++            pool, waiter.WaitUntil(pool.get_executor(), 500ms,
++                                   [&] { return ready.load(); }),
++            boost::asio::use_future);
++        const auto deadline = std::chrono::steady_clock::now() + 500ms;
++        while (waiter.WaiterCount() == 0 && std::chrono::steady_clock::now() < deadline) {
++            std::this_thread::yield();
++        }
++        std::promise<void> ping;
++        auto ping_result = ping.get_future();
++        boost::asio::post(pool, [&] { ping.set_value(); });
++        workers_available &= ping_result.wait_for(100ms) == std::future_status::ready;
++        ready = true;
++        waiter.NotifyAll();
++        all_ready &= waiting.wait_for(100ms) == std::future_status::ready;
++        waiting.get();
++        ping_result.get();
++    }
++    pool.join();
++    BOOST_CHECK(workers_available);
++    BOOST_CHECK(all_ready);
++    BOOST_CHECK_EQUAL(waiter.WaiterCount(), 0U);
++}
++
++BOOST_AUTO_TEST_CASE(timeout_sign_and_zero_timeout_notification) {
++    AsyncBlockChangeWaiter waiter;
++    boost::asio::thread_pool pool(1);
++    std::atomic<bool> cancel_negative{false};
++    auto negative = boost::asio::co_spawn(
++        pool, waiter.WaitUntil(pool.get_executor(), -1ms, [&] { return cancel_negative.load(); }),
++        boost::asio::use_future);
++    const bool negative_ready = negative.wait_for(100ms) == std::future_status::ready;
++    cancel_negative = true;
++    waiter.NotifyAll();
++    // Use a mutable predicate for the unbounded timeout so cleanup is explicit.
++    std::atomic<bool> done{false};
++    auto zero = boost::asio::co_spawn(
++        pool, waiter.WaitUntil(pool.get_executor(), 0ms, [&] { return done.load(); }),
++        boost::asio::use_future);
++    const bool initially_waiting = zero.wait_for(10ms) == std::future_status::timeout;
++    done = true;
++    waiter.NotifyAll();
++    const bool notified = zero.wait_for(100ms) == std::future_status::ready;
++    // Explicit predicate changes permit cleanup even when a timeout assertion fails.
++    negative.get();
++    zero.get();
++    pool.join();
++    BOOST_CHECK(negative_ready);
++    BOOST_CHECK(initially_waiting);
++    BOOST_CHECK(notified);
++    BOOST_CHECK_EQUAL(waiter.WaiterCount(), 0U);
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/test/rpc_coroutine_pool_tests.cpp b/src/test/rpc_coroutine_pool_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..ddedbb8610eb2da3389684bb9f695b79de229cf4
+--- /dev/null
++++ b/src/test/rpc_coroutine_pool_tests.cpp
+@@ -0,0 +1,145 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <config.h>
++#include <consensus/amount.h>
++#include <consensus/tx_check.h>
++#include <core_io.h>
++#include <kernel/disconnected_transactions.h>
++#include <key_io.h>
++#include <minerfund.h>
++#include <pow/pow.h>
++#include <primitives/block.h>
++#include <rpc/async_waiter.h>
++#include <rpc/blockchain.h>
++#include <rpc/server.h>
++#include <script/standard.h>
++#include <streams.h>
++#include <test/util/setup_common.h>
++#include <txmempool.h>
++#include <univalue.h>
++#include <util/strencodings.h>
++#include <validation.h>
++
++#include <boost/asio/co_spawn.hpp>
++#include <boost/asio/detached.hpp>
++#include <boost/asio/thread_pool.hpp>
++#include <boost/test/unit_test.hpp>
++
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <future>
++#include <memory>
++#include <thread>
++#include <vector>
++
++BOOST_FIXTURE_TEST_SUITE(rpc_coroutine_pool_tests, TestChain100Setup)
++
++BOOST_AUTO_TEST_CASE(coro_50_waiters_non_blocking_on_4_threads) {
++    GlobalConfig config;
++    StartRPC();
++    {
++        LOCK(::cs_main);
++        RPCNotifyBlockChange(m_node.chainman->ActiveChain().Tip());
++    }
++
++    boost::asio::thread_pool pool(4);
++    constexpr int kNumWaiters = 50;
++    std::atomic<int> waiters_completed{0};
++
++    BlockHash target_block_hash{};
++    {
++        uint256 dummy = uint256S("000000000000000000000000000000000000000000000000000000000000beef");
++        target_block_hash = BlockHash(dummy);
++    }
++
++    for (int i = 0; i < kNumWaiters; ++i) {
++        boost::asio::co_spawn(
++            pool,
++            [this, &config, &pool, &waiters_completed, i, target_block_hash]()
++                -> boost::asio::awaitable<void> {
++                JSONRPCRequest req;
++                req.context = &m_node;
++                req.params = UniValue(UniValue::VARR);
++                if (i % 3 == 0) {
++                    req.strMethod = "waitfornewblock";
++                    req.params.push_back(5000);
++                } else if (i % 3 == 1) {
++                    req.strMethod = "waitforblockheight";
++                    req.params.push_back(101);
++                    req.params.push_back(5000);
++                } else {
++                    req.strMethod = "waitforblock";
++                    req.params.push_back(target_block_hash.GetHex());
++                    req.params.push_back(5000);
++                }
++                UniValue res = co_await tableRPC.executeAsync(
++                    config, req, pool.get_executor());
++                if (res.find_value("height").getInt<int>() >= 100) {
++                    waiters_completed.fetch_add(1, std::memory_order_relaxed);
++                }
++            },
++            boost::asio::detached);
++    }
++
++    while (GetRPCBlockChangeWaiter().WaiterCount() <
++           static_cast<size_t>(kNumWaiters)) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(2));
++    }
++
++    // All 50 waiters are suspended on the 4-thread pool. Fast RPCs dispatched
++    // onto the same 4-thread pool must execute immediately without starvation.
++    constexpr int kFastCalls = 20;
++    std::atomic<int> fast_completed{0};
++    std::promise<void> all_fast_done;
++    auto all_fast_future = all_fast_done.get_future();
++
++    for (int i = 0; i < kFastCalls; ++i) {
++        boost::asio::co_spawn(
++            pool,
++            [this, &config, &pool, &fast_completed, &all_fast_done]()
++                -> boost::asio::awaitable<void> {
++                JSONRPCRequest req;
++                req.context = &m_node;
++                req.strMethod = "getblockcount";
++                req.params = UniValue(UniValue::VARR);
++                UniValue res = co_await tableRPC.executeAsync(
++                    config, req, pool.get_executor());
++                if (res.getInt<int>() == 100) {
++                    if (fast_completed.fetch_add(1,
++                                                 std::memory_order_acq_rel) +
++                            1 ==
++                        kFastCalls) {
++                        all_fast_done.set_value();
++                    }
++                }
++            },
++            boost::asio::detached);
++    }
++
++    const auto status =
++        all_fast_future.wait_for(std::chrono::milliseconds(500));
++    BOOST_REQUIRE(status == std::future_status::ready);
++    BOOST_CHECK_EQUAL(fast_completed.load(), kFastCalls);
++    BOOST_CHECK_EQUAL(waiters_completed.load(), 0);
++
++    // Wake all 50 suspended coroutines via RPCNotifyBlockChange.
++    CBlockIndex fake_tip;
++    fake_tip.nHeight = 101;
++    fake_tip.phashBlock = &target_block_hash;
++    RPCNotifyBlockChange(&fake_tip);
++
++    pool.join();
++    BOOST_CHECK_EQUAL(waiters_completed.load(), kNumWaiters);
++
++    {
++        LOCK(::cs_main);
++        RPCNotifyBlockChange(m_node.chainman->ActiveChain().Tip());
++    }
++    InterruptRPC();
++    StopRPC();
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/test/functional/rpc_coroutine_longpoll.py b/test/functional/rpc_coroutine_longpoll.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f3cf095c805ab9bd50804867e2d826de2c62497c
+--- /dev/null
++++ b/test/functional/rpc_coroutine_longpoll.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Long-poll requests yield a single HTTP worker and wake on tip/shutdown."""
++from concurrent.futures import ThreadPoolExecutor
++
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal, get_rpc_proxy
++
++
++class CoroutineLongpollTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 2
++        self.setup_clean_chain = True
++        self.supports_cli = False
++        self.extra_args = [["-rpcthreads=1", "-rpcworkqueue=64"], []]
++
++    def run_test(self):
++        node = self.nodes[0]
++        self.generate(node, 1)
++        tip = node.getbestblockhash()
++        height = node.getblockcount()
++        longpollid = node.getblocktemplate()["longpollid"]
++
++        def call(method, args):
++            proxy = get_rpc_proxy(node.url, 0, timeout=15)
++            return getattr(proxy, method)(*args)
++
++        quick = get_rpc_proxy(node.url, 0, timeout=3)
++        with ThreadPoolExecutor(max_workers=8) as workers:
++            requests = [("waitfornewblock", [10000])] * 4 + [
++                ("waitforblockheight", [height + 1, 10000]),
++                ("getblocktemplate", [{"longpollid": longpollid}]),
++                ("getblocktemplate", [{"longpollid": longpollid}]),
++            ]
++            futures = [workers.submit(call, method, args) for method, args in requests]
++            self.wait_until(lambda: sum(c["method"] in {"waitfornewblock", "waitforblockheight", "getblocktemplate"}
++                                       for c in quick.getrpcinfo()["active_commands"]) == len(requests), timeout=5)
++            assert all(not f.done() for f in futures)
++            assert_equal(quick.getblockcount(), height)
++            new_tip = self.generate(self.nodes[1], 1)[0]
++            for (method, _), future in zip(requests, futures):
++                result = future.result(timeout=5)
++                if method == "getblocktemplate":
++                    assert_equal(result["previousblockhash"], new_tip)
++                else:
++                    assert_equal(result, {"hash": new_tip, "height": height + 1})
++            # ABC treats negative nonzero wait timeouts as already expired.
++            assert_equal(quick.waitforblock(tip, -1)["hash"], new_tip)
++            shutdown_waiters = [workers.submit(call, "waitfornewblock", [0]) for _ in range(3)]
++            self.wait_until(lambda: sum(c["method"] == "waitfornewblock"
++                                       for c in quick.getrpcinfo()["active_commands"]) == 3, timeout=5)
++            self.stop_node(0)
++            for future in shutdown_waiters:
++                assert_equal(future.result(timeout=5), {"hash": new_tip, "height": height + 1})
++
++
++if __name__ == "__main__":
++    CoroutineLongpollTest().main()
+-- 
+2.50.1 (Apple Git-155)
+

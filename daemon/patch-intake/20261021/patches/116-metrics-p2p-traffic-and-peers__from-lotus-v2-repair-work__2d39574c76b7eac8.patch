@@ -1,0 +1,421 @@
+From 201ec81ad24cfc4c7c3c61fa6f4c741ef77c483e Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 01:59:22 -0700
+Subject: [PATCH] metrics: P2P traffic and peers
+
+Counts every P2P message, sent and received, by message type (the fixed
+protocol list plus "other"), in bytes and in messages. The counts are
+added where net.cpp already accounts bytes per message type, to the
+recording thread's own counter shard: no lock is taken for them.
+
+Connected peers are a gauge by direction, transport (TCP or P2P
+WebSocket) and network, counted when a CNode is created and removed when
+it is destroyed; connections established are counted by direction and
+transport, and P2P WebSocket peers by compression and TLS. A node
+remembers the series it was counted in, so its destruction removes
+exactly that, even if metrics started in between.
+
+Labels are bounded: no peer ids, addresses or user agents.
+
+(cherry picked from commit c0872c638b0b60981ff818b65ae037f4133d8d3c)
+
+N3-Source-Commit: c0872c638b0b60981ff818b65ae037f4133d8d3c
+N3-Source-Export: 0008
+---
+ src/net.cpp                               | 46 ++++++++++-
+ src/net.h                                 |  4 +
+ src/node/metrics.cpp                      | 94 ++++++++++++++++++++++-
+ src/node/metrics.h                        | 28 +++++++
+ src/test/metrics_tests.cpp                | 15 ++++
+ test/functional/interface_http_metrics.py | 24 ++++++
+ 6 files changed, 208 insertions(+), 3 deletions(-)
+
+diff --git a/src/net.cpp b/src/net.cpp
+index 7178018098c4118561d1ccfd1d905e7e8e4b39b6..f83d30bdb67ea69f527be3d09aa3670fadd2ba8d 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -26,6 +26,7 @@
+ #include <netaddress.h>
+ #include <netbase.h>
+ #include <node/eviction.h>
++#include <node/metrics.h>
+ #include <node/ui_interface.h>
+ #include <protocol.h>
+ #include <random.h>
+@@ -34,8 +35,8 @@
+ #include <util/sock.h>
+ #include <util/strencodings.h>
+ #include <util/thread.h>
+-#include <util/threadnames.h>
+ #include <util/threadinterrupt.h>
++#include <util/threadnames.h>
+ #include <util/trace.h>
+ #include <util/translation.h>
+ 
+@@ -779,6 +780,11 @@ bool CNode::ReceiveMsgBytes(const Config &config, Span<const uint8_t> msg_bytes,
+ 
+             assert(i != mapRecvBytesPerMsgType.end());
+             i->second += msg.m_raw_message_size;
++            if (auto *metrics{node::GetNodeMetrics()}) {
++                const size_t type{node::MetricMsgTypeIndex(i->first)};
++                metrics->p2p_received_bytes.Add(type, msg.m_raw_message_size);
++                metrics->p2p_received_messages.Add(type);
++            }
+ 
+             // push the message to the process queue,
+             vRecvMsg.push_back(std::move(msg));
+@@ -3602,6 +3608,28 @@ CNode::CNode(NodeId idIn, std::shared_ptr<Sock> sock, const CAddress &addrIn,
+     }
+     mapRecvBytesPerMsgType[NET_MESSAGE_TYPE_OTHER] = 0;
+ 
++    if (auto *metrics{node::GetNodeMetrics()}) {
++        static_assert(NET_MAX == 8, "update node::metric_labels::Networks()");
++        const bool inbound{IsInboundConn()};
++        const bool websocket{m_websocket_info != nullptr};
++        const size_t peer{metrics->PeerSeries(
++            inbound, websocket, size_t(ConnectedThroughNetwork()))};
++        metrics->peers.Add(1, peer);
++        const std::array<size_t, 2> conn{inbound ? 0U : 1U,
++                                         websocket ? 1U : 0U};
++        metrics->p2p_connections.Add(
++            metrics->p2p_connections.SeriesIndex(conn));
++        std::optional<size_t> ws;
++        if (websocket) {
++            const std::array<size_t, 2> idx{
++                std::min<size_t>(size_t(m_websocket_info->compression), 3),
++                m_websocket_info->tls ? 1U : 0U};
++            ws = metrics->websocket_peers.SeriesIndex(idx);
++            metrics->websocket_peers.Add(1, *ws);
++        }
++        m_metrics_series.emplace(peer, ws);
++    }
++
+     if (fLogIPs) {
+         LogDebug(BCLog::NET, "Added connection to %s peer=%d\n", m_addr_name,
+                  id);
+@@ -3610,6 +3638,17 @@ CNode::CNode(NodeId idIn, std::shared_ptr<Sock> sock, const CAddress &addrIn,
+     }
+ }
+ 
++CNode::~CNode() {
++    if (m_metrics_series) {
++        // Counted at construction, so the metrics exist (never freed).
++        auto &metrics{*Assert(node::GetNodeMetrics())};
++        metrics.peers.Add(-1, m_metrics_series->first);
++        if (m_metrics_series->second) {
++            metrics.websocket_peers.Add(-1, *m_metrics_series->second);
++        }
++    }
++}
++
+ void CNode::MarkReceivedMsgsForProcessing() {
+     AssertLockNotHeld(m_msg_process_queue_mutex);
+ 
+@@ -3672,6 +3711,11 @@ void CConnman::PushMessage(CNode *pnode, CSerializedNetMsg &&msg) {
+ 
+         // log total amount of bytes per message type
+         pnode->AccountForSentBytes(msg.m_type, nTotalSize);
++        if (auto *metrics{node::GetNodeMetrics()}) {
++            const size_t type{node::MetricMsgTypeIndex(msg.m_type)};
++            metrics->p2p_sent_bytes.Add(type, nTotalSize);
++            metrics->p2p_sent_messages.Add(type);
++        }
+         pnode->nSendSize += nTotalSize;
+ 
+         if (pnode->nSendSize > nSendBufferMaxSize) {
+diff --git a/src/net.h b/src/net.h
+index ecd3a3cdc30f66662017d336d3f4d4ac1c4cab73..1944bbb67b31601bfd94fed508ab50549cb66cac 100644
+--- a/src/net.h
++++ b/src/net.h
+@@ -482,6 +482,9 @@ public:
+      * then one end of a local socketpair bridged to the WebSocket.
+      */
+     const std::shared_ptr<WebSocketTransportInfo> m_websocket_info;
++    //! Series of the peer gauges this node was counted in (metrics on at
++    //! construction), so that its destruction removes exactly that.
++    std::optional<std::pair<size_t, std::optional<size_t>>> m_metrics_series;
+ 
+     /** Move all messages from the received queue to the processing queue. */
+     void MarkReceivedMsgsForProcessing()
+@@ -687,6 +690,7 @@ public:
+           uint64_t nLocalExtraEntropyIn, const CAddress &addrBindIn,
+           const std::string &addrNameIn, ConnectionType conn_type_in,
+           bool inbound_onion, CNodeOptions &&node_opts = {});
++    ~CNode();
+     CNode(const CNode &) = delete;
+     CNode &operator=(const CNode &) = delete;
+ 
+diff --git a/src/node/metrics.cpp b/src/node/metrics.cpp
+index 16e9bdea862dd92959d21cfe01a4d8dd2df49763..6e1cb806c36d65c100424862c405e100afabc3d8 100644
+--- a/src/node/metrics.cpp
++++ b/src/node/metrics.cpp
+@@ -4,7 +4,10 @@
+ 
+ #include <node/metrics.h>
+ 
++#include <protocol.h>
++
+ #include <algorithm>
++#include <array>
+ #include <memory>
+ 
+ namespace node {
+@@ -14,6 +17,34 @@ namespace detail {
+ }
+ 
+ namespace metric_labels {
++    const std::vector<std::string> &MsgTypes() {
++        static const std::vector<std::string> labels{[] {
++            std::vector<std::string> v{getAllNetMessageTypes()};
++            std::sort(v.begin(), v.end());
++            v.push_back("other");
++            return v;
++        }()};
++        return labels;
++    }
++    const std::vector<std::string> &Networks() {
++        static const std::vector<std::string> labels{
++            "unroutable", "ipv4",  "ipv6",     "onion",
++            "i2p",        "cjdns", "internal", "wss"};
++        return labels;
++    }
++    const std::vector<std::string> &WebSocketCompressions() {
++        static const std::vector<std::string> labels{
++            "none", "permessage-deflate", "zstd", "zstd-dict"};
++        return labels;
++    }
++    const std::vector<std::string> &Directions() {
++        static const std::vector<std::string> labels{"inbound", "outbound"};
++        return labels;
++    }
++    const std::vector<std::string> &Transports() {
++        static const std::vector<std::string> labels{"tcp", "websocket"};
++        return labels;
++    }
+     const std::vector<std::string> &HTTPEndpoints() {
+         static const std::vector<std::string> labels{
+             "rpc", "wallet", "rest", "chronik", "health", "metrics", "other"};
+@@ -29,6 +60,7 @@ namespace metric_labels {
+ namespace {
+     using metrics::Counter;
+     using metrics::EventHistogram;
++    using metrics::Gauge;
+     using metrics::LabelDim;
+     namespace L = metric_labels;
+ 
+@@ -37,14 +69,63 @@ namespace {
+         0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+         0.25,   0.5,     1,      2.5,   5,      10,    30,   60,    300};
+ 
++    /** Index of s in sorted[0, size-1), else size-1 ("other") */
++    size_t SortedIndex(const std::vector<std::string> &sorted,
++                       std::string_view s) noexcept {
++        const auto end{sorted.end() - 1};
++        const auto it{std::lower_bound(
++            sorted.begin(), end, s,
++            [](const std::string &a, std::string_view b) { return a < b; })};
++        if (it != end && *it == s) {
++            return size_t(it - sorted.begin());
++        }
++        return sorted.size() - 1;
++    }
++
+     template <typename T, typename... Args>
+     T &Add(metrics::Registry &reg, Args &&...args) {
+         return reg.Add(std::make_unique<T>(std::forward<Args>(args)...));
+     }
+ } // namespace
+ 
++size_t MetricMsgTypeIndex(std::string_view msg_type) noexcept {
++    return SortedIndex(L::MsgTypes(), msg_type);
++}
++
+ NodeMetrics::NodeMetrics()
+-    : http_requests{Add<Counter>(
++    : p2p_received_bytes{Add<Counter>(
++          registry, "lotus_p2p_received_bytes_total",
++          "P2P bytes received (header and payload), by message type.",
++          std::vector<LabelDim>{{"type", L::MsgTypes()}})},
++      p2p_sent_bytes{Add<Counter>(
++          registry, "lotus_p2p_sent_bytes_total",
++          "P2P bytes queued for sending (header and payload), by message "
++          "type.",
++          std::vector<LabelDim>{{"type", L::MsgTypes()}})},
++      p2p_received_messages{
++          Add<Counter>(registry, "lotus_p2p_received_messages_total",
++                       "P2P messages received, by message type.",
++                       std::vector<LabelDim>{{"type", L::MsgTypes()}})},
++      p2p_sent_messages{
++          Add<Counter>(registry, "lotus_p2p_sent_messages_total",
++                       "P2P messages queued for sending, by message type.",
++                       std::vector<LabelDim>{{"type", L::MsgTypes()}})},
++      peers{Add<Gauge>(registry, "lotus_peers",
++                       "Connected peers, by direction, transport and network.",
++                       std::vector<LabelDim>{{"direction", L::Directions()},
++                                             {"transport", L::Transports()},
++                                             {"network", L::Networks()}})},
++      p2p_connections{Add<Counter>(
++          registry, "lotus_p2p_connections_total",
++          "P2P connections established, by direction and transport.",
++          std::vector<LabelDim>{{"direction", L::Directions()},
++                                {"transport", L::Transports()}})},
++      websocket_peers{Add<Gauge>(
++          registry, "lotus_p2p_websocket_peers",
++          "Connected P2P WebSocket peers, by compression and TLS.",
++          std::vector<LabelDim>{{"compression", L::WebSocketCompressions()},
++                                {"tls", {"false", "true"}}})},
++      http_requests{Add<Counter>(
+           registry, "lotus_http_requests_total",
+           "HTTP requests answered (not WebSocket sessions), by endpoint and "
+           "status class.",
+@@ -59,7 +140,16 @@ NodeMetrics::NodeMetrics()
+       http_tls_handshakes{
+           Add<Counter>(registry, "lotus_http_tls_handshakes_total",
+                        "TLS handshakes on the HTTP listeners, by result.",
+-                       std::vector<LabelDim>{{"result", {"ok", "failed"}}})} {}
++                       std::vector<LabelDim>{{"result", {"ok", "failed"}}})} {
++}
++
++size_t NodeMetrics::PeerSeries(bool inbound, bool websocket,
++                               size_t network) const noexcept {
++    const std::array<size_t, 3> idx{
++        inbound ? 0U : 1U, websocket ? 1U : 0U,
++        std::min(network, L::Networks().size() - 1)};
++    return peers.SeriesIndex(idx);
++}
+ 
+ NodeMetrics &StartNodeMetrics() {
+     NodeMetrics *m{GetNodeMetrics()};
+diff --git a/src/node/metrics.h b/src/node/metrics.h
+index d2e9d9fb61b2db5a1bc72d23cab85912906fbbf6..e1fa89f78253ed10a65d1ab13de6a142e7e50fe9 100644
+--- a/src/node/metrics.h
++++ b/src/node/metrics.h
+@@ -23,6 +23,16 @@ namespace node {
+ 
+ /** Label values of the node's metrics (index = enum value where noted) */
+ namespace metric_labels {
++    //! P2P message types, sorted, then "other"
++    const std::vector<std::string> &MsgTypes();
++    //! Index = Network (netaddress.h)
++    const std::vector<std::string> &Networks();
++    //! Index = P2PWebSocketCompression (net_websocket.h)
++    const std::vector<std::string> &WebSocketCompressions();
++    //! 0 = inbound, 1 = outbound
++    const std::vector<std::string> &Directions();
++    //! 0 = tcp, 1 = websocket
++    const std::vector<std::string> &Transports();
+     //! HTTP endpoint classes (see HTTPEndpoint)
+     const std::vector<std::string> &HTTPEndpoints();
+     //! 0 = 1xx ... 4 = 5xx, 5 = other
+@@ -44,10 +54,25 @@ struct NodeMetrics {
+     NodeMetrics();
+     metrics::Registry registry;
+ 
++    // P2P traffic, by message type (index: MetricMsgTypeIndex)
++    metrics::Counter &p2p_received_bytes;
++    metrics::Counter &p2p_sent_bytes;
++    metrics::Counter &p2p_received_messages;
++    metrics::Counter &p2p_sent_messages;
++
++    // Peers (CNode objects), by direction x transport x network
++    metrics::Gauge &peers;
++    metrics::Counter &p2p_connections;
++    //! WebSocket peers, by compression x tls (0 = plain, 1 = TLS)
++    metrics::Gauge &websocket_peers;
++
+     // HTTP and RPC
+     metrics::Counter &http_requests;
+     metrics::EventHistogram &http_request_seconds;
+     metrics::Counter &http_tls_handshakes;
++
++    size_t PeerSeries(bool inbound, bool websocket,
++                      size_t network) const noexcept;
+ };
+ 
+ namespace detail {
+@@ -69,6 +94,9 @@ NodeMetrics &StartNodeMetrics();
+ /** Stop the drain thread (recording still works, into full rings) */
+ void StopNodeMetrics();
+ 
++/** Label index of a P2P message type ("other" for unknown types) */
++size_t MetricMsgTypeIndex(std::string_view msg_type) noexcept;
++
+ } // namespace node
+ 
+ #endif // BITCOIN_NODE_METRICS_H
+diff --git a/src/test/metrics_tests.cpp b/src/test/metrics_tests.cpp
+index 94e8ffe77e95b53ed722d74abe4dff9b8783c9cc..a89ff79b7c8af8ed1e0ca972d71762d4ac99b8ec 100644
+--- a/src/test/metrics_tests.cpp
++++ b/src/test/metrics_tests.cpp
+@@ -3,6 +3,8 @@
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
+ #include <metrics/metrics.h>
++#include <node/metrics.h>
++#include <protocol.h>
+ 
+ #include <test/util/setup_common.h>
+ 
+@@ -10,6 +12,7 @@
+ 
+ #include <cmath>
+ #include <memory>
++#include <set>
+ #include <string>
+ #include <thread>
+ #include <vector>
+@@ -221,4 +224,16 @@ BOOST_AUTO_TEST_CASE(rings_prepared_and_reused) {
+     BOOST_CHECK(reg.Render().find("\nx_count 10\n") != std::string::npos);
+ }
+ 
++BOOST_AUTO_TEST_CASE(msg_type_index) {
++    const size_t other{node::MetricMsgTypeIndex("no-such-type")};
++    std::set<size_t> seen;
++    for (const std::string &type : getAllNetMessageTypes()) {
++        const size_t i{node::MetricMsgTypeIndex(type)};
++        BOOST_CHECK(i < other);
++        seen.insert(i);
++    }
++    BOOST_CHECK_EQUAL(seen.size(), getAllNetMessageTypes().size());
++    BOOST_CHECK_EQUAL(node::MetricMsgTypeIndex("*other*"), other);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/test/functional/interface_http_metrics.py b/test/functional/interface_http_metrics.py
+index 797362907346692c9db445dd868d4105577900ca..0788f434b7624e6ddbf0c3c3bc0b3575507c96f0 100755
+--- a/test/functional/interface_http_metrics.py
++++ b/test/functional/interface_http_metrics.py
+@@ -126,6 +126,30 @@ class HTTPMetricsTest(BitcoinTestFramework):
+         samples = self.scrape()
+         assert_equal(samples[("lotus_metrics_dropped_samples_total", ())], 0)
+ 
++        self.log.info("Peers: node1 over WebSocket, node1 over TCP")
++        self.wait_until(
++            lambda: self.total(
++                self.scrape(), "lotus_peers", direction="inbound",
++                transport="websocket") == 1
++        )
++        self.connect_nodes(0, 1)
++        self.wait_until(
++            lambda: self.total(
++                self.scrape(), "lotus_peers", direction="outbound",
++                transport="tcp") == 1
++        )
++        samples = self.scrape()
++        assert_equal(self.total(samples, "lotus_p2p_websocket_peers"), 1)
++        assert_equal(
++            self.total(samples, "lotus_p2p_websocket_peers", tls="false"), 1)
++        assert_equal(
++            self.total(samples, "lotus_p2p_connections_total",
++                       direction="inbound", transport="websocket"), 1)
++        for name in ("lotus_p2p_received_messages_total",
++                     "lotus_p2p_sent_messages_total"):
++            assert self.total(samples, name, type="version") >= 2, name
++        assert self.total(samples, "lotus_p2p_sent_bytes_total") > 0
++        assert ("lotus_p2p_received_bytes_total", (("type", "other"),)) in samples
+ 
+ 
+         self.log.info("HTTP and RPC requests")
+-- 
+2.50.1 (Apple Git-155)
+

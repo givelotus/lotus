@@ -1,0 +1,669 @@
+From 277115b34821a7b428a410b685574a5ffa5babdd Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 16:02:09 -0700
+Subject: [PATCH] http: delegate /chronik/* and /chronik/ws on main RPC port to
+ Chronik server
+
+With -chronik, the RPC port now also serves Chronik under /chronik
+(-chronikpubliconrpcport, default 1), so a single port can carry JSON-RPC,
+REST and Chronik over plain HTTP or TLS:
+
+- HTTP requests to /chronik/<path> are forwarded asynchronously, on the
+  I/O threads, to Chronik's own listener (the first -chronikbind address,
+  via loopback for wildcard binds, default port BaseParams().ChronikPort()).
+  Hop-by-hop headers are dropped, X-Forwarded-For/-Proto are added, a
+  keep-alive upstream connection is reused per client connection, and the
+  reply gets the usual zstd Content-Encoding when the client accepts it.
+- WebSocket upgrades to /chronik/ws are accepted locally and bridged
+  message-for-message (text/binary preserved) to Chronik's /ws.
+
+RegisterPublicHTTPPrefix() exempts such paths from the -rpcallowip
+address check; they perform no RPC authentication. JSON-RPC and
+/wallet/ keep the ACL and Basic auth. Builds without Chronik, -chronik=0
+or -chronikpubliconrpcport=0 return 404 for /chronik.
+
+The new chronik_rpc_port_proxy.py test checks byte-identical replies
+against the Chronik port, error passthrough, https, zstd, ws:// and wss://
+subscriptions, and the opt-out.
+
+Integration adaptation relative to HTTP/WS series-20261019/0002: attach public-prefix registration to the retained asynchronous handler registration API and retain HTTPCoroutinePool; proxy transport and ACL semantics are unchanged.
+
+diff --git a/src/httpserver.cpp b/src/httpserver.cpp
+index c6c13cc766..b15f506865 100644
+--- a/src/httpserver.cpp
++++ b/src/httpserver.cpp
+@@ -30,6 +30,7 @@
+ #include <boost/asio/as_tuple.hpp>
+ #include <boost/asio/co_spawn.hpp>
+ #include <boost/asio/detached.hpp>
++#include <boost/asio/experimental/awaitable_operators.hpp>
+ #include <boost/asio/io_context.hpp>
+ #include <boost/asio/ip/tcp.hpp>
+ #include <boost/asio/ip/v6_only.hpp>
+@@ -41,6 +42,8 @@
+ #include <boost/beast/core.hpp>
+ #include <boost/beast/http.hpp>
+ #include <boost/beast/ssl.hpp>
++#include <boost/beast/websocket.hpp>
++#include <boost/beast/websocket/ssl.hpp>
+ 
+ #include <openssl/bn.h>
+ #include <openssl/evp.h>
+@@ -83,7 +86,9 @@ namespace beast = boost::beast;
+ namespace http = beast::http;
+ namespace asio = boost::asio;
+ namespace ssl = asio::ssl;
++namespace websocket = beast::websocket;
+ using tcp = asio::ip::tcp;
++using namespace boost::asio::experimental::awaitable_operators;
+ 
+ /** Maximum size of http request (request line + headers) */
+ static const size_t MAX_HEADERS_SIZE = 8192;
+@@ -310,6 +315,19 @@ static std::vector<CSubNet> rpc_allow_subnets;
+ static std::unique_ptr<HTTPCoroutinePool> g_work_queue{nullptr};
+ //! Handlers for (sub)paths
+ static std::vector<HTTPPathHandler> pathHandlers;
++//! URI prefixes exempt from the -rpcallowip ACL (they do no RPC auth either)
++static std::vector<std::string> g_public_prefixes;
++
++/** Where /chronik requests on the RPC port are forwarded to */
++struct ChronikProxyTarget {
++    bool enabled{false};
++    std::string host;
++    uint16_t port{0};
++};
++static ChronikProxyTarget g_chronik_proxy;
++static const std::string CHRONIK_PREFIX{"/chronik"};
++//! Maximum size of a proxied Chronik response
++static const uint64_t MAX_CHRONIK_PROXY_RESPONSE_SIZE = 256 * 1024 * 1024;
+ 
+ /**
+  * Tracks live connections (so they can be closed on shutdown) and requests
+@@ -370,6 +388,22 @@ public:
+ };
+ static HTTPConnectionTracker g_connections;
+ 
++/** Whether uri is prefix itself or continues it with '/' or '?' */
++static bool URIHasPathPrefix(std::string_view uri, std::string_view prefix) {
++    if (uri.substr(0, prefix.size()) != prefix) {
++        return false;
++    }
++    return uri.size() == prefix.size() || uri[prefix.size()] == '/' ||
++           uri[prefix.size()] == '?';
++}
++
++static bool IsPublicPath(std::string_view uri) {
++    return std::any_of(g_public_prefixes.begin(), g_public_prefixes.end(),
++                       [&](const std::string &prefix) {
++                           return URIHasPathPrefix(uri, prefix);
++                       });
++}
++
+ /** Check if a network address is allowed to access the HTTP server */
+ static bool ClientAllowed(const CNetAddr &netaddr) {
+     if (!netaddr.IsValid()) {
+@@ -462,6 +496,32 @@ static bool HeaderListsToken(std::string_view value, std::string_view token) {
+     return false;
+ }
+ 
++/**
++ * Replace the response body by its zstd compression if the request accepts
++ * it, the body is large enough and no other encoding is set.
++ */
++static void MaybeCompressZstd(const BeastRequest &req, BeastResponse &res) {
++    if (res.body().size() < HTTP_ZSTD_MIN_REPLY_SIZE ||
++        res.find(http::field::content_encoding) != res.end()) {
++        return;
++    }
++    auto ae = req.find(http::field::accept_encoding);
++    if (ae == req.end() || !HeaderListsToken(ae->value(), "zstd")) {
++        return;
++    }
++    const std::string &in = res.body();
++    std::string out(ZSTD_compressBound(in.size()), '\0');
++    const size_t n{ZSTD_compress(out.data(), out.size(), in.data(), in.size(),
++                                 /*compressionLevel=*/1)};
++    if (ZSTD_isError(n)) {
++        return;
++    }
++    out.resize(n);
++    res.body() = std::move(out);
++    res.set(http::field::content_encoding, "zstd");
++    res.set(http::field::vary, "Accept-Encoding");
++}
++
+ /** Fill in fields of a response that libevent used to add by default */
+ static void FinalizeResponse(BeastResponse &res, unsigned version) {
+     res.version(version);
+@@ -531,7 +591,7 @@ DispatchRequest(BeastRequest &&beast_req, const HTTPConnectionInfo &conn) {
+     auto hreq{std::make_unique<HTTPRequest>(std::move(impl))};
+ 
+     // Early address-based allow check
+-    if (!ClientAllowed(hreq->GetPeer())) {
++    if (!IsPublicPath(hreq->GetURI()) && !ClientAllowed(hreq->GetPeer())) {
+         LogDebug(BCLog::HTTP,
+                  "HTTP request from %s rejected: Client network is not allowed "
+                  "RPC access\n",
+@@ -606,11 +666,234 @@ WriteResponse(Stream &stream, BeastResponse &res) {
+     co_return ec;
+ }
+ 
++/** Hop-by-hop headers (RFC 9110 7.6.1) and framing headers not to forward */
++static bool IsHopByHopField(http::field f) {
++    switch (f) {
++        case http::field::connection:
++        case http::field::keep_alive:
++        case http::field::proxy_authenticate:
++        case http::field::proxy_authorization:
++        case http::field::proxy_connection:
++        case http::field::te:
++        case http::field::trailer:
++        case http::field::transfer_encoding:
++        case http::field::upgrade:
++        case http::field::content_length:
++        case http::field::host:
++            return true;
++        default:
++            return false;
++    }
++}
++
++/** Map "/chronik/x?y" to "/x?y" */
++static std::string ChronikUpstreamTarget(std::string_view target) {
++    std::string rest{target.substr(CHRONIK_PREFIX.size())};
++    if (rest.empty() || rest[0] != '/') {
++        rest.insert(rest.begin(), '/');
++    }
++    return rest;
++}
++
++static asio::awaitable<boost::system::error_code>
++ConnectChronik(beast::tcp_stream &upstream) {
++    tcp::resolver resolver{co_await asio::this_coro::executor};
++    auto [rec, results] = co_await resolver.async_resolve(
++        g_chronik_proxy.host, std::to_string(g_chronik_proxy.port),
++        asio::as_tuple(asio::use_awaitable));
++    if (rec) {
++        co_return rec;
++    }
++    upstream.expires_after(std::chrono::seconds{10});
++    auto [cec, endpoint] = co_await upstream.async_connect(
++        results, asio::as_tuple(asio::use_awaitable));
++    if (!cec) {
++        boost::system::error_code ignored;
++        upstream.socket().set_option(tcp::no_delay(true), ignored);
++    }
++    co_return cec;
++}
++
++/**
++ * Forward a /chronik request to Chronik's own HTTP listener, reusing the
++ * per-client upstream connection when possible.
++ */
++static asio::awaitable<BeastResponse>
++ProxyChronikHTTP(const BeastRequest &req, const HTTPConnectionInfo &conn,
++                 std::optional<beast::tcp_stream> &upstream) {
++    const unsigned version{req.version()};
++    BeastRequest out{req.method(), ChronikUpstreamTarget(req.target()), 11};
++    for (const auto &f : req) {
++        if (!IsHopByHopField(f.name()) &&
++            f.name() != http::field::accept_encoding &&
++            !beast::iequals(f.name_string(), "X-Forwarded-For") &&
++            !beast::iequals(f.name_string(), "X-Forwarded-Proto")) {
++            out.insert(f.name_string(), f.value());
++        }
++    }
++    out.set(http::field::host, strprintf("%s:%u", g_chronik_proxy.host,
++                                         g_chronik_proxy.port));
++    std::string forwarded_for{conn.peer.ToStringAddr()};
++    if (auto xff = req.find("X-Forwarded-For"); xff != req.end()) {
++        forwarded_for = std::string{xff->value()} + ", " + forwarded_for;
++    }
++    out.set("X-Forwarded-For", forwarded_for);
++    out.set("X-Forwarded-Proto", conn.is_tls ? "https" : "http");
++    out.body() = req.body();
++    out.keep_alive(true);
++    out.prepare_payload();
++
++    for (int attempt = 0; attempt < 2; ++attempt) {
++        const bool reused{upstream.has_value()};
++        if (!upstream) {
++            upstream.emplace(co_await asio::this_coro::executor);
++            if (auto ec = co_await ConnectChronik(*upstream)) {
++                upstream.reset();
++                LogDebug(BCLog::HTTP, "Chronik proxy connect failed: %s\n",
++                         ec.message());
++                co_return MakeSimpleResponse(502, version,
++                                             "Chronik is not reachable");
++            }
++        }
++        upstream->expires_after(g_server_timeout);
++        auto [wec, wn] = co_await http::async_write(
++            *upstream, out, asio::as_tuple(asio::use_awaitable));
++        http::response_parser<http::string_body> parser;
++        parser.body_limit(MAX_CHRONIK_PROXY_RESPONSE_SIZE);
++        beast::flat_buffer upstream_buffer;
++        boost::system::error_code rec{wec};
++        if (!rec) {
++            auto [ec, n] = co_await http::async_read(
++                *upstream, upstream_buffer, parser,
++                asio::as_tuple(asio::use_awaitable));
++            rec = ec;
++        }
++        if (rec) {
++            upstream.reset();
++            if (reused) {
++                // The idle upstream connection was closed: retry once.
++                continue;
++            }
++            LogDebug(BCLog::HTTP, "Chronik proxy request failed: %s\n",
++                     rec.message());
++            co_return MakeSimpleResponse(502, version, "Chronik proxy error");
++        }
++        auto upstream_res{parser.release()};
++        if (!upstream_res.keep_alive()) {
++            upstream.reset();
++        }
++        BeastResponse res{upstream_res.result(), version};
++        for (const auto &f : upstream_res) {
++            if (!IsHopByHopField(f.name())) {
++                res.insert(f.name_string(), f.value());
++            }
++        }
++        res.body() = std::move(upstream_res.body());
++        MaybeCompressZstd(req, res);
++        FinalizeResponse(res, version);
++        co_return res;
++    }
++    co_return MakeSimpleResponse(502, version, "Chronik proxy error");
++}
++
++/** Copy WebSocket messages from `from` to `to` until either side fails */
++template <typename From, typename To>
++static asio::awaitable<void> PumpWebSocket(From &from, To &to) {
++    beast::flat_buffer buffer;
++    while (true) {
++        auto [rec, rn] = co_await from.async_read(
++            buffer, asio::as_tuple(asio::use_awaitable));
++        if (rec) {
++            co_return;
++        }
++        to.binary(from.got_binary());
++        auto [wec, wn] = co_await to.async_write(
++            buffer.data(), asio::as_tuple(asio::use_awaitable));
++        if (wec) {
++            co_return;
++        }
++        buffer.consume(buffer.size());
++    }
++}
++
++/** Bridge a /chronik/ws upgrade to Chronik's /ws endpoint */
++template <typename Stream>
++static asio::awaitable<void> ProxyChronikWebSocket(Stream &stream,
++                                                   const BeastRequest &req,
++                                                   const HTTPConnectionInfo &conn) {
++    beast::tcp_stream upstream_tcp{co_await asio::this_coro::executor};
++    if (auto ec = co_await ConnectChronik(upstream_tcp)) {
++        LogDebug(BCLog::HTTP, "Chronik WebSocket proxy connect failed: %s\n",
++                 ec.message());
++        BeastResponse res{MakeSimpleResponse(502, req.version(),
++                                             "Chronik is not reachable")};
++        res.keep_alive(false);
++        co_await WriteResponse(stream, res);
++        co_return;
++    }
++    websocket::stream<beast::tcp_stream> upstream{std::move(upstream_tcp)};
++    upstream.next_layer().expires_never();
++    upstream.set_option(
++        websocket::stream_base::timeout::suggested(beast::role_type::client));
++    const std::string forwarded_for{conn.peer.ToStringAddr()};
++    upstream.set_option(websocket::stream_base::decorator(
++        [forwarded_for](websocket::request_type &r) {
++            r.set("X-Forwarded-For", forwarded_for);
++        }));
++    const std::string target{
++        ChronikUpstreamTarget(req.target()).substr(std::string_view{"/ws"}.size())};
++    auto [hec] = co_await upstream.async_handshake(
++        strprintf("%s:%u", g_chronik_proxy.host, g_chronik_proxy.port),
++        "/ws" + target, asio::as_tuple(asio::use_awaitable));
++    if (hec) {
++        LogDebug(BCLog::HTTP, "Chronik WebSocket handshake failed: %s\n",
++                 hec.message());
++        BeastResponse res{MakeSimpleResponse(502, req.version(),
++                                             "Chronik WebSocket error")};
++        res.keep_alive(false);
++        co_await WriteResponse(stream, res);
++        co_return;
++    }
++
++    beast::get_lowest_layer(stream).expires_never();
++    websocket::stream<Stream &> client{stream};
++    client.set_option(
++        websocket::stream_base::timeout::suggested(beast::role_type::server));
++    auto [aec] =
++        co_await client.async_accept(req, asio::as_tuple(asio::use_awaitable));
++    if (aec) {
++        co_return;
++    }
++    co_await (PumpWebSocket(client, upstream) ||
++              PumpWebSocket(upstream, client));
++    boost::system::error_code ignored;
++    beast::get_lowest_layer(upstream).socket().close(ignored);
++}
++
++/**
++ * Handle a WebSocket upgrade request if a WebSocket endpoint matches its
++ * target. Returns true if the connection was taken over.
++ */
++template <typename Stream>
++static asio::awaitable<bool>
++TryHandleWebSocketUpgrade(Stream &stream, const BeastRequest &req,
++                          const HTTPConnectionInfo &conn) {
++    const std::string_view target{req.target()};
++    if (g_chronik_proxy.enabled &&
++        URIHasPathPrefix(target, CHRONIK_PREFIX + "/ws")) {
++        co_await ProxyChronikWebSocket(stream, req, conn);
++        co_return true;
++    }
++    co_return false;
++}
++
+ /** Serve HTTP/1.1 keep-alive requests on an established (TLS or plain) stream */
+ template <typename Stream>
+ static asio::awaitable<void> ServeHTTP(Stream &stream,
+                                        beast::flat_buffer &buffer,
+                                        const HTTPConnectionInfo &conn) {
++    //! Keep-alive connection to Chronik reused by this client's requests
++    std::optional<beast::tcp_stream> chronik_upstream;
+     while (true) {
+         http::request_parser<http::string_body> parser;
+         parser.header_limit(MAX_HEADERS_SIZE);
+@@ -669,9 +952,21 @@ static asio::awaitable<void> ServeHTTP(Stream &stream,
+         const unsigned version{req.version()};
+         const bool is_head{req.method() == http::verb::head};
+ 
++        if (websocket::is_upgrade(req) && !g_reject_requests.load() &&
++            co_await TryHandleWebSocketUpgrade(stream, req, conn)) {
++            co_return;
++        }
++
+         // Handlers may take arbitrarily long (e.g. long polling).
+         beast::get_lowest_layer(stream).expires_never();
+-        BeastResponse res{co_await DispatchRequest(std::move(req), conn)};
++        BeastResponse res;
++        if (g_chronik_proxy.enabled && !g_reject_requests.load() &&
++            URIHasPathPrefix(req.target(), CHRONIK_PREFIX)) {
++            g_connections.AddRequest();
++            res = co_await ProxyChronikHTTP(req, conn, chronik_upstream);
++        } else {
++            res = co_await DispatchRequest(std::move(req), conn);
++        }
+ 
+         bool close{!keep_alive || g_reject_requests.load()};
+         if (auto c{res.find(http::field::connection)};
+@@ -1079,6 +1374,32 @@ bool InitHTTPServer(Config &config) {
+         return false;
+     }
+ 
++    g_public_prefixes.clear();
++    g_chronik_proxy = {};
++    if (gArgs.GetBoolArg("-chronik", false) &&
++        gArgs.GetBoolArg("-chronikpubliconrpcport",
++                         DEFAULT_CHRONIK_PUBLIC_ON_RPC_PORT)) {
++        // Forward to the first Chronik bind address, via loopback if it is a
++        // wildcard address.
++        uint16_t port{BaseParams().ChronikPort()};
++        std::string host{"127.0.0.1"};
++        const auto binds{gArgs.GetArgs("-chronikbind")};
++        if (!binds.empty()) {
++            std::string bind_host;
++            SplitHostPort(binds.front(), port, bind_host);
++            const std::optional<CNetAddr> addr{LookupHost(bind_host, false)};
++            if (addr && addr->IsBindAny()) {
++                host = addr->IsIPv6() ? "::1" : "127.0.0.1";
++            } else if (!bind_host.empty()) {
++                host = bind_host;
++            }
++        }
++        g_chronik_proxy = {.enabled = true, .host = host, .port = port};
++        RegisterPublicHTTPPrefix(CHRONIK_PREFIX);
++        LogPrintf("Serving Chronik on the RPC port at %s (proxied to %s:%u)\n",
++                  CHRONIK_PREFIX, host, port);
++    }
++
+     g_config = &config;
+     g_server_timeout = std::chrono::seconds{std::max<int64_t>(
+         gArgs.GetIntArg("-rpcservertimeout", DEFAULT_HTTP_SERVER_TIMEOUT), 1)};
+@@ -1339,29 +1660,8 @@ void HTTPRequest::WriteReply(int nStatus, const std::string &strReply) {
+     }
+     BeastResponse &res = m_impl->beast_res;
+     res.result(static_cast<unsigned>(nStatus));
+-
+-    bool compressed{false};
+-    if (strReply.size() >= HTTP_ZSTD_MIN_REPLY_SIZE &&
+-        res.find(http::field::content_encoding) == res.end()) {
+-        auto ae = m_impl->beast_req.find(http::field::accept_encoding);
+-        if (ae != m_impl->beast_req.end() &&
+-            HeaderListsToken(ae->value(), "zstd")) {
+-            std::string out(ZSTD_compressBound(strReply.size()), '\0');
+-            const size_t n{ZSTD_compress(out.data(), out.size(),
+-                                         strReply.data(), strReply.size(),
+-                                         /*compressionLevel=*/1)};
+-            if (!ZSTD_isError(n)) {
+-                out.resize(n);
+-                res.body() = std::move(out);
+-                res.set(http::field::content_encoding, "zstd");
+-                res.set(http::field::vary, "Accept-Encoding");
+-                compressed = true;
+-            }
+-        }
+-    }
+-    if (!compressed) {
+-        res.body() = strReply;
+-    }
++    res.body() = strReply;
++    MaybeCompressZstd(m_impl->beast_req, res);
+     FinalizeResponse(res, m_impl->beast_req.version());
+ 
+     if (m_impl->send_reply_fn) {
+@@ -1544,6 +1844,11 @@ void RegisterHTTPAsyncHandler(const std::string &prefix, bool exactMatch,
+     pathHandlers.push_back(HTTPPathHandler(prefix, exactMatch, handler));
+ }
+ 
++void RegisterPublicHTTPPrefix(const std::string &prefix) {
++    LogDebug(BCLog::HTTP, "Exempting %s from the RPC IP allow list\n", prefix);
++    g_public_prefixes.push_back(prefix);
++}
++
+ void UnregisterHTTPHandler(const std::string &prefix, bool exactMatch) {
+     std::vector<HTTPPathHandler>::iterator i = pathHandlers.begin();
+     std::vector<HTTPPathHandler>::iterator iend = pathHandlers.end();
+diff --git a/src/httpserver.h b/src/httpserver.h
+index 557b46611b..0d12da36c7 100644
+--- a/src/httpserver.h
++++ b/src/httpserver.h
+@@ -25,6 +25,8 @@ static const char *const HTTP_TLS_CERT_FILENAME = "node_tls_cert.pem";
+ static const char *const HTTP_TLS_KEY_FILENAME = "node_tls_key.pem";
+ //! Replies at least this large are zstd-compressed if the client accepts it.
+ static const size_t HTTP_ZSTD_MIN_REPLY_SIZE = 512;
++//! Serve /chronik/* (incl. /chronik/ws) on the RPC port when Chronik is on.
++static const bool DEFAULT_CHRONIK_PUBLIC_ON_RPC_PORT = true;
+ 
+ /**
+  * Opaque token kept for source compatibility with code that used to queue
+@@ -85,6 +87,13 @@ void RegisterHTTPHandler(const std::string &prefix, bool exactMatch,
+ void RegisterHTTPAsyncHandler(const std::string &prefix, bool exactMatch,
+                               const HTTPAsyncRequestHandler &handler);
+ 
++/**
++ * Exempt requests whose URI is `prefix`, or continues it with '/' or '?', from
++ * the -rpcallowip address check. Handlers for such paths must not rely on the
++ * ACL. Call before StartHTTPServer.
++ */
++void RegisterPublicHTTPPrefix(const std::string &prefix);
++
+ /** Unregister handler for prefix */
+ void UnregisterHTTPHandler(const std::string &prefix, bool exactMatch);
+ 
+diff --git a/src/init.cpp b/src/init.cpp
+index afadf91587..88d857f772 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -786,6 +786,14 @@ void SetupServerArgs(NodeContext &node) {
+         ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION |
+             ArgsManager::NETWORK_ONLY,
+         OptionsCategory::CHRONIK);
++    argsman.AddArg(
++        "-chronikpubliconrpcport",
++        strprintf("Also serve Chronik on the RPC port under /chronik (HTTP "
++                  "and /chronik/ws WebSocket, with TLS when enabled), "
++                  "forwarded to the first -chronikbind address. These paths "
++                  "are exempt from -rpcallowip (default: %d)",
++                  DEFAULT_CHRONIK_PUBLIC_ON_RPC_PORT),
++        ArgsManager::ALLOW_ANY, OptionsCategory::CHRONIK);
+     argsman.AddArg("-chroniktokenindex",
+                    "Enable token indexing in Chronik (default: 1)",
+                    ArgsManager::ALLOW_ANY, OptionsCategory::CHRONIK);
+diff --git a/test/functional/chronik_rpc_port_proxy.py b/test/functional/chronik_rpc_port_proxy.py
+new file mode 100644
+index 0000000000..2df6a9ea13
+--- /dev/null
++++ b/test/functional/chronik_rpc_port_proxy.py
+@@ -0,0 +1,136 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Bitcoin developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Test serving Chronik on the RPC port under /chronik (HTTP, TLS, zstd, ws)."""
++
++import http.client
++import ssl
++
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import (
++    assert_equal,
++    chronik_sub_to_blocks,
++    chronik_port,
++    rpc_port,
++)
++
++
++def raw_get(port, path, *, tls=False, headers=None):
++    if tls:
++        ctx = ssl.create_default_context()
++        ctx.check_hostname = False
++        ctx.verify_mode = ssl.CERT_NONE
++        conn = http.client.HTTPSConnection("127.0.0.1", port, context=ctx, timeout=30)
++    else:
++        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
++    conn.request("GET", path, headers=headers or {})
++    resp = conn.getresponse()
++    body = resp.read()
++    conn.close()
++    return resp, body
++
++
++class ChronikRpcPortProxyTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.setup_clean_chain = True
++        self.num_nodes = 1
++        self.extra_args = [["-chronik"]]
++
++    def skip_test_if_missing_module(self):
++        self.skip_if_no_chronik()
++
++    def run_test(self):
++        from test_framework.chronik.client import ChronikClient, pb
++
++        node = self.nodes[0]
++        self.generate(node, 120)
++        direct = ChronikClient("127.0.0.1", chronik_port(node.index))
++        proxied = ChronikClient("127.0.0.1/chronik", rpc_port(node.index))
++
++        self.log.info("Chronik requests on the RPC port match the Chronik port")
++        assert_equal(proxied.blockchain_info().ok(), direct.blockchain_info().ok())
++        assert_equal(
++            proxied.blocks(0, 100).ok().blocks, direct.blocks(0, 100).ok().blocks
++        )
++        assert_equal(proxied.block(5).ok(), direct.block(5).ok())
++
++        self.log.info("Chronik errors pass through with their status")
++        direct_resp, direct_body = raw_get(
++            chronik_port(node.index), "/block/doesnotexist"
++        )
++        resp, body = raw_get(rpc_port(node.index), "/chronik/block/doesnotexist")
++        assert_equal(resp.status, direct_resp.status)
++        assert_equal(body, direct_body)
++        assert_equal(resp.getheader("Content-Type"), "application/x-protobuf")
++
++        self.log.info("Chronik is served over TLS on the RPC port")
++        resp, body = raw_get(rpc_port(node.index), "/chronik/blockchain-info", tls=True)
++        assert_equal(resp.status, 200)
++        info = pb.BlockchainInfo()
++        info.ParseFromString(body)
++        assert_equal(info.tip_height, 120)
++
++        self.log.info("Chronik replies are zstd-encoded when accepted")
++        _, plain = raw_get(chronik_port(node.index), "/blocks/0/100")
++        resp, body = raw_get(
++            rpc_port(node.index),
++            "/chronik/blocks/0/100",
++            headers={"Accept-Encoding": "gzip, zstd"},
++        )
++        assert_equal(resp.getheader("Content-Encoding"), "zstd")
++        try:
++            import zstandard
++        except ImportError:
++            self.log.info("zstandard module missing, not decompressing")
++        else:
++            assert_equal(
++                zstandard.ZstdDecompressor().decompress(body, max_output_size=1 << 24),
++                plain,
++            )
++            assert len(body) < len(plain)
++
++        self.log.info("Chronik WebSocket works through /chronik/ws")
++        ws = proxied.ws()
++        chronik_sub_to_blocks(ws, node)
++        tip = self.generate(node, 1)[0]
++        msg = ws.recv()
++        assert_equal(msg.block.msg_type, pb.BLK_CONNECTED)
++        assert_equal(msg.block.block_hash[::-1].hex(), tip)
++        ws.close()
++
++        self.log.info("Over TLS too (wss://)")
++        import websocket
++
++        tls_ws = websocket.create_connection(
++            f"wss://127.0.0.1:{rpc_port(node.index)}/chronik/ws",
++            sslopt={"cert_reqs": ssl.CERT_NONE},
++            timeout=30,
++        )
++        with node.assert_debug_log(["WS subscribe to blocks"]):
++            tls_ws.send_binary(
++                pb.WsSub(is_unsub=False, blocks=pb.WsSubBlocks()).SerializeToString()
++            )
++        tip = self.generate(node, 1)[0]
++        while True:
++            msg = pb.WsMsg()
++            msg.ParseFromString(tls_ws.recv())
++            if msg.HasField("block") and msg.block.msg_type == pb.BLK_CONNECTED:
++                break
++        assert_equal(msg.block.block_hash[::-1].hex(), tip)
++        tls_ws.close()
++
++        self.log.info("RPC on the same port still requires credentials")
++        conn = http.client.HTTPConnection("127.0.0.1", rpc_port(node.index))
++        conn.request("POST", "/", '{"method": "getblockcount"}')
++        assert_equal(conn.getresponse().status, 401)
++        conn.close()
++
++        self.log.info("-chronikpubliconrpcport=0 disables /chronik on the RPC port")
++        self.restart_node(0, ["-chronik", "-chronikpubliconrpcport=0"])
++        resp, _ = raw_get(rpc_port(node.index), "/chronik/blockchain-info")
++        assert_equal(resp.status, 404)
++
++
++if __name__ == "__main__":
++    ChronikRpcPortProxyTest().main()

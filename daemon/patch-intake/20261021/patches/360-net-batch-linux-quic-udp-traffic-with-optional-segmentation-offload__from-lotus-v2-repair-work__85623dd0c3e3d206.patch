@@ -1,0 +1,918 @@
+From 693f2415a107050a65139d3a352dfd1380deef9b Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@gmail.com>
+Date: Mon, 19 Oct 2026 23:28:38 -0700
+Subject: [PATCH] net: batch Linux QUIC UDP traffic with optional segmentation
+ offload
+
+Use bounded recvmmsg/sendmmsg batches with one reused per-thread receive
+buffer set, preserving UDP and destination-address boundaries. Probe
+UDP_SEGMENT and split back into original datagrams if offload is unsupported.
+Keep GRO disabled and guard kernel-specific APIs/constants. Wire the GSO
+option through listener and outbound sockets.
+
+Extract the existing one-packet ngtcp2 scheduler and aggregate at most ten
+naturally full packets within its send quantum, without forced padding.
+Preserve stream priorities and sent-byte accounting. Honor ngtcp2's generated
+path for validation traffic instead of the original remote tuple; mark this
+narrow W4 repair for owner-folding in final integration.
+
+Combined native daemon/unit build passes 15 actions. On macOS, 31 selected
+cases pass 13366 assertions, including segmentation fallback, one-megabyte
+option on/off transfers and deterministic same-IP NAT port rebinding on one
+TLS session. Basic 19.38s and limits 3.45s functionals pass first run. Linux
+branches, actual GSO execution, Guix and CPU/loss/packetization gates remain
+unvalidated. Cross-IP admission/permission transfer remains an integration
+gap. No rendezvous, broad sweep, benchmark or default enablement was added.
+---
+ doc/p2p-webtransport.md            |  35 ++++
+ src/init.cpp                       |   5 +
+ src/net_quic/node_webtransport.cpp |   1 +
+ src/net_quic/quic_connection.cpp   | 126 ++++++++++---
+ src/net_quic/quic_connection.h     |   4 +
+ src/net_quic/quic_engine.cpp       |   2 +
+ src/net_quic/quic_engine.h         |   2 +
+ src/net_quic/udp_socket.cpp        | 278 +++++++++++++++++++++++------
+ src/net_quic/udp_socket.h          |   5 +-
+ src/test/net_quic_tests.cpp        | 131 ++++++++++++++
+ 10 files changed, 508 insertions(+), 81 deletions(-)
+
+diff --git a/doc/p2p-webtransport.md b/doc/p2p-webtransport.md
+index c446280d4287bcce3e2a766a4aad81543b40ef95..1d67a11dd7c936ca6cec3f6ec4da275e9ad9dcae 100644
+--- a/doc/p2p-webtransport.md
++++ b/doc/p2p-webtransport.md
+@@ -321,3 +321,38 @@ mode, the untrusted control rejects and the profile-trusted control passes.
+ This does not establish stock publicly trusted CA or reverse-proxy acceptance.
+ Raw development NetLogs have unfinished JSON envelopes after browser SIGTERM;
+ complete event records and the browser's final result are preserved separately.
++
++## Linux UDP batching (W10)
++
++Linux uses nonblocking `recvmmsg`/`sendmmsg` batches of at most 64 datagrams.
++One receive-buffer set is reused by the engine thread across its sockets.
++Other platforms retain individual `recvmsg`/`sendmsg` calls; unavailable Linux
++batch syscalls fall back to those calls too. Destination-address ancillary
++data is kept so wildcard listeners reply from the address the peer used.
++Outgoing packets use ngtcp2's generated path, including path-validation
++traffic and standard NAT port rebinding, rather than the original tuple.
++This does not perform rendezvous discovery or coordinated hole punching.
++
++`-p2pwebtransportgso=0` disables UDP segmentation offload. When requested,
++Linux probes `UDP_SEGMENT`; ngtcp2 may aggregate up to ten naturally full
++packets with a final shorter packet, within its send quantum. No forced or
++random padding is added. Unsupported offload falls back to the original
++individual datagram boundaries and disables offload on that socket. UDP GRO
++is not enabled: each receive result remains one wire datagram. A nonblocking
++send's unsent suffix uses normal QUIC loss recovery, as the earlier sendmsg
++path did. Existing engine packet/byte counters count constructed send attempts,
++not an acknowledgement or a capture of successful wire transmission.
++
++The portable tests check segmentation fallback, one-megabyte on/off stream
++transfers and a same-IP port rebinding. A separate Linux-only test checks a
++one-megabyte UDP transfer and logs the runtime offload capability before/after;
++fallback success is not evidence that GSO executed. Linux/Guix runtime/build,
++CPU measurements and wire packetization comparisons remain separate gates.
++Cross-IP migration also needs shared admission/permission transfer review;
++peer permissions currently refer to the address accepted at session setup.
++
++Focused macOS W10 checks pass: combined daemon/unit build, 31 selected cases
++(13,366 assertions), existing basic and limits functionals. Payloads match
++with the GSO option on/off on this host's portable fallback; the Linux-only
++case is not compiled here. These results do not validate Linux batching,
++actual GSO execution, Guix or the CPU gate.
+diff --git a/src/init.cpp b/src/init.cpp
+index 351b15377b776ea800866992f79913a19e28945d..69e235699fa67ec3e711aaa2f5a83b769f033a22 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -1365,6 +1365,11 @@ void SetupServerArgs(NodeContext &node) {
+         "serverCertificateHashes on the H3 WebTransport listener only; "
+         "reuse the existing TLS key (default: 0)",
+         ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
++    argsman.AddArg(
++        "-p2pwebtransportgso",
++        "Use runtime-probed Linux UDP segmentation offload for WebTransport "
++        "(default: 1; unsupported kernels use ordinary UDP datagrams)",
++        ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+     argsman.AddArg(
+         "-p2pwebtransporttoken=<token>",
+         "Only accept WebTransport sessions whose URL carries ?t=<token> "
+diff --git a/src/net_quic/node_webtransport.cpp b/src/net_quic/node_webtransport.cpp
+index 6beecbcc676b52e430d1757911d5dae846eeb3e7..ca312818571c51edd5ee8cf8ea91e8cdd7125c3c 100644
+--- a/src/net_quic/node_webtransport.cpp
++++ b/src/net_quic/node_webtransport.cpp
+@@ -185,6 +185,7 @@ bool StartNodeWebTransport(const ArgsManager &args, CConnman &connman,
+         return false;
+     }
+     opts.bbr = cc == "bbr";
++    opts.gso = args.GetBoolArg("-p2pwebtransportgso", true);
+     opts.idle_timeout = std::chrono::seconds{
+         std::max<int64_t>(5, args.GetIntArg("-p2pwebtransportidle", 30))};
+     // Ask for client certificates when keys grant permissions.
+diff --git a/src/net_quic/quic_connection.cpp b/src/net_quic/quic_connection.cpp
+index 523706754b84e2afffb71f5c18b76653dc1d95df..86bb5dff7477339296135b42c2527d18e876c7a7 100644
+--- a/src/net_quic/quic_connection.cpp
++++ b/src/net_quic/quic_connection.cpp
+@@ -445,10 +445,36 @@ void QuicConnection::OnHandshakeCompletedInternal() {
+     }
+ }
+ 
++UdpDatagram QuicConnection::Packet(const uint8_t *data, size_t len,
++                                   const ngtcp2_path *path,
++                                   size_t segment_size) const {
++    UdpDatagram packet;
++    packet.remote = m_remote;
++    packet.remote_len = m_remote_len;
++    packet.local = m_local;
++    packet.local_len = m_local_len;
++    // ngtcp2 may be writing path validation traffic or a validated new path.
++    // Preserve its per-packet path instead of always using the original peer.
++    if (path && path->remote.addrlen &&
++        path->remote.addrlen <= sizeof(packet.remote)) {
++        std::memcpy(&packet.remote, path->remote.addr, path->remote.addrlen);
++        packet.remote_len = path->remote.addrlen;
++    }
++    if (path && path->local.addrlen &&
++        path->local.addrlen <= sizeof(packet.local)) {
++        std::memcpy(&packet.local, path->local.addr, path->local.addrlen);
++        packet.local_len = path->local.addrlen;
++    }
++    packet.segment_size = segment_size;
++    packet.data.assign(data, data + len);
++    return packet;
++}
++
+ void QuicConnection::SendPacket(const uint8_t *data, size_t len) {
+-    // A full socket buffer drops the packet; QUIC loss recovery resends.
+-    m_sock.SendOne(data, len, reinterpret_cast<const sockaddr *>(&m_remote),
+-                   m_remote_len, &m_local, m_local_len);
++    const auto packet{Packet(data, len, ngtcp2_conn_get_path2(m_conn))};
++    m_sock.SendOne(packet.data.data(), packet.data.size(),
++                   reinterpret_cast<const sockaddr *>(&packet.remote),
++                   packet.remote_len, &packet.local, packet.local_len);
+     m_engine.OnPacketSent(len);
+ }
+ 
+@@ -563,16 +589,72 @@ void QuicConnection::Write(uint64_t now) {
+     if (m_txbuf.size() < max_pkt) {
+         m_txbuf.resize(std::max<size_t>(max_pkt, 1500));
+     }
+-    ngtcp2_path_storage ps;
+-    ngtcp2_path_storage_zero(&ps);
+-    ngtcp2_pkt_info pi{};
+-    for (int pkts = 0; pkts < MAX_PACKETS_PER_WRITE;) {
++    const size_t burst{m_sock.GsoSupported() ? 10U : 1U};
++    const size_t capacity{
++        std::max(max_pkt, std::min(max_pkt * burst,
++                                   ngtcp2_conn_get_send_quantum2(m_conn)))};
++    if (m_txbuf.size() < capacity) m_txbuf.resize(capacity);
++    std::vector<UdpDatagram> packets;
++    packets.reserve(MAX_PACKETS_PER_WRITE);
++    const auto flush = [&] {
++        // An unsent suffix is dropped, as with the previous nonblocking
++        // sendmsg path; ngtcp2 retains it for ordinary loss recovery.
++        m_sock.SendBatch(packets);
++        for (const auto &packet : packets) {
++            const size_t segment{packet.segment_size ? packet.segment_size
++                                                     : packet.data.size()};
++            for (size_t offset{0}; offset < packet.data.size();
++                 offset += segment)
++                m_engine.OnPacketSent(
++                    std::min(segment, packet.data.size() - offset));
++        }
++        packets.clear();
++    };
++    for (size_t count{0}; count < MAX_PACKETS_PER_WRITE;) {
++        ngtcp2_path_storage path;
++        ngtcp2_path_storage_zero(&path);
++        ngtcp2_pkt_info pi{};
++        size_t segment{0};
++        ngtcp2_ssize written;
++        if (m_sock.GsoSupported()) {
++            written = ngtcp2_conn_write_aggregate_pkt2(
++                m_conn, &path.path, &pi, m_txbuf.data(), capacity, &segment,
++                [](ngtcp2_conn *, ngtcp2_path *p, ngtcp2_pkt_info *info,
++                   uint8_t *buffer, size_t len, uint64_t ts, void *user) {
++                    return static_cast<QuicConnection *>(user)->WritePacket(
++                        p, info, buffer, len, ts);
++                },
++                std::min<size_t>(10, MAX_PACKETS_PER_WRITE - count), now);
++        } else {
++            written =
++                WritePacket(&path.path, &pi, m_txbuf.data(), max_pkt, now);
++        }
++        if (written < 0) {
++            flush();
++            CloseLib(static_cast<int>(written));
++            return;
++        }
++        if (written == 0) break;
++        const size_t bytes{static_cast<size_t>(written)};
++        packets.push_back(Packet(m_txbuf.data(), bytes, &path.path, segment));
++        count += segment ? (bytes + segment - 1) / segment : 1;
++        if (!IsOpen()) break;
++    }
++    flush();
++    ngtcp2_conn_update_pkt_tx_time(m_conn, now);
++}
++
++ngtcp2_ssize QuicConnection::WritePacket(ngtcp2_path *path, ngtcp2_pkt_info *pi,
++                                         uint8_t *buffer, size_t capacity,
++                                         uint64_t now) {
++    if (!IsOpen()) return 0;
++    while (true) {
+         if (!m_datagrams.empty()) {
+             const std::vector<uint8_t> &d{m_datagrams.front()};
+             ngtcp2_vec v{const_cast<uint8_t *>(d.data()), d.size()};
+             int accepted{0};
+             const ngtcp2_ssize n{ngtcp2_conn_writev_datagram(
+-                m_conn, &ps.path, &pi, m_txbuf.data(), max_pkt, &accepted,
++                m_conn, path, pi, buffer, capacity, &accepted,
+                 NGTCP2_WRITE_DATAGRAM_FLAG_MORE, m_next_datagram_id++, &v, 1,
+                 now)};
+             if (n == NGTCP2_ERR_WRITE_MORE) {
+@@ -588,8 +670,7 @@ void QuicConnection::Write(uint64_t now) {
+                     m_datagrams.pop_front();
+                     continue;
+                 }
+-                CloseLib(static_cast<int>(n));
+-                return;
++                return static_cast<int>(n);
+             }
+             if (accepted) {
+                 m_datagrams.pop_front();
+@@ -597,9 +678,7 @@ void QuicConnection::Write(uint64_t now) {
+             if (n == 0) {
+                 break;
+             }
+-            SendPacket(m_txbuf.data(), static_cast<size_t>(n));
+-            ++pkts;
+-            continue;
++            return n;
+         }
+         int64_t stream_id{-1};
+         int fin{0};
+@@ -614,8 +693,7 @@ void QuicConnection::Write(uint64_t now) {
+                 const ngtcp2_ssize cnt{m_app->WritevLibrary(
+                     *this, stream_id, fin, vec, MAX_WRITE_VECS)};
+                 if (cnt < 0) {
+-                    CloseLib(NGTCP2_ERR_CALLBACK_FAILURE);
+-                    return;
++                    return NGTCP2_ERR_CALLBACK_FAILURE;
+                 }
+                 vcnt = static_cast<size_t>(cnt);
+                 library = stream_id >= 0;
+@@ -648,8 +726,8 @@ void QuicConnection::Write(uint64_t now) {
+         }
+         ngtcp2_ssize ndatalen{-1};
+         const ngtcp2_ssize n{ngtcp2_conn_writev_stream(
+-            m_conn, &ps.path, &pi, m_txbuf.data(), max_pkt, &ndatalen, flags,
+-            stream_id, vec, vcnt, now)};
++            m_conn, path, pi, buffer, capacity, &ndatalen, flags, stream_id,
++            vec, vcnt, now)};
+         if (n < 0) {
+             switch (n) {
+                 case NGTCP2_ERR_STREAM_DATA_BLOCKED:
+@@ -673,8 +751,7 @@ void QuicConnection::Write(uint64_t now) {
+                             if (m_app->OnLibraryWritten(
+                                     *this, stream_id,
+                                     static_cast<size_t>(ndatalen)) != 0) {
+-                                CloseLib(NGTCP2_ERR_CALLBACK_FAILURE);
+-                                return;
++                                return NGTCP2_ERR_CALLBACK_FAILURE;
+                             }
+                         } else if (own) {
+                             AccountWritten(*own, static_cast<size_t>(ndatalen),
+@@ -685,8 +762,7 @@ void QuicConnection::Write(uint64_t now) {
+                     }
+                     continue;
+                 default:
+-                    CloseLib(static_cast<int>(n));
+-                    return;
++                    return static_cast<int>(n);
+             }
+         }
+         if (ndatalen >= 0) {
+@@ -694,8 +770,7 @@ void QuicConnection::Write(uint64_t now) {
+                 if (m_app->OnLibraryWritten(*this, stream_id,
+                                             static_cast<size_t>(ndatalen)) !=
+                     0) {
+-                    CloseLib(NGTCP2_ERR_CALLBACK_FAILURE);
+-                    return;
++                    return NGTCP2_ERR_CALLBACK_FAILURE;
+                 }
+             } else if (own) {
+                 AccountWritten(*own, static_cast<size_t>(ndatalen),
+@@ -715,10 +790,9 @@ void QuicConnection::Write(uint64_t now) {
+             // Congestion, pacing or nothing left.
+             break;
+         }
+-        SendPacket(m_txbuf.data(), static_cast<size_t>(n));
+-        ++pkts;
++        return n;
+     }
+-    ngtcp2_conn_update_pkt_tx_time(m_conn, now);
++    return 0;
+ }
+ 
+ uint64_t QuicConnection::NextExpiry() const {
+diff --git a/src/net_quic/quic_connection.h b/src/net_quic/quic_connection.h
+index 05413d8ecb26fda061f05f3f70d055a5879fd689..a5e0acbc934c961e000851e006a2281360354b7e 100644
+--- a/src/net_quic/quic_connection.h
++++ b/src/net_quic/quic_connection.h
+@@ -214,6 +214,10 @@ public:
+ private:
+     bool InitTls(bool server, const std::string &sni);
+     void SendPacket(const uint8_t *data, size_t len);
++    UdpDatagram Packet(const uint8_t *data, size_t len, const ngtcp2_path *path,
++                       size_t segment_size = 0) const;
++    ngtcp2_ssize WritePacket(ngtcp2_path *path, ngtcp2_pkt_info *pi,
++                             uint8_t *buffer, size_t capacity, uint64_t now);
+     void StartClosing(const ngtcp2_ccerr &err);
+     void EnterDraining(uint64_t now);
+     QuicStream *PickOwnStream();
+diff --git a/src/net_quic/quic_engine.cpp b/src/net_quic/quic_engine.cpp
+index f274cec943ed35622f36b617b724427e484dd6be..15611f484e09712bd2234288823ba10251f039d8 100644
+--- a/src/net_quic/quic_engine.cpp
++++ b/src/net_quic/quic_engine.cpp
+@@ -610,6 +610,7 @@ public:
+                         ": " + why;
+                 return false;
+             }
++            if (m_opts.gso) sock->EnableGso();
+             m_listeners.push_back(std::make_unique<UdpSocket>(std::move(*sock)));
+         }
+         m_client_ctx = NewClientContext();
+@@ -1025,6 +1026,7 @@ private:
+                           error);
+                 return nullptr;
+             }
++            if (m_opts.gso) sock->EnableGso();
+             slot = std::make_unique<UdpSocket>(std::move(*sock));
+         }
+         return slot.get();
+diff --git a/src/net_quic/quic_engine.h b/src/net_quic/quic_engine.h
+index ea2b6d3e9f0641cf0b1f9fce7604a780938818ea..bd22b3b6eb3e72116af100d7d8b1e6a1e1a3de56 100644
+--- a/src/net_quic/quic_engine.h
++++ b/src/net_quic/quic_engine.h
+@@ -65,6 +65,8 @@ struct QuicEngineOptions {
+     QuicRetryMode retry{QuicRetryMode::AUTO};
+     //! BBR instead of CUBIC
+     bool bbr{false};
++    //! Linux UDP segmentation offload (runtime-probed; safe datagram fallback).
++    bool gso{true};
+     std::chrono::milliseconds idle_timeout{std::chrono::seconds{30}};
+     //! PING after this long without traffic (outbound connections; 0: off)
+     std::chrono::milliseconds keep_alive{std::chrono::seconds{15}};
+diff --git a/src/net_quic/udp_socket.cpp b/src/net_quic/udp_socket.cpp
+index 79ce47b6fe269216435172dfcccfd9b7c52b6bfc..ec6b1edfd6a58c669e85b2122b99b5657c658651 100644
+--- a/src/net_quic/udp_socket.cpp
++++ b/src/net_quic/udp_socket.cpp
+@@ -4,6 +4,9 @@
+ 
+ // IPV6_RECVPKTINFO on macOS
+ #define __APPLE_USE_RFC_3542 1
++#if defined(__linux__) && !defined(_GNU_SOURCE)
++#define _GNU_SOURCE 1
++#endif
+ 
+ #include <net_quic/udp_socket.h>
+ 
+@@ -13,10 +16,17 @@
+ #include <sys/socket.h>
+ #include <sys/types.h>
+ #include <sys/uio.h>
++#ifdef __linux__
++#include <linux/udp.h>
++#endif
+ 
++#include <algorithm>
++#include <array>
++#include <cassert>
+ #include <cerrno>
+ #include <cstring>
+ #include <fcntl.h>
++#include <memory>
+ #include <unistd.h>
+ 
+ namespace {
+@@ -25,10 +35,81 @@ constexpr int UDP_SOCKET_BUFFER = 4 * 1024 * 1024;
+ //! Largest UDP payload we receive (QUIC packets are at most 1452 bytes for
+ //! our settings; a coalesced/GRO read can be larger)
+ constexpr size_t MAX_UDP_PAYLOAD = 65535;
++constexpr size_t MAX_BATCH = 64;
++
++struct alignas(cmsghdr) Ancillary {
++    std::array<uint8_t, 256> bytes{};
++};
++
++void SendMessage(msghdr &msg, iovec &iov, Ancillary &control,
++                 const uint8_t *data, size_t len, const sockaddr *remote,
++                 socklen_t remote_len, const sockaddr_storage *local,
++                 socklen_t local_len, bool wildcard, uint16_t segment_size) {
++    msg = {};
++    iov = {const_cast<uint8_t *>(data), len};
++    msg.msg_name = const_cast<sockaddr *>(remote);
++    msg.msg_namelen = remote_len;
++    msg.msg_iov = &iov;
++    msg.msg_iovlen = 1;
++    size_t used{0};
++#ifdef __linux__
++    const auto append = [&](int level, int type, const auto &value) {
++        const size_t space{CMSG_SPACE(sizeof(value))};
++        assert(used + space <= control.bytes.size());
++        auto *c{reinterpret_cast<cmsghdr *>(control.bytes.data() + used)};
++        c->cmsg_level = level;
++        c->cmsg_type = type;
++        c->cmsg_len = CMSG_LEN(sizeof(value));
++        std::memcpy(CMSG_DATA(c), &value, sizeof(value));
++        used += space;
++    };
++#if defined(IP_PKTINFO)
++    if (wildcard && local && local_len > 0) {
++        if (local->ss_family == AF_INET) {
++            in_pktinfo info{};
++            info.ipi_spec_dst =
++                reinterpret_cast<const sockaddr_in *>(local)->sin_addr;
++            append(IPPROTO_IP, IP_PKTINFO, info);
++        } else if (local->ss_family == AF_INET6) {
++            in6_pktinfo info{};
++            info.ipi6_addr =
++                reinterpret_cast<const sockaddr_in6 *>(local)->sin6_addr;
++            append(IPPROTO_IPV6, IPV6_PKTINFO, info);
++        }
++    }
++#endif
++#ifdef UDP_SEGMENT
++    if (segment_size) append(IPPROTO_UDP, UDP_SEGMENT, segment_size);
++#endif
++#else
++    (void)local;
++    (void)local_len;
++    (void)wildcard;
++    (void)segment_size;
++#endif
++    if (used) {
++        msg.msg_control = control.bytes.data();
++        msg.msg_controllen = used;
++    }
++}
++
++#ifdef __linux__
++// Reused by the engine thread across its sockets: 64 UDP receive buffers,
++// not 64 allocations per poll or per bound address. Never enable UDP_GRO:
++// each returned element must still represent exactly one UDP datagram.
++struct ReceiveStorage {
++    std::array<std::array<uint8_t, MAX_UDP_PAYLOAD>, MAX_BATCH> payload;
++    std::array<sockaddr_storage, MAX_BATCH> remote;
++    std::array<Ancillary, MAX_BATCH> control;
++    std::array<iovec, MAX_BATCH> iov;
++    std::array<mmsghdr, MAX_BATCH> messages;
++};
++#endif
+ 
+ void SetLocal(UdpDatagram &d, const cmsghdr *cmsg, uint16_t port) {
+ #if defined(IP_PKTINFO)
+-    if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {
++    if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO &&
++        cmsg->cmsg_len >= CMSG_LEN(sizeof(in_pktinfo))) {
+         in_pktinfo info;
+         std::memcpy(&info, CMSG_DATA(cmsg), sizeof(info));
+         sockaddr_in sin{};
+@@ -41,7 +122,8 @@ void SetLocal(UdpDatagram &d, const cmsghdr *cmsg, uint16_t port) {
+     }
+ #endif
+ #if defined(IPV6_PKTINFO)
+-    if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO) {
++    if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO &&
++        cmsg->cmsg_len >= CMSG_LEN(sizeof(in6_pktinfo))) {
+         in6_pktinfo info;
+         std::memcpy(&info, CMSG_DATA(cmsg), sizeof(info));
+         sockaddr_in6 sin6{};
+@@ -72,6 +154,8 @@ UdpSocket &UdpSocket::operator=(UdpSocket &&other) noexcept {
+         m_local = other.m_local;
+         m_wildcard = other.m_wildcard;
+         m_gso = other.m_gso;
++        m_recv_batch_supported = other.m_recv_batch_supported;
++        m_send_batch_supported = other.m_send_batch_supported;
+         m_send_errors = other.m_send_errors.load();
+         other.m_fd = INVALID_SOCKET;
+     }
+@@ -153,15 +237,70 @@ std::optional<UdpSocket> UdpSocket::Bind(const CService &addr,
+ }
+ 
+ bool UdpSocket::EnableGso() {
+-    // UDP segmentation offload is Linux only (W10 adds it).
+     m_gso = false;
++#if defined(__linux__) && defined(UDP_SEGMENT)
++    // A zero default segment size leaves ordinary datagrams unchanged while
++    // checking whether this kernel knows UDP_SEGMENT. Actual sends use a
++    // uint16 ancillary value and can still reject hardware/path capabilities.
++    const int zero{0};
++    m_gso =
++        ::setsockopt(m_fd, IPPROTO_UDP, UDP_SEGMENT, &zero, sizeof(zero)) == 0;
++#endif
+     return m_gso;
+ }
+ 
+ size_t UdpSocket::RecvBatch(std::vector<UdpDatagram> &out, size_t max) {
++    if (max == 0) return 0;
++#ifdef __linux__
++    if (m_recv_batch_supported) {
++        static thread_local std::unique_ptr<ReceiveStorage> cache;
++        if (!cache) cache = std::make_unique<ReceiveStorage>();
++        auto &storage{*cache};
++        const size_t count{std::min(max, MAX_BATCH)};
++        for (size_t i{0}; i < count; ++i) {
++            storage.iov[i] = {storage.payload[i].data(), MAX_UDP_PAYLOAD};
++            auto &message{storage.messages[i]};
++            message = {};
++            message.msg_hdr.msg_name = &storage.remote[i];
++            message.msg_hdr.msg_namelen = sizeof(sockaddr_storage);
++            message.msg_hdr.msg_iov = &storage.iov[i];
++            message.msg_hdr.msg_iovlen = 1;
++            message.msg_hdr.msg_control = storage.control[i].bytes.data();
++            message.msg_hdr.msg_controllen = storage.control[i].bytes.size();
++        }
++        int received;
++        do {
++            received = ::recvmmsg(m_fd, storage.messages.data(), count,
++                                  MSG_DONTWAIT, nullptr);
++        } while (received < 0 && errno == EINTR);
++        if (received >= 0) {
++            size_t appended{0};
++            for (int i{0}; i < received; ++i) {
++                auto &message{storage.messages[i]};
++                if (message.msg_hdr.msg_flags & (MSG_TRUNC | MSG_CTRUNC))
++                    continue;
++                UdpDatagram d;
++                d.remote = storage.remote[i];
++                d.remote_len = message.msg_hdr.msg_namelen;
++                d.data.assign(storage.payload[i].begin(),
++                              storage.payload[i].begin() + message.msg_len);
++                if (m_wildcard) {
++                    for (auto *c{CMSG_FIRSTHDR(&message.msg_hdr)}; c;
++                         c = CMSG_NXTHDR(&message.msg_hdr, c))
++                        SetLocal(d, c, m_local.GetPort());
++                }
++                out.push_back(std::move(d));
++                ++appended;
++            }
++            return appended;
++        }
++        if (errno != ENOSYS) return 0;
++        m_recv_batch_supported = false;
++    }
++#endif
+     size_t n{0};
+     const uint16_t port{m_local.GetPort()};
+-    while (n < max) {
++    for (size_t attempts{0}; attempts < std::min(max, MAX_BATCH); ++attempts) {
+         UdpDatagram d;
+         d.data.resize(MAX_UDP_PAYLOAD);
+         iovec iov{d.data.data(), d.data.size()};
+@@ -175,8 +314,10 @@ size_t UdpSocket::RecvBatch(std::vector<UdpDatagram> &out, size_t max) {
+         msg.msg_controllen = sizeof(control);
+         const ssize_t r{::recvmsg(m_fd, &msg, 0)};
+         if (r < 0) {
++            if (errno == EINTR) continue;
+             break;
+         }
++        if (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) continue;
+         d.remote_len = msg.msg_namelen;
+         d.data.resize(static_cast<size_t>(r));
+         if (m_wildcard) {
+@@ -195,67 +336,96 @@ bool UdpSocket::SendOne(const uint8_t *data, size_t len,
+                         const sockaddr *remote, socklen_t remote_len,
+                         const sockaddr_storage *local, socklen_t local_len,
+                         size_t segment_size) {
+-    iovec iov{const_cast<uint8_t *>(data), len};
+-    msghdr msg{};
+-    msg.msg_name = const_cast<sockaddr *>(remote);
+-    msg.msg_namelen = remote_len;
+-    msg.msg_iov = &iov;
+-    msg.msg_iovlen = 1;
+-#if defined(__linux__) && defined(IP_PKTINFO)
+-    alignas(cmsghdr) uint8_t control[CMSG_SPACE(sizeof(in6_pktinfo))]{};
+-    if (m_wildcard && local != nullptr && local_len > 0) {
+-        msg.msg_control = control;
+-        msg.msg_controllen = sizeof(control);
+-        cmsghdr *c{CMSG_FIRSTHDR(&msg)};
+-        if (local->ss_family == AF_INET) {
+-            in_pktinfo info{};
+-            info.ipi_spec_dst =
+-                reinterpret_cast<const sockaddr_in *>(local)->sin_addr;
+-            c->cmsg_level = IPPROTO_IP;
+-            c->cmsg_type = IP_PKTINFO;
+-            c->cmsg_len = CMSG_LEN(sizeof(info));
+-            std::memcpy(CMSG_DATA(c), &info, sizeof(info));
+-            msg.msg_controllen = CMSG_SPACE(sizeof(info));
+-        } else {
+-            in6_pktinfo info{};
+-            info.ipi6_addr =
+-                reinterpret_cast<const sockaddr_in6 *>(local)->sin6_addr;
+-            c->cmsg_level = IPPROTO_IPV6;
+-            c->cmsg_type = IPV6_PKTINFO;
+-            c->cmsg_len = CMSG_LEN(sizeof(info));
+-            std::memcpy(CMSG_DATA(c), &info, sizeof(info));
+-            msg.msg_controllen = CMSG_SPACE(sizeof(info));
++    if (segment_size > UINT16_MAX) {
++        ++m_send_errors;
++        return false;
++    }
++    if (segment_size && len > segment_size && !m_gso) {
++        // Preserve the UDP boundaries from ngtcp2 when offload is unavailable.
++        for (size_t offset{0}; offset < len; offset += segment_size) {
++            if (!SendOne(data + offset, std::min(segment_size, len - offset),
++                         remote, remote_len, local, local_len, 0))
++                return false;
+         }
++        return true;
+     }
+-#else
+-    (void)local;
+-    (void)local_len;
+-#endif
+-    (void)segment_size;
++    iovec iov;
++    msghdr message;
++    Ancillary control;
++    const uint16_t segment{segment_size && len > segment_size
++                               ? static_cast<uint16_t>(segment_size)
++                               : uint16_t{0}};
++    SendMessage(message, iov, control, data, len, remote, remote_len, local,
++                local_len, m_wildcard, segment);
+     while (true) {
+-        const ssize_t r{::sendmsg(m_fd, &msg, 0)};
+-        if (r >= 0) {
+-            return true;
+-        }
+-        if (errno == EINTR) {
+-            continue;
+-        }
+-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+-            ++m_send_errors;
++        const ssize_t result{::sendmsg(m_fd, &message, 0)};
++        if (result >= 0) return true;
++        const int error{errno};
++        if (error == EINTR) continue;
++        if (segment &&
++            (error == EOPNOTSUPP || error == ENOPROTOOPT || error == EINVAL)) {
++            m_gso = false;
++            return SendOne(data, len, remote, remote_len, local, local_len,
++                           segment_size);
+         }
++        if (error != EAGAIN && error != EWOULDBLOCK) ++m_send_errors;
+         return false;
+     }
+ }
+ 
+ size_t UdpSocket::SendBatch(Span<const UdpDatagram> in) {
+-    size_t n{0};
+-    for (const UdpDatagram &d : in) {
++    if (in.empty()) return 0;
++#ifdef __linux__
++    const size_t count{std::min(in.size(), MAX_BATCH)};
++    const bool needs_split{
++        std::any_of(in.begin(), in.begin() + count, [&](const UdpDatagram &d) {
++            return d.segment_size && !m_gso;
++        })};
++    if (m_send_batch_supported && !needs_split) {
++        std::array<mmsghdr, MAX_BATCH> messages{};
++        std::array<iovec, MAX_BATCH> vectors;
++        std::array<Ancillary, MAX_BATCH> controls;
++        bool segmented{false};
++        for (size_t i{0}; i < count; ++i) {
++            const auto &d{in[i]};
++            if (d.segment_size > UINT16_MAX) {
++                ++m_send_errors;
++                return 0;
++            }
++            const uint16_t segment{d.segment_size &&
++                                           d.data.size() > d.segment_size
++                                       ? static_cast<uint16_t>(d.segment_size)
++                                       : uint16_t{0}};
++            segmented |= segment != 0;
++            SendMessage(
++                messages[i].msg_hdr, vectors[i], controls[i], d.data.data(),
++                d.data.size(), reinterpret_cast<const sockaddr *>(&d.remote),
++                d.remote_len, &d.local, d.local_len, m_wildcard, segment);
++        }
++        int sent;
++        do {
++            sent = ::sendmmsg(m_fd, messages.data(), count, MSG_DONTWAIT);
++        } while (sent < 0 && errno == EINTR);
++        if (sent >= 0) return static_cast<size_t>(sent);
++        const int error{errno};
++        if (error == ENOSYS) {
++            m_send_batch_supported = false;
++        } else if (segmented && (error == EOPNOTSUPP || error == ENOPROTOOPT ||
++                                 error == EINVAL)) {
++            m_gso = false;
++        } else {
++            if (error != EAGAIN && error != EWOULDBLOCK) ++m_send_errors;
++            return 0;
++        }
++    }
++#endif
++    size_t sent{0};
++    for (const auto &d : in) {
+         if (!SendOne(d.data.data(), d.data.size(),
+                      reinterpret_cast<const sockaddr *>(&d.remote),
+-                     d.remote_len, &d.local, d.local_len, d.segment_size)) {
++                     d.remote_len, &d.local, d.local_len, d.segment_size))
+             break;
+-        }
+-        ++n;
++        ++sent;
+     }
+-    return n;
++    return sent;
+ }
+diff --git a/src/net_quic/udp_socket.h b/src/net_quic/udp_socket.h
+index bc65e096eb93931caa8f462e5a961fc6b4e64182..468a82d98a02205b540fcc4f96127480b9347c77 100644
+--- a/src/net_quic/udp_socket.h
++++ b/src/net_quic/udp_socket.h
+@@ -80,7 +80,8 @@ public:
+ 
+     /** Whether UDP segmentation offload (UDP_SEGMENT) works on this socket */
+     bool GsoSupported() const { return m_gso; }
+-    /** Try to enable UDP GSO/GRO (Linux); returns whether it is on */
++    /** Probe per-message UDP_SEGMENT (Linux); GRO is deliberately not enabled
++     */
+     bool EnableGso();
+ 
+     //! Datagrams that the OS refused (other than EAGAIN), for metrics
+@@ -95,6 +96,8 @@ private:
+     //! Bound to 0.0.0.0 / :: : use packet info for the local address
+     bool m_wildcard{false};
+     bool m_gso{false};
++    bool m_recv_batch_supported{true};
++    bool m_send_batch_supported{true};
+     std::atomic<uint64_t> m_send_errors{0};
+ };
+ 
+diff --git a/src/test/net_quic_tests.cpp b/src/test/net_quic_tests.cpp
+index 9b72203fd13c259a937454e679fe2bc7965fb904..8baa01806aae1b87b396733a2e332be8a59ba46a 100644
+--- a/src/test/net_quic_tests.cpp
++++ b/src/test/net_quic_tests.cpp
+@@ -7,6 +7,7 @@
+ #include <crypto/common.h>
+ #include <net_quic/quic_certificate.h>
+ #include <net_quic/quic_engine.h>
++#include <net_quic/udp_socket.h>
+ #include <net_quic/webtransport_wire.h>
+ 
+ #include <netaddress.h>
+@@ -123,6 +124,7 @@ public:
+     std::atomic<bool> corrupt_tokens{false};
+     std::atomic<bool> drop{false};
+     std::atomic<int> tokens_corrupted{0};
++    std::atomic<bool> rebind_on_short_header{false}, rebound{false};
+ 
+ private:
+     static int Bind() {
+@@ -185,6 +187,13 @@ private:
+                         Corrupt(buf.data(), static_cast<size_t>(r));
+                     }
+                     if (!drop) {
++                        if (rebind_on_short_header && !rebound &&
++                            !(buf[0] & 0x80)) {
++                            const int replacement{Bind()};
++                            close(m_back);
++                            m_back = replacement;
++                            rebound = true;
++                        }
+                         sendto(m_back, buf.data(), static_cast<size_t>(r), 0,
+                                reinterpret_cast<sockaddr *>(&m_server),
+                                sizeof(m_server));
+@@ -223,6 +232,128 @@ std::vector<uint8_t> RandomPayload(size_t n) {
+ 
+ BOOST_FIXTURE_TEST_SUITE(net_quic_tests, QuicTestSetup)
+ 
++BOOST_AUTO_TEST_CASE(udp_segment_fallback_preserves_boundaries) {
++    std::string error;
++    auto receiver{UdpSocket::Bind(Loopback(), error)};
++    auto sender{UdpSocket::Bind(Loopback(), error)};
++    BOOST_REQUIRE(receiver && sender);
++    UdpDatagram packet;
++    packet.remote_len = sizeof(packet.remote);
++    BOOST_REQUIRE(receiver->Local().GetSockAddr(
++        reinterpret_cast<sockaddr *>(&packet.remote), &packet.remote_len));
++    packet.data = RandomPayload(3 * 1200 + 17);
++    packet.segment_size = 1200;
++    BOOST_CHECK(!sender->GsoSupported());
++    BOOST_REQUIRE_EQUAL(sender->SendBatch({&packet, 1}), 1U);
++    std::vector<UdpDatagram> received;
++    const auto deadline{std::chrono::steady_clock::now() + 2s};
++    while (received.size() < 4 && std::chrono::steady_clock::now() < deadline) {
++        receiver->RecvBatch(received, 64);
++        if (received.size() < 4) std::this_thread::sleep_for(1ms);
++    }
++    BOOST_REQUIRE_EQUAL(received.size(), 4U);
++    std::vector<uint8_t> joined;
++    for (size_t i{0}; i < received.size(); ++i) {
++        BOOST_CHECK_EQUAL(received[i].data.size(), i == 3 ? 17U : 1200U);
++        joined.insert(joined.end(), received[i].data.begin(),
++                      received[i].data.end());
++    }
++    BOOST_CHECK(joined == packet.data);
++}
++
++BOOST_AUTO_TEST_CASE(quic_megabyte_with_gso_option_on_and_off) {
++    const auto payload{RandomPayload(1024 * 1024)};
++    for (bool enabled : {false, true}) {
++        auto server_options{ServerOptions()};
++        server_options.gso = enabled;
++        QuicEngineOptions client_options;
++        client_options.gso = enabled;
++        auto server{StartEngine(server_options)};
++        auto client{StartEngine(client_options)};
++        const auto result{client->EchoForTest(server->BoundAddresses().front(),
++                                              payload, 5s, cert_sha256)};
++        BOOST_REQUIRE(result);
++        BOOST_CHECK(*result == payload);
++        client->Stop();
++        server->Stop();
++    }
++}
++
++BOOST_AUTO_TEST_CASE(quic_rebinding_uses_generated_packet_path) {
++    auto server{StartEngine(ServerOptions())};
++    auto client{StartEngine(QuicEngineOptions{})};
++    Relay relay{server->BoundAddresses().front()};
++    relay.rebind_on_short_header = true;
++    const auto payload{RandomPayload(1024 * 1024)};
++    const auto result{
++        client->EchoForTest(relay.Address(), payload, 5s, cert_sha256)};
++    BOOST_REQUIRE(result);
++    BOOST_CHECK(*result == payload);
++    BOOST_CHECK(relay.rebound.load());
++    BOOST_CHECK_EQUAL(client->Stats().handshakes_completed, 1U);
++    BOOST_CHECK_EQUAL(server->Stats().handshakes_completed, 1U);
++    client->Stop();
++    server->Stop();
++}
++
++#ifdef __linux__
++BOOST_AUTO_TEST_CASE(linux_udp_batch_megabyte_gso_on_and_off) {
++    const auto expected{RandomPayload(1024 * 1024)};
++    for (bool offload : {false, true}) {
++        std::string error;
++        auto receiver{UdpSocket::Bind(Loopback(), error)};
++        auto sender{UdpSocket::Bind(Loopback(), error)};
++        BOOST_REQUIRE(receiver && sender);
++        if (offload)
++            BOOST_TEST_MESSAGE(
++                "UDP_SEGMENT runtime probe: " << sender->EnableGso());
++        std::vector<uint8_t> actual;
++        size_t offset{0};
++        while (offset < expected.size()) {
++            std::vector<UdpDatagram> packets;
++            const size_t start{offset};
++            // <=64 wire datagrams fit below ordinary loopback socket limits.
++            for (size_t count{0}; count < 64 && offset < expected.size();) {
++                UdpDatagram packet;
++                packet.remote_len = sizeof(packet.remote);
++                BOOST_REQUIRE(receiver->Local().GetSockAddr(
++                    reinterpret_cast<sockaddr *>(&packet.remote),
++                    &packet.remote_len));
++                const size_t segments{offload ? std::min<size_t>(10, 64 - count)
++                                              : 1};
++                const size_t length{
++                    std::min(expected.size() - offset, segments * 1200)};
++                packet.data.assign(expected.begin() + offset,
++                                   expected.begin() + offset + length);
++                packet.segment_size = offload ? 1200 : 0;
++                packets.push_back(std::move(packet));
++                offset += length;
++                count += (length + 1199) / 1200;
++            }
++            BOOST_REQUIRE_EQUAL(sender->SendBatch(packets), packets.size());
++            const auto deadline{std::chrono::steady_clock::now() + 2s};
++            const size_t target{actual.size() + offset - start};
++            while (actual.size() < target &&
++                   std::chrono::steady_clock::now() < deadline) {
++                std::vector<UdpDatagram> received;
++                receiver->RecvBatch(received, 64);
++                for (const auto &packet : received) {
++                    BOOST_CHECK_LE(packet.data.size(), 1200U);
++                    actual.insert(actual.end(), packet.data.begin(),
++                                  packet.data.end());
++                }
++                if (actual.size() < target) std::this_thread::sleep_for(1ms);
++            }
++            BOOST_REQUIRE_EQUAL(actual.size(), target);
++        }
++        BOOST_CHECK(actual == expected);
++        BOOST_TEST_MESSAGE("UDP GSO requested=" << offload
++                                                << " active after transfer="
++                                                << sender->GsoSupported());
++    }
++}
++#endif
++
+ BOOST_AUTO_TEST_CASE(browser_certificate_overlap_and_key_stability) {
+     int64_t now{GetTime<std::chrono::seconds>().count()};
+     const auto original_key{tls::ReadFile(key)};
+-- 
+2.50.1 (Apple Git-155)
+

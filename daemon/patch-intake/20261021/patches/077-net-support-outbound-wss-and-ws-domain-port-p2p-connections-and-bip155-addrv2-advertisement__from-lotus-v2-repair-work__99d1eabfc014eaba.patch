@@ -1,0 +1,1746 @@
+From 12664a440911a3858393cdd9a32a60fbd61e7b3d Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 16:24:01 -0700
+Subject: [PATCH] net: support outbound wss:// and ws:// domain:port P2P
+ connections and BIP155 ADDRv2 advertisement
+
+Outbound: -addnode, -connect and the addnode RPC accept ws:// and wss://
+URLs (e.g. wss://node.example.com:443/p2p/ws; default ports 80/443,
+default path /p2p/ws). CConnman::ConnectNode() dispatches them, and
+NET_WSS addresses from addrman, to the new ConnectWebSocketNode();
+ordinary "ip:port"/"host:port" peers keep using the unchanged TCP path.
+
+The dialer (net_websocket.cpp, its own I/O thread) resolves and connects,
+does TLS with SNI (SSL_set_tlsext_host_name) for wss://, sends
+Host: <host>:<port> and Sec-WebSocket-Protocol: p2p-zstd-v1, p2p-zstd
+(permessage-deflate offered as fallback), and bridges the result to
+CConnman over a socketpair with the same pump as inbound /p2p/ws. Peers
+are not authenticated by TLS (self-signed certificates are expected);
+our certificate is presented to servers using -tlsmutual. It is
+registered through SetWebSocketDialer() so net.cpp stays free of
+Boost.Beast/OpenSSL for bitcoinkernel.
+The debug-only -p2pwebsocketoffer restricts what is offered (for
+benchmarking dictionary vs. plain zstd vs. uncompressed).
+
+Addresses: new Network NET_WSS holds a lowercase DNS name (max 253
+chars), serialized in ADDRv2 with network id 0x10 ("wss"). It is not
+ADDRv1-compatible, so the existing IsAddrCompatible() check relays it
+only to peers that sent sendaddrv2; ADDRv2 nodes without this change
+ignore the unknown id as BIP155 requires, and malformed names are
+ignored rather than treated as errors. Each name is its own netgroup.
+-externaldomain=<domain>[:port] (default port 443) adds such a local
+address so it is advertised. getnetworkinfo's network list is unchanged.
+
+Tests: NET_WSS/URL unit tests, and p2p_websocket_tls.py: node1 joins
+node0 over wss:// with p2p-zstd-v1, node2 over TCP; http/https/zstd RPC
+on node0's port; blocks and transactions relay across TCP <-> wss; the
+domain is advertised to an ADDRv2 test peer but not to an ADDRv1 one, and
+node2 learns it over TCP ADDRv2. The test framework's CAddress learns
+network id 0x10.
+
+Re-derived from authoritative HTTP/WS series-20261019/0004, including versioned Lotus-private NET_WSS 0x10 and opaque unknown-version relay. The previous stack copy embedded later TCP-advertisement/proxy safeguards; those are retained in their authoritative source0009/0010 owner positions, not duplicated here. Existing source0003 inbound-WebSocket safety adaptation remains in its preceding commit.
+---
+ src/CMakeLists.txt                            |   1 +
+ src/init.cpp                                  |  48 +++
+ src/net.cpp                                   |  95 ++++++
+ src/net.h                                     |   8 +
+ src/net_websocket.cpp                         | 305 ++++++++++++++++++
+ src/net_websocket.h                           |  33 ++
+ src/net_websocket_dialer.h                    |  46 +++
+ src/netaddress.cpp                            | 149 ++++++++-
+ src/netaddress.h                              |  71 +++-
+ src/netbase.cpp                               |   7 +-
+ src/qt/guiutil.cpp                            |   2 +
+ src/rpc/net.cpp                               |  15 +-
+ src/test/net_tests.cpp                        | 146 +++++++++
+ src/test/util/net.h                           |   3 +-
+ .../functional/p2p_websocket_addr_versions.py | 103 ++++++
+ test/functional/p2p_websocket_tls.py          | 186 +++++++++++
+ test/functional/test_framework/messages.py    |  34 +-
+ 17 files changed, 1241 insertions(+), 11 deletions(-)
+ create mode 100644 src/net_websocket.cpp
+ create mode 100644 src/net_websocket_dialer.h
+ create mode 100755 test/functional/p2p_websocket_addr_versions.py
+ create mode 100644 test/functional/p2p_websocket_tls.py
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 1be6bf077551886654150a9abb7c92f6c484ccf6..88eac6b020c6d73001db59b164d39191a03a6fec 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -656,6 +656,7 @@ add_library(server
+ 	minerfund.cpp
+ 	net.cpp
+ 	net_processing.cpp
++	net_websocket.cpp
+ 	node/abort.cpp
+ 	node/blockfitter.cpp
+ 	node/blockmanager_args.cpp
+diff --git a/src/init.cpp b/src/init.cpp
+index ed6eb63598890ce02c614c5c7e931bdfe826a3a9..24e074add80f25a21460a50c44d68fa2010aaa83 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -33,6 +33,7 @@
+ #include <hash.h>
+ #include <httprpc.h>
+ #include <httpserver.h>
++#include <net_websocket_dialer.h>
+ #include <index/blockfilterindex.h>
+ #include <index/coinstatsindex.h>
+ #include <index/txindex.h>
+@@ -304,6 +305,7 @@ void Shutdown(NodeContext &node) {
+     if (node.connman) {
+         node.connman->Stop();
+     }
++    StopP2PWebSocketDialer();
+ 
+     StopTorControl();
+ 
+@@ -1048,6 +1050,21 @@ void SetupServerArgs(NodeContext &node) {
+                   "exempt from -rpcallowip (default: %d)",
+                   P2P_WEBSOCKET_PATH, DEFAULT_P2P_WEBSOCKET),
+         ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
++    argsman.AddArg(
++        "-externaldomain=<domain>[:port]",
++        "Advertise that this node accepts P2P over WebSocket+TLS at "
++        "wss://<domain>:<port>/p2p/ws (default port: 443), e.g. behind a "
++        "TLS-terminating proxy. Only announced to peers supporting ADDRv2 "
++        "(BIP155); others never see it. Can be specified multiple times.",
++        ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY,
++        OptionsCategory::CONNECTION);
++    argsman.AddArg(
++        "-p2pwebsocketoffer=<list>",
++        strprintf("Compression offered on outbound P2P WebSockets, in order "
++                  "of preference, or \"none\" (default: %s)",
++                  DEFAULT_P2P_WEBSOCKET_OFFER),
++        ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY,
++        OptionsCategory::CONNECTION);
+     argsman.AddArg(
+         "-p2pwebsockettrustforwardedfor",
+         "For P2P WebSocket peers connecting from localhost (a reverse "
+@@ -3407,10 +3424,41 @@ bool AppInitMain(Config &config, RPCServer &rpcServer,
+     connOptions.m_i2p_accept_incoming =
+         args.GetBoolArg("-i2pacceptincoming", true);
+ 
++    {
++        // Outbound ws:// and wss:// peers. Present our TLS certificate, if
++        // any, to peers requesting client certificates.
++        std::optional<fs::path> cert, key;
++        if (args.IsArgSet("-tlscert") && args.IsArgSet("-tlskey")) {
++            cert = args.GetPathArg("-tlscert");
++            key = args.GetPathArg("-tlskey");
++        } else if (fs::exists(args.GetDataDirNet() / HTTP_TLS_CERT_FILENAME) &&
++                   fs::exists(args.GetDataDirNet() / HTTP_TLS_KEY_FILENAME)) {
++            cert = args.GetDataDirNet() / HTTP_TLS_CERT_FILENAME;
++            key = args.GetDataDirNet() / HTTP_TLS_KEY_FILENAME;
++        }
++        if (!StartP2PWebSocketDialer(
++                cert, key,
++                args.GetArg("-p2pwebsocketoffer",
++                            DEFAULT_P2P_WEBSOCKET_OFFER))) {
++            LogPrintf("P2P over WebSocket is not supported on this platform\n");
++        }
++    }
++
+     if (!node.connman->Start(scheduler, connOptions)) {
+         return false;
+     }
+ 
++    for (const std::string &strDomain : args.GetArgs("-externaldomain")) {
++        uint16_t port{443};
++        std::string host;
++        CNetAddr domain;
++        if (!SplitHostPort(strDomain, port, host) || !domain.SetWSSDomain(host)) {
++            return InitError(strprintf(_("Invalid -externaldomain: '%s'"),
++                                       strDomain));
++        }
++        AddLocal(CService{domain, port}, LOCAL_MANUAL);
++    }
++
+     if (fListen && args.GetBoolArg("-p2pwebsocket", DEFAULT_P2P_WEBSOCKET)) {
+         // Inbound P2P peers arriving over WebSocket on the HTTP server.
+         SetP2PWebSocketAcceptor(
+diff --git a/src/net.cpp b/src/net.cpp
+index 27074cc19f70b6c1898614fcfaff341f7fb35c29..1182008bef10f4706c900be34f3b59179ce9588a 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -428,6 +428,20 @@ CNode *CConnman::ConnectNode(CAddress addrConnect, const char *pszDest,
+     AssertLockNotHeld(m_unused_i2p_sessions_mutex);
+     assert(conn_type != ConnectionType::INBOUND);
+ 
++    // P2P over WebSocket: ws:// and wss:// URLs, and NET_WSS addresses.
++    if (pszDest != nullptr && IsWebSocketURL(pszDest)) {
++        return ConnectWebSocketNode(pszDest, nullptr, fCountFailure,
++                                    conn_type);
++    }
++    if (pszDest == nullptr && addrConnect.IsWSS()) {
++        if (!addrConnect.IsDialableWSS() || IsLocal(addrConnect) ||
++            FindNode(static_cast<CService>(addrConnect))) {
++            return nullptr;
++        }
++        return ConnectWebSocketNode(WebSocketURLForAddress(addrConnect),
++                                    &addrConnect, fCountFailure, conn_type);
++    }
++
+     if (pszDest == nullptr) {
+         if (IsLocal(addrConnect)) {
+             return nullptr;
+@@ -1083,6 +1097,82 @@ WebSocketTransportTotals &GetWebSocketTransportTotals() {
+     return totals;
+ }
+ 
++static GlobalMutex g_websocket_dialer_mutex;
++static WebSocketDialer g_websocket_dialer GUARDED_BY(g_websocket_dialer_mutex);
++
++void SetWebSocketDialer(WebSocketDialer dialer) {
++    LOCK(g_websocket_dialer_mutex);
++    g_websocket_dialer = std::move(dialer);
++}
++
++WebSocketDialer GetWebSocketDialer() {
++    LOCK(g_websocket_dialer_mutex);
++    return g_websocket_dialer;
++}
++
++bool IsWebSocketURL(std::string_view str) {
++    return str.substr(0, 5) == "ws://" || str.substr(0, 6) == "wss://";
++}
++
++std::string WebSocketURLForAddress(const CService &addr) {
++    return strprintf("wss://%s%s", addr.ToStringAddrPort(), addr.GetWSSPath());
++}
++
++CNode *CConnman::ConnectWebSocketNode(const std::string &url,
++                                      const CAddress *wss_addr,
++                                      bool fCountFailure,
++                                      ConnectionType conn_type) {
++    const WebSocketDialer dialer{GetWebSocketDialer()};
++    if (!dialer) {
++        LogPrintf("Cannot connect to %s: P2P over WebSocket is unavailable\n",
++                  url);
++        return nullptr;
++    }
++    LogPrintLevel(BCLog::NET, BCLog::Level::Debug,
++                  "trying WebSocket connection %s\n", url);
++    std::optional<WebSocketDialResult> dialed{dialer(url)};
++    if (wss_addr) {
++        addrman.Attempt(*wss_addr, fCountFailure);
++    }
++    if (!dialed) {
++        return nullptr;
++    }
++
++    // The peer is known by its NET_WSS address if it came from addrman, or
++    // by the IP it resolved to for a -addnode/-connect URL.
++    const CAddress addrConnect{wss_addr ? *wss_addr
++                                        : CAddress{dialed->remote, NODE_NONE}};
++    NetPermissionFlags permission_flags = NetPermissionFlags::None;
++    std::vector<NetWhitelistPermissions> whitelist_permissions =
++        conn_type == ConnectionType::MANUAL
++            ? vWhitelistedRangeOutgoing
++            : std::vector<NetWhitelistPermissions>{};
++    AddWhitelistPermissionFlags(permission_flags, dialed->remote,
++                                whitelist_permissions);
++
++    NodeId id = GetNewNodeId();
++    uint64_t nonce = GetDeterministicRandomizer(RANDOMIZER_ID_LOCALHOSTNONCE)
++                         .Write(id)
++                         .Finalize();
++    uint64_t extra_entropy =
++        GetDeterministicRandomizer(RANDOMIZER_ID_EXTRAENTROPY)
++            .Write(id)
++            .Finalize();
++    CNode *pnode = new CNode(
++        id, std::move(dialed->sock), addrConnect,
++        CalculateKeyedNetGroup(addrConnect), nonce, extra_entropy,
++        CAddress{dialed->local, NODE_NONE}, wss_addr ? "" : url, conn_type,
++        /* inbound_onion */ false,
++        CNodeOptions{
++            .permission_flags = permission_flags,
++            .recv_flood_size = nReceiveFloodSize,
++            .websocket_info = std::move(dialed->info),
++        });
++    pnode->AddRef();
++    RandAddEvent(uint32_t(id));
++    return pnode;
++}
++
+ void CConnman::AcceptWebSocketPeer(
+     std::unique_ptr<Sock> &&sock, const CAddress &addr,
+     const CAddress &addr_bind, std::shared_ptr<WebSocketTransportInfo> info) {
+@@ -2076,6 +2166,11 @@ void CConnman::ThreadOpenConnections(
+                 continue;
+             }
+ 
++            // NET_WSS addresses of later versions are relayed, not dialed.
++            if (addr.IsWSS() && !addr.IsDialableWSS()) {
++                continue;
++            }
++
+             // only consider very recently tried nodes after 30 failed attempts
+             if (current_time - addr_last_try < 10min && nTries < 30) {
+                 continue;
+diff --git a/src/net.h b/src/net.h
+index 5e44fd70c3a8900fe7e78b125f61b07da151546d..a9eb70031660d5f2879bf3ec9cdbc53eb1286b25 100644
+--- a/src/net.h
++++ b/src/net.h
+@@ -1213,6 +1213,14 @@ private:
+     CNode *ConnectNode(CAddress addrConnect, const char *pszDest,
+                        bool fCountFailure, ConnectionType conn_type)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
++    /**
++     * Open an outbound P2P connection over WebSocket to `url` (ws:// or
++     * wss://), via the dialer set with SetWebSocketDialer(). `wss_addr` is
++     * the NET_WSS address the URL was made from, if any.
++     */
++    CNode *ConnectWebSocketNode(const std::string &url,
++                                const CAddress *wss_addr, bool fCountFailure,
++                                ConnectionType conn_type);
+     ;
+     void AddWhitelistPermissionFlags(
+         NetPermissionFlags &flags, const CNetAddr &addr,
+diff --git a/src/net_websocket.cpp b/src/net_websocket.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..51396e8164d7b886247a748be9caf14bb7b933ad
+--- /dev/null
++++ b/src/net_websocket.cpp
+@@ -0,0 +1,305 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <net_websocket_dialer.h>
++
++#include <clientversion.h>
++#include <logging.h>
++#include <net_websocket.h>
++#include <net_websocket_bridge.h>
++#include <netbase.h>
++#include <util/fs.h>
++#include <util/strencodings.h>
++#include <util/string.h>
++#include <util/threadnames.h>
++
++#include <boost/asio/co_spawn.hpp>
++#include <boost/asio/detached.hpp>
++#include <boost/asio/io_context.hpp>
++#include <boost/asio/ip/tcp.hpp>
++#include <boost/asio/ssl.hpp>
++#include <boost/asio/strand.hpp>
++#include <boost/asio/use_future.hpp>
++#include <boost/beast/http.hpp>
++#include <boost/beast/ssl.hpp>
++#include <boost/beast/websocket/ssl.hpp>
++
++#include <openssl/ssl.h>
++
++#include <chrono>
++#include <future>
++#include <thread>
++
++namespace {
++
++namespace asio = boost::asio;
++namespace beast = boost::beast;
++namespace http = beast::http;
++namespace ssl = asio::ssl;
++namespace websocket = beast::websocket;
++using tcp = asio::ip::tcp;
++
++//! Total time allowed for resolving, connecting and both handshakes
++constexpr std::chrono::seconds DIAL_TIMEOUT{20};
++
++std::unique_ptr<asio::io_context> g_dial_io;
++std::optional<asio::executor_work_guard<asio::io_context::executor_type>>
++    g_dial_work;
++std::thread g_dial_thread;
++std::unique_ptr<ssl::context> g_client_tls;
++//! Sec-WebSocket-Protocol offered to peers ("" offers nothing)
++std::string g_offered_protocols;
++//! Whether to also offer permessage-deflate
++bool g_offer_deflate{true};
++} // namespace
++
++std::optional<ParsedWebSocketURL> ParseWebSocketURL(std::string_view url) {
++    ParsedWebSocketURL out;
++    if (url.substr(0, 6) == "wss://") {
++        out.tls = true;
++        url.remove_prefix(6);
++    } else if (url.substr(0, 5) == "ws://") {
++        url.remove_prefix(5);
++    } else {
++        return std::nullopt;
++    }
++    const size_t slash{url.find('/')};
++    const std::string authority{url.substr(0, slash)};
++    out.target = slash == std::string_view::npos ? std::string{P2P_WEBSOCKET_PATH}
++                                                 : std::string{url.substr(slash)};
++    uint16_t port{static_cast<uint16_t>(out.tls ? 443 : 80)};
++    std::string host;
++    if (authority.empty() || !SplitHostPort(authority, port, host) ||
++        host.empty()) {
++        return std::nullopt;
++    }
++    out.host = host;
++    out.port = port;
++    const bool ipv6{host.find(':') != std::string::npos};
++    out.authority = strprintf(ipv6 ? "[%s]:%u" : "%s:%u", host, port);
++    return out;
++}
++
++// The dialer bridges through a local socketpair (not available on Windows).
++#ifdef HAVE_P2P_WEBSOCKET_BRIDGE
++namespace {
++CService ToCService(const tcp::endpoint &endpoint) {
++    return LookupNumeric(endpoint.address().to_string(), endpoint.port());
++}
++
++/** WebSocket handshake on a connected stream, then start the bridge */
++template <typename WS>
++asio::awaitable<std::optional<WebSocketDialResult>>
++FinishDial(std::shared_ptr<WS> ws, const ParsedWebSocketURL &url, bool tls,
++           CService remote, CService local) {
++    // Offer permessage-deflate as a last resort for servers without zstd.
++    p2pws::ConfigureP2PWebSocket(*ws, beast::role_type::client,
++                                 g_offer_deflate);
++    ws->set_option(websocket::stream_base::decorator(
++        [protocols = g_offered_protocols](websocket::request_type &req) {
++            if (!protocols.empty()) {
++                req.set(http::field::sec_websocket_protocol, protocols);
++            }
++            req.set(http::field::user_agent, FormatFullVersion());
++        }));
++    websocket::response_type res;
++    auto [hec] = co_await ws->async_handshake(
++        res, url.authority, url.target, asio::as_tuple(asio::use_awaitable));
++    if (hec) {
++        LogDebug(BCLog::NET, "WebSocket handshake with %s failed: %s\n",
++                 url.authority, hec.message());
++        co_return std::nullopt;
++    }
++    const bool deflate{res[http::field::sec_websocket_extensions].find(
++                           "permessage-deflate") != std::string_view::npos};
++
++    const auto pair{p2pws::CreateBridgeSocketPair()};
++    if (!pair) {
++        co_return std::nullopt;
++    }
++    WebSocketDialResult result{
++        .sock = std::make_unique<Sock>(static_cast<SOCKET>(pair->first)),
++        .info = std::make_shared<WebSocketTransportInfo>(),
++        .remote = remote,
++        .local = local,
++    };
++    result.info->tls = tls;
++    result.info->compression = p2pws::CompressionFromSelectedProtocol(
++        res[http::field::sec_websocket_protocol], deflate);
++    p2pws::LocalSocket bridge{ws->get_executor()};
++    boost::system::error_code ec;
++    bridge.assign(asio::local::stream_protocol{}, pair->second, ec);
++    if (ec) {
++        ::close(pair->second);
++        co_return std::nullopt;
++    }
++    LogDebug(BCLog::NET, "WebSocket P2P connection to %s (%s, %s)\n",
++             url.authority, tls ? "wss" : "ws",
++             P2PWebSocketCompressionName(result.info->compression));
++    asio::co_spawn(
++        ws->get_executor(),
++        [](std::shared_ptr<WS> ws, p2pws::LocalSocket bridge,
++           std::shared_ptr<WebSocketTransportInfo> info)
++            -> asio::awaitable<void> {
++            co_await p2pws::RunP2PWebSocketBridge(*ws, std::move(bridge),
++                                                  std::move(info),
++                                                  /*is_client=*/true);
++        }(ws, std::move(bridge), result.info),
++        asio::detached);
++    co_return result;
++}
++
++asio::awaitable<std::optional<WebSocketDialResult>>
++Dial(ParsedWebSocketURL url) {
++    try {
++        auto executor{co_await asio::this_coro::executor};
++        tcp::resolver resolver{executor};
++        auto [rec, results] = co_await resolver.async_resolve(
++            url.host, std::to_string(url.port),
++            asio::as_tuple(asio::use_awaitable));
++        if (rec) {
++            LogDebug(BCLog::NET, "Cannot resolve %s: %s\n", url.host,
++                     rec.message());
++            co_return std::nullopt;
++        }
++        beast::tcp_stream stream{executor};
++        stream.expires_after(DIAL_TIMEOUT);
++        auto [cec, endpoint] = co_await stream.async_connect(
++            results, asio::as_tuple(asio::use_awaitable));
++        if (cec) {
++            LogDebug(BCLog::NET, "WebSocket connect to %s failed: %s\n",
++                     url.authority, cec.message());
++            co_return std::nullopt;
++        }
++        boost::system::error_code ignored;
++        stream.socket().set_option(tcp::no_delay(true), ignored);
++        const CService remote{ToCService(endpoint)};
++        const CService local{ToCService(stream.socket().local_endpoint(ignored))};
++
++        if (!url.tls) {
++            stream.expires_never();
++            auto ws{std::make_shared<websocket::stream<beast::tcp_stream>>(
++                std::move(stream))};
++            co_return co_await FinishDial(ws, url, false, remote, local);
++        }
++
++        auto ws{std::make_shared<
++            websocket::stream<beast::ssl_stream<beast::tcp_stream>>>(
++            std::move(stream), *g_client_tls)};
++        auto &tls_stream{ws->next_layer()};
++        // SNI lets TLS-terminating proxies route by name; not for literals.
++        boost::system::error_code addr_ec;
++        asio::ip::make_address(url.host, addr_ec);
++        if (addr_ec &&
++            !SSL_set_tlsext_host_name(tls_stream.native_handle(),
++                                      url.host.c_str())) {
++            co_return std::nullopt;
++        }
++        auto [hs_ec] = co_await tls_stream.async_handshake(
++            ssl::stream_base::client, asio::as_tuple(asio::use_awaitable));
++        if (hs_ec) {
++            LogDebug(BCLog::NET, "TLS handshake with %s failed: %s\n",
++                     url.authority, hs_ec.message());
++            co_return std::nullopt;
++        }
++        beast::get_lowest_layer(*ws).expires_never();
++        co_return co_await FinishDial(ws, url, true, remote, local);
++    } catch (const std::exception &e) {
++        LogDebug(BCLog::NET, "WebSocket dial to %s failed: %s\n",
++                 url.authority, e.what());
++        co_return std::nullopt;
++    }
++}
++
++std::optional<WebSocketDialResult> DialBlocking(const std::string &url_str) {
++    const auto url{ParseWebSocketURL(url_str)};
++    if (!url) {
++        LogPrintf("Invalid WebSocket peer URL: %s\n", url_str);
++        return std::nullopt;
++    }
++    auto future{asio::co_spawn(asio::make_strand(*g_dial_io), Dial(*url),
++                               asio::use_future)};
++    if (future.wait_for(DIAL_TIMEOUT + std::chrono::seconds{5}) !=
++        std::future_status::ready) {
++        // The late result (if any) is dropped, closing its socketpair.
++        return std::nullopt;
++    }
++    try {
++        return future.get();
++    } catch (const std::exception &) {
++        return std::nullopt;
++    }
++}
++} // namespace
++#endif // HAVE_P2P_WEBSOCKET_BRIDGE
++
++bool StartP2PWebSocketDialer(const std::optional<fs::path> &client_cert,
++                             const std::optional<fs::path> &client_key,
++                             const std::string &offer) {
++#ifndef HAVE_P2P_WEBSOCKET_BRIDGE
++    return false;
++#else
++    // "p2p-zstd-v1,p2p-zstd,permessage-deflate" by default; "none" offers
++    // plain binary messages only.
++    g_offered_protocols.clear();
++    g_offer_deflate = false;
++    for (const std::string &token : util::SplitString(offer, ',')) {
++        const std::string t{util::TrimString(token)};
++        if (t == "permessage-deflate") {
++            g_offer_deflate = true;
++        } else if (t == P2P_WS_PROTOCOL_ZSTD_DICT || t == P2P_WS_PROTOCOL_ZSTD) {
++            g_offered_protocols += (g_offered_protocols.empty() ? "" : ", ") + t;
++        } else if (t != "none") {
++            LogPrintf("Ignoring unknown -p2pwebsocketoffer entry %s\n", t);
++        }
++    }
++    auto ctx{std::make_unique<ssl::context>(ssl::context::tls_client)};
++    ctx->set_options(ssl::context::default_workarounds |
++                     ssl::context::no_sslv2 | ssl::context::no_sslv3 |
++                     ssl::context::no_tlsv1 | ssl::context::no_tlsv1_1);
++    // Peers commonly use self-signed certificates: TLS here protects against
++    // passive observers and lets proxies route by SNI; peers are not
++    // authenticated (as with plain TCP P2P).
++    ctx->set_verify_mode(ssl::verify_none);
++    if (client_cert && client_key) {
++        try {
++            ctx->use_certificate_chain_file(fs::PathToString(*client_cert));
++            ctx->use_private_key_file(fs::PathToString(*client_key),
++                                      ssl::context::pem);
++        } catch (const boost::system::system_error &e) {
++            LogPrintf("Not presenting a TLS client certificate to WebSocket "
++                      "peers: %s\n",
++                      e.what());
++        }
++    }
++    g_client_tls = std::move(ctx);
++    if (!g_dial_io) {
++        g_dial_io = std::make_unique<asio::io_context>();
++    } else {
++        g_dial_io->restart();
++    }
++    g_dial_work.emplace(asio::make_work_guard(*g_dial_io));
++    g_dial_thread = std::thread([] {
++        util::ThreadRename("p2pws");
++        g_dial_io->run();
++    });
++    SetWebSocketDialer(DialBlocking);
++    return true;
++#endif
++}
++
++void StopP2PWebSocketDialer() {
++    SetWebSocketDialer(nullptr);
++    if (!g_dial_io) {
++        return;
++    }
++    g_dial_work.reset();
++    // Bridges end once CConnman has closed its sockets; stop regardless.
++    g_dial_io->stop();
++    if (g_dial_thread.joinable()) {
++        g_dial_thread.join();
++    }
++    // g_dial_io is kept: destroying it could run pending handlers'
++    // destructors after the TLS context is gone.
++}
+diff --git a/src/net_websocket.h b/src/net_websocket.h
+index 70e4658554a3e27df4dafaecbfc85368c8441eda..bc0ca4f7cee56cbc98eafa124c4f06f40080a060 100644
+--- a/src/net_websocket.h
++++ b/src/net_websocket.h
+@@ -5,9 +5,16 @@
+ #ifndef BITCOIN_NET_WEBSOCKET_H
+ #define BITCOIN_NET_WEBSOCKET_H
+ 
++#include <netaddress.h>
++#include <util/sock.h>
++
+ #include <atomic>
+ #include <cstdint>
++#include <functional>
++#include <memory>
++#include <optional>
+ #include <string>
++#include <string_view>
+ 
+ /**
+  * P2P over WebSocket (/p2p/ws).
+@@ -21,6 +28,7 @@
+ 
+ //! URI path of the P2P WebSocket endpoint on the RPC/HTTP port
+ static const char *const P2P_WEBSOCKET_PATH = "/p2p/ws";
++static_assert(std::string_view{"/p2p/ws"} == P2P_WSS_DEFAULT_PATH);
+ //! Accept P2P connections over WebSocket on the RPC/HTTP port
+ static const bool DEFAULT_P2P_WEBSOCKET = true;
+ //! Sec-WebSocket-Protocol tokens, in order of preference
+@@ -68,6 +76,31 @@ struct WebSocketTransportTotals {
+ };
+ WebSocketTransportTotals &GetWebSocketTransportTotals();
+ 
++/** An established outbound P2P WebSocket, bridged to a socketpair */
++struct WebSocketDialResult {
++    //! CConnman's end of the socketpair
++    std::unique_ptr<Sock> sock;
++    std::shared_ptr<WebSocketTransportInfo> info;
++    //! TCP endpoints of the WebSocket connection
++    CService remote;
++    CService local;
++};
++
++/**
++ * Opens a ws:// or wss:// P2P connection and starts bridging it. Blocking,
++ * with an internal timeout. Provided by the node (net_websocket.cpp).
++ */
++using WebSocketDialer =
++    std::function<std::optional<WebSocketDialResult>(const std::string &url)>;
++void SetWebSocketDialer(WebSocketDialer dialer);
++WebSocketDialer GetWebSocketDialer();
++
++/** Whether a -addnode/-connect string is a ws:// or wss:// URL */
++bool IsWebSocketURL(std::string_view str);
++
++/** The URL dialed for a dialable NET_WSS address: wss://<name>:<port><path> */
++std::string WebSocketURLForAddress(const CService &addr);
++
+ /** Size of a WebSocket frame header for a payload of this size */
+ constexpr uint64_t WebSocketFrameHeaderSize(uint64_t payload_size,
+                                             bool masked) {
+diff --git a/src/net_websocket_dialer.h b/src/net_websocket_dialer.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..79df4d7ac1075423ebb72a0c8d5ab3c8c1cd220d
+--- /dev/null
++++ b/src/net_websocket_dialer.h
+@@ -0,0 +1,46 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_NET_WEBSOCKET_DIALER_H
++#define BITCOIN_NET_WEBSOCKET_DIALER_H
++
++#include <util/fs.h>
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++
++/** A ws:// or wss:// P2P peer URL */
++struct ParsedWebSocketURL {
++    bool tls{false};
++    std::string host;
++    uint16_t port{0};
++    //! Value of the Host header: host:port, with [] around IPv6 literals
++    std::string authority;
++    //! Request target, "/p2p/ws" if the URL has no path
++    std::string target;
++};
++
++/** Parse ws://host[:port][/path] (default port 80) or wss:// (443) */
++std::optional<ParsedWebSocketURL> ParseWebSocketURL(std::string_view url);
++
++//! What outbound P2P WebSockets offer, in order of preference
++static const char *const DEFAULT_P2P_WEBSOCKET_OFFER =
++    "p2p-zstd-v1,p2p-zstd,permessage-deflate";
++
++/**
++ * Start the outbound P2P WebSocket dialer (its own I/O thread) and register
++ * it with SetWebSocketDialer(). If given, the certificate is presented to
++ * wss:// peers that ask for one (see -tlsmutual). `offer` is a comma
++ * separated subset of DEFAULT_P2P_WEBSOCKET_OFFER, or "none".
++ */
++bool StartP2PWebSocketDialer(const std::optional<fs::path> &client_cert,
++                             const std::optional<fs::path> &client_key,
++                             const std::string &offer);
++
++/** Unregister and stop the dialer. Call after CConnman::Stop(). */
++void StopP2PWebSocketDialer();
++
++#endif // BITCOIN_NET_WEBSOCKET_DIALER_H
+diff --git a/src/netaddress.cpp b/src/netaddress.cpp
+index 7d47d671ab912d4913e23129ffe583b50df66173..21b11dd8feeee8cf0e44870bbb8283fa13dd6a0d 100644
+--- a/src/netaddress.cpp
++++ b/src/netaddress.cpp
+@@ -44,6 +44,8 @@ CNetAddr::BIP155Network CNetAddr::GetBIP155Network() const {
+             return BIP155Network::I2P;
+         case NET_CJDNS:
+             return BIP155Network::CJDNS;
++        case NET_WSS:
++            return BIP155Network::WSS_DOMAIN;
+         case NET_INTERNAL:
+             // should have been handled before calling this function
+         case NET_UNROUTABLE:
+@@ -107,6 +109,13 @@ bool CNetAddr::SetNetFromBIP155Network(uint8_t possible_bip155_net,
+             throw std::ios_base::failure(
+                 strprintf("BIP155 CJDNS address with length %u (should be %u)",
+                           address_size, ADDR_CJDNS_SIZE));
++        case BIP155Network::WSS_DOMAIN:
++            // Not a BIP155 founding network: never throw, ignore bad sizes.
++            if (address_size >= 1 && address_size <= ADDR_WSS_MAX_SIZE) {
++                m_net = NET_WSS;
++                return true;
++            }
++            return false;
+     }
+ 
+     // Don't throw on addresses with unknown network ids (maybe from the
+@@ -141,6 +150,10 @@ void CNetAddr::SetIP(const CNetAddr &ipIn) {
+         case NET_CJDNS:
+             assert(ipIn.m_addr.size() == ADDR_CJDNS_SIZE);
+             break;
++        case NET_WSS:
++            assert(ipIn.m_addr.size() >= 1 &&
++                   ipIn.m_addr.size() <= ADDR_WSS_MAX_SIZE);
++            break;
+         case NET_INTERNAL:
+             assert(ipIn.m_addr.size() == ADDR_INTERNAL_SIZE);
+             break;
+@@ -485,6 +498,10 @@ bool CNetAddr::IsValid() const {
+         return false;
+     }
+ 
++    if (IsWSS()) {
++        return IsValidWSSPayload(m_addr);
++    }
++
+     // documentation IPv6 address
+     if (IsRFC3849()) {
+         return false;
+@@ -539,6 +556,7 @@ bool CNetAddr::IsAddrV1Compatible() const {
+             return m_addr.size() == ADDR_TORV2_SIZE;
+         case NET_I2P:
+         case NET_CJDNS:
++        case NET_WSS:
+             return false;
+         case NET_UNROUTABLE:
+             // m_net is never and should not be set to NET_UNROUTABLE
+@@ -550,6 +568,114 @@ bool CNetAddr::IsAddrV1Compatible() const {
+     assert(false);
+ }
+ 
++bool CNetAddr::IsValidWSSDomain(Span<const uint8_t> name) {
++    if (name.empty() || name.size() > WSS_MAX_HOST_SIZE) {
++        return false;
++    }
++    size_t label_len{0};
++    for (size_t i = 0; i < name.size(); ++i) {
++        const uint8_t c{name[i]};
++        if (c == '.') {
++            if (label_len == 0 || name[i - 1] == '-') {
++                return false;
++            }
++            label_len = 0;
++            continue;
++        }
++        const bool alnum{(c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')};
++        if (!alnum && !(c == '-' && label_len > 0)) {
++            return false;
++        }
++        if (++label_len > 63) {
++            return false;
++        }
++    }
++    return label_len > 0 && name.back() != '-';
++}
++
++bool CNetAddr::IsValidWSSPath(std::string_view path) {
++    if (path.size() < 2 || path.size() > WSS_MAX_PATH_SIZE || path[0] != '/' ||
++        path.back() == '/') {
++        return false;
++    }
++    return std::all_of(path.begin(), path.end(), [](char c) {
++        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++               (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' ||
++               c == '~' || c == '/';
++    });
++}
++
++bool CNetAddr::IsValidWSSPayload(Span<const uint8_t> payload) {
++    if (payload.empty() || payload.size() > ADDR_WSS_MAX_SIZE) {
++        return false;
++    }
++    switch (payload[0]) {
++        case 0:
++            // Reserved.
++            return false;
++        case WSS_ADDR_V1: {
++            const auto body{payload.subspan(1)};
++            const auto slash{std::find(body.begin(), body.end(), '/')};
++            const Span<const uint8_t> host{body.data(),
++                                           size_t(slash - body.begin())};
++            if (!IsValidWSSDomain(host)) {
++                return false;
++            }
++            const std::string_view path{
++                reinterpret_cast<const char *>(body.data()) + host.size(),
++                body.size() - host.size()};
++            // Canonical: the default path is never written out.
++            return path.empty() ||
++                   (IsValidWSSPath(path) && path != P2P_WSS_DEFAULT_PATH);
++        }
++        default:
++            // A later version: opaque here.
++            return true;
++    }
++}
++
++bool CNetAddr::SetWSSDomain(std::string_view domain, std::string_view path) {
++    std::vector<uint8_t> name(domain.begin(), domain.end());
++    for (uint8_t &c : name) {
++        if (c >= 'A' && c <= 'Z') {
++            c = c - 'A' + 'a';
++        }
++    }
++    if (!IsValidWSSDomain(name)) {
++        return false;
++    }
++    if (path == P2P_WSS_DEFAULT_PATH) {
++        path = {};
++    }
++    if (!path.empty() && !IsValidWSSPath(path)) {
++        return false;
++    }
++    m_net = NET_WSS;
++    m_addr.clear();
++    m_addr.push_back(WSS_ADDR_V1);
++    m_addr.insert(m_addr.end(), name.begin(), name.end());
++    m_addr.insert(m_addr.end(), path.begin(), path.end());
++    m_scope_id = 0;
++    return true;
++}
++
++std::string CNetAddr::GetWSSHost() const {
++    if (!IsDialableWSS()) {
++        return {};
++    }
++    const auto slash{std::find(m_addr.begin() + 1, m_addr.end(), '/')};
++    return std::string(m_addr.begin() + 1, slash);
++}
++
++std::string CNetAddr::GetWSSPath() const {
++    if (!IsDialableWSS()) {
++        return {};
++    }
++    const auto slash{std::find(m_addr.begin() + 1, m_addr.end(), '/')};
++    return slash == m_addr.end() ? std::string{P2P_WSS_DEFAULT_PATH}
++                                 : std::string(slash, m_addr.end());
++}
++
+ enum Network CNetAddr::GetNetwork() const {
+     if (IsInternal()) {
+         return NET_INTERNAL;
+@@ -660,6 +786,13 @@ std::string CNetAddr::ToStringAddr() const {
+                    ".b32.i2p";
+         case NET_CJDNS:
+             return IPv6ToString(m_addr, 0);
++        case NET_WSS:
++            if (IsDialableWSS()) {
++                return GetWSSHost();
++            }
++            // A version we cannot read: a stable, name-like label.
++            return strprintf("wss-v%u-%s.invalid", GetWSSVersion(),
++                             HexStr(Hash(m_addr)).substr(0, 16));
+         case NET_INTERNAL:
+             return EncodeBase32(m_addr) + ".internal";
+         case NET_UNROUTABLE:
+@@ -835,6 +968,16 @@ std::vector<uint8_t> CNetAddr::GetGroup(const std::vector<bool> &asmap) const {
+         vchRet.push_back((ipv4 >> 24) & 0xFF);
+         vchRet.push_back((ipv4 >> 16) & 0xFF);
+         return vchRet;
++    } else if (IsWSS()) {
++        // Each DNS name is its own group (whatever the path). All addresses
++        // of a version we cannot read share one group, so they cannot crowd
++        // out usable ones in addrman.
++        vchRet.push_back(GetWSSVersion());
++        if (IsDialableWSS()) {
++            const std::string host{GetWSSHost()};
++            vchRet.insert(vchRet.end(), host.begin(), host.end());
++        }
++        return vchRet;
+     } else if (IsTor() || IsI2P() || IsCJDNS()) {
+         nBits = 4;
+     } else if (IsHeNet()) {
+@@ -1100,7 +1243,7 @@ std::vector<uint8_t> CService::GetKey() const {
+ std::string CService::ToStringAddrPort() const {
+     const auto port_str = strprintf("%u", port);
+ 
+-    if (IsIPv4() || IsTor() || IsI2P() || IsInternal()) {
++    if (IsIPv4() || IsTor() || IsI2P() || IsInternal() || IsWSS()) {
+         return ToStringAddr() + ":" + port_str;
+     } else {
+         return "[" + ToStringAddr() + "]:" + port_str;
+@@ -1204,6 +1347,7 @@ CSubNet::CSubNet(const CNetAddr &addr) : CSubNet() {
+         case NET_ONION:
+         case NET_I2P:
+         case NET_CJDNS:
++        case NET_WSS:
+             valid = true;
+             break;
+         case NET_INTERNAL:
+@@ -1231,6 +1375,7 @@ bool CSubNet::Match(const CNetAddr &addr) const {
+         case NET_ONION:
+         case NET_I2P:
+         case NET_CJDNS:
++        case NET_WSS:
+         case NET_INTERNAL:
+             return addr == network;
+         case NET_UNROUTABLE:
+@@ -1270,6 +1415,7 @@ std::string CSubNet::ToString() const {
+         case NET_ONION:
+         case NET_I2P:
+         case NET_CJDNS:
++        case NET_WSS:
+         case NET_INTERNAL:
+         case NET_UNROUTABLE:
+         case NET_MAX:
+@@ -1291,6 +1437,7 @@ bool CSubNet::SanityCheck() const {
+         case NET_ONION:
+         case NET_I2P:
+         case NET_CJDNS:
++        case NET_WSS:
+             return true;
+         case NET_INTERNAL:
+         case NET_UNROUTABLE:
+diff --git a/src/netaddress.h b/src/netaddress.h
+index 768a8ff3d63244ae7e2189aa34c6e79f8184a7de..8252ce7616fd5e03835b25ebad36a683c2a6b994 100644
+--- a/src/netaddress.h
++++ b/src/netaddress.h
+@@ -23,6 +23,7 @@
+ #include <cstdint>
+ #include <ios>
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
+ /**
+@@ -58,6 +59,11 @@ enum Network {
+     /// them in AddrMan to keep track of which DNS seeds were used.
+     NET_INTERNAL,
+ 
++    /// A DNS name reached with P2P over WebSocket+TLS
++    /// (wss://<name>:<port>/p2p/ws). Only gossiped in ADDRv2 (BIP155 network
++    /// id 0x10), which pre-existing ADDRv2 nodes skip as unknown.
++    NET_WSS,
++
+     /// Dummy value to indicate the number of NET_* constants.
+     NET_MAX,
+ };
+@@ -105,6 +111,22 @@ static constexpr size_t ADDR_CJDNS_SIZE = 16;
+ /// Size of "internal" (NET_INTERNAL) address (in bytes).
+ static constexpr size_t ADDR_INTERNAL_SIZE = 10;
+ 
++/**
++ * NET_WSS address payload: a version byte, then a version-specific body.
++ * Version 1: a DNS name, optionally followed by a "/path" (absent: /p2p/ws).
++ * Other versions are kept and relayed but never dialed, so later formats can
++ * spread through nodes that do not understand them.
++ */
++static constexpr uint8_t WSS_ADDR_V1 = 0x01;
++/// WebSocket path of a NET_WSS address that carries none
++static constexpr std::string_view P2P_WSS_DEFAULT_PATH{"/p2p/ws"};
++/// Maximum size of a NET_WSS address payload (MAX_ADDRV2_SIZE)
++static constexpr size_t ADDR_WSS_MAX_SIZE = 512;
++/// Longest DNS name in a NET_WSS address
++static constexpr size_t WSS_MAX_HOST_SIZE = 253;
++/// Longest path in a version 1 NET_WSS address
++static constexpr size_t WSS_MAX_PATH_SIZE = 255;
++
+ /// SAM 3.1 and earlier do not support specifying ports and force the port to 0.
+ static constexpr uint16_t I2P_SAM31_PORT{0};
+ 
+@@ -196,6 +218,36 @@ public:
+     bool IsTor() const;
+     bool IsI2P() const;
+     bool IsCJDNS() const;
++    /** Whether this is a NET_WSS (DNS name reached via wss://) address */
++    bool IsWSS() const { return m_net == NET_WSS; }
++
++    /**
++     * Set this object to the version 1 NET_WSS address of a DNS name
++     * (lowercased) and WebSocket path ("" or "/p2p/ws": the default).
++     * @returns Whether `domain` is a valid DNS name of at most
++     * WSS_MAX_HOST_SIZE characters (letters, digits, '-' and '.', labels of
++     * 1-63 characters not starting or ending with '-'), and `path` a valid
++     * path (see IsValidWSSPath).
++     */
++    bool SetWSSDomain(std::string_view domain, std::string_view path = "");
++
++    /** NET_WSS: the payload version (0 if not NET_WSS) */
++    uint8_t GetWSSVersion() const {
++        return IsWSS() && !m_addr.empty() ? m_addr[0] : 0;
++    }
++    /** NET_WSS: whether this node can dial it (a version it understands) */
++    bool IsDialableWSS() const { return GetWSSVersion() == WSS_ADDR_V1; }
++    /** Dialable NET_WSS: the DNS name */
++    std::string GetWSSHost() const;
++    /** Dialable NET_WSS: the WebSocket path (default /p2p/ws) */
++    std::string GetWSSPath() const;
++
++    /**
++     * Whether `path` can be carried in a NET_WSS address: "/" followed by
++     * 1-254 of A-Z a-z 0-9 - . _ ~ / (no query, fragment or escapes), not
++     * ending in "/".
++     */
++    static bool IsValidWSSPath(std::string_view path);
+     [[nodiscard]] bool HasCJDNSPrefix() const { return m_addr[0] == 0xfc; }
+     bool IsLocal() const;
+     bool IsRoutable() const;
+@@ -309,6 +361,9 @@ private:
+         TORV3 = 4,
+         I2P = 5,
+         CJDNS = 6,
++        //! Not part of BIP155: a versioned wss:// endpoint (see WSS_ADDR_V1).
++        //! Nodes that don't know it ignore it, as BIP155 requires.
++        WSS_DOMAIN = 0x10,
+     };
+ 
+     /**
+@@ -343,6 +398,11 @@ private:
+     bool SetNetFromBIP155Network(uint8_t possible_bip155_net,
+                                  size_t address_size);
+ 
++    /** Whether `name` is a valid NET_WSS DNS name (already lowercase) */
++    static bool IsValidWSSDomain(Span<const uint8_t> name);
++    /** Whether `payload` is a well-formed NET_WSS payload of any version */
++    static bool IsValidWSSPayload(Span<const uint8_t> payload);
++
+     /**
+      * Serialize in pre-ADDRv2/BIP155 format to an array.
+      */
+@@ -379,12 +439,14 @@ private:
+                 break;
+             case NET_CJDNS:
+                 break;
++            case NET_WSS:
++                break;
+             case NET_UNROUTABLE:
+             case NET_MAX:
+                 assert(false);
+         } // no default case, so the compiler can warn about missing cases
+ 
+-        // Serialize TORv3, I2P and CJDNS as all-zeros.
++        // Serialize TORv3, I2P, CJDNS and WSS as all-zeros.
+         memset(arr, 0x0, V1_SERIALIZATION_SIZE);
+     }
+ 
+@@ -457,6 +519,13 @@ private:
+             m_addr.resize(address_size);
+             s >> Span{m_addr};
+ 
++            if (m_net == NET_WSS && !IsValidWSSPayload(m_addr)) {
++                // Malformed payload: ignore it like an unknown network.
++                m_net = NET_IPV6;
++                m_addr.assign(ADDR_IPV6_SIZE, 0x0);
++                return;
++            }
++
+             if (m_net != NET_IPV6) {
+                 return;
+             }
+diff --git a/src/netbase.cpp b/src/netbase.cpp
+index 63a52c5676499cce95af5b2a784449e4bbd69fa6..bb156fe0887b1fb733dbb00ed57125dabf70fe95 100644
+--- a/src/netbase.cpp
++++ b/src/netbase.cpp
+@@ -116,6 +116,9 @@ enum Network ParseNetwork(const std::string &net_in) {
+     if (net == "i2p") {
+         return NET_I2P;
+     }
++    if (net == "wss") {
++        return NET_WSS;
++    }
+     return NET_UNROUTABLE;
+ }
+ 
+@@ -135,6 +138,8 @@ std::string GetNetworkName(enum Network net) {
+             return "cjdns";
+         case NET_INTERNAL:
+             return "internal";
++        case NET_WSS:
++            return "wss";
+         case NET_MAX:
+             assert(false);
+     } // no default case, so the compiler can warn about missing cases
+@@ -147,7 +152,7 @@ std::vector<std::string> GetNetworkNames(bool append_unroutable) {
+     for (int n = 0; n < NET_MAX; ++n) {
+         const enum Network network { static_cast<Network>(n) };
+         if (network == NET_UNROUTABLE || network == NET_CJDNS ||
+-            network == NET_INTERNAL) {
++            network == NET_INTERNAL || network == NET_WSS) {
+             continue;
+         }
+         names.emplace_back(GetNetworkName(network));
+diff --git a/src/qt/guiutil.cpp b/src/qt/guiutil.cpp
+index 8a1a6df6617bcde32a602e4bb22d138f5b6e1b5b..6896d0af5cf7db76869840a47eaba90800369c26 100644
+--- a/src/qt/guiutil.cpp
++++ b/src/qt/guiutil.cpp
+@@ -813,6 +813,8 @@ QString NetworkToQString(Network net) {
+             return "CJDNS";
+         case NET_INTERNAL:
+             return QObject::tr("Internal");
++        case NET_WSS:
++            return "WSS";
+         case NET_MAX:
+             assert(false);
+     } // no default case, so the compiler can warn about missing cases
+diff --git a/src/rpc/net.cpp b/src/rpc/net.cpp
+index 7f6c7aa7395c128121f142f05b8f4cf776d3e6d8..6a601710c70b8df1684aa4c9e2a960bb8cd04f96 100644
+--- a/src/rpc/net.cpp
++++ b/src/rpc/net.cpp
+@@ -764,7 +764,7 @@ static UniValue GetNetworksInfo() {
+     for (int n = 0; n < NET_MAX; ++n) {
+         enum Network network = static_cast<enum Network>(n);
+         if (network == NET_UNROUTABLE || network == NET_CJDNS ||
+-            network == NET_INTERNAL) {
++            network == NET_INTERNAL || network == NET_WSS) {
+             continue;
+         }
+         Proxy proxy;
+@@ -1144,6 +1144,13 @@ static RPCHelpMan getnodeaddresses() {
+                            {RPCResult::Type::STR, "network",
+                             "The network (" + Join(GetNetworkNames(), ", ") +
+                                 ") the node connected through"},
++                           {RPCResult::Type::STR, "wss_path",
++                            /*optional=*/true,
++                            "For wss addresses: the WebSocket path dialed"},
++                           {RPCResult::Type::NUM, "wss_version",
++                            /*optional=*/true,
++                            "For wss addresses: the address format version "
++                            "(only version 1 is dialed)"},
+                        }},
+                   }},
+         RPCExamples{HelpExampleCli("getnodeaddresses", "8") +
+@@ -1189,6 +1196,12 @@ static RPCHelpMan getnodeaddresses() {
+                 obj.pushKV("address", addr.ToStringAddr());
+                 obj.pushKV("port", addr.GetPort());
+                 obj.pushKV("network", GetNetworkName(addr.GetNetClass()));
++                if (addr.IsWSS()) {
++                    if (addr.IsDialableWSS()) {
++                        obj.pushKV("wss_path", addr.GetWSSPath());
++                    }
++                    obj.pushKV("wss_version", addr.GetWSSVersion());
++                }
+                 ret.push_back(std::move(obj));
+             }
+             return ret;
+diff --git a/src/test/net_tests.cpp b/src/test/net_tests.cpp
+index c230520dfcde0b59fed6ccc6acc612da97fb0def..645384dd147ff3cedb3886633aa1132c33ee7e25 100644
+--- a/src/test/net_tests.cpp
++++ b/src/test/net_tests.cpp
+@@ -17,6 +17,7 @@
+ #include <net_processing.h>
+ #include <net_websocket.h>
+ #include <net_websocket_bridge.h>
++#include <net_websocket_dialer.h>
+ #include <net_zstd_dict.h>
+ #include <netaddress.h>
+ #include <netbase.h>
+@@ -1729,4 +1730,149 @@ BOOST_AUTO_TEST_CASE(p2p_websocket_negotiation) {
+     BOOST_CHECK_EQUAL(WebSocketFrameHeaderSize(65536, true), 14U);
+ }
+ 
++BOOST_AUTO_TEST_CASE(net_wss_address) {
++    CNetAddr addr;
++    BOOST_CHECK(addr.SetWSSDomain("Node.Example.COM"));
++    BOOST_CHECK(addr.IsWSS());
++    BOOST_CHECK(addr.IsValid());
++    BOOST_CHECK(addr.IsRoutable());
++    BOOST_CHECK(!addr.IsAddrV1Compatible());
++    BOOST_CHECK_EQUAL(addr.GetNetClass(), NET_WSS);
++    BOOST_CHECK_EQUAL(addr.ToStringAddr(), "node.example.com");
++    BOOST_CHECK_EQUAL(GetNetworkName(NET_WSS), "wss");
++    BOOST_CHECK_EQUAL(ParseNetwork("wss"), NET_WSS);
++    const CService service{addr, 443};
++    BOOST_CHECK_EQUAL(service.ToStringAddrPort(), "node.example.com:443");
++    BOOST_CHECK_EQUAL(WebSocketURLForAddress(service),
++                      "wss://node.example.com:443/p2p/ws");
++
++    for (const char *bad :
++         {"", "-a.com", "a-.com", "a..com", ".a.com", "a.com.", "a_b.com",
++          "a b", "x.y/z"}) {
++        BOOST_CHECK_MESSAGE(!CNetAddr{}.SetWSSDomain(bad), bad);
++    }
++    BOOST_CHECK(!CNetAddr{}.SetWSSDomain(std::string(64, 'a') + ".com"));
++    BOOST_CHECK(CNetAddr{}.SetWSSDomain(std::string(63, 'a') + ".com"));
++    BOOST_CHECK(!CNetAddr{}.SetWSSDomain(std::string(254, 'a')));
++
++    // ADDRv2 round trip with BIP155 network id 0x10: version 1, name only
++    // (the default path is never written out)
++    BOOST_CHECK_EQUAL(addr.GetWSSVersion(), WSS_ADDR_V1);
++    BOOST_CHECK(addr.IsDialableWSS());
++    BOOST_CHECK_EQUAL(addr.GetWSSHost(), "node.example.com");
++    BOOST_CHECK_EQUAL(addr.GetWSSPath(), "/p2p/ws");
++    DataStream s{};
++    ParamsStream ps{CAddress::V2_NETWORK, s};
++    ps << addr;
++    BOOST_CHECK_EQUAL(HexStr(s),
++                      "101101" + HexStr(std::string{"node.example.com"}));
++    CNetAddr decoded;
++    ps >> decoded;
++    BOOST_CHECK(decoded == addr);
++    CNetAddr explicit_default;
++    BOOST_CHECK(explicit_default.SetWSSDomain("node.example.com", "/p2p/ws"));
++    BOOST_CHECK(explicit_default == addr);
++
++    // With a path
++    CNetAddr with_path;
++    BOOST_CHECK(with_path.SetWSSDomain("Node.Example.com", "/Lotus/p2p"));
++    BOOST_CHECK(with_path != addr);
++    BOOST_CHECK_EQUAL(with_path.ToStringAddr(), "node.example.com");
++    BOOST_CHECK_EQUAL(with_path.GetWSSPath(), "/Lotus/p2p");
++    BOOST_CHECK(with_path.GetGroup({}) == addr.GetGroup({}));
++    BOOST_CHECK_EQUAL(WebSocketURLForAddress(CService{with_path, 8443}),
++                      "wss://node.example.com:8443/Lotus/p2p");
++    s.clear();
++    ps << with_path;
++    BOOST_CHECK_EQUAL(HexStr(s), "101b01" + HexStr(std::string{
++                                                "node.example.com/Lotus/p2p"}));
++    ps >> decoded;
++    BOOST_CHECK(decoded == with_path);
++    for (const char *bad :
++         {"/", "p2p", "/a/", "/a?b", "/a#b", "/a%20", "/a b"}) {
++        BOOST_CHECK_MESSAGE(!CNetAddr{}.SetWSSDomain("a.com", bad), bad);
++    }
++    BOOST_CHECK(!CNetAddr{}.SetWSSDomain("a.com", "/" + std::string(255, 'a')));
++    BOOST_CHECK(CNetAddr{}.SetWSSDomain("a.com", "/" + std::string(254, 'a')));
++
++    // A later version is kept and relayed as is, but never dialed, and all
++    // such addresses share one addrman group.
++    for (const std::string body : {"", "anything \x01\xff at all"}) {
++        const std::vector<uint8_t> payload{[&] {
++            std::vector<uint8_t> v{0x02};
++            v.insert(v.end(), body.begin(), body.end());
++            return v;
++        }()};
++        DataStream later{};
++        ParamsStream pl{CAddress::V2_NETWORK, later};
++        pl << uint8_t{0x10} << payload;
++        const std::string wire{HexStr(later)};
++        CNetAddr opaque;
++        pl >> opaque;
++        BOOST_CHECK(opaque.IsWSS());
++        BOOST_CHECK(opaque.IsValid());
++        BOOST_CHECK_EQUAL(opaque.GetWSSVersion(), 2);
++        BOOST_CHECK(!opaque.IsDialableWSS());
++        BOOST_CHECK_EQUAL(opaque.GetWSSPath(), "");
++        BOOST_CHECK(opaque.ToStringAddr().starts_with("wss-v2-"));
++        BOOST_CHECK(opaque.GetGroup({}) == std::vector<uint8_t>({NET_WSS, 2}));
++        pl << opaque;
++        BOOST_CHECK_EQUAL(HexStr(later), wire);
++    }
++
++    // ADDRv1 cannot carry names: serialized as all-zeros (and never relayed
++    // to ADDRv1 peers, see IsAddrV1Compatible).
++    DataStream s1{};
++    ParamsStream ps1{CAddress::V1_NETWORK, s1};
++    ps1 << addr;
++    BOOST_CHECK_EQUAL(HexStr(s1), std::string(32, '0'));
++
++    // Malformed payloads (and bad sizes) from peers are ignored, not fatal:
++    // a bad name, a bad or explicit default path, the reserved version 0 and
++    // an empty payload.
++    for (const std::string &hex :
++         {std::string{"100501"} + HexStr(std::string{"a b."}),
++          std::string{"100a01"} + HexStr(std::string{"a.com/p?q"}),
++          std::string{"100d01"} + HexStr(std::string{"a.com/p2p/ws"}),
++          std::string{"100700"} + HexStr(std::string{"a.com/"}),
++          std::string{"1000"}}) {
++        DataStream bad{ParseHex(hex)};
++        ParamsStream pbad{CAddress::V2_NETWORK, bad};
++        CNetAddr out;
++        pbad >> out;
++        BOOST_CHECK(!out.IsValid());
++        BOOST_CHECK(bad.empty());
++    }
++}
++
++BOOST_AUTO_TEST_CASE(p2p_websocket_url_parsing) {
++    auto url{ParseWebSocketURL("wss://Node.example.com/p2p/ws")};
++    BOOST_REQUIRE(url);
++    BOOST_CHECK(url->tls);
++    BOOST_CHECK_EQUAL(url->host, "Node.example.com");
++    BOOST_CHECK_EQUAL(url->port, 443);
++    BOOST_CHECK_EQUAL(url->authority, "Node.example.com:443");
++    BOOST_CHECK_EQUAL(url->target, "/p2p/ws");
++
++    url = ParseWebSocketURL("ws://127.0.0.1:18443");
++    BOOST_REQUIRE(url);
++    BOOST_CHECK(!url->tls);
++    BOOST_CHECK_EQUAL(url->port, 18443);
++    BOOST_CHECK_EQUAL(url->target, "/p2p/ws");
++
++    url = ParseWebSocketURL("wss://[::1]:8443/custom?x=1");
++    BOOST_REQUIRE(url);
++    BOOST_CHECK_EQUAL(url->host, "::1");
++    BOOST_CHECK_EQUAL(url->authority, "[::1]:8443");
++    BOOST_CHECK_EQUAL(url->target, "/custom?x=1");
++
++    for (const char *bad :
++         {"http://a.com", "wss://", "wss://:443", "ws://a.com:99999", "a.com"}) {
++        BOOST_CHECK_MESSAGE(!ParseWebSocketURL(bad), bad);
++    }
++    BOOST_CHECK(IsWebSocketURL("wss://a"));
++    BOOST_CHECK(IsWebSocketURL("ws://a"));
++    BOOST_CHECK(!IsWebSocketURL("1.2.3.4:8333"));
++}
++
+ BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/test/util/net.h b/src/test/util/net.h
+index ff35fac2ca526a1b7df54b33f8fe02ca3a2044bd..a4870b1a18c4efdff9c57159d80a6d5aa0e50d3b 100644
+--- a/src/test/util/net.h
++++ b/src/test/util/net.h
+@@ -73,7 +73,7 @@ constexpr ConnectionType ALL_CONNECTION_TYPES[]{
+     ConnectionType::BLOCK_RELAY, ConnectionType::ADDR_FETCH,
+ };
+ 
+-constexpr std::array<Network, 7> ALL_NETWORKS = {{
++constexpr std::array<Network, 8> ALL_NETWORKS = {{
+     Network::NET_UNROUTABLE,
+     Network::NET_IPV4,
+     Network::NET_IPV6,
+@@ -81,6 +81,7 @@ constexpr std::array<Network, 7> ALL_NETWORKS = {{
+     Network::NET_I2P,
+     Network::NET_CJDNS,
+     Network::NET_INTERNAL,
++    Network::NET_WSS,
+ }};
+ 
+ /**
+diff --git a/test/functional/p2p_websocket_addr_versions.py b/test/functional/p2p_websocket_addr_versions.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..e24a9635dd74cb8e9bb966dc2f8d16c4d094facb
+--- /dev/null
++++ b/test/functional/p2p_websocket_addr_versions.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Bitcoin developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Test versioned NET_WSS (0x10) addresses in ADDRv2 gossip.
++
++- Version 1 carries a DNS name and optional path; the node stores it, relays
++  it and dials wss://<name>:<port><path>.
++- A later version is stored and relayed unchanged, so new formats spread
++  through this node, but never dialed.
++- Malformed payloads are dropped without penalizing the peer.
++"""
++
++import os
++import time
++
++from test_framework.messages import NODE_NETWORK, CAddress, msg_addrv2
++from test_framework.p2p import P2PInterface, p2p_lock
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal
++
++
++def wss(body, port, version=CAddress.WSS_V1):
++    a = CAddress()
++    a.time = int(time.time())
++    a.nServices = NODE_NETWORK
++    a.net = CAddress.NET_WSS
++    a.wss_version = version
++    a.ip = body
++    a.port = port
++    return a
++
++
++class AddrReceiver(P2PInterface):
++    def __init__(self):
++        super().__init__(support_addrv2=True)
++        self.received = []
++
++    def on_addrv2(self, message):
++        self.received.extend(message.addrs)
++
++
++class P2PWebSocketAddrVersionsTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 1
++        self.setup_clean_chain = True
++        self.extra_args = [["-whitelist=addr@127.0.0.1"]]
++
++    def setup_network(self):
++        self.add_nodes(self.num_nodes, self.extra_args)
++        # Automatic outbound connections, to see what gets dialed.
++        conf = os.path.join(self.nodes[0].datadir, "bitcoin.conf")
++        with open(conf, encoding="utf8") as f:
++            lines = [line for line in f if line.strip() != "connect=0"]
++        with open(conf, "w", encoding="utf8") as f:
++            f.writelines(lines)
++        self.start_nodes()
++
++    def run_test(self):
++        node = self.nodes[0]
++        with_path = wss("lotus-node.invalid/lotus/p2p", 8443)
++        later = wss(b"\x00\xffsome future format", 9000, version=0x7f)
++        malformed = [
++            wss("bad name.invalid", 443),
++            wss("x.invalid/p2p/ws", 443),  # the default path is implicit
++            wss(b"x.invalid", 443, version=0),  # reserved version
++        ]
++
++        self.log.info("The node stores version 1 and later-version addresses")
++        source = node.add_p2p_connection(P2PInterface(support_addrv2=True))
++        receiver = node.add_p2p_connection(AddrReceiver())
++        msg = msg_addrv2()
++        msg.addrs = [with_path, later] + malformed
++        source.send_and_ping(msg)
++        known = {(a["port"], a.get("wss_version"), a.get("wss_path"), a["address"])
++                 for a in node.getnodeaddresses(0, "wss")}
++        assert (8443, 1, "/lotus/p2p", "lotus-node.invalid") in known, known
++        assert any(port == 9000 and version == 0x7F for port, version, _, _ in known), known
++        assert_equal(len(known), 2)
++        assert_equal(len(node.getpeerinfo()), 2)  # nobody was disconnected
++
++        self.log.info("...and relays both unchanged")
++        node.setmocktime(int(time.time()) + 30 * 60)
++        receiver.wait_until(lambda: len(receiver.received) >= 2)
++        with p2p_lock:
++            relayed = {(a.port, a.wss_version, a.ip) for a in receiver.received}
++        assert_equal(relayed, {
++            (8443, 1, "lotus-node.invalid/lotus/p2p"),
++            (9000, 0x7F, b"\x00\xffsome future format"),
++        })
++        node.setmocktime(0)
++
++        self.log.info("It dials version 1 at its path, never a later version")
++        with node.assert_debug_log(
++            ["trying WebSocket connection wss://lotus-node.invalid:8443/lotus/p2p"],
++            unexpected_msgs=["trying WebSocket connection wss://wss-v127"],
++            timeout=120,
++        ):
++            pass
++
++
++if __name__ == "__main__":
++    P2PWebSocketAddrVersionsTest().main()
+diff --git a/test/functional/p2p_websocket_tls.py b/test/functional/p2p_websocket_tls.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f85ddffead6719bc10ce5c1bfc7c5255c5d67dc4
+--- /dev/null
++++ b/test/functional/p2p_websocket_tls.py
+@@ -0,0 +1,186 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Bitcoin developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""End-to-end hybrid TCP + WebSocket (wss://, p2p-zstd-v1) P2P test.
++
++- node0 serves JSON-RPC (http/https/zstd) and /p2p/ws on its RPC port and
++  advertises -externaldomain=localhost:<rpcport>.
++- node1 connects to node0 over wss://localhost:<rpcport>/p2p/ws.
++- node2 connects to node0 over ordinary TCP P2P.
++"""
++
++import base64
++import http.client
++import json
++import ssl
++import time
++import urllib.parse
++
++from test_framework.messages import CAddress, msg_getaddr
++from test_framework.p2p import P2PInterface, p2p_lock
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.util import assert_equal, rpc_port
++from test_framework.wallet import MiniWallet
++
++
++class AddrReceiver(P2PInterface):
++    def __init__(self, support_addrv2):
++        super().__init__(support_addrv2=support_addrv2)
++        self.addrs = []
++
++    def on_addr(self, message):
++        self.addrs.extend(message.addrs)
++
++    def on_addrv2(self, message):
++        self.addrs.extend(message.addrs)
++
++    def wss_addrs(self):
++        with p2p_lock:
++            return [a for a in self.addrs if a.net == CAddress.NET_WSS]
++
++
++class P2PWebSocketTLSTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 3
++        self.setup_clean_chain = True
++        self.extra_args = [[], [], []]
++
++    def setup_network(self):
++        port0 = rpc_port(0)
++        self.extra_args[0] = [f"-externaldomain=localhost:{port0}"]
++        self.extra_args[1] = [f"-addnode=wss://localhost:{port0}/p2p/ws"]
++        self.setup_nodes()
++        # node2 <-> node0 over plain TCP P2P
++        self.connect_nodes(2, 0)
++
++    def rpc(self, body, *, tls=False, headers=None):
++        url = urllib.parse.urlparse(self.nodes[0].url)
++        auth = base64.b64encode(f"{url.username}:{url.password}".encode()).decode()
++        h = {"Authorization": f"Basic {auth}", "Content-Type": "application/json"}
++        h.update(headers or {})
++        if tls:
++            ctx = ssl.create_default_context()
++            ctx.check_hostname = False
++            ctx.verify_mode = ssl.CERT_NONE
++            conn = http.client.HTTPSConnection("127.0.0.1", rpc_port(0), context=ctx)
++        else:
++            conn = http.client.HTTPConnection("127.0.0.1", rpc_port(0))
++        conn.request("POST", "/", json.dumps(body), h)
++        resp = conn.getresponse()
++        data = resp.read()
++        conn.close()
++        return resp, data
++
++    def ws_peers(self, n):
++        return [p for p in self.nodes[n].getpeerinfo() if p["transport"] != "tcp"]
++
++    def run_test(self):
++        node0, node1, node2 = self.nodes
++
++        self.log.info("node1 reaches node0 over wss:// with p2p-zstd-v1")
++        self.wait_until(lambda: len(self.ws_peers(1)) == 1)
++        out = self.ws_peers(1)[0]
++        assert_equal(out["transport"], "wss")
++        assert_equal(out["inbound"], False)
++        assert_equal(out["addr"], f"wss://localhost:{rpc_port(0)}/p2p/ws")
++        assert_equal(out["websocket"]["compression"], "p2p-zstd-v1")
++        assert_equal(out["websocket"]["tls"], True)
++        self.wait_until(lambda: len(self.ws_peers(0)) == 1)
++        inbound = self.ws_peers(0)[0]
++        assert_equal(inbound["transport"], "wss")
++        assert_equal(inbound["inbound"], True)
++        # node0's TCP peer is node2
++        tcp_peers = [p for p in node0.getpeerinfo() if p["transport"] == "tcp"]
++        assert_equal(len(tcp_peers), 1)
++
++        self.log.info("JSON-RPC over http:// and https:// on the same port")
++        resp, data = self.rpc({"method": "getblockchaininfo", "id": 1})
++        assert_equal(resp.status, 200)
++        assert_equal(json.loads(data)["result"]["chain"], "regtest")
++        resp, data = self.rpc({"method": "getblockchaininfo", "id": 1}, tls=True)
++        assert_equal(resp.status, 200)
++        assert_equal(json.loads(data)["result"]["chain"], "regtest")
++
++        self.log.info("Mine on node2 (TCP), relay through node0 to node1 (wss)")
++        wallet = MiniWallet(node2)
++        self.generate(wallet, 101, sync_fun=self.no_op)
++        self.sync_blocks()
++        assert_equal(node1.getblockcount(), 101)
++
++        self.log.info("Accept-Encoding: zstd on getblock verbosity 2")
++        tip = node0.getbestblockhash()
++        resp, data = self.rpc(
++            {"method": "getblock", "params": [tip, 2], "id": 1},
++            headers={"Accept-Encoding": "zstd"},
++        )
++        assert_equal(resp.getheader("Content-Encoding"), "zstd")
++        try:
++            import zstandard
++        except ImportError:
++            self.log.info("zstandard not installed: skipping decompression")
++        else:
++            block = json.loads(
++                zstandard.ZstdDecompressor().decompress(
++                    data, max_output_size=1 << 26
++                )
++            )
++            assert_equal(block["result"]["hash"], tip)
++
++        self.log.info("Transactions from node1 (wss) reach node2 (TCP)")
++        self.generate(wallet, 1)
++        wallet1 = MiniWallet(node1)
++        self.generate(wallet1, 101)
++        txids = [wallet1.send_self_transfer(from_node=node1)["txid"] for _ in range(5)]
++        self.wait_until(lambda: set(txids) <= set(node2.getrawmempool()))
++        self.log.info("Blocks mined on node2 (TCP) reach node1 (wss)")
++        tip = self.generate(node2, 1, sync_fun=self.no_op)[0]
++        self.wait_until(lambda: node1.getbestblockhash() == tip)
++        assert_equal(node1.getrawmempool(), [])
++
++        ws = self.ws_peers(1)[0]["websocket"]
++        self.log.info(
++            f"node1 WebSocket bytes: payload sent/recv "
++            f"{ws['payload_bytes_sent']}/{ws['payload_bytes_recv']}, wire "
++            f"{ws['wire_bytes_sent']}/{ws['wire_bytes_recv']}"
++        )
++        assert ws["wire_bytes_recv"] < ws["payload_bytes_recv"]
++
++        self.log.info("node0 advertises localhost:<rpcport> only via ADDRv2")
++        v2 = node0.add_p2p_connection(AddrReceiver(support_addrv2=True))
++        v1 = node0.add_p2p_connection(AddrReceiver(support_addrv2=False))
++        for peer in (v1, v2):
++            peer.send_and_ping(msg_getaddr())
++        now = int(time.time())
++        for i in range(1, 6):
++            node0.setmocktime(now + i * 60 * 60)
++            v2.sync_with_ping()
++            if v2.wss_addrs():
++                break
++        self.wait_until(lambda: len(v2.wss_addrs()) > 0)
++        addr = v2.wss_addrs()[0]
++        assert_equal(addr.ip, "localhost")
++        assert_equal(addr.port, rpc_port(0))
++        v1.sync_with_ping()
++        assert_equal(v1.wss_addrs(), [])
++        # ADDRv1 has no encoding for names: nothing (e.g. 0.0.0.0) was sent
++        assert all(a.ip != "0.0.0.0" for a in v1.addrs)
++        node0.setmocktime(0)
++
++        self.log.info("node2 learns the NET_WSS address over TCP ADDRv2")
++        # node0 relays node0's own address to node2 (an ADDRv2 bitcoind)
++        self.wait_until(
++            lambda: any(
++                a["network"] == "wss" and a["address"] == "localhost"
++                for a in node2.getnodeaddresses(0)
++            ),
++            timeout=120,
++        )
++
++        totals = node0.getnettotals()
++        self.log.info(f"node0 getnettotals: {totals}")
++        assert totals["websocket"]["wire_bytes_sent"] > 0
++
++
++if __name__ == "__main__":
++    P2PWebSocketTLSTest().main()
+diff --git a/test/functional/test_framework/messages.py b/test/functional/test_framework/messages.py
+index 13773888e47325fb86cc4ad8873b7c0895068d17..211e6fe9ff11a39fc2041e123e1d2440be28442c 100644
+--- a/test/functional/test_framework/messages.py
++++ b/test/functional/test_framework/messages.py
+@@ -205,12 +205,17 @@ def ToHex(obj):
+ 
+ 
+ class CAddress:
+-    __slots__ = ("net", "ip", "nServices", "port", "time")
++    __slots__ = ("net", "ip", "nServices", "port", "time", "wss_version")
+ 
+     # see https://github.com/bitcoin/bips/blob/master/bip-0155.mediawiki
+     NET_IPV4 = 1
++    # Not BIP155: a versioned wss:// endpoint. Version 1: "<name>[/<path>]",
++    # dialed as wss://<name>:<port><path or /p2p/ws>. For NET_WSS, `ip` holds
++    # the body: a str for version 1, bytes for other versions.
++    NET_WSS = 0x10
++    WSS_V1 = 1
+ 
+-    ADDRV2_NET_NAME = {NET_IPV4: "IPv4"}
++    ADDRV2_NET_NAME = {NET_IPV4: "IPv4", NET_WSS: "WSS"}
+ 
+     ADDRV2_ADDRESS_LENGTH = {NET_IPV4: 4}
+ 
+@@ -220,6 +225,7 @@ class CAddress:
+         self.net = self.NET_IPV4
+         self.ip = "0.0.0.0"
+         self.port = 0
++        self.wss_version = self.WSS_V1
+ 
+     def deserialize(self, f, *, with_time=True):
+         """Deserialize from addrv1 format (pre-BIP155)"""
+@@ -254,17 +260,33 @@ class CAddress:
+         self.nServices = deser_compact_size(f)
+ 
+         self.net = int.from_bytes(f.read(1), "little")
+-        assert self.net == self.NET_IPV4
++        assert self.net in (self.NET_IPV4, self.NET_WSS)
+ 
+         address_length = deser_compact_size(f)
+-        assert address_length == self.ADDRV2_ADDRESS_LENGTH[self.net]
+-
+-        self.ip = socket.inet_ntoa(f.read(4))
++        if self.net == self.NET_WSS:
++            payload = f.read(address_length)
++            self.wss_version = payload[0]
++            body = payload[1:]
++            self.ip = body.decode("ascii") if self.wss_version == self.WSS_V1 else body
++        else:
++            assert address_length == self.ADDRV2_ADDRESS_LENGTH[self.net]
++            self.ip = socket.inet_ntoa(f.read(4))
+ 
+         self.port = int.from_bytes(f.read(2), "big")
+ 
+     def serialize_v2(self) -> bytes:
+         """Serialize in addrv2 format (BIP155)"""
++        if self.net == self.NET_WSS:
++            body = self.ip.encode("ascii") if isinstance(self.ip, str) else self.ip
++            payload = bytes([self.wss_version]) + body
++            return (
++                self.time.to_bytes(4, "little")
++                + ser_compact_size(self.nServices)
++                + self.net.to_bytes(1, "little")
++                + ser_compact_size(len(payload))
++                + payload
++                + self.port.to_bytes(2, "big")
++            )
+         assert self.net == self.NET_IPV4
+         return (
+             self.time.to_bytes(4, "little")
+-- 
+2.50.1 (Apple Git-155)
+

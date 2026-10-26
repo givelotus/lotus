@@ -1,0 +1,156 @@
+diff --git a/src/kernel/disconnected_transactions.cpp b/src/kernel/disconnected_transactions.cpp
+index 6c4b572cca..e2ccb94afa 100644
+--- a/src/kernel/disconnected_transactions.cpp
++++ b/src/kernel/disconnected_transactions.cpp
+@@ -153,6 +153,7 @@ void DisconnectedBlockTransactions::removeForBlock(
+         return;
+     }
+ 
++    CTxMemPool::ScopedSnapshotDefer snap_defer(pool);
+     addForBlock(vtx, pool);
+ 
+     for (const CTransactionRef &tx :
+@@ -178,6 +179,7 @@ void DisconnectedBlockTransactions::updateMempoolForReorg(
+     Chainstate &active_chainstate, bool fAddToMempool, CTxMemPool &pool) {
+     AssertLockHeld(cs_main);
+     AssertLockHeld(pool.cs);
++    CTxMemPool::ScopedSnapshotDefer snap_defer(pool);
+ 
+     if (fAddToMempool) {
+         // disconnectpool's insertion_order index sorts the entries from oldest
+diff --git a/src/test/snapshot_rcu_tests.cpp b/src/test/snapshot_rcu_tests.cpp
+index e4d2188683..d7c758ffb3 100644
+--- a/src/test/snapshot_rcu_tests.cpp
++++ b/src/test/snapshot_rcu_tests.cpp
+@@ -6,6 +6,7 @@
+ #include <consensus/amount.h>
+ #include <consensus/tx_check.h>
+ #include <core_io.h>
++#include <kernel/disconnected_transactions.h>
+ #include <key_io.h>
+ #include <minerfund.h>
+ #include <node/snapshot.h>
+@@ -735,5 +736,90 @@ BOOST_AUTO_TEST_CASE(snapshot_prune_height_and_difficulty_shift_branches) {
+     opts.prune_target = orig_prune_target;
+ }
+ 
+-BOOST_AUTO_TEST_SUITE_END()
++BOOST_AUTO_TEST_CASE(
++    abc_mempool_batch_removal_and_prioritisation_snapshot_coalescing) {
++    CScript spk = GetScriptForDestination(PKHash(coinbaseKey.GetPubKey()));
++    std::vector<CTransactionRef> block_txs;
++    constexpr size_t kNumTxs = 4;
++    CTransactionRef prev_tx = m_coinbase_txns[0];
++    int prev_height = 1;
++    Amount cur_val = prev_tx->vout[0].nValue;
++    for (size_t i = 0; i < kNumTxs; ++i) {
++        cur_val -= 2000 * SATOSHI;
++        CMutableTransaction mtx = CreateValidMempoolTransaction(
++            prev_tx, 0, prev_height, coinbaseKey, spk, cur_val,
++            /*submit=*/true);
++        prev_tx = MakeTransactionRef(mtx);
++        prev_height = 101;
++        block_txs.push_back(prev_tx);
++    }
++    BOOST_CHECK_EQUAL(m_node.mempool->size(), kNumTxs);
+ 
++    node::SnapshotPublisher &publisher = node::GetGlobalSnapshotPublisher();
++
++    // Exercise PublishMempoolUnbroadcastSnapshot fallback when prev->mempool_valid is false
++    // and PopulateMiningTemplate when prev->mining_template.template_valid is false
++    {
++        auto invalid_prev = std::make_shared<node::ChainAndMempoolSnapshot>(
++            *publisher.Load());
++        invalid_prev->mempool_valid = false;
++        invalid_prev->mining_template.template_valid = false;
++        publisher.Publish(std::move(invalid_prev));
++        m_node.mempool->AddUnbroadcastTx(block_txs[0]->GetId());
++        BOOST_CHECK(publisher.Load()->mempool_valid);
++    }
++
++    // Exercise blockFitter.testTxFits false branch when -blockmaxsize=1000
++    {
++        gArgs.ForceSetArg("-blockmaxsize", "1000");
++        LOCK(m_node.mempool->cs);
++        node::PublishMempoolSnapshot(*m_node.mempool);
++        gArgs.ClearForcedArg("-blockmaxsize");
++        node::PublishMempoolSnapshot(*m_node.mempool);
++    }
++
++    // Exercise lightweight PublishMempoolUnbroadcastSnapshot on AddUnbroadcastTx / RemoveUnbroadcastTx
++    m_node.mempool->AddUnbroadcastTx(block_txs[0]->GetId());
++    m_node.mempool->RemoveUnbroadcastTx(block_txs[0]->GetId(), /*unchecked=*/false);
++    m_node.mempool->AddUnbroadcastTx(block_txs[0]->GetId());
++
++    // 1. ClearPrioritisation on an unprioritized transaction must NOT publish
++    // a redundant RCU snapshot.
++    {
++        LOCK(m_node.mempool->cs);
++        const auto snap_before = publisher.Load();
++        m_node.mempool->ClearPrioritisation(block_txs[0]->GetId());
++        BOOST_CHECK_EQUAL(publisher.Load().get(), snap_before.get());
++    }
++
++    // 2. Prioritising and then clearing prioritisation on a transaction MUST
++    // publish a snapshot when a delta actually existed.
++    m_node.mempool->PrioritiseTransaction(block_txs[0]->GetId(),
++                                          1000 * SATOSHI);
++    {
++        LOCK(m_node.mempool->cs);
++        const auto snap_before = publisher.Load();
++        m_node.mempool->ClearPrioritisation(block_txs[0]->GetId());
++        BOOST_CHECK_NE(publisher.Load().get(), snap_before.get());
++    }
++
++    // 3. DisconnectedBlockTransactions::removeForBlock must coalesce per-tx
++    // mempool removals under ScopedSnapshotDefer into a single snapshot
++    // publication (template_id + 1 instead of + 2*kNumTxs).
++    {
++        LOCK2(::cs_main, m_node.mempool->cs);
++        const auto snap_before = publisher.Load();
++        BOOST_REQUIRE(snap_before != nullptr);
++        DisconnectedBlockTransactions disconnectpool;
++        disconnectpool.removeForBlock(block_txs, *m_node.mempool);
++        BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
++        const auto snap_after = publisher.Load();
++        BOOST_REQUIRE(snap_after != nullptr);
++        BOOST_CHECK_EQUAL(snap_after->mempool_size, 0U);
++        BOOST_CHECK_EQUAL(snap_after->mining_template.template_id,
++                          snap_before->mining_template.template_id + 1);
++        disconnectpool.clear();
++    }
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index 76af1ba4d3..2d8192545d 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -853,8 +853,9 @@ void CTxMemPool::ApplyDelta(const TxId &txid, Amount &nFeeDelta) const {
+ 
+ void CTxMemPool::ClearPrioritisation(const TxId &txid) {
+     AssertLockHeld(cs);
+-    mapDeltas.erase(txid);
+-    node::PublishMempoolSnapshot(*this);
++    if (mapDeltas.erase(txid) > 0) {
++        node::PublishMempoolSnapshot(*this);
++    }
+ }
+ 
+ CTransactionRef CTxMemPool::GetConflictTx(const COutPoint &prevout) const {
+@@ -1015,6 +1016,7 @@ int CTxMemPool::Expire(std::chrono::seconds time) {
+ void CTxMemPool::LimitSize(CCoinsViewCache &coins_cache) {
+     AssertLockHeld(::cs_main);
+     AssertLockHeld(cs);
++    ScopedSnapshotDefer defer(*this);
+     int expired = Expire(GetTime<std::chrono::seconds>() - m_opts.expiry);
+     if (expired != 0) {
+         LogDebug(BCLog::MEMPOOL,
+@@ -1082,6 +1084,7 @@ void CTxMemPool::trackPackageRemoved(const CFeeRate &rate) {
+ void CTxMemPool::TrimToSize(size_t sizelimit,
+                             std::vector<COutPoint> *pvNoSpendsRemaining) {
+     AssertLockHeld(cs);
++    ScopedSnapshotDefer defer(*this);
+ 
+     unsigned nTxnRemoved = 0;
+     size_t finalizedTxsSkipped = 0;

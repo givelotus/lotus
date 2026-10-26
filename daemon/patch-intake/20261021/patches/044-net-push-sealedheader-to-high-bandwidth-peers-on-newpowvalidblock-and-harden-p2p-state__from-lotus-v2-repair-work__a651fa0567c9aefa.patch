@@ -1,0 +1,356 @@
+From 379b044326b9bc8365b0da838ab2de30d976548c Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:30 -0700
+Subject: [PATCH] net: push SealedHeader to high-bandwidth peers on
+ NewPoWValidBlock and harden P2P state
+
+Push compact SealedHeader announcements directly to high-bandwidth peers inside
+NewPoWValidBlock and re-anchor peer speculative overlays before matching.
+
+Original-Commit: e9721643c45ccc4cc4ceb693a8079cca1a238590
+Original-Patch: ecash/033
+Split-Concern: whole
+
+Historical compilation prerequisites are tracked separately in daemon/patch-audit;
+this provenance-preserving split does not imply standalone build validation.
+
+Plan-v2 owner repair: C: explicit regtest test hook at VERACK replaces user-agent matching. Preserve B raw-callback fixture drain before unregister/destruction. Controlled lifetime check fails before and passes after; original one-off signal attribution remains nonconclusive.
+
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index ad6170a35333bcf4f6c4731a24de3ed257f33789..f746a2f3f6977dd75dcda213ff5a892f49fe041b 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -2413,6 +2413,10 @@ void PeerManagerImpl::InitializeNode(const Config &config, CNode &node,
+         m_peer_map.emplace_hint(m_peer_map.end(), nodeid, peer);
+     }
+     m_v2_protocol_handler.RegisterPeerNode(node);
++    if (gArgs.GetBoolArg("-highbandwidthtx", false) &&
++        !node.IsBlockOnlyConn()) {
++        m_v2_protocol_handler.SetHighBandwidthShortTxPeer(nodeid, true);
++    }
+     if (!node.IsInboundConn()) {
+         PushNodeVersion(config, node, *peer);
+     }
+@@ -3058,6 +3062,11 @@ void PeerManagerImpl::NewPoWValidBlock(
+         std::async(std::launch::deferred, [&] {
+             return NetMsg::Make(NetMsgType::CMPCTBLOCK, *pcmpctblock);
+         })};
++    const bool is_v2_sealed_candidate = !pblock->vtx.empty();
++    const std::shared_future<CSerializedNetMsg> lazy_sealed_ser{
++        std::async(std::launch::deferred, [&] {
++            return NetMsg::Make(NetMsgType::SEALEDHEADER, SealedHeader(*pblock));
++        })};
+ 
+     {
+         LOCK(m_most_recent_block_mutex);
+@@ -3068,7 +3077,8 @@ void PeerManagerImpl::NewPoWValidBlock(
+     }
+ 
+     m_connman.ForEachNode(
+-        [this, pindex, &lazy_ser, &hashBlock](CNode *pnode)
++        [this, pindex, &lazy_ser, &lazy_sealed_ser, is_v2_sealed_candidate,
++         &hashBlock](CNode *pnode)
+             EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+                 AssertLockHeld(::cs_main);
+ 
+@@ -3076,8 +3086,33 @@ void PeerManagerImpl::NewPoWValidBlock(
+                     pnode->fDisconnect) {
+                     return;
+                 }
++                if (auto known_hash =
++                        m_v2_protocol_handler.GetLastPeerKnownBlock(
++                            pnode->GetId())) {
++                    UpdateBlockAvailability(pnode->GetId(), *known_hash);
++                }
++                if (m_v2_protocol_handler.PeerKnowsBlock(pnode->GetId(),
++                                                         hashBlock)) {
++                    UpdateBlockAvailability(pnode->GetId(), hashBlock);
++                }
+                 ProcessBlockAvailability(pnode->GetId());
+                 CNodeState &state = *State(pnode->GetId());
++                if (is_v2_sealed_candidate &&
++                    m_v2_protocol_handler.IsHighBandwidthShortTxPeer(
++                        pnode->GetId()) &&
++                    !PeerHasHeader(&state, pindex) &&
++                    (PeerHasHeader(&state, pindex->pprev) ||
++                     (pindex->pprev && pindex->pprev->pprev == nullptr))) {
++                    LogDebug(BCLog::NET,
++                             "%s sending sealedheader %s to peer=%d\n",
++                             "PeerManager::NewPoWValidBlock",
++                             hashBlock.ToString(), pnode->GetId());
++
++                    const CSerializedNetMsg &ser_sealed{lazy_sealed_ser.get()};
++                    PushMessage(*pnode, ser_sealed.Copy());
++                    state.pindexBestHeaderSent = pindex;
++                    return;
++                }
+                 // If the peer has, or we announced to them the previous block
+                 // already, but we don't think they have this one, go ahead and
+                 // announce it.
+@@ -3130,6 +3165,9 @@ void PeerManagerImpl::UpdatedBlockTip(const CBlockIndex *pindexNew,
+             Peer &peer = *it.second;
+             LOCK(peer.m_block_inv_mutex);
+             for (const BlockHash &hash : reverse_iterate(vHashes)) {
++                if (m_v2_protocol_handler.PeerKnowsBlock(peer.m_id, hash)) {
++                    continue;
++                }
+                 peer.m_blocks_for_headers_relay.push_back(hash);
+             }
+         }
+@@ -5484,6 +5522,14 @@ void PeerManagerImpl::ProcessMessage(
+                                     tx_relay->m_next_inv_send_time == 0s));
+         }
+ 
++        const bool disable_shorttx_for_test =
++            Params().GetChainType() == ChainType::REGTEST &&
++            gArgs.GetBoolArg("-testdisablehighbandwidthshorttx", false);
++        m_v2_protocol_handler.SetHighBandwidthShortTxPeer(
++            pfrom.GetId(), !disable_shorttx_for_test &&
++                               gArgs.GetBoolArg("-highbandwidthtx", false) &&
++                               !pfrom.IsBlockOnlyConn());
++
+         pfrom.fSuccessfullyConnected = true;
+         return;
+     }
+diff --git a/src/test/v2_protocol_handler_tests.cpp b/src/test/v2_protocol_handler_tests.cpp
+index 92ba4d44a395f0df8d6898ba4458619fee9b79a5..7dfdf44a89e9e8455ba35b78398d815c42e05922 100644
+--- a/src/test/v2_protocol_handler_tests.cpp
++++ b/src/test/v2_protocol_handler_tests.cpp
+@@ -2691,4 +2691,237 @@ BOOST_AUTO_TEST_CASE(shorttx_batch_admission_fallback_and_proactive_push) {
+     peerman->FinalizeNode(config, peer_hb);
+ }
+ 
++BOOST_AUTO_TEST_CASE(high_bandwidth_sealedheader_push_and_peer_cleanup) {
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    SetMockTime(
++        WITH_LOCK(cs_main, return m_node.chainman->ActiveTip()->GetBlockTime()));
++
++    const Config &config = m_node.chainman->GetConfig();
++    const Consensus::Params &params = config.GetChainParams().GetConsensus();
++
++    auto connman = std::make_unique<ConnmanTestMsg>(config, 0x3570, 0x3570,
++                                                    *m_node.addrman);
++    PeerManager::Options peer_opts;
++    peer_opts.deterministic_rng = true;
++    auto peerman = PeerManager::make(*connman, *m_node.addrman, nullptr,
++                                     *m_node.chainman, *m_node.mempool,
++                                     /*avalanche=*/nullptr, peer_opts);
++
++    CConnman::Options options;
++    options.m_msgproc = {peerman.get()};
++    options.m_max_outbound_full_relay = 8;
++    connman->Init(options);
++    m_node.validation_signals->RegisterValidationInterface(peerman.get());
++
++    V2PeerProtocolHandler *v2_handler = peerman->GetV2ProtocolHandler();
++    BOOST_REQUIRE(v2_handler != nullptr);
++
++    CAddress addr_sender(MakeTestIp(0xa0b0c050), NODE_NONE);
++    CNode *peer_sender = new CNode(
++        /*id=*/920, /*sock=*/nullptr, addr_sender,
++        /*nKeyedNetGroupIn=*/0, /*nLocalHostNonceIn=*/0,
++        /*nLocalExtraEntropyIn=*/0, CAddress(), /*pszDest=*/"",
++        ConnectionType::OUTBOUND_FULL_RELAY, /*inbound_onion=*/false);
++    connman->Handshake(*peer_sender, /*successfully_connected=*/true,
++                       ServiceFlags(NODE_NETWORK), ServiceFlags(NODE_NETWORK),
++                       PROTOCOL_VERSION, /*relay_txs=*/true);
++
++    CAddress addr_hb(MakeTestIp(0xa0b0c051), NODE_NONE);
++    CNode *peer_hb = new CNode(
++        /*id=*/921, /*sock=*/nullptr, addr_hb,
++        /*nKeyedNetGroupIn=*/1, /*nLocalHostNonceIn=*/0,
++        /*nLocalExtraEntropyIn=*/0, CAddress(), /*pszDest=*/"",
++        ConnectionType::OUTBOUND_FULL_RELAY, /*inbound_onion=*/false);
++    connman->Handshake(*peer_hb, /*successfully_connected=*/true,
++                       ServiceFlags(NODE_NETWORK), ServiceFlags(NODE_NETWORK),
++                       PROTOCOL_VERSION, /*relay_txs=*/true);
++
++    CAddress addr_normal(MakeTestIp(0xa0b0c052), NODE_NONE);
++    CNode *peer_normal = new CNode(
++        /*id=*/922, /*sock=*/nullptr, addr_normal,
++        /*nKeyedNetGroupIn=*/2, /*nLocalHostNonceIn=*/0,
++        /*nLocalExtraEntropyIn=*/0, CAddress(), /*pszDest=*/"",
++        ConnectionType::OUTBOUND_FULL_RELAY, /*inbound_onion=*/false);
++    connman->Handshake(*peer_normal, /*successfully_connected=*/true,
++                       ServiceFlags(NODE_NETWORK), ServiceFlags(NODE_NETWORK),
++                       PROTOCOL_VERSION, /*relay_txs=*/true);
++
++    for (CNode *p : {peer_sender, peer_hb, peer_normal}) {
++        BOOST_CHECK(peerman->SendMessages(config, p));
++        LOCK(p->cs_vSend);
++        p->vSendMsg.clear();
++    }
++    for (CNode *p : {peer_sender, peer_hb, peer_normal}) {
++        connman->AddTestNode(*p);
++    }
++
++    // Opt in peer_sender and peer_hb as high-bandwidth V2 peers; keep peer_normal
++    // as a standard low-bandwidth peer.
++    peer_sender->m_bip152_highbandwidth_to = true;
++    peer_sender->m_bip152_highbandwidth_from = true;
++    v2_handler->SetHighBandwidthShortTxPeer(peer_sender->GetId(), true);
++
++    peer_hb->m_bip152_highbandwidth_to = true;
++    peer_hb->m_bip152_highbandwidth_from = true;
++    v2_handler->SetHighBandwidthShortTxPeer(peer_hb->GetId(), true);
++
++    peer_normal->m_bip152_highbandwidth_to = false;
++    peer_normal->m_bip152_highbandwidth_from = false;
++    v2_handler->SetHighBandwidthShortTxPeer(peer_normal->GetId(), false);
++
++    // 1. Build a valid V2 block containing tx1 on top of the current tip, and
++    //    add tx1 to the mempool WITHOUT manually calling SyncMerklixOverlayToTip
++    //    first (simulating a peer whose tip just advanced and received mempool
++    //    transactions via SHORTTX).
++    FastRandomContext rng(uint256{99});
++    CTransactionRef tx1 = MakeNonCoinbaseTx(rng, 0x51);
++    BOOST_REQUIRE(tx1 != nullptr);
++    FundTxInputInCoinsTip(*m_node.chainman, *tx1);
++
++    std::shared_ptr<CBlock> v2_block =
++        PrepareBlock(config, m_node, CScript() << OP_TRUE);
++    v2_block->vtx.push_back(tx1);
++    {
++        LOCK(cs_main);
++        v2_block->hashMerkleRoot = BlockMerkleRoot(*v2_block);
++    }
++    while (!CheckProofOfWork(v2_block->GetHash(), v2_block->nBits, params)) {
++        ++v2_block->nNonce;
++    }
++
++    {
++        TestMemPoolEntryHelper entry;
++        LOCK2(cs_main, m_node.mempool->cs);
++        m_node.mempool->addUnchecked(entry.Fee(1000 * SATOSHI).FromTx(tx1));
++    }
++
++    // 2. Deliver SEALEDHEADER from peer_sender.
++    //    Verify:
++    //    - MatchCandidateOverlay re-anchors the speculative overlay to the active
++    //      tip and hits the O(1) ComputeV2StateRootFromOverlay fast path
++    //      (sealedheader_overlay_fastpath increments).
++    //    - peer_sender is recorded as knowing v2_block->GetHash() and does NOT
++    //      receive a redundant SEALEDHEADER or CMPCTBLOCK back.
++    //    - peer_hb receives a direct SEALEDHEADER push via NewPoWValidBlock!
++    const auto stats_before = v2_handler->GetStats();
++    std::atomic<bool> interrupt{false};
++    std::chrono::microseconds cur_time{100'000};
++    {
++        SealedHeader sealed(*v2_block);
++        DataStream ss{};
++        ss << sealed;
++        peerman->ProcessMessage(config, *peer_sender, NetMsgType::SEALEDHEADER,
++                                ss, cur_time, interrupt);
++    }
++
++    const auto stats_after = v2_handler->GetStats();
++    BOOST_CHECK_EQUAL(stats_after.sealedheader_received,
++                      stats_before.sealedheader_received + 1);
++    BOOST_CHECK_EQUAL(stats_after.sealedheader_invalid,
++                      stats_before.sealedheader_invalid);
++    BOOST_CHECK_EQUAL(stats_after.sealedheader_rejected,
++                      stats_before.sealedheader_rejected);
++    BOOST_CHECK_EQUAL(stats_after.sealedheader_fallback_getdata,
++                      stats_before.sealedheader_fallback_getdata);
++    BOOST_CHECK_EQUAL(stats_after.sealedheader_reconstructed,
++                      stats_before.sealedheader_reconstructed + 1);
++    BOOST_CHECK_EQUAL(stats_after.sealedheader_overlay_fastpath,
++                      stats_before.sealedheader_overlay_fastpath + 1);
++    BOOST_CHECK(
++        v2_handler->PeerKnowsBlock(peer_sender->GetId(), v2_block->GetHash()));
++
++    // Verify peer_sender received NO redundant block announcement for v2_block.
++    {
++        V1TransportDeserializer deser_sender(config, peer_sender->GetId());
++        LOCK(peer_sender->cs_vSend);
++        for (const auto &chunk : peer_sender->vSendMsg) {
++            Span<const uint8_t> sp{chunk};
++            while (!sp.empty()) {
++                const int ret = deser_sender.Read(config, sp);
++                BOOST_REQUIRE_GE(ret, 0);
++                if (deser_sender.Complete()) {
++                    bool reject = false;
++                    CNetMessage msg = deser_sender.GetMessage(0us, reject);
++                    BOOST_CHECK(!reject);
++                    BOOST_CHECK_NE(msg.m_type, NetMsgType::SEALEDHEADER);
++                    BOOST_CHECK_NE(msg.m_type, NetMsgType::CMPCTBLOCK);
++                }
++            }
++        }
++    }
++
++    // Verify peer_hb received SEALEDHEADER directly during NewPoWValidBlock!
++    size_t hb_sealedheader_count = 0;
++    {
++        V1TransportDeserializer deser_hb(config, peer_hb->GetId());
++        LOCK(peer_hb->cs_vSend);
++        for (const auto &chunk : peer_hb->vSendMsg) {
++            Span<const uint8_t> sp{chunk};
++            while (!sp.empty()) {
++                const int ret = deser_hb.Read(config, sp);
++                BOOST_REQUIRE_GE(ret, 0);
++                if (deser_hb.Complete()) {
++                    bool reject = false;
++                    CNetMessage msg = deser_hb.GetMessage(0us, reject);
++                    BOOST_CHECK(!reject);
++                    if (msg.m_type == NetMsgType::SEALEDHEADER) {
++                        SealedHeader pushed_sh;
++                        msg.m_recv >> pushed_sh;
++                        BOOST_CHECK_EQUAL(pushed_sh.header.GetHash(),
++                                          v2_block->GetHash());
++                        ++hb_sealedheader_count;
++                    }
++                }
++            }
++        }
++    }
++    BOOST_CHECK_EQUAL(hb_sealedheader_count, 1U);
++
++    // 3. Verify duplicate SEALEDHEADER from peer_hb for an already-connected
++    //    block is a no-op (no fallback GETDATA(MSG_CMPCT_BLOCK) emitted).
++    {
++        LOCK(peer_hb->cs_vSend);
++        peer_hb->vSendMsg.clear();
++    }
++    {
++        SealedHeader dup_sealed(*v2_block);
++        DataStream ss{};
++        ss << dup_sealed;
++        peerman->ProcessMessage(config, *peer_hb, NetMsgType::SEALEDHEADER, ss,
++                                cur_time + 100us, interrupt);
++    }
++    BOOST_CHECK_EQUAL(v2_handler->GetStats().sealedheader_fallback_getdata,
++                      stats_after.sealedheader_fallback_getdata);
++
++    // 4. Verify FinalizeNode calls RemovePeer and cleans up all per-peer state.
++    {
++        const auto [k0, k1] =
++            DeriveReconSipHashKey(ReconScope::LIVE_MEMPOOL, uint256::ZERO, 0);
++        v2_handler->RecordPendingShortTxRequest(
++            peer_hb->GetId(), ReconScope::LIVE_MEMPOOL, uint256::ZERO, k0, k1,
++            {111ULL, 222ULL});
++    }
++    BOOST_CHECK(v2_handler->HasPendingShortTxRequests(peer_hb->GetId()));
++    BOOST_CHECK(v2_handler->IsHighBandwidthShortTxPeer(peer_hb->GetId()));
++    BOOST_CHECK(
++        v2_handler->PeerKnowsBlock(peer_hb->GetId(), v2_block->GetHash()));
++
++    // Raw callback registration does not own peerman or wait for an active
++    // callback on unregister. Drain after producers stop, before destruction.
++    AssertLockNotHeld(cs_main);
++    m_node.validation_signals->SyncWithValidationInterfaceQueue();
++    m_node.validation_signals->UnregisterValidationInterface(peerman.get());
++    SetMockTime(0);
++    peerman->FinalizeNode(config, *peer_sender);
++    peerman->FinalizeNode(config, *peer_hb);
++    peerman->FinalizeNode(config, *peer_normal);
++
++    BOOST_CHECK(!v2_handler->IsHighBandwidthShortTxPeer(peer_hb->GetId()));
++    BOOST_CHECK(!v2_handler->HasPendingShortTxRequests(peer_hb->GetId()));
++    BOOST_CHECK(
++        !v2_handler->PeerKnowsBlock(peer_hb->GetId(), v2_block->GetHash()));
++
++    connman->ClearTestNodes();
++}
++
+ BOOST_AUTO_TEST_SUITE_END()

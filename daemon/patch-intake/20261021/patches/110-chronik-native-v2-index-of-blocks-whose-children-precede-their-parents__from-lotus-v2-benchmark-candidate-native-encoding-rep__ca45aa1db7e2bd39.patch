@@ -1,0 +1,384 @@
+From 3ae4226ea5b06c21465546bcbc9bc8d0a43f5de5 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 11:58:05 -0700
+Subject: [PATCH] chronik: native V2 index of blocks whose children precede
+ their parents
+
+Port the Rust fix: V2Db::Connect and the disconnect undo validation
+resolve, spend and plan asset events in a parents-first order
+(ProcessingOrder: in-block parents before their children, otherwise block
+order), since the ABC host confirms blocks in canonical (txid) order. The
+explorer input check accepts a creation anywhere else in the same block,
+and asset planning accepts a first event at a later position in the same
+block. Tests cover a canonical-order block with chained spends and an
+in-block mint (connect, replay, disconnect, reconnect, equal asset counts
+to the topological order) and the ordering itself.
+
+Tier: V2
+---
+ chronik/native/ext/lotus_v2/db/asset.cpp      |   6 +-
+ chronik/native/ext/lotus_v2/db/branch.cpp     |  85 ++++++++--
+ chronik/native/ext/lotus_v2/db/branch.h       |  10 ++
+ chronik/native/ext/lotus_v2/db/explorer.cpp   |   7 +-
+ .../ext/lotus_v2/db/test/v2_branch_tests.cpp  | 145 ++++++++++++++++++
+ 5 files changed, 239 insertions(+), 14 deletions(-)
+
+diff --git a/chronik/native/ext/lotus_v2/db/asset.cpp b/chronik/native/ext/lotus_v2/db/asset.cpp
+index b9dc4b61d41be80d57aa2c6efaa394328528b4d4..e1a262a4f23f1e9feb50eea9533d8d9a0941e59b 100644
+--- a/chronik/native/ext/lotus_v2/db/asset.cpp
++++ b/chronik/native/ext/lotus_v2/db/asset.cpp
+@@ -162,10 +162,10 @@ PlanAssetTx(const AssetTxView &view, const OldAssetSummaries &old) {
+         }
+         AssetSummary summary;
+         if (const auto &s = it->second) {
++            // In a block in canonical (txid) order, an in-block parent
++            // applied first can sit at a later position.
+             if (s->token_id != event.token_id || s->event_count == 0 ||
+-                std::make_pair(s->first_seen.height, s->first_seen.tx_index) >
+-                    std::make_pair(view.location.height,
+-                                   view.location.tx_index)) {
++                s->first_seen.height > view.location.height) {
+                 ThrowCorrupt();
+             }
+             if (s->event_count == UINT64_MAX) {
+diff --git a/chronik/native/ext/lotus_v2/db/branch.cpp b/chronik/native/ext/lotus_v2/db/branch.cpp
+index 718951d9cd29fb87d237c06228750a1e2d305eac..93916aa84bfdbc0efb0c6c65d59f593c8d592139 100644
+--- a/chronik/native/ext/lotus_v2/db/branch.cpp
++++ b/chronik/native/ext/lotus_v2/db/branch.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <algorithm>
+ #include <map>
++#include <queue>
+ #include <set>
+ #include <tuple>
+ 
+@@ -281,10 +282,66 @@ std::vector<SpentInput> ReceiptSpends(const ReceiptTx &tx) {
+ 
+ using OldValueFn = std::function<std::optional<Bytes>(const Bytes &)>;
+ 
++} // namespace
++
++std::vector<size_t>
++ProcessingOrder(const std::vector<ConfirmedTx> &transactions) {
++    std::map<TxId, size_t> index;
++    for (size_t i = 0; i < transactions.size(); ++i) {
++        index.emplace(transactions[i].location.txid, i);
++    }
++    std::vector<size_t> pending(transactions.size(), 0);
++    std::vector<std::vector<size_t>> children(transactions.size());
++    for (size_t child = 0; child < transactions.size(); ++child) {
++        for (const SpentInput &spend : transactions[child].spends) {
++            const auto it = index.find(spend.outpoint.txid);
++            if (it != index.end() && it->second != child) {
++                ++pending[child];
++                children[it->second].push_back(child);
++            }
++        }
++    }
++    std::priority_queue<size_t, std::vector<size_t>, std::greater<size_t>>
++        ready;
++    for (size_t i = 0; i < transactions.size(); ++i) {
++        if (pending[i] == 0) {
++            ready.push(i);
++        }
++    }
++    std::vector<size_t> order;
++    order.reserve(transactions.size());
++    while (!ready.empty()) {
++        const size_t i = ready.top();
++        ready.pop();
++        order.push_back(i);
++        for (const size_t child : children[i]) {
++            if (--pending[child] == 0) {
++                ready.push(child);
++            }
++        }
++    }
++    if (order.size() < transactions.size()) {
++        std::vector<bool> placed(transactions.size(), false);
++        for (const size_t i : order) {
++            placed[i] = true;
++        }
++        for (size_t i = 0; i < transactions.size(); ++i) {
++            if (!placed[i]) {
++                order.push_back(i);
++            }
++        }
++    }
++    return order;
++}
++
++namespace {
++
+ std::map<Bytes, Bytes> AssetEntries(const CommittedBlock &block,
++                                    const std::vector<size_t> &order,
+                                     const OldValueFn &old_value) {
+     std::map<Bytes, Bytes> entries;
+-    for (const ConfirmedTx &tx : block.transactions) {
++    for (const size_t tx_index : order) {
++        const ConfirmedTx &tx = block.transactions[tx_index];
+         std::vector<ResolvedCreation> resolved_spends;
+         std::vector<Hash32> mint_token_ids;
+         for (const InputFact &input : tx.explorer.inputs) {
+@@ -414,7 +471,9 @@ void ValidateUndo(const V2Env &db, const Binding &binding, const Anchor &anchor,
+     reserve(reservation, PreflightExplorerBlock(restored));
+     std::map<Bytes, Bytes> legacy_current;
+     std::map<Bytes, std::optional<Bytes>> legacy_previous;
+-    for (const ConfirmedTx &tx : restored.transactions) {
++    const std::vector<size_t> order = ProcessingOrder(restored.transactions);
++    for (const size_t tx_index : order) {
++        const ConfirmedTx &tx = restored.transactions[tx_index];
+         const Bytes tk = PrefixKey('t', tx.location.txid.hash.b);
+         legacy_current[tk] = codec::Encode(tx.location);
+         legacy_previous[tk] = std::nullopt;
+@@ -481,10 +540,12 @@ void ValidateUndo(const V2Env &db, const Binding &binding, const Anchor &anchor,
+         undo_map.emplace(k, v);
+     }
+     const auto asset_entries =
+-        AssetEntries(restored, [&](const Bytes &k) -> std::optional<Bytes> {
+-            auto it = undo_map.find(k);
+-            return it == undo_map.end() ? std::nullopt : it->second;
+-        });
++        AssetEntries(restored, order,
++                     [&](const Bytes &k) -> std::optional<Bytes> {
++                         auto it = undo_map.find(k);
++                         return it == undo_map.end() ? std::nullopt
++                                                     : it->second;
++                     });
+     for (const auto &[k, v] : asset_entries) {
+         if (!expected.insert(k).second || db.Get(k) != v) {
+             ThrowCorrupt();
+@@ -783,9 +844,14 @@ void V2Db::ConnectImpl(const CommittedBlock &block, bool genesis) {
+         }
+         return;
+     }
++    // Resolve and apply in-block parents before their children: the host
++    // may confirm blocks in canonical (txid) order, where a child can precede
++    // the parent whose output it spends.
++    const std::vector<size_t> order = ProcessingOrder(block.transactions);
+     CommittedBlock resolved = block;
+     std::map<OutPoint, ResolvedCreation> creations;
+-    for (ConfirmedTx &tx : resolved.transactions) {
++    for (const size_t tx_index : order) {
++        ConfirmedTx &tx = resolved.transactions[tx_index];
+         for (size_t index = 0; index < tx.explorer.inputs.size(); ++index) {
+             InputFact &input = tx.explorer.inputs[index];
+             if (input.flags == 1) {
+@@ -854,7 +920,8 @@ void V2Db::ConnectImpl(const CommittedBlock &block, bool genesis) {
+     std::map<Bytes, std::optional<Bytes>> state;
+     std::map<Bytes, std::optional<Bytes>> undo;
+     std::set<OutPoint> spent;
+-    for (const ConfirmedTx &tx : block.transactions) {
++    for (const size_t tx_index : order) {
++        const ConfirmedTx &tx = block.transactions[tx_index];
+         const Bytes tx_key = PrefixKey('t', tx.location.txid.hash.b);
+         if (m_db->Get(tx_key)) {
+             ThrowInvalid("duplicate transaction");
+@@ -926,7 +993,7 @@ void V2Db::ConnectImpl(const CommittedBlock &block, bool genesis) {
+         undo[k] = std::nullopt;
+         state[k] = std::move(v);
+     }
+-    for (auto &[k, v] : AssetEntries(resolved, [&](const Bytes &key) {
++    for (auto &[k, v] : AssetEntries(resolved, order, [&](const Bytes &key) {
+              return m_db->Get(key);
+          })) {
+         auto old = m_db->Get(k);
+diff --git a/chronik/native/ext/lotus_v2/db/branch.h b/chronik/native/ext/lotus_v2/db/branch.h
+index 9a66e0b6c584d1f9f7340ebc19dc77715c68b06a..450fd8ae622247d7fb1e12fcb968664d60c56b1b 100644
+--- a/chronik/native/ext/lotus_v2/db/branch.h
++++ b/chronik/native/ext/lotus_v2/db/branch.h
+@@ -35,6 +35,16 @@ Bytes PrefixKey(uint8_t prefix, ByteView bytes);
+ /** 'p' || root || (position or 255) */
+ Bytes PostingPrefix(const Hash32 &root, std::optional<uint8_t> position);
+ 
++/**
++ * Order in which a block's transactions are resolved and applied: every
++ * in-block parent before the children spending its outputs, otherwise block
++ * order (a topologically ordered block keeps its own order). Hosts may
++ * confirm blocks in canonical (txid) order. Members of a dependency cycle
++ * follow in block order and are rejected as spending a missing coin.
++ */
++std::vector<size_t>
++ProcessingOrder(const std::vector<ConfirmedTx> &transactions);
++
+ class ReadSnapshot;
+ 
+ /** Owns a dedicated database. Mutations require exclusive access. */
+diff --git a/chronik/native/ext/lotus_v2/db/explorer.cpp b/chronik/native/ext/lotus_v2/db/explorer.cpp
+index a9464fcf9097d155a14351827c7ecb162579e157..ae26664043e504aca2a29ea6af997ec3b5ce2dc9 100644
+--- a/chronik/native/ext/lotus_v2/db/explorer.cpp
++++ b/chronik/native/ext/lotus_v2/db/explorer.cpp
+@@ -475,8 +475,11 @@ std::optional<InputMeta> ReadSnapshot::ExplorerInput(const TxId &id,
+         const auto creation_tx = ExplorerTx(coin->creation.txid);
+         if (!creation_tx || creation_tx->location != coin->creation ||
+             coin->outpoint.out_idx >= creation_tx->output_count ||
+-            std::make_pair(coin->creation.height, coin->creation.tx_index) >=
+-                std::make_pair(tx->location.height, tx->location.tx_index)) {
++            // Created earlier, or elsewhere in the same block (which may be
++            // in canonical, not topological, order).
++            coin->creation.height > tx->location.height ||
++            (coin->creation.height == tx->location.height &&
++             coin->creation.tx_index == tx->location.tx_index)) {
+             ThrowCorrupt();
+         }
+     }
+diff --git a/chronik/native/ext/lotus_v2/db/test/v2_branch_tests.cpp b/chronik/native/ext/lotus_v2/db/test/v2_branch_tests.cpp
+index 8e76f1fdf63df2cbfda7484641317b2e2114c201..7064f53088d4e2a04a73c556e53c503018869ff8 100644
+--- a/chronik/native/ext/lotus_v2/db/test/v2_branch_tests.cpp
++++ b/chronik/native/ext/lotus_v2/db/test/v2_branch_tests.cpp
+@@ -420,6 +420,151 @@ BOOST_AUTO_TEST_CASE(intra_block_spend_and_snapshot_isolation) {
+     BOOST_CHECK(!db.Snapshot().GetOutput(Op(22, 0)));
+ }
+ 
++// Hosts may confirm blocks in canonical (txid) order, where a child precedes
++// the in-block parent whose output it spends.
++BOOST_AUTO_TEST_CASE(canonical_order_block_spends_later_parents) {
++    auto tx = [](const Anchor &anchor, uint32_t index, uint8_t txid,
++                 std::vector<Output> outputs,
++                 const std::vector<OutPoint> &spent) {
++        std::vector<SpentInput> spends;
++        for (size_t i = 0; i < spent.size(); ++i) {
++            spends.push_back(SpentInput{spent[i], uint32_t(i)});
++        }
++        ExplorerTxFacts explorer = FixtureFacts(spends, outputs);
++        return ConfirmedTx{TxLocation{H(anchor.block_id), anchor.height, index,
++                                      TxId{Fill(txid)},
++                                      TxHash{Fill(uint8_t(txid ^ 0xff))}},
++                           std::move(outputs), std::move(spends),
++                           std::move(explorer)};
++    };
++    Output token = TestOutput(5, false);
++    token.flags = 1;
++    token.token_id = Fill(77);
++    Output minted = token;
++    minted.token_id = Fill(78);
++    // 0x20 -> 0x30 -> 0x40 -> 0x21, carrying a token; 0x31 mints a second
++    // token that 0x22 spends. Canonical order is 0x21, 0x22, 0x30, 0x31,
++    // 0x40; the topological order is 0x30, 0x31, 0x22, 0x40, 0x21.
++    struct Spec {
++        uint8_t txid;
++        Output output;
++        std::optional<OutPoint> spend;
++    };
++    const Anchor anchor{B32(11), 2};
++    auto second_block = [&](const CommittedBlock &first, bool canonical) {
++        std::vector<Spec> specs{{0x30, token, Op(0x20, 0)},
++                                {0x31, minted, std::nullopt},
++                                {0x22, minted, Op(0x31, 0)},
++                                {0x40, token, Op(0x30, 0)},
++                                {0x21, token, Op(0x40, 0)}};
++        if (canonical) {
++            std::sort(specs.begin(), specs.end(),
++                      [](const Spec &a, const Spec &b) {
++                          return a.txid < b.txid;
++                      });
++        }
++        CommittedBlock block{anchor, first.anchor, {},
++                             FixtureHeader(anchor, first.anchor)};
++        for (size_t i = 0; i < specs.size(); ++i) {
++            std::vector<OutPoint> spent;
++            if (specs[i].spend) {
++                spent.push_back(*specs[i].spend);
++            }
++            block.transactions.push_back(
++                tx(anchor, uint32_t(i), specs[i].txid, {specs[i].output},
++                   spent));
++        }
++        return block;
++    };
++    V2TempDir topo_dir("v2-topo");
++    V2TempDir dir("v2-ctor");
++    V2Db topo(topo_dir.path, TestBinding());
++    V2Db db(dir.path, TestBinding());
++    CommittedBlock second;
++    for (V2Db *d : {&topo, &db}) {
++        d->InitializeGenesis(FixtureGenesis({}));
++        const Anchor genesis = *d->Checkpoint();
++        const CommittedBlock first = TestBlock(genesis, 10, 0x20, {token}, {});
++        d->Connect(first);
++        second = second_block(first, d == &db);
++        d->Connect(second);
++        d->Connect(second); // exact replay is a no-op
++    }
++    BOOST_CHECK(second.transactions[0].location.txid == TxId{Fill(0x21)});
++    {
++        const ReadSnapshot view = db.Snapshot();
++        for (const auto &[parent, child] :
++             std::vector<std::pair<uint8_t, uint8_t>>{
++                 {0x20, 0x30}, {0x30, 0x40}, {0x40, 0x21}, {0x31, 0x22}}) {
++            const auto record = view.GetOutput(Op(parent, 0));
++            BOOST_REQUIRE(record && record->spend);
++            BOOST_CHECK(record->spend->transaction.txid == TxId{Fill(child)});
++        }
++        BOOST_CHECK(!view.GetOutput(Op(0x21, 0))->spend);
++        const auto input = view.ExplorerInput(TxId{Fill(0x21)}, 0);
++        BOOST_REQUIRE(input && input->resolved_creation);
++        BOOST_CHECK(input->resolved_creation->outpoint == Op(0x40, 0));
++        const ReadSnapshot topo_view = topo.Snapshot();
++        for (uint8_t token_id : {77, 78}) {
++            const auto summary = view.GetAssetSummary(Fill(token_id));
++            const auto expected = topo_view.GetAssetSummary(Fill(token_id));
++            BOOST_REQUIRE(summary && expected);
++            BOOST_CHECK_EQUAL(summary->event_count, expected->event_count);
++            BOOST_CHECK_EQUAL(summary->output_count, expected->output_count);
++        }
++        // The mint stays the first seen location, after its spender.
++        const auto minted_summary = view.GetAssetSummary(Fill(78));
++        BOOST_CHECK(minted_summary->first_seen.txid == TxId{Fill(0x31)});
++        BOOST_CHECK_EQUAL(minted_summary->first_seen.tx_index, 3u);
++        const auto minted_input = view.ExplorerInput(TxId{Fill(0x22)}, 0);
++        BOOST_REQUIRE(minted_input && minted_input->resolved_creation);
++        BOOST_CHECK(minted_input->resolved_creation->outpoint == Op(0x31, 0));
++    }
++    db.Disconnect(second.anchor);
++    {
++        const ReadSnapshot view = db.Snapshot();
++        BOOST_CHECK(!view.GetOutput(Op(0x20, 0))->spend);
++        for (uint8_t txid : {0x21, 0x22, 0x30, 0x31, 0x40}) {
++            BOOST_CHECK(!view.GetOutput(Op(txid, 0)));
++        }
++    }
++    db.Connect(second);
++
++    // A dependency cycle cannot be resolved.
++    const Anchor cycle_anchor{B32(12), 3};
++    const CommittedBlock cycle{
++        cycle_anchor,
++        second.anchor,
++        {tx(cycle_anchor, 0, 0x50, {TestOutput(6, false)}, {Op(0x51, 0)}),
++         tx(cycle_anchor, 1, 0x51, {TestOutput(6, false)}, {Op(0x50, 0)})},
++        FixtureHeader(cycle_anchor, second.anchor)};
++    BOOST_CHECK(ThrowsInvalid([&] { db.Connect(cycle); }, "missing coin"));
++    BOOST_CHECK(db.Checkpoint() == second.anchor);
++}
++
++BOOST_AUTO_TEST_CASE(processing_order_places_parents_first) {
++    auto tx = [](uint8_t txid, std::vector<uint8_t> parents) {
++        ConfirmedTx out;
++        out.location.txid = TxId{Fill(txid)};
++        for (uint8_t parent : parents) {
++            out.spends.push_back(
++                SpentInput{Op(parent, 0), uint32_t(out.spends.size())});
++        }
++        return out;
++    };
++    // Topological blocks keep their order.
++    BOOST_CHECK(ProcessingOrder({tx(1, {}), tx(2, {1}), tx(3, {1, 2})}) ==
++                (std::vector<size_t>{0, 1, 2}));
++    // Children move after parents; ties keep block order.
++    BOOST_CHECK(ProcessingOrder({tx(1, {4}), tx(2, {9}), tx(3, {}),
++                                 tx(4, {3, 3})}) ==
++                (std::vector<size_t>{1, 2, 3, 0}));
++    // Cycles keep block order at the end.
++    BOOST_CHECK(ProcessingOrder({tx(1, {2}), tx(2, {1}), tx(3, {})}) ==
++                (std::vector<size_t>{2, 0, 1}));
++    BOOST_CHECK(ProcessingOrder({}).empty());
++}
++
+ // crash_tests::durable_checkpoint_without_clean_shutdown: the Rust test
+ // re-executes itself; here a fork()ed child commits then _exit(77)s,
+ // bypassing destructors, so durability must come from the synced commit.
+-- 
+2.50.1 (Apple Git-155)
+

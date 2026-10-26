@@ -1,0 +1,310 @@
+diff --git a/src/rpc/async_waiter.h b/src/rpc/async_waiter.h
+index 2be98cd02981b1cd750acaa244b23d89173978d8..03e9ddd222e0439440f8cafda536d9a224edae13 100644
+--- a/src/rpc/async_waiter.h
++++ b/src/rpc/async_waiter.h
+@@ -39,6 +39,18 @@ private:
+ public:
+     AsyncBlockChangeWaiter() = default;
+ 
++    size_t WaiterCount() {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        size_t count = 0;
++        for (const auto &weak_timer : m_timers) {
++            if (!weak_timer.expired()) {
++                ++count;
++            }
++        }
++        return count;
++    }
++
++
+     /**
+      * Wake all currently suspended coroutines by cancelling their timers.
+      * Safe to call from any thread (validation, mempool, or shutdown).
+diff --git a/src/rpc/blockchain.cpp b/src/rpc/blockchain.cpp
+index f7af7bae718d89f79cdd894c9a391d366c1a6d79..9f7fe7d428282e67287e976d1f54216bda13b87c 100644
+--- a/src/rpc/blockchain.cpp
++++ b/src/rpc/blockchain.cpp
+@@ -3494,9 +3494,11 @@ static RPCHelpMan setfastsyncpivot() {
+                             strprintf("Fast-sync shard verification failed: %s",
+                                       err));
+                     }
+-                    active_chainstate.ActivateVerifiedFastSyncPivot(
+-                        pindex_pivot, assembled_utxo.Coins(),
+-                        assembled_monetary);
++                    if (!active_chainstate.ActivateVerifiedFastSyncPivot(
++                            pindex_pivot, assembled_utxo.Coins(),
++                            assembled_monetary, err)) {
++                        throw JSONRPCError(RPC_VERIFY_ERROR, err);
++                    }
+                     coins_imported = assembled_utxo.Coins().size();
+                 }
+             } else {
+diff --git a/src/rpc/mining.cpp b/src/rpc/mining.cpp
+index ef28ada6a9541c7043d5438f915f7f4c60897073..ee0430dae0ee14fd5530688163a804b3e4f22be4 100644
+--- a/src/rpc/mining.cpp
++++ b/src/rpc/mining.cpp
+@@ -1357,6 +1357,32 @@ static RPCHelpMan getblocktemplate() {
+                     static_cast<uint64_t>(tmpl.next_height);
+                 candidate_header.hashMerkleRoot = hashMerkleRoot;
+                 candidate_header.hashStateRoot = hashStateRoot;
++                // Overlay membership authenticates neither scripts nor input
++                // provenance. Validate the pinned selection once; warm reads
++                // retain the native cached-root path without writer locks.
++                {
++                    std::lock_guard<std::mutex> validation_lock(*tmpl.validation_mutex);
++                    if (!tmpl.validated) {
++                        CBlock candidate(candidate_header);
++                        candidate.vtx.push_back(MakeTransactionRef(coinbaseTx));
++                        candidate.vtx.insert(candidate.vtx.end(),
++                            tmpl.non_coinbase_txs.begin(), tmpl.non_coinbase_txs.end());
++                        LOCK(cs_main);
++                        auto &chainstate = chainman.ActiveChainstate();
++                        auto *tip = chainstate.m_chain.Tip();
++                        if (!tip || tip->GetBlockHash() != tmpl.prev_block_hash) {
++                            throw JSONRPCError(RPC_VERIFY_ERROR, "Template parent changed during assembly; retry");
++                        }
++                        BlockValidationState state;
++                        if (!TestBlockValidity(state, chainparams, chainstate, candidate,
++                                tip, GetAdjustedTime,
++                                BlockValidationOptions(config).withCheckPoW(false)
++                                                              .withCheckMerkleRoot(true))) {
++                            throw JSONRPCError(RPC_VERIFY_ERROR, "getblocktemplate: " + state.ToString());
++                        }
++                        tmpl.validated = true;
++                    }
++                }
+                 DataStream ss_header{};
+                 ss_header << candidate_header;
+                 lotus::v2::Hash pow_limit_bytes{};
+diff --git a/src/test/rpc_snapshot_mining_tests.cpp b/src/test/rpc_snapshot_mining_tests.cpp
+index 97f1199a94656709ecf9176de9efa8c0ae337276..04658e7197b99e3a460d8a937f9e5be415f3f173 100644
+--- a/src/test/rpc_snapshot_mining_tests.cpp
++++ b/src/test/rpc_snapshot_mining_tests.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include <config.h>
+ #include <consensus/amount.h>
++#include <consensus/merkle.h>
++#include <consensus/validation.h>
+ #include <consensus/tx_check.h>
+ #include <core_io.h>
+ #include <kernel/disconnected_transactions.h>
+@@ -37,7 +39,21 @@
+ #include <thread>
+ #include <vector>
+ 
+-BOOST_FIXTURE_TEST_SUITE(rpc_snapshot_mining_tests, TestChain100Setup)
++namespace {
++const node::MiningTemplateSnapshot &MiningTemplate(
++    const node::ChainAndMempoolSnapshot &snapshot) {
++    snapshot.EnsureMiningTemplate();
++    return snapshot.mining_template;
++}
++} // namespace
++
++struct NativeMiningRPCSetup : TestChain100Setup {
++    NativeMiningRPCSetup() {
++        m_node.args->ForceSetArg("-gbtwithoutpeers", "1");
++        SetMockTime(m_node.chainman->ActiveTip()->GetBlockTime() + 1);
++    }
++};
++BOOST_FIXTURE_TEST_SUITE(rpc_snapshot_mining_tests, NativeMiningRPCSetup)
+ 
+ BOOST_AUTO_TEST_CASE(
+     abc_mempool_batch_removal_and_prioritisation_snapshot_coalescing) {
+@@ -99,8 +115,8 @@ BOOST_AUTO_TEST_CASE(
+         const auto snap_after = publisher.Load();
+         BOOST_REQUIRE(snap_after != nullptr);
+         BOOST_CHECK_EQUAL(snap_after->mempool_size, 0U);
+-        BOOST_CHECK_EQUAL(snap_after->GetMiningTemplate().template_id,
+-                          snap_before->GetMiningTemplate().template_id + 1);
++        BOOST_CHECK_EQUAL(MiningTemplate(*snap_after).template_id,
++                          MiningTemplate(*snap_before).template_id + 1);
+         disconnectpool.clear();
+     }
+ }
+@@ -152,10 +168,10 @@ BOOST_AUTO_TEST_CASE(snapshot_publisher_concurrent_rcu_stress) {
+         next->headers_height = i;
+         next->mempool_valid = true;
+         next->mempool_size = static_cast<size_t>(i % 17);
+-        next->mining->value.template_valid = true;
+-        next->mining->value.template_id = publisher.AllocateTemplateId();
+-        next->mining->value.next_height = i + 1;
+-        next->mining->ready = true;
++        next->mining_template.template_valid = true;
++        next->mining_template.template_id = publisher.AllocateTemplateId();
++        next->mining_template.next_height = i + 1;
++        next->mining_template_ready = true;
+         publisher.Publish(std::move(next));
+     }
+ 
+@@ -202,9 +218,14 @@ BOOST_AUTO_TEST_CASE(getblocktemplate_o1_and_submitsealedheader) {
+             req.context = &m_node;
+             req.strMethod = "getblocktemplate";
+             req.params = UniValue(UniValue::VARR);
+-            UniValue res = co_await tableRPC.executeAsync(
+-                config, req, pool.get_executor());
+-            gbt_promise.set_value(std::move(res));
++            try {
++                UniValue res = co_await tableRPC.executeAsync(config, req, pool.get_executor());
++                gbt_promise.set_value(std::move(res));
++            } catch (const UniValue &error) {
++                gbt_promise.set_exception(std::make_exception_ptr(std::runtime_error(error.write())));
++            } catch (...) {
++                gbt_promise.set_exception(std::current_exception());
++            }
+         },
+         boost::asio::detached);
+ 
+@@ -225,54 +246,30 @@ BOOST_AUTO_TEST_CASE(getblocktemplate_o1_and_submitsealedheader) {
+     // submitsealedheader without re-uploading non-coinbase transactions.
+     const auto snap = node::GetGlobalSnapshotPublisher().Load();
+     BOOST_REQUIRE(snap != nullptr);
+-    const auto &tmpl = snap->GetMiningTemplate();
++    const auto &tmpl = MiningTemplate(*snap);
+     BOOST_REQUIRE(tmpl.template_valid);
+     BOOST_CHECK_EQUAL(tmpl.template_id, template_id);
+ 
+     const Consensus::Params &consensusParams =
+         config.GetChainParams().GetConsensus();
+-    CMutableTransaction coinbaseTx;
+-    coinbaseTx.vin.resize(1);
+-    coinbaseTx.vin[0].prevout = COutPoint();
+-    coinbaseTx.vout.resize(1);
+-    coinbaseTx.vout[0].scriptPubKey = CScript() << OP_TRUE;
+-    coinbaseTx.vout[0].nValue =
+-        gbt_res.find_value("coinbasevalue").getInt<int64_t>() * SATOSHI;
+-    coinbaseTx.vin[0].scriptSig = CScript() << tmpl.next_height << OP_0;
+-
+-    const auto whitelisted = GetMinerFundWhitelist(consensusParams);
+-    if (!whitelisted.empty()) {
+-        const Amount fund = GetMinerFundAmount(
+-            consensusParams, coinbaseTx.vout[0].nValue, nullptr);
+-        coinbaseTx.vout[0].nValue -= fund;
+-        coinbaseTx.vout.emplace_back(
+-            fund, GetScriptForDestination(*whitelisted.begin()));
+-    }
+-    uint64_t cb_size = ::GetSerializeSize(coinbaseTx);
+-    if (cb_size < MIN_TX_SIZE) {
+-        coinbaseTx.vin[0].scriptSig
+-            << std::vector<uint8_t>(MIN_TX_SIZE - cb_size - 1);
+-    }
+-
++    // Native GBT supplies the exact V7 coinbase and 134-byte committed header.
+     CBlockHeader header;
+-    header.nVersion = gbt_res.find_value("version").getInt<int32_t>();
+-    header.hashPrevBlock = tmpl.prev_block_hash;
+-    header.hashMerkleRoot =
+-        uint256S(gbt_res.find_value("merkleroot").get_str());
+-    header.nTime =
+-        static_cast<uint32_t>(gbt_res.find_value("curtime").getInt<int64_t>());
+-    header.nBits = tmpl.nBits;
+-    header.nNonce = 0;
+-
++    BOOST_REQUIRE(DecodeHexBlockHeader(header,
++        gbt_res.find_value("headerhex").get_str()));
++    BOOST_CHECK(header.hashPrevBlock == tmpl.prev_block_hash);
++    BOOST_CHECK_EQUAL(header.nHeight, uint64_t(tmpl.next_height));
+     while (!CheckProofOfWork(header.GetHash(), header.nBits, consensusParams)) {
+         ++header.nNonce;
+     }
+-
+     DataStream ss_hdr{};
+     ss_hdr << header;
+     const std::string header_hex = HexStr(ss_hdr);
+-    BOOST_CHECK_EQUAL(header_hex.size(), 160U); // 80-byte CBlockHeader
+-    const std::string coinbase_hex = EncodeHexTx(CTransaction(coinbaseTx));
++    BOOST_CHECK_EQUAL(header_hex.size(), 268U);
++    const std::string coinbase_hex =
++        gbt_res.find_value("coinbasetxhex").get_str();
++    CMutableTransaction decoded_coinbase;
++    BOOST_REQUIRE(DecodeHexTx(decoded_coinbase, coinbase_hex));
++    BOOST_CHECK(CTransaction(decoded_coinbase).IsCoinBase());
+ 
+     JSONRPCRequest submit_req;
+     submit_req.context = &m_node;
+@@ -324,26 +321,32 @@ BOOST_AUTO_TEST_CASE(getblocktemplate_mineraddress_and_submitsealedblock) {
+             tmpl_req.pushKV("mineraddress", minerAddr);
+             req.params = UniValue(UniValue::VARR);
+             req.params.push_back(std::move(tmpl_req));
+-            UniValue res = co_await tableRPC.executeAsync(
+-                config, req, pool.get_executor());
+-            gbt_promise.set_value(std::move(res));
++            try {
++                UniValue res = co_await tableRPC.executeAsync(config, req, pool.get_executor());
++                gbt_promise.set_value(std::move(res));
++            } catch (const UniValue &error) {
++                gbt_promise.set_exception(std::make_exception_ptr(std::runtime_error(error.write())));
++            } catch (...) {
++                gbt_promise.set_exception(std::current_exception());
++            }
+         },
+         boost::asio::detached);
+ 
+     UniValue gbt_res = gbt_future.get();
+     pool.join();
+ 
+-    // Verify 80-byte CBlockHeader (160 hex chars), coinbasetxhex, and blocksize
++    // Verify the native 134-byte header, coinbasetxhex and exact blocksize
+     const std::string header_hex = gbt_res.find_value("headerhex").get_str();
+     const std::string cb_hex = gbt_res.find_value("coinbasetxhex").get_str();
+-    BOOST_CHECK_EQUAL(header_hex.size(), 160U);
++    BOOST_CHECK_EQUAL(header_hex.size(), 268U);
+     BOOST_CHECK(!cb_hex.empty());
+-    BOOST_CHECK_GT(gbt_res.find_value("blocksize").getInt<int64_t>(), 80);
++    BOOST_CHECK_GT(gbt_res.find_value("blocksize").getInt<int64_t>(), 134);
+ 
+     CMutableTransaction decoded_cb;
+     BOOST_REQUIRE(DecodeHexTx(decoded_cb, cb_hex));
+     BOOST_REQUIRE(!decoded_cb.vout.empty());
+-    BOOST_CHECK(decoded_cb.vout[0].scriptPubKey == expectedMinerSpk);
++    BOOST_CHECK(decoded_cb.vout[0].ToV2Output() ==
++        CTxOut(decoded_cb.vout[0].nValue, expectedMinerSpk).ToV2Output());
+ 
+     CBlockHeader header;
+     BOOST_REQUIRE(DecodeHexBlockHeader(header, header_hex));
+@@ -412,10 +415,10 @@ BOOST_AUTO_TEST_CASE(lazy_mining_template_pins_old_generation_and_warm_rpc_avoid
+     m_node.mempool->clear(true);
+     const auto empty = node::GetGlobalSnapshotPublisher().Load();
+     // Neither template was materialized before clearing the live pool.
+-    BOOST_REQUIRE_EQUAL(old->GetMiningTemplate().non_coinbase_txs.size(), 1U);
+-    BOOST_CHECK(old->GetMiningTemplate().non_coinbase_txs[0]->GetId() == tx.GetId());
+-    BOOST_CHECK(empty->GetMiningTemplate().non_coinbase_txs.empty());
+-    BOOST_CHECK_NE(old->GetMiningTemplate().template_id, empty->GetMiningTemplate().template_id);
++    BOOST_REQUIRE_EQUAL(MiningTemplate(*old).non_coinbase_txs.size(), 1U);
++    BOOST_CHECK(MiningTemplate(*old).non_coinbase_txs[0]->GetId() == tx.GetId());
++    BOOST_CHECK(MiningTemplate(*empty).non_coinbase_txs.empty());
++    BOOST_CHECK_NE(MiningTemplate(*old).template_id, MiningTemplate(*empty).template_id);
+     boost::asio::thread_pool pool(2);
+     JSONRPCRequest req;
+     req.context = &m_node; req.strMethod = "getblocktemplate";
+@@ -448,7 +451,7 @@ BOOST_AUTO_TEST_CASE(snapshot_template_rejects_unchecked_invalid_p2sh) {
+     { LOCK2(cs_main, m_node.mempool->cs);
+       m_node.mempool->addUnchecked(TestMemPoolEntryHelper().Fee(2000 * SATOSHI).FromTx(bad));
+       node::PublishChainTipSnapshot(*m_node.chainman, m_node.mempool.get()); }
+-    BOOST_REQUIRE_EQUAL(node::GetGlobalSnapshotPublisher().Load()->GetMiningTemplate().non_coinbase_txs.size(), 2U);
++    BOOST_REQUIRE_EQUAL(MiningTemplate(*node::GetGlobalSnapshotPublisher().Load()).non_coinbase_txs.size(), 2U);
+     boost::asio::thread_pool pool(2);
+     JSONRPCRequest req;
+     req.context = &m_node; req.strMethod = "getblocktemplate";
+@@ -467,8 +470,17 @@ BOOST_AUTO_TEST_CASE(cached_merkle_branch_does_not_certify_duplicate_transaction
+     tx.vout.emplace_back(1000 * SATOSHI, CScript() << OP_TRUE);
+     const auto ref = MakeTransactionRef(tx);
+     tmpl.non_coinbase_txs = {ref, ref};
+-    tmpl.EnsureTemplateRoots();
+-    BOOST_CHECK(!tmpl.merkle_cache_safe);
++    tmpl.EnsureRoots();
++    CBlock block;
++    block.nHeaderVersion = lotus::v2::kHeaderVersion;
++    block.nBits = 0x207fffff;
++    block.vtx = tmpl.non_coinbase_txs;
++    block.hashMerkleRoot = BlockMerkleRoot(block);
++    GlobalConfig config;
++    BlockValidationState state;
++    BOOST_CHECK(!CheckBlock(block, state, config.GetChainParams().GetConsensus(),
++        BlockValidationOptions(config).withCheckPoW(false)));
++    BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-txns-duplicate");
+ }
+ 
+ BOOST_AUTO_TEST_SUITE_END()

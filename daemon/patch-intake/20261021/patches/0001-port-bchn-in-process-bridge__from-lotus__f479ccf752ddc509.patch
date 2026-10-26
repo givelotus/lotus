@@ -1,0 +1,1485 @@
+From 3443fe70b1f731483f183180d0d533a0f44f98c1 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Wed, 14 Oct 2026 18:28:11 -0700
+Subject: [PATCH] chronik: adapt pinned in-process bridge to exact BCHN host
+
+Use native BCHN context, block/undo storage and immutable admission/removal snapshots. Preserve ordinary transaction IDs, 80-byte headers and CashTokens wrapped script bytes. Keep token-aware indexing, Avalanche, unsupported networks and pruning explicitly unavailable. Native policy and the original Rust indexing implementation remain unchanged.
+---
+ chronik/CMakeLists.txt                        |   8 +-
+ chronik/chronik-bridge/src/ffi.rs             |  10 +-
+ chronik/chronik-cpp/chronik.cpp               | 274 +++-----------
+ chronik/chronik-cpp/chronik.h                 |  10 +-
+ chronik/chronik-cpp/chronik_bridge.cpp        | 340 +++++++-----------
+ chronik/chronik-cpp/chronik_bridge.h          |  50 +--
+ .../chronik_validationinterface.cpp           | 232 ++++++------
+ .../chronik-cpp/chronik_validationinterface.h |   7 +-
+ chronik/chronik-lib/src/ffi.rs                |   4 +-
+ 9 files changed, 332 insertions(+), 603 deletions(-)
+
+diff --git a/chronik/CMakeLists.txt b/chronik/CMakeLists.txt
+index 37c3211762be57f9a557c24b7188b3b557db35a6..36aeffbc42f7770da166602949a2b70b5b1e61b4 100644
+--- a/chronik/CMakeLists.txt
++++ b/chronik/CMakeLists.txt
+@@ -23,7 +23,7 @@ function(add_cargo_custom_target TARGET)
+         ${CHRONIK_CARGO_FLAGS}
+         ${ARGN}
+     WORKING_DIRECTORY
+-        "${CMAKE_SOURCE_DIR}"
++        "${CMAKE_CURRENT_SOURCE_DIR}/.."
+     )
+ endfunction()
+ 
+@@ -132,6 +132,8 @@ add_library(chronik-bridge
+ )
+ target_include_directories(chronik-bridge
+     PUBLIC
++        "${PROJECT_SOURCE_DIR}/src"
++        "${PROJECT_BINARY_DIR}/src"
+         "${CMAKE_CURRENT_SOURCE_DIR}"
+         "${CXXBRIDGE_GENERATED_FOLDER}"
+ )
+@@ -209,8 +211,8 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
+ endif()
+ 
+ # Rocksdb requires "atomic"
+-include(AddCompilerFlags)
+-custom_check_linker_flag(LINKER_HAS_ATOMIC "-latomic")
++include(CheckLinkerFlag)
++check_linker_flag(CXX "-latomic" LINKER_HAS_ATOMIC)
+ if(LINKER_HAS_ATOMIC)
+     target_link_libraries(chronik atomic)
+ endif()
+diff --git a/chronik/chronik-bridge/src/ffi.rs b/chronik/chronik-bridge/src/ffi.rs
+index e7136e80b28608d60118f7eb970165ea2ba2ab38..05ec6cb0075ee18a3cb4eea566dc2aed3f6dd41a 100644
+--- a/chronik/chronik-bridge/src/ffi.rs
++++ b/chronik/chronik-bridge/src/ffi.rs
+@@ -142,7 +142,7 @@ mod ffi_inner {
+ 
+     #[allow(missing_debug_implementations)]
+     unsafe extern "C++" {
+-        include!("blockindex.h");
++        include!("chain.h");
+         include!("chronik-cpp/chronik_bridge.h");
+         include!("coins.h");
+         include!("node/context.h");
+@@ -150,8 +150,8 @@ mod ffi_inner {
+         include!("primitives/transaction.h");
+         include!("undo.h");
+ 
+-        /// node::NodeContext from node/context.h
+-        #[namespace = "node"]
++        /// ::NodeContext from node/context.h
++        #[namespace = ""]
+         type NodeContext;
+ 
+         /// ::CBlockIndex from blockindex.h
+@@ -395,12 +395,12 @@ mod ffi_inner {
+ }
+ 
+ /// SAFETY: All fields of ChronikBridge (const Consensus::Params &, const
+-/// node::NodeContext &) can be moved betweed threads safely.
++/// ::NodeContext &) can be moved betweed threads safely.
+ #[allow(unsafe_code)]
+ unsafe impl Send for ChronikBridge {}
+ 
+ /// SAFETY: All fields of ChronikBridge (const Consensus::Params &, const
+-/// node::NodeContext &) can be accessed from different threads safely.
++/// ::NodeContext &) can be accessed from different threads safely.
+ #[allow(unsafe_code)]
+ unsafe impl Sync for ChronikBridge {}
+ 
+diff --git a/chronik/chronik-cpp/chronik.cpp b/chronik/chronik-cpp/chronik.cpp
+index 3ebaff253e2909533033d4df76e826dbc2622f69..0fc6a22bb653f8e95f3bd4617f1870b5b445f81a 100644
+--- a/chronik/chronik-cpp/chronik.cpp
++++ b/chronik/chronik-cpp/chronik.cpp
+@@ -1,240 +1,56 @@
+ // Copyright (c) 2022 The Bitcoin developers
++// Copyright (c) 2026 The Bitcoin Cash Node developers
+ // Distributed under the MIT software license, see the accompanying
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+-
+ #include <chainparams.h>
+-#include <chainparamsbase.h>
+-#include <common/args.h>
+-#include <config.h>
+-#include <logging.h>
+-#include <node/context.h>
+-#include <node/ui_interface.h>
+-#include <script/script.h>
+-#include <util/chaintype.h>
+-#include <util/result.h>
+-#include <util/time.h>
+-#include <util/translation.h>
+-
+ #include <chronik-cpp/chronik.h>
+ #include <chronik-cpp/chronik_validationinterface.h>
++#include <chronik/options.h>
+ #include <chronik_lib/src/ffi.rs.h>
+-
+-#include <tinyformat.h>
+-
+-#include <limits>
++#include <config.h>
++#include <logging.h>
++#include <node/context.h>
++#include <ui_interface.h>
++#include <util/system.h>
+ 
+ namespace chronik {
+-
+-// Duration between WebSocket pings initiated by Chronik.
+-// 45s has been empirically established as a reliable duration for both browser
+-// and NodeJS WebSockets.
+-static constexpr std::chrono::seconds WS_PING_INTERVAL_DEFAULT{45s};
+-
+-// Ping duration is just 5s on regtest to speed up ping tests and make
+-// functional tests more reliable.
+-static constexpr std::chrono::seconds WS_PING_INTERVAL_REGTEST{5s};
+-
+-template <typename T, typename C> rust::Vec<T> ToRustVec(const C &container) {
+-    rust::Vec<T> vec;
+-    vec.reserve(container.size());
+-    std::copy(container.begin(), container.end(), std::back_inserter(vec));
+-    return vec;
+-}
+-
+-chronik_bridge::Net ParseNet(const ChainType chain_type) {
+-    if (chain_type == ChainType::MAIN) {
+-        return chronik_bridge::Net::Mainnet;
+-    } else if (chain_type == ChainType::TESTNET) {
+-        return chronik_bridge::Net::Testnet;
+-    } else if (chain_type == ChainType::REGTEST) {
+-        return chronik_bridge::Net::Regtest;
+-    }
+-    throw std::runtime_error("Unknown chain type");
+-}
+-
+-util::Result<chronik_bridge::SetupParams>
+-ParseChronikParams(const ArgsManager &args, const Config &config, bool fWipe) {
+-    const bool is_pause_allowed = args.GetBoolArg("-chronikallowpause", false);
+-    const CChainParams &params = config.GetChainParams();
+-    if (is_pause_allowed && !params.IsTestChain()) {
+-        return {{_("Using -chronikallowpause on a mainnet chain is not allowed "
+-                   "for security reasons.")}};
+-    }
+-
+-    const auto electrum_hosts = args.GetArgs("-chronikelectrumbind");
+-    const bool is_scripthashindex_enabled =
+-        args.GetBoolArg("-chronikscripthashindex", !electrum_hosts.empty());
+-    if (!electrum_hosts.empty()) {
+-        if (args.IsArgSet("-chronikelectrumcert") ^
+-            args.IsArgSet("-chronikelectrumprivkey")) {
+-            return {{_("The -chronikelectrumcert and -chronikelectrumprivkey "
+-                       "options should both be set or unset.")}};
+-        }
+-        if (args.IsArgSet("-chronikscripthashindex") &&
+-            !is_scripthashindex_enabled) {
+-            return {{_("The -chronikelectrumbind option requires "
+-                       "-chronikscripthashindex to be true.")}};
+-        }
+-    }
+-
+-    const int64_t electrum_max_history = args.GetIntArg(
+-        "-chronikelectrummaxhistory", DEFAULT_ELECTRUM_MAX_HISTORY);
+-    if (electrum_max_history < 1 ||
+-        electrum_max_history > std::numeric_limits<uint32_t>::max()) {
+-        return {{_(strprintf("The -chronikelectrummaxhistory value should be "
+-                             "within the range [1, %d].",
+-                             std::numeric_limits<uint32_t>::max())
+-                       .c_str())}};
+-    }
+-
+-    const std::string donation_address =
+-        args.GetArg("-chronikelectrumdonationaddress", "");
+-    if (donation_address.length() > MAX_LENGTH_DONATION_ADDRESS) {
+-        return {
+-            {_(strprintf(
+-                   "The -chronikelectrumdonationaddress parameter must be at "
+-                   "most %u characters long.",
+-                   MAX_LENGTH_DONATION_ADDRESS)
+-                   .c_str())}};
+-    }
+-
+-    const int64_t electrum_peers_validation_interval =
+-        args.GetIntArg("-chronikelectrumpeersvalidationinterval",
+-                       std::chrono::duration_cast<std::chrono::seconds>(
+-                           chronik::DEFAULT_ELECTRUM_PEER_VALIDATION_INTERVAL)
+-                           .count());
+-    if (electrum_peers_validation_interval < 0 ||
+-        electrum_peers_validation_interval >
+-            std::numeric_limits<uint32_t>::max()) {
+-        return {{_(strprintf("The -chronikelectrumpeersvalidationinterval "
+-                             "value should be within the range [0, %d]",
+-                             std::numeric_limits<uint32_t>::max())
+-                       .c_str())}};
+-    }
+-
+-    const int64_t electrum_idle_timeout =
+-        args.GetIntArg("-chronikelectrumidletimeout",
+-                       std::chrono::duration_cast<std::chrono::seconds>(
+-                           chronik::DEFAULT_ELECTRUM_IDLE_TIMEOUT)
+-                           .count());
+-    if (electrum_idle_timeout < 0 ||
+-        electrum_idle_timeout > std::numeric_limits<uint32_t>::max()) {
+-        return {{_(strprintf("The -chronikelectrumidletimeout value should be "
+-                             "within the range [0, %d]",
+-                             std::numeric_limits<uint32_t>::max())
+-                       .c_str())}};
+-    }
+-
+-    const int64_t max_subs =
+-        args.GetIntArg("-chronikmaxsubs", chronik::DEFAULT_MAX_SUBS);
+-    if (max_subs < 1 ||
+-        static_cast<uint64_t>(max_subs) > std::numeric_limits<size_t>::max()) {
+-        return {{_(strprintf("The -chronikmaxsubs value should be within the "
+-                             "range [1, %llu].",
+-                             static_cast<unsigned long long>(
+-                                 std::numeric_limits<size_t>::max()))
+-                       .c_str())}};
+-    }
+-
+-    const int64_t max_subs_per_ip = args.GetIntArg(
+-        "-chronikmaxsubsperip", chronik::DEFAULT_MAX_SUBS_PER_IP);
+-    if (max_subs_per_ip < 1 || static_cast<uint64_t>(max_subs_per_ip) >
+-                                   std::numeric_limits<size_t>::max()) {
+-        return {
+-            {_(strprintf("The -chronikmaxsubsperip value should be within the "
+-                         "range [1, %llu].",
+-                         static_cast<unsigned long long>(
+-                             std::numeric_limits<size_t>::max()))
+-                   .c_str())}};
+-    }
+-
+-    const int64_t subscription_max_script_size =
+-        args.GetIntArg("-chroniksubsmaxscriptsize",
+-                       chronik::DEFAULT_SUBSCRIPTION_MAX_SCRIPT_SIZE);
+-    if (subscription_max_script_size < 1 ||
+-        subscription_max_script_size > MAX_SCRIPT_SIZE) {
+-        return {{_(strprintf("The -chroniksubsmaxscriptsize value should "
+-                             "be within the range [1, %d].",
+-                             MAX_SCRIPT_SIZE)
+-                       .c_str())}};
+-    }
+-
+-    const int64_t subscription_max_plugin_size =
+-        args.GetIntArg("-chroniksubsmaxpluginsize",
+-                       chronik::DEFAULT_SUBSCRIPTION_MAX_PLUGIN_SIZE);
+-    if (subscription_max_plugin_size < 1 ||
+-        subscription_max_plugin_size > 2 * MAX_SCRIPT_SIZE) {
+-        return {{_(strprintf("The -chroniksubsmaxpluginsize value should "
+-                             "be within the range [1, %d].",
+-                             2 * MAX_SCRIPT_SIZE)
+-                       .c_str())}};
+-    }
+-
+-    return {{
+-        .net = ParseNet(params.GetChainType()),
+-        .datadir = args.GetDataDirBase().u8string(),
+-        .datadir_net = args.GetDataDirNet().u8string(),
+-        .hosts = ToRustVec<rust::String>(args.IsArgSet("-chronikbind")
+-                                             ? args.GetArgs("-chronikbind")
+-                                             : DEFAULT_BINDS),
+-        .default_port = BaseParams().ChronikPort(),
+-        .wipe_db = fWipe,
+-        .enable_token_index = args.GetBoolArg("-chroniktokenindex", true),
+-        .enable_lokad_id_index = args.GetBoolArg("-chroniklokadidindex", true),
+-        .enable_scripthash_index = is_scripthashindex_enabled,
+-        .is_pause_allowed = is_pause_allowed,
+-        .enable_perf_stats = args.GetBoolArg("-chronikperfstats", false),
+-        .ws_ping_interval_secs =
+-            params.GetChainType() == ChainType::REGTEST
+-                ? uint64_t(count_seconds(WS_PING_INTERVAL_REGTEST))
+-                : uint64_t(count_seconds(WS_PING_INTERVAL_DEFAULT)),
+-        .enable_cors = args.GetBoolArg("-chronikcors", false),
+-        .tx_num_cache =
+-            {
+-                .num_buckets = (size_t)args.GetIntArg(
+-                    "-chroniktxnumcachebuckets", DEFAULT_TX_NUM_CACHE_BUCKETS),
+-                .bucket_size =
+-                    (size_t)args.GetIntArg("-chroniktxnumcachebucketsize",
+-                                           DEFAULT_TX_NUM_CACHE_BUCKET_SIZE),
+-            },
+-        .electrum_hosts = ToRustVec<rust::String>(electrum_hosts),
+-        .electrum_url = args.GetArg("-chronikelectrumurl", "127.0.0.1"),
+-        .electrum_default_port = BaseParams().ChronikElectrumPort(),
+-        .electrum_default_protocol = 's',
+-        .electrum_cert_path = args.GetArg("-chronikelectrumcert", ""),
+-        .electrum_privkey_path = args.GetArg("-chronikelectrumprivkey", ""),
+-        .electrum_max_history = static_cast<uint32_t>(electrum_max_history),
+-        .electrum_donation_address =
+-            args.GetArg("-chronikelectrumdonationaddress", ""),
+-        .electrum_peers_validation_interval =
+-            static_cast<uint32_t>(electrum_peers_validation_interval),
+-        .electrum_idle_timeout = static_cast<uint32_t>(electrum_idle_timeout),
+-        .max_subs = static_cast<size_t>(max_subs),
+-        .max_subs_per_ip = static_cast<size_t>(max_subs_per_ip),
+-        .subscription_max_script_size =
+-            static_cast<size_t>(subscription_max_script_size),
+-        .subscription_max_plugin_size =
+-            static_cast<size_t>(subscription_max_plugin_size),
+-    }};
+-}
+-
+-bool Start(const ArgsManager &args, const Config &config,
+-           const node::NodeContext &node, bool fWipe) {
+-    util::Result<chronik_bridge::SetupParams> params =
+-        ParseChronikParams(args, config, fWipe);
+-    if (!params) {
+-        return InitError(ErrorString(params));
+-    }
+-    return chronik_bridge::setup_chronik(*params, node);
++bool Start(const ArgsManager &args, const Config &config, const ::NodeContext &node, bool wipe) {
++    const Options options = ReadOptions(args);
++    const std::string network = config.GetChainParams().NetworkIDString();
++    if (network != "main" && network != "test" && network != "regtest") {
++        return InitError("This Chronik BCHN profile supports main, test and regtest only");
++    }
++    if (options.token_index) {
++        return InitError(
++            "CashTokens-aware Chronik indexing is not implemented; raw token bytes are preserved");
++    }
++    chronik_bridge::SetupParams params{};
++    params.net = network == "main"   ? chronik_bridge::Net::Mainnet
++                 : network == "test" ? chronik_bridge::Net::Testnet
++                                     : chronik_bridge::Net::Regtest;
++    params.datadir = GetDataDir(false).string();
++    params.datadir_net = GetDataDir().string();
++    for (const auto &host : options.binds)
++        params.hosts.push_back(host);
++    params.default_port = network == "regtest" ? 18440 : network == "test" ? 18331 : 8331;
++    params.wipe_db = wipe;
++    params.enable_token_index = false;
++    params.enable_lokad_id_index = true;
++    params.enable_scripthash_index = options.script_hash_index;
++    params.is_pause_allowed = false;
++    params.enable_perf_stats = false;
++    params.ws_ping_interval_secs = network == "regtest" ? 5 : 45;
++    params.enable_cors = options.cors;
++    params.tx_num_cache = {DEFAULT_TX_NUM_CACHE_BUCKETS, DEFAULT_TX_NUM_CACHE_BUCKET_SIZE};
++    params.electrum_default_port = 50001;
++    params.electrum_default_protocol = 't';
++    params.electrum_max_history = DEFAULT_ELECTRUM_MAX_HISTORY;
++    params.max_subs = DEFAULT_MAX_SUBS;
++    params.max_subs_per_ip = DEFAULT_MAX_SUBS_PER_IP;
++    params.subscription_max_script_size = DEFAULT_SUBSCRIPTION_MAX_SCRIPT_SIZE;
++    params.subscription_max_plugin_size = DEFAULT_SUBSCRIPTION_MAX_PLUGIN_SIZE;
++    return chronik_bridge::setup_chronik(std::move(params), node);
+ }
+-
+-void Interrupt() {
+-    InterruptChronikRequestHandlers();
+-}
+-
+-void Stop() {
+-    LogPrintf("Stopping Chronik...\n");
+-    StopChronikValidationInterface();
+-}
+-
++void Interrupt() { InterruptChronikRequestHandlers(); }
++void Stop() { StopChronikValidationInterface(); }
+ } // namespace chronik
+diff --git a/chronik/chronik-cpp/chronik.h b/chronik/chronik-cpp/chronik.h
+index 3bdc03f08ef301d5dfb3af0dfe08b7bf66c28f29..6d6f904c97ab430bc456018f88f201d53244da09 100644
+--- a/chronik/chronik-cpp/chronik.h
++++ b/chronik/chronik-cpp/chronik.h
+@@ -10,9 +10,8 @@
+ #include <vector>
+ 
+ class Config;
+-namespace node {
++class ArgsManager;
+ struct NodeContext;
+-} // namespace node
+ 
+ namespace chronik {
+ 
+@@ -45,17 +44,16 @@ static constexpr size_t MAX_LENGTH_DONATION_ADDRESS{80};
+ 
+ // 0 disables Electrum peer validation; server.add_peer rejects peers and
+ // server.peers.subscribe advertises none.
+-static constexpr auto DEFAULT_ELECTRUM_PEER_VALIDATION_INTERVAL{0s};
++static constexpr auto DEFAULT_ELECTRUM_PEER_VALIDATION_INTERVAL{std::chrono::seconds{0}};
+ 
+ /**
+  * Drop Electrum clients that send no data for this long; 0 disables the
+  * timeout.
+  */
+-static constexpr auto DEFAULT_ELECTRUM_IDLE_TIMEOUT{10min};
++static constexpr auto DEFAULT_ELECTRUM_IDLE_TIMEOUT{std::chrono::minutes{10}};
+ 
+ // Registers Chronik indexer as ValidationInterface, listens to HTTP queries
+-bool Start(const ArgsManager &args, const Config &config,
+-           const node::NodeContext &node, bool fWipe);
++bool Start(const ArgsManager &args, const Config &config, const ::NodeContext &node, bool fWipe);
+ 
+ // Stops the HTTP and Electrum servers, keeping the indexer running. Must run
+ // before the node subsystems the request handlers use are shut down.
+diff --git a/chronik/chronik-cpp/chronik_bridge.cpp b/chronik/chronik-cpp/chronik_bridge.cpp
+index bae29312a1f5d407d4c578de8fe68eadd756a3ae..efc61b861d4afeb87d90a568b0bfcd87659e038a 100644
+--- a/chronik/chronik-cpp/chronik_bridge.cpp
++++ b/chronik/chronik-cpp/chronik_bridge.cpp
+@@ -2,35 +2,34 @@
+ // Distributed under the MIT software license, see the accompanying
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
+-#include <blockindex.h>
++#include <chain.h>
+ #include <chainparams.h>
+ #include <chronik-bridge/src/ffi.rs.h>
+ #include <chronik-cpp/chronik_bridge.h>
+ #include <chronik-cpp/util/collection.h>
+ #include <chronik-cpp/util/hash.h>
++#include <chronik/validation_hooks.h>
+ #include <clientversion.h>
+-#include <common/messages.h>
+ #include <compressor.h>
+ #include <config.h>
++#include <consensus/validation.h>
+ #include <feerate.h>
+ #include <logging.h>
+ #include <node/blockstorage.h>
+-#include <node/coin.h>
+ #include <node/context.h>
+ #include <node/transaction.h>
+-#include <node/ui_interface.h>
+ #include <shutdown.h>
+ #include <span.h>
+ #include <streams.h>
+ #include <sync.h>
++#include <ui_interface.h>
+ #include <undo.h>
+ #include <validation.h>
+ #include <validationinterface.h>
+ 
++#include <net.h>
+ #include <optional>
+-
+-using common::TransactionErrorString;
+-using node::TransactionError;
++#include <util/system.h>
+ 
+ chronik_bridge::OutPoint BridgeOutPoint(const COutPoint &outpoint) {
+     return {
+@@ -40,15 +39,16 @@ chronik_bridge::OutPoint BridgeOutPoint(const COutPoint &outpoint) {
+ }
+ 
+ chronik_bridge::TxOutput BridgeTxOutput(const CTxOut &output) {
++    token::WrappedScriptPubKey wrapped;
++    token::WrapScriptPubKey(wrapped, output.tokenDataPtr, output.scriptPubKey, PROTOCOL_VERSION);
+     return {
+-        .sats = output.nValue / Amount::satoshi(),
+-        .script = chronik::util::ToRustVec<uint8_t>(output.scriptPubKey),
++        .sats = output.nValue / SATOSHI,
++        .script = chronik::util::ToRustVec<uint8_t>(wrapped),
+     };
+ }
+ 
+ chronik_bridge::Coin BridgeCoin(const Coin &coin) {
+-    const int32_t nHeight =
+-        coin.GetHeight() == 0x7fff'ffff ? -1 : coin.GetHeight();
++    const int32_t nHeight = coin.GetHeight() == 0x7fff'ffff ? -1 : coin.GetHeight();
+     return {
+         .output = BridgeTxOutput(coin.GetTxOut()),
+         .height = nHeight,
+@@ -56,9 +56,8 @@ chronik_bridge::Coin BridgeCoin(const Coin &coin) {
+     };
+ }
+ 
+-rust::Vec<chronik_bridge::TxInput>
+-BridgeTxInputs(bool isCoinbase, const std::vector<CTxIn> &inputs,
+-               const std::vector<Coin> &spent_coins) {
++rust::Vec<chronik_bridge::TxInput> BridgeTxInputs(bool isCoinbase, const std::vector<CTxIn> &inputs,
++                                                  const std::vector<Coin> &spent_coins) {
+     rust::Vec<chronik_bridge::TxInput> bridged_inputs;
+     bridged_inputs.reserve(inputs.size());
+     for (size_t idx = 0; idx < inputs.size(); ++idx) {
+@@ -80,8 +79,7 @@ BridgeTxInputs(bool isCoinbase, const std::vector<CTxIn> &inputs,
+     return bridged_inputs;
+ }
+ 
+-rust::Vec<chronik_bridge::TxOutput>
+-BridgeTxOutputs(const std::vector<CTxOut> &outputs) {
++rust::Vec<chronik_bridge::TxOutput> BridgeTxOutputs(const std::vector<CTxOut> &outputs) {
+     rust::Vec<chronik_bridge::TxOutput> bridged_outputs;
+     bridged_outputs.reserve(outputs.size());
+     for (const CTxOut &output : outputs) {
+@@ -94,7 +92,7 @@ chronik_bridge::Tx BridgeTx(bool isCoinbase, const CTransaction &tx,
+                             const std::vector<Coin> &spent_coins) {
+     return {
+         .txid = chronik::util::HashToArray(tx.GetId()),
+-        .version = tx.nVersion,
++        .version = static_cast<uint32_t>(tx.nVersion),
+         .inputs = BridgeTxInputs(isCoinbase, tx.vin, spent_coins),
+         .outputs = BridgeTxOutputs(tx.vout),
+         .locktime = tx.nLockTime,
+@@ -102,29 +100,25 @@ chronik_bridge::Tx BridgeTx(bool isCoinbase, const CTransaction &tx,
+ }
+ 
+ chronik_bridge::BlockTx BridgeBlockTx(bool isCoinbase, const CTransaction &tx,
+-                                      const std::vector<Coin> &spent_coins,
+-                                      size_t data_pos, size_t undo_pos) {
++                                      const std::vector<Coin> &spent_coins, size_t data_pos,
++                                      size_t undo_pos) {
+     return {.tx = BridgeTx(isCoinbase, tx, spent_coins),
+             .data_pos = uint32_t(data_pos),
+             .undo_pos = uint32_t(isCoinbase ? 0 : undo_pos)};
+ }
+ 
+-inline size_t GetFirstBlockTxOffset(const CBlock &block,
+-                                    const size_t block_data_pos) {
+-    return block_data_pos + ::GetSerializeSize(CBlockHeader()) +
++inline size_t GetFirstBlockTxOffset(const CBlock &block, const size_t block_data_pos) {
++    return block_data_pos + ::GetSerializeSize(CBlockHeader(), PROTOCOL_VERSION) +
+            GetSizeOfCompactSize(block.vtx.size());
+ }
+ 
+-inline size_t GetFirstUndoOffset(const CBlock &block,
+-                                 const size_t block_undo_pos) {
++inline size_t GetFirstUndoOffset(const CBlock &block, const size_t block_undo_pos) {
+     // We have to -1 here, because coinbase txs don't have undo data.
+     return block_undo_pos + GetSizeOfCompactSize(block.vtx.size() - 1);
+ }
+ 
+-chronik_bridge::Block BridgeBlock(const CBlock &block,
+-                                  const CBlockUndo &block_undo,
+-                                  const CBlockIndex &bindex)
+-    EXCLUSIVE_LOCKS_REQUIRED(!::cs_main) {
++chronik_bridge::Block BridgeBlock(const CBlock &block, const CBlockUndo &block_undo,
++                                  const CBlockIndex &bindex) LOCKS_EXCLUDED(::cs_main) {
+     AssertLockNotHeld(::cs_main);
+ 
+     uint32_t block_file_num{0};
+@@ -153,15 +147,13 @@ chronik_bridge::Block BridgeBlock(const CBlock &block,
+             throw std::runtime_error("Missing undo data for tx");
+         }
+         const std::vector<Coin> &spent_coins =
+-            isCoinbase ? std::vector<Coin>()
+-                       : block_undo.vtxundo[tx_idx - 1].vprevout;
+-        bridged_txs.push_back(
+-            BridgeBlockTx(isCoinbase, tx, spent_coins, data_pos, undo_pos));
++            isCoinbase ? std::vector<Coin>() : block_undo.vtxundo[tx_idx - 1].vprevout;
++        bridged_txs.push_back(BridgeBlockTx(isCoinbase, tx, spent_coins, data_pos, undo_pos));
+ 
+         // advance data_pos and undo_pos positions
+-        data_pos += ::GetSerializeSize(tx);
++        data_pos += ::GetSerializeSize(tx, PROTOCOL_VERSION);
+         if (!isCoinbase) {
+-            undo_pos += ::GetSerializeSize(block_undo.vtxundo[tx_idx - 1]);
++            undo_pos += ::GetSerializeSize(block_undo.vtxundo[tx_idx - 1], PROTOCOL_VERSION);
+         }
+     }
+ 
+@@ -173,27 +165,23 @@ chronik_bridge::Block BridgeBlock(const CBlock &block,
+             .file_num = block_file_num,
+             .data_pos = block_data_pos,
+             .undo_pos = block_undo_pos,
+-            .size = ::GetSerializeSize(block),
++            .size = ::GetSerializeSize(block, PROTOCOL_VERSION),
+             .txs = bridged_txs};
+ }
+ 
+ namespace chronik_bridge {
+ 
+ void log_print(const rust::Str logging_function, const rust::Str source_file,
+-               const uint32_t source_line, const rust::Str msg,
+-               bool should_ratelimit) {
++               const uint32_t source_line, const rust::Str msg, bool should_ratelimit) {
+     // All Chronik Rust call sites share this C++ source_location, so rate
+     // limiting applies a single hourly quota to rate-limited Chronik logs.
+     // Pass should_ratelimit=false for high-volume expected paths (e.g. IBD /
+     // reindex progress).
+-    LogInstance().LogPrintStr(std::string(msg), std::source_location::current(),
+-                              BCLog::LogFlags::NONE, BCLog::Level::Info,
+-                              should_ratelimit);
++    LogInstance().LogPrintStr(std::string(msg), std::source_location::current(), should_ratelimit);
+ }
+ 
+-void log_print_chronik(const rust::Str logging_function,
+-                       const rust::Str source_file, const uint32_t source_line,
+-                       const rust::Str msg) {
++void log_print_chronik(const rust::Str logging_function, const rust::Str source_file,
++                       const uint32_t source_line, const rust::Str msg) {
+     // Never rate-limited: -debug=chronik is opt-in, like other debug
+     // categories.
+     if (LogInstance().WillLogCategory(BCLog::CHRONIK)) {
+@@ -202,56 +190,43 @@ void log_print_chronik(const rust::Str logging_function,
+     }
+ }
+ 
+-ChronikBridge::ChronikBridge(const node::NodeContext &node) : m_node{node} {
+-    // This class relies on these two members not being nullptr
+-    Assert(m_node.chainman);
+-    Assert(m_node.mempool);
+-}
++ChronikBridge::ChronikBridge(const ::NodeContext &node) : m_node{node} { (void)m_node; }
+ 
+ const CBlockIndex &ChronikBridge::get_chain_tip() const {
+-    const CBlockIndex *tip =
+-        WITH_LOCK(cs_main, return m_node.chainman->ActiveTip());
++    const CBlockIndex *tip = WITH_LOCK(cs_main, return ::ChainActive().Tip());
+     if (tip == nullptr) {
+         throw block_index_not_found();
+     }
+     return *tip;
+ }
+ 
+-const CBlockIndex &
+-ChronikBridge::lookup_block_index(std::array<uint8_t, 32> hash) const {
++const CBlockIndex &ChronikBridge::lookup_block_index(std::array<uint8_t, 32> hash) const {
+     BlockHash block_hash{chronik::util::ArrayToHash(hash)};
+-    const CBlockIndex *pindex = WITH_LOCK(
+-        cs_main,
+-        return m_node.chainman->m_blockman.LookupBlockIndex(block_hash));
++    const CBlockIndex *pindex = WITH_LOCK(cs_main, return ::LookupBlockIndex(block_hash));
+     if (!pindex) {
+         throw block_index_not_found();
+     }
+     return *pindex;
+ }
+ 
+-const CBlockIndex &
+-ChronikBridge::lookup_block_index_by_height(int height) const {
++const CBlockIndex &ChronikBridge::lookup_block_index_by_height(int height) const {
+     // The boundary check is performed in the CChain::operator[](int nHeight)
+     // method, a nullptr is returned if height is out of bounds.
+-    const CBlockIndex *pindex = WITH_LOCK(
+-        cs_main,
+-        return m_node.chainman->GetChainstateForIndexing().m_chain[height]);
++    const CBlockIndex *pindex = WITH_LOCK(cs_main, return ::ChainActive()[height]);
+     if (!pindex) {
+         throw block_index_not_found();
+     }
+     return *pindex;
+ }
+ 
+-rust::Vec<RawBlockHeader>
+-ChronikBridge::get_block_headers_by_range(int start, int end) const {
++rust::Vec<RawBlockHeader> ChronikBridge::get_block_headers_by_range(int start, int end) const {
+     if (start < 0 || end < start) {
+         throw invalid_block_range();
+     }
+     LOCK(cs_main);
+     std::vector<RawBlockHeader> headers;
+     for (int height = start; height <= end; height++) {
+-        const CBlockIndex *pindex =
+-            m_node.chainman->GetChainstateForIndexing().m_chain[height];
++        const CBlockIndex *pindex = ::ChainActive()[height];
+         if (!pindex) {
+             // We allow partial results or empty result.
+             // We can assume that if a block height does not exist the following
+@@ -263,88 +238,73 @@ ChronikBridge::get_block_headers_by_range(int start, int end) const {
+     return chronik::util::ToRustVec<RawBlockHeader>(headers);
+ }
+ 
+-rust::Vec<WrappedBlockHash>
+-ChronikBridge::get_block_hashes_by_range(int start, int end) const {
++rust::Vec<WrappedBlockHash> ChronikBridge::get_block_hashes_by_range(int start, int end) const {
+     if (start < 0 || end < start) {
+         throw invalid_block_range();
+     }
+     LOCK(cs_main);
+     std::vector<WrappedBlockHash> block_hashes;
+     for (int height = start; height <= end; height++) {
+-        const CBlockIndex *pindex =
+-            m_node.chainman->GetChainstateForIndexing().m_chain[height];
++        const CBlockIndex *pindex = ::ChainActive()[height];
+         if (!pindex) {
+             throw block_index_not_found();
+         }
+-        block_hashes.push_back(
+-            {.data = chronik::util::HashToArray(pindex->GetBlockHash())});
++        block_hashes.push_back({.data = chronik::util::HashToArray(pindex->GetBlockHash())});
+     }
+     return chronik::util::ToRustVec<WrappedBlockHash>(block_hashes);
+ }
+ 
+-std::unique_ptr<CBlock>
+-ChronikBridge::load_block(const CBlockIndex &bindex) const {
++std::unique_ptr<CBlock> ChronikBridge::load_block(const CBlockIndex &bindex) const {
+     CBlock block;
+-    if (!m_node.chainman->m_blockman.ReadBlock(block, bindex)) {
++    if (!ReadBlockFromDisk(block, &bindex, Params().GetConsensus())) {
+         throw std::runtime_error("Reading block data failed");
+     }
+     return std::make_unique<CBlock>(std::move(block));
+ }
+ 
+-std::unique_ptr<CBlockUndo>
+-ChronikBridge::load_block_undo(const CBlockIndex &bindex) const {
++std::unique_ptr<CBlockUndo> ChronikBridge::load_block_undo(const CBlockIndex &bindex) const {
+     CBlockUndo block_undo;
+     // Read undo data (genesis block doesn't have undo data)
+     if (bindex.nHeight > 0) {
+-        if (!m_node.chainman->m_blockman.ReadBlockUndo(block_undo, bindex)) {
++        if (!UndoReadFromDisk(block_undo, &bindex)) {
+             throw std::runtime_error("Reading block undo data failed");
+         }
+     }
+     return std::make_unique<CBlockUndo>(std::move(block_undo));
+ }
+ 
+-Tx ChronikBridge::load_tx(uint32_t file_num, uint32_t data_pos,
+-                          uint32_t undo_pos) const {
++Tx ChronikBridge::load_tx(uint32_t file_num, uint32_t data_pos, uint32_t undo_pos) const {
+     CMutableTransaction tx;
+-    CTxUndo txundo{};
+-    const bool isCoinbase = undo_pos == 0;
+-    if (!m_node.chainman->m_blockman.ReadTxFromDisk(
+-            tx, FlatFilePos(file_num, data_pos))) {
+-        throw std::runtime_error("Reading tx data from disk failed");
+-    }
+-    if (!isCoinbase) {
+-        if (!m_node.chainman->m_blockman.ReadTxUndoFromDisk(
+-                txundo, FlatFilePos(file_num, undo_pos))) {
+-            throw std::runtime_error("Reading tx undo data from disk failed");
+-        }
++    CAutoFile file(OpenBlockFile(FlatFilePos(file_num, data_pos), true), SER_DISK, CLIENT_VERSION);
++    if (file.IsNull())
++        throw std::runtime_error("Reading transaction file failed");
++    file >> tx;
++    CTxUndo undo;
++    if (undo_pos) {
++        CAutoFile undo_file(OpenUndoFile(FlatFilePos(file_num, undo_pos), true), SER_DISK,
++                            CLIENT_VERSION);
++        if (undo_file.IsNull())
++            throw std::runtime_error("Reading undo file failed");
++        undo_file >> undo;
+     }
+-    return BridgeTx(isCoinbase, CTransaction(std::move(tx)), txundo.vprevout);
++    return BridgeTx(undo_pos == 0, CTransaction(std::move(tx)), undo.vprevout);
+ }
+ 
+-rust::Vec<uint8_t> ChronikBridge::load_raw_tx(uint32_t file_num,
+-                                              uint32_t data_pos) const {
++rust::Vec<uint8_t> ChronikBridge::load_raw_tx(uint32_t file_num, uint32_t data_pos) const {
+     CMutableTransaction tx;
+-    if (!m_node.chainman->m_blockman.ReadTxFromDisk(
+-            tx, FlatFilePos(file_num, data_pos))) {
+-        throw std::runtime_error("Reading tx data from disk failed");
+-    }
+-    DataStream raw_tx{};
+-    raw_tx << tx;
+-    return chronik::util::ToRustVec<uint8_t>(MakeUCharSpan(raw_tx));
++    CAutoFile file(OpenBlockFile(FlatFilePos(file_num, data_pos), true), SER_DISK, CLIENT_VERSION);
++    if (file.IsNull())
++        throw std::runtime_error("Reading transaction file failed");
++    file >> tx;
++    CDataStream raw(SER_NETWORK, PROTOCOL_VERSION);
++    raw << tx;
++    return chronik::util::ToRustVec<uint8_t>(raw);
+ }
+ 
+ bool ChronikBridge::is_avalanche_finalized_preconsensus(
+     const std::array<uint8_t, 32> &mempool_txid) const {
+-    if (!m_node.mempool) {
+-        return false;
+-    }
+-
+-    AssertLockNotHeld(m_node.mempool->cs);
+-
+-    TxId txid{chronik::util::ArrayToHash(mempool_txid)};
+-    return WITH_LOCK(
+-        m_node.mempool->cs,
+-        return m_node.mempool->isAvalancheFinalizedPreConsensus(txid));
++    (void)mempool_txid;
++    return false; // BCHN has no Avalanche finality.
+ }
+ 
+ Tx bridge_tx(const CTransaction &tx, const std::vector<::Coin> &spent_coins) {
+@@ -352,25 +312,20 @@ Tx bridge_tx(const CTransaction &tx, const std::vector<::Coin> &spent_coins) {
+ }
+ 
+ const CBlockIndex &ChronikBridge::find_fork(const CBlockIndex &index) const {
+-    const CBlockIndex *fork = WITH_LOCK(
+-        cs_main,
+-        return m_node.chainman->GetChainstateForIndexing().m_chain.FindFork(
+-            &index));
++    const CBlockIndex *fork = WITH_LOCK(cs_main, return ::ChainActive().FindFork(&index));
+     if (!fork) {
+         throw block_index_not_found();
+     }
+     return *fork;
+ }
+ 
+-void ChronikBridge::lookup_spent_coins(
+-    Tx &tx, rust::Vec<OutPoint> &not_found,
+-    rust::Vec<OutPoint> &coins_to_uncache) const {
++void ChronikBridge::lookup_spent_coins(Tx &tx, rust::Vec<OutPoint> &not_found,
++                                       rust::Vec<OutPoint> &coins_to_uncache) const {
+     not_found.clear();
+     coins_to_uncache.clear();
+     LOCK(cs_main);
+-    CCoinsViewCache &coins_cache =
+-        m_node.chainman->GetChainstateForIndexing().CoinsTip();
+-    CCoinsViewMemPool coin_view(&coins_cache, *m_node.mempool);
++    CCoinsViewCache &coins_cache = *pcoinsTip;
++    CCoinsViewMemPool coin_view(&coins_cache, g_mempool);
+     for (TxInput &input : tx.inputs) {
+         TxId txid = TxId(chronik::util::ArrayToHash(input.prev_out.txid));
+         COutPoint outpoint = COutPoint(txid, input.prev_out.out_idx);
+@@ -378,8 +333,8 @@ void ChronikBridge::lookup_spent_coins(
+         // Remember if coin was already cached
+         const bool had_cached = coins_cache.HaveCoinInCache(outpoint);
+ 
+-        std::optional<::Coin> coin{coin_view.GetCoin(outpoint)};
+-        if (!coin) {
++        ::Coin coin;
++        if (!coin_view.GetCoin(outpoint, coin)) {
+             not_found.push_back(input.prev_out);
+             continue;
+         }
+@@ -391,81 +346,74 @@ void ChronikBridge::lookup_spent_coins(
+             // so we save one extra cache lookup here.
+             coins_to_uncache.push_back(input.prev_out);
+         }
+-        input.coin = BridgeCoin(std::move(*coin));
++        input.coin = BridgeCoin(coin);
+     }
+ }
+ 
+-void ChronikBridge::uncache_coins(
+-    rust::Slice<const OutPoint> coins_to_uncache) const {
++void ChronikBridge::uncache_coins(rust::Slice<const OutPoint> coins_to_uncache) const {
+     LOCK(cs_main);
+-    CCoinsViewCache &coins_cache =
+-        m_node.chainman->GetChainstateForIndexing().CoinsTip();
++    CCoinsViewCache &coins_cache = *pcoinsTip;
+     for (const OutPoint &outpoint : coins_to_uncache) {
+         TxId txid = TxId(chronik::util::ArrayToHash(outpoint.txid));
+         coins_cache.Uncache(COutPoint(txid, outpoint.out_idx));
+     }
+ }
+ 
+-std::array<uint8_t, 32>
+-ChronikBridge::broadcast_tx(rust::Slice<const uint8_t> raw_tx,
+-                            int64_t max_fee) const {
++std::array<uint8_t, 32> ChronikBridge::broadcast_tx(rust::Slice<const uint8_t> raw_tx,
++                                                    int64_t max_fee) const {
++    // The Rust HTTP listener starts just before native observer registration.
++    // Do not admit a request during that small startup window.
++    if (!chronik::HasMempoolObserver()) {
++        throw std::runtime_error("Chronik is not ready for transaction admission");
++    }
+     std::vector<uint8_t> vec = chronik::util::FromRustSlice(raw_tx);
+-    DataStream stream{vec};
++    CDataStream stream(vec, SER_NETWORK, PROTOCOL_VERSION);
+     CMutableTransaction tx;
+     stream >> tx;
+-    CTransactionRef tx_ref = MakeTransactionRef(tx);
+-    std::string err_str;
+-    // wait_callback is false because this would cause a deadlock. Instead we
+-    // explicitly call SyncWithValidationInterfaceQueue() after broadcasting
+-    // the transaction to ensure that the transaction is fully processed before
+-    // we return.
+-    TransactionError error = node::BroadcastTransaction(
+-        m_node, tx_ref, err_str, max_fee * Amount::satoshi(), /*relay=*/true,
+-        /*wait_callback=*/false);
+-    if (error != TransactionError::OK) {
+-        bilingual_str txErrorMsg = TransactionErrorString(error);
+-        if (err_str.empty()) {
+-            throw std::runtime_error(txErrorMsg.original.c_str());
+-        } else {
+-            std::string msg = strprintf("%s: %s", txErrorMsg.original, err_str);
+-            throw std::runtime_error(msg.c_str());
++    if (!stream.empty())
++        throw std::runtime_error("Trailing transaction bytes");
++    CTransactionRef ref = MakeTransactionRef(std::move(tx));
++    MempoolAcceptExtraInfo info;
++    {
++        LOCK(cs_main);
++        if (!g_mempool.exists(ref->GetId())) {
++            CValidationState state;
++            bool missing = false;
++            if (!AcceptToMemoryPool(GetConfig(), g_mempool, state, ref, &missing, false,
++                                    max_fee * SATOSHI, false, &info)) {
++                throw std::runtime_error(missing ? "Missing inputs" : FormatStateMessage(state));
++            }
+         }
+     }
+-    return chronik::util::HashToArray(tx_ref->GetId());
++    // Never wait for callbacks while the requesting Rust indexer lock is held.
++    if (g_connman) {
++        const CInv inv(MSG_TX, ref->GetId());
++        g_connman->ForEachNode(
++            [&](const NodeRef &peer) { peer->PushInventory(inv, info.entryId.value_or(0)); });
++    }
++    return chronik::util::HashToArray(ref->GetId());
+ }
+ 
+-void ChronikBridge::fatal_error(const rust::Str msg,
+-                                const rust::Str user_msg) const {
+-    m_node.chainman->GetNotifications().fatalError(
+-        std::string(msg), Untranslated(std::string(user_msg)));
++void ChronikBridge::fatal_error(const rust::Str msg, const rust::Str user_msg) const {
++    LogPrintf("Chronik fatal error: %s\n", std::string(msg));
++    InitError(std::string(user_msg));
++    StartShutdown();
+ }
+ 
+-bool ChronikBridge::shutdown_requested() const {
+-    return ShutdownRequested();
+-}
++bool ChronikBridge::shutdown_requested() const { return ShutdownRequested(); }
+ 
+ WrappedBlockHash ChronikBridge::get_genesis_hash() const {
+-    const CBlock &genesis = m_node.chainman->GetParams().GenesisBlock();
+-    return WrappedBlockHash{.data =
+-                                chronik::util::HashToArray(genesis.GetHash())};
++    const CBlock &genesis = Params().GenesisBlock();
++    return WrappedBlockHash{.data = chronik::util::HashToArray(genesis.GetHash())};
+ }
+ 
+ int64_t ChronikBridge::estimate_feerate_sats_per_kb() const {
+-    if (!m_node.mempool) {
+-        return -1;
+-    }
+-
+-    const Amount feeRateSatsPerK = m_node.mempool->estimateFee().GetFeePerK();
+-    return feeRateSatsPerK / Amount::satoshi();
++    const Amount feeRateSatsPerK = g_mempool.estimateFee().GetFeePerK();
++    return feeRateSatsPerK / SATOSHI;
+ }
+ 
+ int64_t ChronikBridge::min_relay_feerate_sats_per_kb() const {
+-    if (!m_node.mempool) {
+-        return -1;
+-    }
+-
+-    return m_node.mempool->m_opts.min_relay_feerate.GetFeePerK() /
+-           Amount::satoshi();
++    return minRelayTxFee.GetFeePerK() / SATOSHI;
+ }
+ 
+ bool ChronikBridge::get_feerate_info(std::array<uint8_t, 32> mempool_txid,
+@@ -473,37 +421,30 @@ bool ChronikBridge::get_feerate_info(std::array<uint8_t, 32> mempool_txid,
+                                      uint32_t &virtual_size_bytes) const {
+     TxId txid{chronik::util::ArrayToHash(mempool_txid)};
+ 
+-    if (!m_node.mempool) {
+-        return false;
+-    }
+-
+-    AssertLockNotHeld(m_node.mempool->cs);
+-    LOCK(m_node.mempool->cs);
++    AssertLockNotHeld(g_mempool.cs);
++    LOCK(g_mempool.cs);
+ 
+-    auto iter = m_node.mempool->GetIter(txid);
++    auto iter = g_mempool.GetIter(txid);
+     if (!iter) {
+         return false;
+     }
+ 
+-    modified_fee_rate_sats_per_kb =
+-        (**iter)->GetModifiedFeeRate().GetFeePerK() / Amount::satoshi();
+-    virtual_size_bytes = (**iter)->GetTxVirtualSize();
++    modified_fee_rate_sats_per_kb = (**iter).GetModifiedFeeRate().GetFeePerK() / SATOSHI;
++    virtual_size_bytes = (**iter).GetTxVirtualSize();
+ 
+     return true;
+ }
+ 
+ void ChronikBridge::sync_with_validation_interface_queue() const {
+-    m_node.validation_signals->SyncWithValidationInterfaceQueue();
++    ::SyncWithValidationInterfaceQueue();
+ }
+ 
+-std::unique_ptr<ChronikBridge> make_bridge(const node::NodeContext &node) {
++std::unique_ptr<ChronikBridge> make_bridge(const ::NodeContext &node) {
+     return std::make_unique<ChronikBridge>(node);
+ }
+ 
+-chronik_bridge::Block bridge_block(const CBlock &block,
+-                                   const CBlockUndo &block_undo,
+-                                   const CBlockIndex &bindex)
+-    EXCLUSIVE_LOCKS_REQUIRED(!::cs_main) {
++chronik_bridge::Block bridge_block(const CBlock &block, const CBlockUndo &block_undo,
++                                   const CBlockIndex &bindex) LOCKS_EXCLUDED(::cs_main) {
+     return BridgeBlock(block, block_undo, bindex);
+ }
+ 
+@@ -515,15 +456,14 @@ BlockInfo get_block_info(const CBlockIndex &bindex) {
+ }
+ 
+ std::array<uint8_t, 80> get_block_header(const CBlockIndex &index) {
+-    DataStream ser_header{};
++    CDataStream ser_header(SER_NETWORK, PROTOCOL_VERSION);
+     ser_header << index.GetBlockHeader();
+     std::array<uint8_t, 80> array;
+-    std::copy_n(MakeUCharSpan(ser_header).begin(), 80, array.begin());
++    std::copy_n(ser_header.begin(), 80, array.begin());
+     return array;
+ }
+ 
+-const CBlockIndex &get_block_ancestor(const CBlockIndex &index,
+-                                      int32_t height) {
++const CBlockIndex &get_block_ancestor(const CBlockIndex &index, int32_t height) {
+     const CBlockIndex *pindex = index.GetAncestor(height);
+     if (!pindex) {
+         throw block_index_not_found();
+@@ -534,14 +474,14 @@ const CBlockIndex &get_block_ancestor(const CBlockIndex &index,
+ rust::Vec<uint8_t> compress_script(rust::Slice<const uint8_t> bytecode) {
+     std::vector<uint8_t> vec = chronik::util::FromRustSlice(bytecode);
+     CScript script{vec.begin(), vec.end()};
+-    DataStream compressed{};
++    CDataStream compressed(SER_NETWORK, PROTOCOL_VERSION);
+     compressed << Using<ScriptCompression>(script);
+-    return chronik::util::ToRustVec<uint8_t>(MakeUCharSpan(compressed));
++    return chronik::util::ToRustVec<uint8_t>(compressed);
+ }
+ 
+ rust::Vec<uint8_t> decompress_script(rust::Slice<const uint8_t> compressed) {
+     std::vector<uint8_t> vec = chronik::util::FromRustSlice(compressed);
+-    DataStream stream{vec};
++    CDataStream stream(vec, SER_NETWORK, PROTOCOL_VERSION);
+     CScript script;
+     stream >> Using<ScriptCompression>(script);
+     return chronik::util::ToRustVec<uint8_t>(script);
+@@ -551,20 +491,12 @@ int64_t calc_fee(size_t num_bytes, int64_t sats_fee_per_kb) {
+     return CFeeRate(sats_fee_per_kb * SATOSHI).GetFee(num_bytes) / SATOSHI;
+ }
+ 
+-int64_t default_max_raw_tx_fee_rate_per_kb() {
+-    return node::DEFAULT_MAX_RAW_TX_FEE_RATE.GetFeePerK() / SATOSHI;
+-}
++int64_t default_max_raw_tx_fee_rate_per_kb() { return (COIN / 10) / SATOSHI; }
+ 
+-bool init_error(const rust::Str msg) {
+-    return InitError(Untranslated(std::string(msg)));
+-}
++bool init_error(const rust::Str msg) { return InitError(std::string(msg)); }
+ 
+-rust::String client_name() {
+-    return CLIENT_NAME;
+-}
++rust::String client_name() { return CLIENT_NAME; }
+ 
+-rust::String format_full_version() {
+-    return FormatFullVersion();
+-}
++rust::String format_full_version() { return FormatFullVersion(); }
+ 
+ } // namespace chronik_bridge
+diff --git a/chronik/chronik-cpp/chronik_bridge.h b/chronik/chronik-cpp/chronik_bridge.h
+index e7e40f3cd05114fd3dd6f806922dfd169fcae221..f4d2154efa1cf0d2c5a98eb4a422ab439c5e88bd 100644
+--- a/chronik/chronik-cpp/chronik_bridge.h
++++ b/chronik/chronik-cpp/chronik_bridge.h
+@@ -36,35 +36,29 @@ struct WrappedBlockHash;
+ struct RawBlockHeader;
+ 
+ class block_index_not_found : public std::exception {
+-public:
+-    const char *what() const noexcept override {
+-        return "CBlockIndex not found";
+-    }
++  public:
++    const char *what() const noexcept override { return "CBlockIndex not found"; }
+ };
+ 
+ class invalid_block_range : public std::exception {
+-public:
+-    const char *what() const noexcept override {
+-        return "Invalid block range requested";
+-    }
++  public:
++    const char *what() const noexcept override { return "Invalid block range requested"; }
+ };
+ 
+ void log_print(const rust::Str logging_function, const rust::Str source_file,
+-               const uint32_t source_line, const rust::Str msg,
+-               bool should_ratelimit);
++               const uint32_t source_line, const rust::Str msg, bool should_ratelimit);
+ 
+-void log_print_chronik(const rust::Str logging_function,
+-                       const rust::Str source_file, const uint32_t source_line,
+-                       const rust::Str msg);
++void log_print_chronik(const rust::Str logging_function, const rust::Str source_file,
++                       const uint32_t source_line, const rust::Str msg);
+ 
+ /**
+  * Bridge to bitcoind to access the node.
+  */
+ class ChronikBridge {
+-    const node::NodeContext &m_node;
++    const ::NodeContext &m_node;
+ 
+-public:
+-    ChronikBridge(const node::NodeContext &node);
++  public:
++    ChronikBridge(const ::NodeContext &node);
+ 
+     const CBlockIndex &get_chain_tip() const;
+ 
+@@ -72,23 +66,18 @@ public:
+ 
+     const CBlockIndex &lookup_block_index_by_height(int height) const;
+ 
+-    rust::Vec<RawBlockHeader> get_block_headers_by_range(int start,
+-                                                         int end) const;
+-    rust::Vec<WrappedBlockHash> get_block_hashes_by_range(int start,
+-                                                          int end) const;
++    rust::Vec<RawBlockHeader> get_block_headers_by_range(int start, int end) const;
++    rust::Vec<WrappedBlockHash> get_block_hashes_by_range(int start, int end) const;
+ 
+     std::unique_ptr<CBlock> load_block(const CBlockIndex &bindex) const;
+ 
+-    std::unique_ptr<CBlockUndo>
+-    load_block_undo(const CBlockIndex &bindex) const;
++    std::unique_ptr<CBlockUndo> load_block_undo(const CBlockIndex &bindex) const;
+ 
+     Tx load_tx(uint32_t file_num, uint32_t data_pos, uint32_t undo_pos) const;
+ 
+     rust::Vec<uint8_t> load_raw_tx(uint32_t file_num, uint32_t data_pos) const;
+ 
+-    bool is_avalanche_finalized_preconsensus(
+-        const std::array<uint8_t, 32> &txid) const
+-        EXCLUSIVE_LOCKS_REQUIRED(!m_node.mempool->cs);
++    bool is_avalanche_finalized_preconsensus(const std::array<uint8_t, 32> &txid) const;
+ 
+     const CBlockIndex &find_fork(const CBlockIndex &index) const;
+ 
+@@ -96,8 +85,7 @@ public:
+                             rust::Vec<OutPoint> &coins_to_uncache) const;
+     void uncache_coins(rust::Slice<const OutPoint>) const;
+ 
+-    std::array<uint8_t, 32> broadcast_tx(rust::Slice<const uint8_t> raw_tx,
+-                                         int64_t max_fee) const;
++    std::array<uint8_t, 32> broadcast_tx(rust::Slice<const uint8_t> raw_tx, int64_t max_fee) const;
+ 
+     void fatal_error(const rust::Str msg, const rust::Str user_msg) const;
+ 
+@@ -111,18 +99,16 @@ public:
+ 
+     bool get_feerate_info(std::array<uint8_t, 32> mempool_txid,
+                           int64_t &modified_fee_rate_sats_per_kb,
+-                          uint32_t &virtual_size_bytes) const
+-        EXCLUSIVE_LOCKS_REQUIRED(!m_node.mempool->cs);
++                          uint32_t &virtual_size_bytes) const;
+ 
+     void sync_with_validation_interface_queue() const;
+ };
+ 
+-std::unique_ptr<ChronikBridge> make_bridge(const node::NodeContext &node);
++std::unique_ptr<ChronikBridge> make_bridge(const ::NodeContext &node);
+ 
+ Tx bridge_tx(const CTransaction &tx, const std::vector<Coin> &spent_coins);
+ 
+-Block bridge_block(const CBlock &block, const CBlockUndo &block_undo,
+-                   const CBlockIndex &bindex);
++Block bridge_block(const CBlock &block, const CBlockUndo &block_undo, const CBlockIndex &bindex);
+ 
+ BlockInfo get_block_info(const CBlockIndex &index);
+ 
+diff --git a/chronik/chronik-cpp/chronik_validationinterface.cpp b/chronik/chronik-cpp/chronik_validationinterface.cpp
+index 8d09d69c7bd73751153eec7c310f802ecd33c093..72b261e35fb42f969ddd62c2e74756a621ad2041 100644
+--- a/chronik/chronik-cpp/chronik_validationinterface.cpp
++++ b/chronik/chronik-cpp/chronik_validationinterface.cpp
+@@ -1,145 +1,143 @@
+ // Copyright (c) 2022 The Bitcoin developers
++// Copyright (c) 2026 The Bitcoin Cash Node developers
+ // Distributed under the MIT software license, see the accompanying
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+-
+-#include <blockindex.h>
++#include <atomic>
++#include <chain.h>
++#include <chronik-cpp/chronik_validationinterface.h>
+ #include <chronik-cpp/util/hash.h>
++#include <chronik/validation_hooks.h>
+ #include <chronik_lib/src/ffi.rs.h>
+-#include <kernel/chain.h>
++#include <coins.h>
+ #include <logging.h>
+-#include <node/context.h>
++#include <map>
+ #include <primitives/block.h>
+-#include <txmempool.h>
++#include <set>
++#include <validation.h>
+ #include <validationinterface.h>
+ 
+ namespace chronik {
+-
+-/**
+- * CValidationInterface connecting bitcoind events to Chronik
+- */
+-class ChronikValidationInterface final : public CValidationInterface {
+-public:
+-    ChronikValidationInterface(const node::NodeContext &node,
+-                               rust::Box<chronik_bridge::Chronik> chronik_box)
+-        : m_node(node), m_chronik(std::move(chronik_box)) {}
+-
+-    void Register() {
+-        m_node.validation_signals->RegisterValidationInterface(this);
+-    }
+-
+-    void Unregister() {
+-        m_node.validation_signals->UnregisterValidationInterface(this);
+-    }
+-
+-    void InterruptChronik() { m_chronik->interrupt(); }
+-
+-    bool StopChronik() {
+-        try {
+-            m_chronik->stop();
+-        } catch (const std::exception &e) {
+-            LogPrintf("Error stopping Chronik: %s\n", e.what());
+-            return false;
++// Conflict vectors have no ordering contract. Derive a descendant-first DAG
++// order from their immutable inputs before updating the indexer's UTXO view.
++static std::vector<CTransactionRef>
++DescendantsFirst(const std::vector<CTransactionRef> &transactions) {
++    std::map<TxId, size_t> indices;
++    for (size_t i = 0; i < transactions.size(); ++i)
++        indices.emplace(transactions[i]->GetId(), i);
++    std::vector<std::set<size_t>> parents(transactions.size());
++    std::vector<size_t> children(transactions.size(), 0), ready;
++    for (size_t i = 0; i < transactions.size(); ++i) {
++        for (const auto &input : transactions[i]->vin) {
++            auto found = indices.find(input.prevout.GetTxId());
++            if (found != indices.end() && parents[i].insert(found->second).second)
++                ++children[found->second];
+         }
+-        return true;
+     }
+-
+-private:
+-    rust::Box<chronik_bridge::Chronik> m_chronik;
+-    const node::NodeContext &m_node;
+-
+-    void TransactionAddedToMempool(
+-        const CTransactionRef &ptx,
+-        std::shared_ptr<const std::vector<Coin>> spent_coins,
+-        uint64_t mempool_sequence) override {
+-        if (spent_coins) {
+-            const TxMempoolInfo info = m_node.mempool->info(ptx->GetId());
+-            m_chronik->handle_tx_added_to_mempool(*ptx, *spent_coins,
+-                                                  info.m_time.count());
+-        } else {
+-            LogPrintf("Chronik: transaction %s added to mempool but spent "
+-                      "coins are not available\n",
+-                      ptx->GetId().ToString());
+-        }
++    for (size_t i = 0; i < children.size(); ++i)
++        if (!children[i])
++            ready.push_back(i);
++    std::vector<CTransactionRef> result;
++    while (!ready.empty()) {
++        const size_t i = ready.back();
++        ready.pop_back();
++        result.push_back(transactions[i]);
++        for (const size_t parent : parents[i])
++            if (!--children[parent])
++                ready.push_back(parent);
+     }
+-
+-    void TransactionRemovedFromMempool(const CTransactionRef &ptx,
+-                                       MemPoolRemovalReason reason,
+-                                       uint64_t mempool_sequence) override {
+-        m_chronik->handle_tx_removed_from_mempool(
+-            chronik::util::HashToArray(ptx->GetId()));
++    if (result.size() != transactions.size())
++        throw std::runtime_error("Cyclic conflict removal snapshot");
++    return result;
++}
++class ChronikValidationInterface final : public CValidationInterface {
++    rust::Box<chronik_bridge::Chronik> m_chronik;
++    // Accessed only on the ordered validation queue. Native size/expiry checks
++    // may remove a tentative entry before its successful admission callback.
++    std::set<TxId> m_observed_mempool;
++
++  public:
++    explicit ChronikValidationInterface(rust::Box<chronik_bridge::Chronik> box)
++        : m_chronik(std::move(box)) {}
++    void Added(const CTransactionRef &tx, const std::vector<Coin> &coins, int64_t time) {
++        m_chronik->handle_tx_added_to_mempool(*tx, coins, time);
++        m_observed_mempool.insert(tx->GetId());
+     }
+-
+-    void BlockConnected(ChainstateRole role,
+-                        const std::shared_ptr<const CBlock> &block,
+-                        const CBlockIndex *pindex) override {
+-        // Ignore events from the assumed-valid chain; we will process its
+-        // blocks (sequentially) after it is fully verified by the background
+-        // chainstate.
+-        if (role == ChainstateRole::ASSUMEDVALID) {
+-            return;
++    void Removed(const CTransactionRef &tx) {
++        if (m_observed_mempool.erase(tx->GetId())) {
++            m_chronik->handle_tx_removed_from_mempool(util::HashToArray(tx->GetId()));
+         }
+-
+-        // We can safely pass T& here as Rust guarantees us that no references
+-        // can be kept after the below function call completed.
+-        m_chronik->handle_block_connected(*block, *pindex);
+-    }
+-
+-    void BlockDisconnected(const std::shared_ptr<const CBlock> &block,
+-                           const CBlockIndex *pindex) override {
+-        // See BlockConnected for safety
+-        m_chronik->handle_block_disconnected(*block, *pindex);
+-    }
+-
+-    void BlockFinalized(const CBlockIndex *pindex) override {
+-        m_chronik->handle_block_finalized(*pindex);
+     }
+-
+-    void BlockInvalidated(const CBlockIndex *pindex,
+-                          const std::shared_ptr<const CBlock> &block) override {
+-        m_chronik->handle_block_invalidated(*block, *pindex);
++    void Interrupt() { m_chronik->interrupt(); }
++    void Stop() {
++        try {
++            m_chronik->stop();
++        } catch (const std::exception &error) {
++            LogPrintf("Chronik stop failed: %s\n", error.what());
++        }
+     }
+ 
+-    void TransactionFinalized(const CTransactionRef &tx) override {
+-        m_chronik->handle_tx_finalized(chronik::util::HashToArray(tx->GetId()));
++  private:
++    void BlockConnected(const std::shared_ptr<const CBlock> &block, const CBlockIndex *index,
++                        const std::vector<CTransactionRef> &conflicts) override {
++        // BCHN reports conflict evictions here rather than individual removals.
++        for (const auto &tx : DescendantsFirst(conflicts))
++            Removed(tx);
++        m_chronik->handle_block_connected(*block, *index);
++        for (const auto &tx : block->vtx)
++            m_observed_mempool.erase(tx->GetId());
+     }
+-
+-    void TransactionInvalidated(
+-        const CTransactionRef &tx,
+-        std::shared_ptr<const std::vector<Coin>> spent_coins) override {
+-        if (spent_coins) {
+-            m_chronik->handle_tx_invalidated(*tx, *spent_coins);
+-        } else {
+-            LogPrintf("Chronik: transaction %s invalidated but spent coins are "
+-                      "not available\n",
+-                      tx->GetId().ToString());
+-        }
++    void BlockDisconnected(const std::shared_ptr<const CBlock> &block) override {
++        const CBlockIndex *index = WITH_LOCK(cs_main, return LookupBlockIndex(block->GetHash()));
++        if (!index)
++            throw std::runtime_error("Disconnected block index unavailable");
++        m_chronik->handle_block_disconnected(*block, *index);
+     }
+ };
+-
+-std::unique_ptr<ChronikValidationInterface> g_chronik_validation_interface;
+-
+-void StartChronikValidationInterface(
+-    const node::NodeContext &node,
+-    rust::Box<chronik_bridge::Chronik> chronik_box) {
+-    g_chronik_validation_interface =
+-        std::make_unique<ChronikValidationInterface>(node,
+-                                                     std::move(chronik_box));
+-    g_chronik_validation_interface->Register();
++std::unique_ptr<ChronikValidationInterface> g_interface;
++std::atomic<bool> g_capture{false};
++void StartChronikValidationInterface(const ::NodeContext &,
++                                     rust::Box<chronik_bridge::Chronik> box) {
++    g_interface = std::make_unique<ChronikValidationInterface>(std::move(box));
++    RegisterValidationInterface(g_interface.get());
++    g_capture.store(true, std::memory_order_release);
+ }
+-
+ void InterruptChronikRequestHandlers() {
+-    if (g_chronik_validation_interface) {
+-        g_chronik_validation_interface->InterruptChronik();
+-    }
++    if (g_interface)
++        g_interface->Interrupt();
+ }
+-
+ void StopChronikValidationInterface() {
+-    if (g_chronik_validation_interface) {
+-        g_chronik_validation_interface->Unregister();
+-        g_chronik_validation_interface->StopChronik();
+-        // Reset so the Box is dropped and all handles are released.
+-        g_chronik_validation_interface.reset();
++    g_capture.store(false, std::memory_order_release);
++    if (g_interface) {
++        UnregisterValidationInterface(g_interface.get());
++        g_interface->Stop();
++        g_interface.reset();
+     }
+ }
+-
++bool HasMempoolObserver() { return g_capture.load(std::memory_order_acquire); }
++void CaptureMempoolRemovals(std::vector<CTransactionRef> transactions) {
++    if (!g_capture.load(std::memory_order_acquire) || transactions.empty())
++        return;
++    CallFunctionInValidationInterfaceQueue([transactions = std::move(transactions)] {
++        if (g_interface)
++            for (const auto &tx : transactions)
++                g_interface->Removed(tx);
++    });
++}
++void CaptureMempoolAdmission(const CTransactionRef &tx, const CCoinsViewCache &view, int64_t time) {
++    if (!g_capture.load(std::memory_order_acquire))
++        return;
++    std::vector<Coin> coins;
++    coins.reserve(tx->vin.size());
++    for (const auto &input : tx->vin) {
++        const Coin &coin = view.AccessCoin(input.prevout);
++        if (coin.IsSpent())
++            throw std::runtime_error("Admission snapshot missing validated coin");
++        coins.push_back(coin);
++    }
++    // Queue the immutable admission snapshot, not a later view of mutable coins.
++    CallFunctionInValidationInterfaceQueue([tx, coins = std::move(coins), time] {
++        if (g_interface)
++            g_interface->Added(tx, coins, time);
++    });
++}
+ } // namespace chronik
+diff --git a/chronik/chronik-cpp/chronik_validationinterface.h b/chronik/chronik-cpp/chronik_validationinterface.h
+index 6acd3a74b84e8f2260e9f5d463bf9e0af67fb13f..1bae585a41a9e7733e23019b283c91da7c409379 100644
+--- a/chronik/chronik-cpp/chronik_validationinterface.h
++++ b/chronik/chronik-cpp/chronik_validationinterface.h
+@@ -7,9 +7,7 @@
+ #ifndef BITCOIN_CHRONIK_CPP_CHRONIK_VALIDATIONINTERFACE_H
+ #define BITCOIN_CHRONIK_CPP_CHRONIK_VALIDATIONINTERFACE_H
+ 
+-namespace node {
+ struct NodeContext;
+-} // namespace node
+ 
+ namespace chronik_bridge {
+ struct Chronik;
+@@ -17,9 +15,8 @@ struct Chronik;
+ 
+ namespace chronik {
+ 
+-void StartChronikValidationInterface(
+-    const node::NodeContext &node,
+-    rust::Box<chronik_bridge::Chronik> chronik_box);
++void StartChronikValidationInterface(const ::NodeContext &node,
++                                     rust::Box<chronik_bridge::Chronik> chronik_box);
+ 
+ /**
+  * Stop serving Chronik requests, while keeping the indexer running. Must be
+diff --git a/chronik/chronik-lib/src/ffi.rs b/chronik/chronik-lib/src/ffi.rs
+index 96ce455405ef723c192439bcc88f008b81d4d021..a0b6d683de7657e606224d76aaeb9ae345958872 100644
+--- a/chronik/chronik-lib/src/ffi.rs
++++ b/chronik/chronik-lib/src/ffi.rs
+@@ -131,7 +131,7 @@ mod ffi_inner {
+     }
+ 
+     unsafe extern "C++" {
+-        include!("blockindex.h");
++        include!("chain.h");
+         include!("chronik-cpp/chronik_validationinterface.h");
+         include!("coins.h");
+         include!("config.h");
+@@ -161,7 +161,7 @@ mod ffi_inner {
+         type CTransaction = chronik_bridge::ffi::CTransaction;
+ 
+         /// NodeContext from node/context.h
+-        #[namespace = "node"]
++        #[namespace = ""]
+         type NodeContext = chronik_bridge::ffi::NodeContext;
+ 
+         /// Bridge to bitcoind to access the node

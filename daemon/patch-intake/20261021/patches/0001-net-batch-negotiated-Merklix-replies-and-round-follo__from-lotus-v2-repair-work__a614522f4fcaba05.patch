@@ -1,0 +1,794 @@
+From 394ba704a6e15d94670a6fb74f41330c90ed940c Mon Sep 17 00:00:00 2001
+From: Canonical endpoint audit <audit@localhost>
+Date: Sun, 18 Oct 2026 21:36:40 -0700
+Subject: [PATCH] net: batch negotiated Merklix replies and round followups
+
+---
+ src/init.cpp                              |   7 +
+ src/net/recon_cost_budget.h               |  10 +-
+ src/net/v2_protocol_handler.cpp           | 217 ++++++++++++++++++++--
+ src/net/v2_protocol_handler.h             |  58 +++++-
+ src/protocol.cpp                          |   5 +
+ src/protocol.h                            |   4 +
+ src/test/CMakeLists.txt                   |   1 +
+ src/test/fuzz/v2_merklix_sync.cpp         |  22 +++
+ src/test/merklix_batch_tests.cpp          | 105 +++++++++++
+ test/functional/p2p_merklix_initiation.py |  14 +-
+ test/functional/p2p_merklix_limits.py     |   6 +-
+ 11 files changed, 416 insertions(+), 33 deletions(-)
+ create mode 100644 src/test/merklix_batch_tests.cpp
+
+diff --git a/src/init.cpp b/src/init.cpp
+index 2323c13ff4..ee6e1e86b9 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -601,6 +601,10 @@ void SetupServerArgs(NodeContext &node) {
+         "-epochminms=<n>",
+         "Minimum adaptive epoch settling window in milliseconds (1..1000, default: 100)",
+         ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
++    argsman.AddArg(
++        "-merklixbatch",
++        "Negotiate vector Merklix bucket requests and replies (default: 1)",
++        ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+     argsman.AddArg(
+         "-merklixreconciliation",
+         "Advertise Merklix reconciliation and initiate changed-set announcements (default: 1)",
+@@ -3121,6 +3125,9 @@ bool AppInitMain(Config &config, RPCServer &rpcServer,
+ 
+     if (args.GetBoolArg("-merklixreconciliation", true)) {
+         nLocalServices = ServiceFlags(nLocalServices | NODE_MERKLIX);
++        if (args.GetBoolArg("-merklixbatch", true)) {
++            nLocalServices = ServiceFlags(nLocalServices | NODE_MERKLIX_BATCH);
++        }
+     }
+ 
+     PeerManager::Options peerman_opts{};
+diff --git a/src/net/recon_cost_budget.h b/src/net/recon_cost_budget.h
+index 2f636ed5e1..6727819c8f 100644
+--- a/src/net/recon_cost_budget.h
++++ b/src/net/recon_cost_budget.h
+@@ -14,22 +14,22 @@ namespace lotus::v2::net {
+  * This class never allocates and does not grant credit on clock reversal.
+  */
+ class ReconCostBudget {
+-    double m_sketch{256 * 1024};
++    double m_sketch{2 * 1024 * 1024};
+     double m_payload{4 * 1024 * 1024};
+-    double m_work{1024 * 1024};
++    double m_work{2 * 1024 * 1024};
+     std::chrono::microseconds m_last{};
+     bool m_started{false};
+ public:
+-    static constexpr size_t SKETCH_BURST = 256 * 1024;
++    static constexpr size_t SKETCH_BURST = 2 * 1024 * 1024;
+     static constexpr size_t PAYLOAD_BURST = 4 * 1024 * 1024;
+-    static constexpr size_t WORK_BURST = 1024 * 1024;
++    static constexpr size_t WORK_BURST = 2 * 1024 * 1024;
+ 
+     bool Consume(size_t bytes, size_t work, bool payload,
+                  std::chrono::microseconds now) {
+         if (!m_started) { m_last = now; m_started = true; }
+         const double seconds = std::max(0.0, (now - m_last).count() / 1e6);
+         m_last = std::max(m_last, now);
+-        m_sketch = std::min<double>(SKETCH_BURST, m_sketch + seconds * SKETCH_BURST);
++        m_sketch = std::min<double>(SKETCH_BURST, m_sketch + seconds * (256 * 1024));
+         m_payload = std::min<double>(PAYLOAD_BURST, m_payload + seconds * PAYLOAD_BURST);
+         m_work = std::min<double>(WORK_BURST, m_work + seconds * WORK_BURST);
+         double &tokens = payload ? m_payload : m_sketch;
+diff --git a/src/net/v2_protocol_handler.cpp b/src/net/v2_protocol_handler.cpp
+index f709d1ef15..e9848d5d3e 100644
+--- a/src/net/v2_protocol_handler.cpp
++++ b/src/net/v2_protocol_handler.cpp
+@@ -249,6 +249,7 @@ bool V2PeerProtocolHandler::TryHandleMessage(
+         return true;
+     }
+     const bool recon = msg_type == NetMsgType::MERKLIXSYNC ||
++        msg_type == NetMsgType::GETMERKLIXBATCH || msg_type == NetMsgType::MERKLIXBATCH ||
+         msg_type == NetMsgType::GETMERKLIXBUCK ||
+         msg_type == NetMsgType::LEGACY_GETMERKLIXBUCK ||
+         msg_type == NetMsgType::MERKLIXBUCK ||
+@@ -294,6 +295,16 @@ bool V2PeerProtocolHandler::TryHandleMessage(
+ bool V2PeerProtocolHandler::DispatchReconMessage(
+     CNode &pfrom, const std::string &msg_type, DataStream &vRecv,
+     std::chrono::microseconds time_received) {
++    if (msg_type == NetMsgType::GETMERKLIXBATCH || msg_type == NetMsgType::MERKLIXBATCH) {
++        if (!(GetPeerServices(pfrom.GetId()) & NODE_MERKLIX_BATCH)) {
++            LOCK(m_mutex);
++            ++m_stats.malformed_messages;
++            return true;
++        }
++        if (msg_type == NetMsgType::GETMERKLIXBATCH) HandleBucketBatchRequest(pfrom, vRecv);
++        else HandleBucketBatchReply(pfrom, vRecv, time_received);
++        return true;
++    }
+     if (msg_type == NetMsgType::MERKLIXSYNC) {
+         HandleMerklixSync(pfrom, vRecv, time_received);
+         return true;
+@@ -327,10 +338,16 @@ bool V2PeerProtocolHandler::AdmitReconMessage(
+     const bool payload = type == NetMsgType::SHORTTX;
+     // Charge scans independently of wire bytes: tiny requests can otherwise
+     // repeatedly trigger an expensive full-set walk. R3 replaces these walks.
+-    const size_t visits = std::max<size_t>(1, m_mempool.size());
++    size_t visits = std::max<size_t>(1, m_mempool.size());
++    {
++        LOCK(m_mutex);
++        for (const auto &[_, scope] : m_scoped_txs)
++            visits = std::max(visits, scope.txs.size());
++    }
+     const size_t work = stream.size() / 26 +
++        (type == NetMsgType::GETMERKLIXBATCH || type == NetMsgType::MERKLIXBATCH ? 3 * visits :
+         (type == NetMsgType::GETMERKLIXBUCK ||
+-         type == NetMsgType::LEGACY_GETMERKLIXBUCK ? 16 * visits : visits);
++         type == NetMsgType::LEGACY_GETMERKLIXBUCK ? 16 * visits : visits));
+     LOCK(m_mutex);
+     auto &queue = m_recon_queues[peer.GetId()];
+     if (stream.size() > (payload ? ReconCostBudget::PAYLOAD_BURST :
+@@ -959,7 +976,8 @@ MerklixSubBucketSummary V2PeerProtocolHandler::BuildSubBucketSummary(
+ }
+ 
+ MerklixSubBucketDiffResult V2PeerProtocolHandler::DiffSubBucketSummary(
+-    const MerklixSubBucketSummary &remote_sub) const {
++    const MerklixSubBucketSummary &remote_sub,
++    const std::vector<CTransactionRef> *snapshot) const {
+     MerklixSubBucketDiffResult result;
+     const uint8_t depth_bits =
+         remote_sub.depth_bits == 0 ? 8 : remote_sub.depth_bits;
+@@ -983,8 +1001,9 @@ MerklixSubBucketDiffResult V2PeerProtocolHandler::DiffSubBucketSummary(
+     const uint8_t child_nibble_idx = static_cast<uint8_t>((depth_bits >> 2) - 1);
+ 
+     const ReconScope scope = static_cast<ReconScope>(remote_sub.scope);
+-    const std::vector<CTransactionRef> local_txs =
++    const std::vector<CTransactionRef> storage = snapshot ? std::vector<CTransactionRef>{} :
+         GetScopedTransactions(scope, remote_sub.context_id);
++    const auto &local_txs = snapshot ? *snapshot : storage;
+ 
+     uint64_t k0 = remote_sub.salt_k0;
+     uint64_t k1 = remote_sub.salt_k1;
+@@ -1303,8 +1322,162 @@ V2PeerProtocolHandler::GetLastPeerKnownBlock(NodeId peer_id) const {
+     return it->second;
+ }
+ 
++void V2PeerProtocolHandler::SendBucketRequests(
++    CNode &peer, const std::vector<MerklixBucketRequest> &requests) {
++    if (!(GetPeerServices(peer.GetId()) & NODE_MERKLIX_BATCH)) {
++        for (const auto &req : requests) SendBucketRequest(peer, req);
++        return;
++    }
++    if (requests.empty() || requests.size() > MerklixBucketBatchRequest::MAX_REQUESTS) return;
++    {
++        LOCK(m_mutex);
++        auto next = m_expected_buckets[peer.GetId()];
++        for (const auto &req : requests) {
++            const uint8_t depth = req.depth_bits == 0 ? 4 : req.depth_bits;
++            for (uint8_t bucket = 0; bucket < 16; ++bucket) {
++                if (!(req.bucket_mask & (1U << bucket))) continue;
++                const uint8_t child_depth = depth == 16 ? 16 : depth + 4;
++                const uint16_t prefix = depth == 16 ? req.parent_prefix :
++                    static_cast<uint16_t>((req.parent_prefix << 4) | bucket);
++                next.emplace(req.scope, req.context_id, req.salt_k0, req.salt_k1,
++                             child_depth, prefix);
++                if (next.size() > MerklixBucketBatchReply::MAX_SUMMARIES) return;
++            }
++        }
++        m_expected_buckets[peer.GetId()] = std::move(next);
++    }
++    MerklixBucketBatchRequest batch{requests};
++    m_connman.PushMessage(&peer, NetMsg::Make(NetMsgType::GETMERKLIXBATCH, batch));
++}
++
++void V2PeerProtocolHandler::HandleBucketBatchRequest(CNode &peer, DataStream &stream) {
++    auto malformed = [&] { LOCK(m_mutex); ++m_stats.malformed_messages; };
++    MerklixBucketBatchRequest request;
++    try { stream >> request; } catch (const std::exception &) { malformed(); return; }
++    if (request.requests.empty()) { malformed(); return; }
++    const auto &first = request.requests.front();
++    if (!IsValidReconScope(first.scope)) { malformed(); return; }
++    const auto scope = static_cast<ReconScope>(first.scope);
++    auto k0 = first.salt_k0, k1 = first.salt_k1;
++    if (k0 == 0 && k1 == 0) std::tie(k0, k1) = DeriveReconSipHashKey(scope, first.context_id, 0);
++    if (!IsValidReconSipHashKey(scope, first.context_id, k0, k1)) { malformed(); return; }
++    MerklixBucketBatchReply reply;
++    std::map<std::pair<uint8_t, uint16_t>, size_t> indices;
++    for (const auto &req : request.requests) {
++        const uint8_t depth = req.depth_bits == 0 ? 4 : req.depth_bits;
++        if (req.scope != first.scope || req.context_id != first.context_id ||
++            req.salt_k0 != first.salt_k0 || req.salt_k1 != first.salt_k1 ||
++            !req.bucket_mask || (depth != 4 && depth != 8 && depth != 12 && depth != 16) ||
++            req.parent_prefix >= (depth == 4 ? 1U : 1U << (depth - 4))) {
++            malformed(); return;
++        }
++        for (uint8_t bucket = 0; bucket < 16; ++bucket) {
++            if (!(req.bucket_mask & (1U << bucket))) continue;
++            const uint8_t child_depth = depth == 16 ? 16 : depth + 4;
++            const uint16_t prefix = depth == 16 ? req.parent_prefix :
++                static_cast<uint16_t>((req.parent_prefix << 4) | bucket);
++            const auto key = std::make_pair(child_depth, prefix);
++            if (indices.count(key)) { if (depth == 16) continue; malformed(); return; }
++            if (reply.summaries.size() >= MerklixBucketBatchReply::MAX_SUMMARIES) { malformed(); return; }
++            indices[key] = reply.summaries.size();
++            MerklixSubBucketSummary summary;
++            summary.scope = first.scope;
++            summary.context_id = first.context_id;
++            summary.salt_k0 = k0;
++            summary.salt_k1 = k1;
++            summary.depth_bits = child_depth;
++            summary.parent_prefix = prefix;
++            summary.parent_bucket = (prefix >> (child_depth - 8)) & 15;
++            reply.summaries.push_back(std::move(summary));
++        }
++    }
++    // One snapshot/scan per vector request, rather than one scan per reply.
++    // At most three prefix lookups per transaction, independent of fanout.
++    const auto txs = GetScopedTransactions(scope, first.context_id);
++    for (const auto &tx : txs) {
++        const auto &id = tx->GetId();
++        const uint64_t sid = ComputeMerklixShortId(k0, k1, id);
++        const uint64_t s3 = GF64Cube(sid), s5 = GF64Pow5(sid);
++        for (uint8_t depth : {8, 12, 16}) {
++            const auto found = indices.find({depth, GetMerklixPrefix(id, depth - 4)});
++            if (found == indices.end()) continue;
++            auto &summary = reply.summaries[found->second];
++            auto &cell = summary.sub_buckets[GetMerklixNibble(id, depth / 4 - 1)];
++            if (cell.count == std::numeric_limits<uint16_t>::max())
++                throw std::length_error("Merklix cell count exceeds legacy capacity");
++            ++cell.count; cell.s1 ^= sid; cell.s3 ^= s3; cell.s5 ^= s5;
++            if (depth == 16) {
++                if (summary.overflow_short_ids.size() >= ShortTxRequest::MAX_SHORT_IDS)
++                    throw std::length_error("Merklix terminal list exceeds complete scope capacity");
++                summary.overflow_short_ids.push_back(sid);
++            }
++        }
++    }
++    for (auto &summary : reply.summaries) {
++        auto &ids = summary.overflow_short_ids;
++        std::sort(ids.begin(), ids.end());
++        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
++    }
++    if (GetSerializeSize(reply) > 2 * 1024 * 1024)
++        throw std::length_error("Merklix vector exceeds wire byte bound");
++    m_connman.PushMessage(&peer, NetMsg::Make(NetMsgType::MERKLIXBATCH, reply));
++}
++
++void V2PeerProtocolHandler::HandleBucketBatchReply(
++    CNode &peer, DataStream &stream, std::chrono::microseconds now) {
++    auto malformed = [&] { LOCK(m_mutex); ++m_stats.malformed_messages; };
++    MerklixBucketBatchReply reply;
++    try { stream >> reply; } catch (const std::exception &) { malformed(); return; }
++    if (reply.summaries.empty()) { malformed(); return; }
++    const auto &first = reply.summaries.front();
++    if (!IsValidReconScope(first.scope)) { malformed(); return; }
++    // Build a local prefix view once. Each transaction is copied into at most
++    // three short-lived prefix vectors, bounding work and memory by scope size.
++    std::map<std::pair<uint8_t, uint16_t>, std::vector<CTransactionRef>> local;
++    for (const auto &summary : reply.summaries) {
++        if (summary.scope != first.scope || summary.context_id != first.context_id ||
++            summary.salt_k0 != first.salt_k0 || summary.salt_k1 != first.salt_k1 ||
++            (summary.depth_bits != 8 && summary.depth_bits != 12 && summary.depth_bits != 16)) {
++            malformed(); return;
++        }
++        if (!local.emplace(std::make_pair(summary.depth_bits, summary.parent_prefix),
++                           std::vector<CTransactionRef>{}).second) { malformed(); return; }
++    }
++    const auto txs = GetScopedTransactions(static_cast<ReconScope>(first.scope), first.context_id);
++    for (const auto &tx : txs) {
++        for (uint8_t depth : {8, 12, 16}) {
++            const auto found = local.find({depth, GetMerklixPrefix(tx->GetId(), depth - 4)});
++            if (found != local.end()) found->second.push_back(tx);
++        }
++    }
++    ReconFollowups followups;
++    for (const auto &summary : reply.summaries) {
++        DataStream one;
++        one << summary;
++        HandleMerklixBuck(peer, one, now, &followups,
++                          &local.at({summary.depth_bits, summary.parent_prefix}));
++    }
++    auto &ids = followups.missing.short_ids;
++    std::sort(ids.begin(), ids.end());
++    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
++    // A request stays honest about the subset it asks for. Any remainder is
++    // recovered on the next root announcement; never send an oversized vector.
++    if (ids.size() > ShortTxRequest::MAX_SHORT_IDS) ids.resize(ShortTxRequest::MAX_SHORT_IDS);
++    if (!ids.empty()) {
++        const auto &req = followups.missing;
++        RecordPendingShortTxRequest(peer.GetId(), static_cast<ReconScope>(req.scope),
++                                     req.context_id, req.salt_k0, req.salt_k1, ids);
++        m_connman.PushMessage(&peer, NetMsg::Make(NetMsgType::GETSHORTTX, req));
++    }
++    if (!followups.descents.empty()) SendBucketRequests(peer, followups.descents);
++}
++
+ void V2PeerProtocolHandler::SendBucketRequest(
+     CNode &peer, const MerklixBucketRequest &req) {
++    if (GetPeerServices(peer.GetId()) & NODE_MERKLIX_BATCH) {
++        SendBucketRequests(peer, {req});
++        return;
++    }
+     {
+         LOCK(m_mutex);
+         auto &pending = m_expected_buckets[peer.GetId()];
+@@ -1388,7 +1561,8 @@ void V2PeerProtocolHandler::HandleMerklixSync(
+ }
+ 
+ void V2PeerProtocolHandler::HandleGetMerklixBuck(
+-    CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received) {
++    CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received,
++    std::vector<MerklixSubBucketSummary> *batch) {
+     MerklixBucketRequest req;
+     try {
+         vRecv >> req;
+@@ -1436,8 +1610,8 @@ void V2PeerProtocolHandler::HandleGetMerklixBuck(
+         MerklixSubBucketSummary sub = BuildSubBucketSummary(
+             scope, req.context_id, req.salt_k0, req.salt_k1, req.parent_prefix,
+             /*depth_bits=*/16);
+-        m_connman.PushMessage(&pfrom,
+-                              NetMsg::Make(NetMsgType::MERKLIXBUCK, sub));
++        if (batch) batch->push_back(std::move(sub));
++        else m_connman.PushMessage(&pfrom, NetMsg::Make(NetMsgType::MERKLIXBUCK, sub));
+         return;
+     }
+ 
+@@ -1452,13 +1626,14 @@ void V2PeerProtocolHandler::HandleGetMerklixBuck(
+             BuildSubBucketSummary(scope, req.context_id, req.salt_k0,
+                                   req.salt_k1, child_parent_prefix,
+                                   child_depth_bits);
+-        m_connman.PushMessage(&pfrom,
+-                              NetMsg::Make(NetMsgType::MERKLIXBUCK, sub));
++        if (batch) batch->push_back(std::move(sub));
++        else m_connman.PushMessage(&pfrom, NetMsg::Make(NetMsgType::MERKLIXBUCK, sub));
+     }
+ }
+ 
+ void V2PeerProtocolHandler::HandleMerklixBuck(
+-    CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received) {
++    CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received,
++    ReconFollowups *followups, const std::vector<CTransactionRef> *snapshot) {
+     MerklixSubBucketSummary sub;
+     try {
+         vRecv >> sub;
+@@ -1507,19 +1682,26 @@ void V2PeerProtocolHandler::HandleMerklixBuck(
+         }
+     }
+ 
+-    const MerklixSubBucketDiffResult diff = DiffSubBucketSummary(sub);
++    const MerklixSubBucketDiffResult diff = DiffSubBucketSummary(sub, snapshot);
+     if (!diff.missing_short_ids.empty()) {
+-        RecordPendingShortTxRequest(pfrom.GetId(), scope, sub.context_id,
+-                                    sub.salt_k0, sub.salt_k1,
+-                                    diff.missing_short_ids);
+         ShortTxRequest req;
+         req.scope = sub.scope;
+         req.context_id = sub.context_id;
+         req.salt_k0 = sub.salt_k0;
+         req.salt_k1 = sub.salt_k1;
+         req.short_ids = diff.missing_short_ids;
+-        m_connman.PushMessage(&pfrom,
+-                              NetMsg::Make(NetMsgType::GETSHORTTX, req));
++        if (followups) {
++            followups->missing.scope = req.scope;
++            followups->missing.context_id = req.context_id;
++            followups->missing.salt_k0 = req.salt_k0;
++            followups->missing.salt_k1 = req.salt_k1;
++            followups->missing.short_ids.insert(followups->missing.short_ids.end(),
++                                                req.short_ids.begin(), req.short_ids.end());
++        } else {
++            RecordPendingShortTxRequest(pfrom.GetId(), scope, sub.context_id,
++                                        sub.salt_k0, sub.salt_k1, req.short_ids);
++            m_connman.PushMessage(&pfrom, NetMsg::Make(NetMsgType::GETSHORTTX, req));
++        }
+     }
+ 
+     // Multi-depth prefix bisection for d >= 3 sub-bucket overflows:
+@@ -1545,7 +1727,8 @@ void V2PeerProtocolHandler::HandleMerklixBuck(
+             bisected_req.bucket_mask = unresolved_mask;
+             bisected_req.depth_bits = depth_bits;
+             bisected_req.parent_prefix = effective_parent_prefix;
+-            SendBucketRequest(pfrom, bisected_req);
++            if (followups) followups->descents.push_back(bisected_req);
++            else SendBucketRequest(pfrom, bisected_req);
+         }
+     }
+ }
+diff --git a/src/net/v2_protocol_handler.h b/src/net/v2_protocol_handler.h
+index 44009710cc..5e62b21014 100644
+--- a/src/net/v2_protocol_handler.h
++++ b/src/net/v2_protocol_handler.h
+@@ -91,6 +91,26 @@ struct CandidateOverlayEntry {
+     lotus::v2::Hash subtree_a_root{};
+ };
+ 
++/** CompactSize vectors rejected before allocating an attacker-selected count. */
++template <size_t Limit> struct ReconVectorFormatter {
++    template <typename Stream, typename Vector> void Ser(Stream &s, const Vector &v) {
++        if (v.size() > Limit) throw std::ios_base::failure("oversized Merklix vector");
++        WriteCompactSize(s, v.size());
++        for (const auto &item : v) ::Serialize(s, item);
++    }
++    template <typename Stream, typename Vector> void Unser(Stream &s, Vector &v) {
++        const auto count = ReadCompactSize(s);
++        if (count > Limit) throw std::ios_base::failure("oversized Merklix vector");
++        v.clear();
++        v.reserve(count);
++        for (size_t i = 0; i < count; ++i) {
++            typename Vector::value_type value;
++            ::Unserialize(s, value);
++            v.push_back(std::move(value));
++        }
++    }
++};
++
+ /**
+  * Depth-4 bucket entry in MerklixSyncSummary (12 bytes serialized).
+  */
+@@ -194,7 +214,24 @@ struct MerklixSubBucketSummary {
+         for (auto &sb : obj.sub_buckets) {
+             READWRITE(sb);
+         }
+-        READWRITE(obj.overflow_short_ids);
++        READWRITE(Using<ReconVectorFormatter<4096>>(obj.overflow_short_ids));
++    }
++};
++
++/** Negotiated vector messages use distinct command names, never the legacy
++ * single-summary encodings. Total wire bytes are also capped before dispatch. */
++struct MerklixBucketBatchRequest {
++    static constexpr size_t MAX_REQUESTS = 256;
++    std::vector<MerklixBucketRequest> requests;
++    SERIALIZE_METHODS(MerklixBucketBatchRequest, obj) {
++        READWRITE(Using<ReconVectorFormatter<MAX_REQUESTS>>(obj.requests));
++    }
++};
++struct MerklixBucketBatchReply {
++    static constexpr size_t MAX_SUMMARIES = 4096;
++    std::vector<MerklixSubBucketSummary> summaries;
++    SERIALIZE_METHODS(MerklixBucketBatchReply, obj) {
++        READWRITE(Using<ReconVectorFormatter<MAX_SUMMARIES>>(obj.summaries));
+     }
+ };
+ 
+@@ -212,7 +249,7 @@ struct ShortTxRequest {
+ 
+     SERIALIZE_METHODS(ShortTxRequest, obj) {
+         READWRITE(obj.scope, obj.context_id, obj.salt_k0, obj.salt_k1,
+-                  obj.short_ids);
++                  Using<ReconVectorFormatter<MAX_SHORT_IDS>>(obj.short_ids));
+     }
+ };
+ 
+@@ -399,6 +436,7 @@ struct FastSyncSwarmStatus {
+  *   "getblockundo", "blockundo").
+  */
+ class V2PeerProtocolHandler {
++    struct ReconFollowups;
+ public:
+     static constexpr size_t MAX_SYNC_MESSAGES_PER_WINDOW = 32;
+     static constexpr size_t MAX_SHARD_MESSAGES_PER_WINDOW = 512;
+@@ -428,10 +466,11 @@ public:
+                            std::chrono::microseconds time_received)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+     void HandleGetMerklixBuck(CNode &pfrom, DataStream &vRecv,
+-                              std::chrono::microseconds time_received)
++                              std::chrono::microseconds time_received, std::vector<MerklixSubBucketSummary> *batch = nullptr)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+     void HandleMerklixBuck(CNode &pfrom, DataStream &vRecv,
+-                           std::chrono::microseconds time_received)
++                           std::chrono::microseconds time_received, ReconFollowups *followups = nullptr,
++                           const std::vector<CTransactionRef> *snapshot = nullptr)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+     void HandleGetShortTx(CNode &pfrom, DataStream &vRecv,
+                           std::chrono::microseconds time_received)
+@@ -618,7 +657,8 @@ public:
+      * recover missing short IDs via 1-tx and 2-tx GF(2^64) syndromes.
+      */
+     MerklixSubBucketDiffResult
+-    DiffSubBucketSummary(const MerklixSubBucketSummary &remote_sub) const
++    DiffSubBucketSummary(const MerklixSubBucketSummary &remote_sub,
++                         const std::vector<CTransactionRef> *snapshot = nullptr) const
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
+     /**
+@@ -812,6 +852,12 @@ private:
+ 
+     using ExpectedBucket = std::tuple<uint8_t, uint256, uint64_t, uint64_t, uint8_t, uint16_t>;
+     std::unordered_map<NodeId, std::set<ExpectedBucket>> m_expected_buckets GUARDED_BY(m_mutex);
++    struct ReconFollowups {
++        ShortTxRequest missing;
++        std::vector<MerklixBucketRequest> descents;
++    };
++    void SendBucketRequests(CNode &peer, const std::vector<MerklixBucketRequest> &requests)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+     void SendBucketRequest(CNode &peer, const MerklixBucketRequest &request)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
+@@ -831,6 +877,8 @@ private:
+     bool AdmitReconMessage(CNode &peer, const std::string &type,
+                            DataStream &stream, std::chrono::microseconds now)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    void HandleBucketBatchRequest(CNode &peer, DataStream &stream);
++    void HandleBucketBatchReply(CNode &peer, DataStream &stream, std::chrono::microseconds now);
+     bool DispatchReconMessage(CNode &peer, const std::string &type,
+                               DataStream &stream, std::chrono::microseconds now)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+diff --git a/src/protocol.cpp b/src/protocol.cpp
+index efc01d8ea5..031335f7a5 100644
+--- a/src/protocol.cpp
++++ b/src/protocol.cpp
+@@ -67,6 +67,8 @@ const char *SEALEDBLOCK = "sealedblock";
+ const char *MERKLIXSYNC = "merklixsync";
+ const char *LEGACY_GETMERKLIXBUCK = "getmerklixbuck";
+ const char *GETMERKLIXBUCK = "getmrklbckt";
++const char *GETMERKLIXBATCH = "getmrklbatch";
++const char *MERKLIXBATCH = "mrklbatch";
+ const char *MERKLIXBUCK = "merklixbuck";
+ const char *GETSHORTTX = "getshorttx";
+ const char *SHORTTX = "shorttx";
+@@ -117,6 +119,7 @@ static const std::string allNetMessageTypes[] = {
+     NetMsgType::AVAPROOFSREQ,   NetMsgType::AVATREASURY,
+     NetMsgType::AVABATCH,       NetMsgType::MINEDHEADER,
+     NetMsgType::SEALEDHEADER,   NetMsgType::SEALEDBLOCK,
++    NetMsgType::GETMERKLIXBATCH, NetMsgType::MERKLIXBATCH,
+     NetMsgType::MERKLIXSYNC,    NetMsgType::GETMERKLIXBUCK,
+     NetMsgType::MERKLIXBUCK,    NetMsgType::GETSHORTTX,
+     NetMsgType::SHORTTX,        NetMsgType::GETUTXOROOTS,
+@@ -285,6 +288,8 @@ static std::string serviceFlagToStr(const size_t bit) {
+             return "UTXO_SHARD";
+         case NODE_MERKLIX:
+             return "MERKLIX";
++        case NODE_MERKLIX_BATCH:
++            return "MERKLIX_BATCH";
+         default:
+             std::ostringstream stream;
+             stream.imbue(std::locale::classic());
+diff --git a/src/protocol.h b/src/protocol.h
+index e8a8ad5407..84e1eddb84 100644
+--- a/src/protocol.h
++++ b/src/protocol.h
+@@ -354,6 +354,8 @@ extern const char *MERKLIXSYNC;
+ // Pre-capability name exceeded the 12-byte transport command limit.
+ extern const char *LEGACY_GETMERKLIXBUCK;
+ extern const char *GETMERKLIXBUCK;
++extern const char *GETMERKLIXBATCH;
++extern const char *MERKLIXBATCH;
+ 
+ /**
+  * Transmits depth-8 sub-bucket algebraic syndromes (count, s1, s3 over GF(2^64)).
+@@ -473,6 +475,8 @@ enum ServiceFlags : uint64_t {
+ 
+     // Supports the original Merklix reconciliation message encodings.
+     NODE_MERKLIX = (1 << 26),
++    // Explicit opt-in to vector requests/replies; old encodings remain intact.
++    NODE_MERKLIX_BATCH = (1 << 27),
+ };
+ 
+ /**
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 4c9e14be86..29ff4ddfd5 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -280,6 +280,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		validation_flush_tests.cpp
+ 		validation_tests.cpp
+ 		validationinterface_tests.cpp
++		merklix_batch_tests.cpp
+ 		merklix_scope_tests.cpp
+ 		merklix_cost_budget_tests.cpp
+ 		merklix_wire_tests.cpp
+diff --git a/src/test/fuzz/v2_merklix_sync.cpp b/src/test/fuzz/v2_merklix_sync.cpp
+index 333c5b33b5..ac32cb9935 100644
+--- a/src/test/fuzz/v2_merklix_sync.cpp
++++ b/src/test/fuzz/v2_merklix_sync.cpp
+@@ -3,6 +3,8 @@
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
+ #include <crypto/siphash.h>
++#include <net/v2_protocol_handler.h>
++#include <streams.h>
+ #include <lotus_v2/commitment.h>
+ #include <lotus_v2/tagged_hash.h>
+ #include <uint256.h>
+@@ -188,6 +190,26 @@ BucketSyndrome ComputeBucketSyndrome(
+ } // namespace
+ 
+ FUZZ_TARGET(v2_merklix_sync) {
++    // Negotiated vector encodings reject CompactSize bounds before allocation.
++    // Keep the existing set-difference fuzz cases below unchanged.
++    {
++        DataStream wire{buffer};
++        try {
++            lotus::v2::net::MerklixBucketBatchRequest request;
++            wire >> request;
++            Assert(request.requests.size() <= request.MAX_REQUESTS);
++        } catch (const std::exception &) {}
++    }
++    {
++        DataStream wire{buffer};
++        try {
++            lotus::v2::net::MerklixBucketBatchReply reply;
++            wire >> reply;
++            Assert(reply.summaries.size() <= reply.MAX_SUMMARIES);
++            for (const auto &summary : reply.summaries)
++                Assert(summary.overflow_short_ids.size() <= 4096);
++        } catch (const std::exception &) {}
++    }
+     FuzzedDataProvider fdp(buffer.data(), buffer.size());
+ 
+     const uint64_t k0 = fdp.ConsumeIntegral<uint64_t>();
+diff --git a/src/test/merklix_batch_tests.cpp b/src/test/merklix_batch_tests.cpp
+new file mode 100644
+index 0000000000..97ad3226b6
+--- /dev/null
++++ b/src/test/merklix_batch_tests.cpp
+@@ -0,0 +1,105 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++#include <net/v2_protocol_handler.h>
++#include <net_processing.h>
++#include <net.h>
++#include <validation.h>
++#include <node/protocol_version.h>
++#include <test/util/net.h>
++#include <test/util/setup_common.h>
++#include <primitives/transaction.h>
++#include <script/script.h>
++#include <boost/test/unit_test.hpp>
++using namespace lotus::v2::net;
++using namespace std::chrono_literals;
++BOOST_FIXTURE_TEST_SUITE(merklix_batch_tests, RegTestingSetup)
++BOOST_AUTO_TEST_CASE(vector_limits_reject_before_elements) {
++    DataStream request_wire;
++    WriteCompactSize(request_wire, MerklixBucketBatchRequest::MAX_REQUESTS + 1);
++    MerklixBucketBatchRequest request;
++    BOOST_CHECK_THROW(request_wire >> request, std::ios_base::failure);
++    BOOST_CHECK(request.requests.empty());
++    DataStream reply_wire;
++    WriteCompactSize(reply_wire, MerklixBucketBatchReply::MAX_SUMMARIES + 1);
++    MerklixBucketBatchReply reply;
++    BOOST_CHECK_THROW(reply_wire >> reply, std::ios_base::failure);
++    BOOST_CHECK(reply.summaries.empty());
++}
++BOOST_AUTO_TEST_CASE(one_reply_and_followup_independent_of_bucket_count) {
++    const auto &config = m_node.chainman->GetConfig();
++    ConnmanTestMsg connman(config, 1, 2, *m_node.addrman);
++    auto peerman = PeerManager::make(connman, *m_node.addrman, nullptr,
++                                     *m_node.chainman, *m_node.mempool, nullptr, {});
++    auto *local = peerman->GetV2ProtocolHandler();
++    V2PeerProtocolHandler remote(*m_node.chainman, *m_node.mempool, connman, *peerman);
++    CNode peer(701, nullptr, CAddress(), 0, 0, 0, CAddress(), "",
++               ConnectionType::OUTBOUND_FULL_RELAY, false);
++    peer.SetCommonVersion(PROTOCOL_VERSION);
++    peer.fSuccessfullyConnected = true;
++    local->SetPeerServices(peer.GetId(), ServiceFlags(NODE_MERKLIX | NODE_MERKLIX_BATCH));
++    remote.SetPeerServices(peer.GetId(), ServiceFlags(NODE_MERKLIX | NODE_MERKLIX_BATCH));
++    auto take_messages = [&] {
++        V1TransportDeserializer decoder(config, peer.GetId());
++        std::vector<CNetMessage> messages;
++        LOCK(peer.cs_vSend);
++        for (const auto &chunk : peer.vSendMsg) {
++            Span<const uint8_t> bytes{chunk};
++            while (!bytes.empty()) {
++                BOOST_REQUIRE_GE(decoder.Read(config, bytes), 0);
++                if (decoder.Complete()) {
++                    bool rejected = false;
++                    messages.push_back(decoder.GetMessage(0us, rejected));
++                    BOOST_REQUIRE(!rejected);
++                }
++            }
++        }
++        peer.vSendMsg.clear();
++        return messages;
++    };
++    for (const unsigned buckets : {1U, 16U}) {
++        std::vector<CTransactionRef> txs;
++        uint64_t nonce = 1;
++        for (unsigned bucket = 0; bucket < buckets; ++bucket) {
++            for (int item = 0; item < 2; ++item) {
++                while (true) {
++                    CMutableTransaction tx;
++                    tx.nVersion = 2;
++                    tx.vin.resize(1);
++                    uint256 id;
++                    for (unsigned byte = 0; byte < 8; ++byte)
++                        id.begin()[byte] = static_cast<uint8_t>(nonce >> (8 * byte));
++                    ++nonce;
++                    tx.vin[0].prevout = COutPoint(TxId(id), 0);
++                    tx.vout.emplace_back(1000 * SATOSHI, CScript() << OP_TRUE);
++                    auto candidate = MakeTransactionRef(std::move(tx));
++                    if (GetMerklixBucketIndex(candidate->GetId()) == bucket) {
++                        txs.push_back(candidate); break;
++                    }
++                }
++            }
++        }
++        uint256 context;
++        context.begin()[0] = buckets;
++        BOOST_REQUIRE(local->SetScopedTransactions(ReconScope::BLOCK_RECON, context, {}));
++        BOOST_REQUIRE(remote.SetScopedTransactions(ReconScope::BLOCK_RECON, context, txs));
++        DataStream summary;
++        summary << remote.BuildSyncSummary(ReconScope::BLOCK_RECON, context);
++        BOOST_REQUIRE(local->TryHandleMessage(peer, NetMsgType::MERKLIXSYNC, summary, 1s));
++        auto requests = take_messages();
++        BOOST_REQUIRE_EQUAL(requests.size(), 1U);
++        BOOST_CHECK_EQUAL(requests[0].m_type, NetMsgType::GETMERKLIXBATCH);
++        BOOST_REQUIRE(remote.TryHandleMessage(peer, requests[0].m_type, requests[0].m_recv, 1s));
++        auto replies = take_messages();
++        BOOST_REQUIRE_EQUAL(replies.size(), 1U);
++        BOOST_CHECK_EQUAL(replies[0].m_type, NetMsgType::MERKLIXBATCH);
++        BOOST_REQUIRE(local->TryHandleMessage(peer, replies[0].m_type, replies[0].m_recv, 1s));
++        auto followups = take_messages();
++        BOOST_REQUIRE_EQUAL(followups.size(), 1U);
++        BOOST_CHECK_EQUAL(followups[0].m_type, NetMsgType::GETSHORTTX);
++        ShortTxRequest missing;
++        followups[0].m_recv >> missing;
++        BOOST_CHECK_EQUAL(missing.short_ids.size(), 2 * buckets);
++    }
++}
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/test/functional/p2p_merklix_initiation.py b/test/functional/p2p_merklix_initiation.py
+index 33fbba8e92..7ee4f8e266 100644
+--- a/test/functional/p2p_merklix_initiation.py
++++ b/test/functional/p2p_merklix_initiation.py
+@@ -21,12 +21,14 @@ from test_framework.test_framework import BitcoinTestFramework
+ class MerklixInitiationTest(BitcoinTestFramework):
+     def add_options(self, parser):
+         parser.add_argument("--legacy-control", action="store_true")
++        parser.add_argument("--legacy-wire", action="store_true")
+ 
+     def set_test_params(self):
+         self.num_nodes = 3
+         self.setup_clean_chain = True
+         self.extra_args = [["-avalanche=0",
+-                            f"-merklixreconciliation={int(not self.options.legacy_control)}"]
++                            f"-merklixreconciliation={int(not self.options.legacy_control)}",
++                            f"-merklixbatch={int(not self.options.legacy_wire)}"]
+                            for _ in range(self.num_nodes)]
+ 
+     def run_test(self):
+@@ -68,8 +70,14 @@ class MerklixInitiationTest(BitcoinTestFramework):
+         # ordinary INV as well. The disabled-capability control isolates the
+         # initiation trigger; do not require zero secondary INV traffic.
+         assert sent.get("merklixsync", 0) > 0, sent
+-        assert sent.get("getmrklbckt", 0) > 0, sent
+-        assert sent.get("merklixbuck", 0) > 0, sent
++        if self.options.legacy_wire:
++            assert sent.get("getmrklbckt", 0) > 0, sent
++            assert sent.get("merklixbuck", 0) > 0, sent
++            assert sent.get("getmrklbatch", 0) == 0, sent
++        else:
++            assert sent.get("getmrklbatch", 0) > 0, sent
++            assert sent.get("mrklbatch", 0) > 0, sent
++            assert sent.get("getmrklbckt", 0) == 0, sent
+         assert sent.get("getshorttx", 0) > 0, sent
+         assert sent.get("shorttx", 0) > 0, sent
+         self.log.info("Production reconciliation bytes by message: %s", sent)
+diff --git a/test/functional/p2p_merklix_limits.py b/test/functional/p2p_merklix_limits.py
+index c3667565d8..a7315a2d92 100644
+--- a/test/functional/p2p_merklix_limits.py
++++ b/test/functional/p2p_merklix_limits.py
+@@ -13,7 +13,7 @@ class RawSync:
+     def serialize(self):
+         # Invalid scope is intentional: admission must bound attacker work
+         # before decoding, and normal malformed handling must remain intact.
+-        return b"\0" * 273
++        return b"\0" * (64 * 1024)
+ 
+ 
+ class MerklixLimitsTest(BitcoinTestFramework):
+@@ -25,12 +25,12 @@ class MerklixLimitsTest(BitcoinTestFramework):
+     def run_test(self):
+         node = self.nodes[0]
+         peer = node.add_p2p_connection(P2PInterface())
+-        for _ in range(1100):
++        for _ in range(36):
+             peer.send_without_ping(RawSync())
+         self.wait_until(lambda: node.getnetworkinfo()["merklix"]["deferred"] > 0)
+         self.wait_until(lambda: node.getnetworkinfo()["merklix"]["drained"] > 0)
+         assert peer.is_connected
+-        for _ in range(5000):
++        for _ in range(128):
+             try:
+                 peer.send_without_ping(RawSync())
+             except OSError:
+-- 
+2.50.1 (Apple Git-155)
+

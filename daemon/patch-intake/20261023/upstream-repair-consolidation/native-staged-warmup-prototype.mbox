@@ -1,0 +1,444 @@
+From bd9ec02d9b09f90b096f4b62a5dae55626f97767 Mon Sep 17 00:00:00 2001
+From: Canonical patch progression <213740+schancel@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 17:09:09 -0700
+Subject: [PATCH 1/4] fixup! net: admit peer transactions on an admission
+ thread (-parallelmempool)
+
+---
+ src/net_processing.cpp | 23 +++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 96d22c6a6b..2eebf68074 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -4168,8 +4168,27 @@ void PeerManagerImpl::ProcessShortTxResponse(
+         m_chainman.IsInitialBlockDownload()) {
+         return;
+     }
+-    // Exactly as if each had come in a tx message: orphan handling, 1p1c
+-    // packages, reject caches and relay all apply.
++    // The handler already checked response bounds and request eligibility.
++    // Use the same bounded admission/verdict path as ordinary TX messages.
++    if (m_tx_admission_running.load()) {
++        for (const auto &tx : txs) {
++            if (tx) AddKnownTx(*peer, tx->GetId());
++        }
++        const auto waiting = SteadyClock::now();
++        LOCK(cs_main);
++        node::AdmissionLockTimer timer(waiting);
++        for (const auto &tx : txs) {
++            if (!tx) continue;
++            if (!peer->m_tx_admission_held_txs.empty() ||
++                !QueueTxForAdmission(node, peer, tx, /*count_full=*/true)) {
++                peer->m_tx_admission_held_txs.push_back(tx);
++            }
++        }
++        // At most one bounded response is retained: ProcessMessages drains
++        // held transactions before reading another frame from this peer.
++        return;
++    }
++    // Serial control: orphan handling, 1p1c, reject caches and relay apply.
+     for (const auto &tx : txs) {
+         ProcessSingleTx(node, *peer, tx);
+     }
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 2d06152a398fd22b3e2ad8d79fd755740f499346 Mon Sep 17 00:00:00 2001
+From: Canonical patch progression <213740+schancel@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 17:09:09 -0700
+Subject: [PATCH 2/4] fixup! consensus(v2): connect native state, monetary and
+ script rules
+
+---
+ src/test/v2_protocol_handler_tests.cpp | 117 +++++++++++++++++++++++++
+ 1 file changed, 117 insertions(+)
+
+diff --git a/src/test/v2_protocol_handler_tests.cpp b/src/test/v2_protocol_handler_tests.cpp
+index 78ca0474ce..6ca37b4aa9 100644
+--- a/src/test/v2_protocol_handler_tests.cpp
++++ b/src/test/v2_protocol_handler_tests.cpp
+@@ -44,6 +44,7 @@
+ #include <array>
+ #include <chrono>
+ #include <memory>
++#include <thread>
+ #include <vector>
+ 
+ #include <script/signingprovider.h>
+@@ -1825,6 +1826,122 @@ BOOST_AUTO_TEST_CASE(single_tx_relays_wait_for_the_relay_tick) {
+     SetMockTime(0);
+ }
+ 
++BOOST_FIXTURE_TEST_CASE(shorttx_uses_bounded_admission_and_orders_following_ping,
++                        TestChain100Setup) {
++    struct ResetMockTime {
++        ~ResetMockTime() { SetMockTime(0); }
++    } reset_mock_time;
++    const Config &config = m_node.chainman->GetConfig();
++    SetMockTime(m_node.chainman->ActiveChain().Tip()->GetBlockTime());
++    BOOST_REQUIRE(!m_node.chainman->IsInitialBlockDownload());
++    constexpr size_t count = 768; // More than an active batch plus a peer FIFO.
++    for (const bool parallel : {false, true}) {
++        const std::vector<uint8_t> program{0x4e}; // Native OP_1.
++        lotus::v2::Output output;
++        output.value = 100000;
++        output.branches = {lotus::v2::BranchLeaf(program)};
++        output.paths = {{0}};
++        const CTxOut funding = CTxOut::FromV2Output(output);
++        std::vector<CTransactionRef> txs;
++        {
++            LOCK(cs_main);
++            for (size_t i = 0; i < count; ++i) {
++                uint256 id;
++                WriteLE64(id.begin(), 10000 + size_t(parallel) * count + i);
++                const COutPoint previous(TxId(id), 0);
++                m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
++                    previous, Coin(funding, 100, false), false);
++                CMutableTransaction tx;
++                tx.nVersion = 7;
++                tx.nV2Lock = 0;
++                CTxIn input(previous);
++                input.nFlags = 1;
++                input.nPathIndex = 0;
++                lotus::v2::BranchWitness witness;
++                witness.script = program;
++                input.vWitnesses = {witness};
++                tx.vin.push_back(std::move(input));
++                auto next = output;
++                next.value -= 10000;
++                tx.vout.push_back(CTxOut::FromV2Output(next));
++                txs.push_back(MakeTransactionRef(std::move(tx)));
++            }
++            const auto control = ProcessRawTxBatch(
++                m_node.chainman->ActiveChainstate(), *m_node.mempool, txs, true);
++            BOOST_REQUIRE_MESSAGE(control.m_state.IsValid(), control.m_state.ToString());
++            BOOST_REQUIRE_EQUAL(m_node.mempool->size(), 0U);
++        }
++        auto connman = std::make_unique<ConnmanTestMsg>(
++            config, 123, 456, *m_node.addrman);
++        auto node = std::make_unique<CNode>(
++            1200 + parallel, nullptr, CAddress(), 0, 0, 0, CAddress(), "",
++            ConnectionType::OUTBOUND_FULL_RELAY, false);
++        PeerManager::Options peer_options;
++        peer_options.deterministic_rng = true;
++        peer_options.parallel_admission = parallel;
++        peer_options.parallel_admission_threads = 2;
++        auto peerman = PeerManager::make(
++            *connman, *m_node.addrman, nullptr, *m_node.chainman,
++            *m_node.mempool, nullptr, peer_options);
++        CConnman::Options options;
++        options.m_msgproc = {peerman.get()};
++        options.nSendBufferMaxSize = 1024 * 1024;
++        connman->Init(options);
++        {
++            LOCK(NetEventsInterface::g_msgproc_mutex);
++            connman->Handshake(*node, true, NODE_NETWORK, NODE_NETWORK,
++                               PROTOCOL_VERSION, true);
++            WITH_LOCK(node->cs_vSend, node->vSendMsg.clear());
++            auto received = txs;
++            received.push_back(txs.front()); // An in-flight duplicate is harmless.
++            {
++                LOCK(cs_main);
++                // With the chain lock pinned, queued work cannot commit yet.
++                // The serial control still admits through its recursive lock.
++                peerman->ProcessShortTxResponse(*node, received);
++                BOOST_CHECK_EQUAL(m_node.mempool->size(), parallel ? 0U : count);
++            }
++            auto ping = NetMsg::Make(NetMsgType::PING, uint64_t{12345});
++            BOOST_REQUIRE(connman->ReceiveMsgFrom(*node, ping));
++            const auto deadline = SteadyClock::now() + std::chrono::seconds{15};
++            bool pong = false;
++            while (!pong && SteadyClock::now() < deadline) {
++                connman->ProcessMessagesOnce(*node);
++                V1TransportDeserializer decoder(config, node->GetId());
++                {
++                    LOCK(node->cs_vSend);
++                    for (const auto &chunk : node->vSendMsg) {
++                        Span<const uint8_t> bytes{chunk};
++                        while (!bytes.empty()) {
++                            BOOST_REQUIRE_GE(decoder.Read(config, bytes), 0);
++                            if (!decoder.Complete()) continue;
++                            bool rejected = false;
++                            auto message = decoder.GetMessage(0us, rejected);
++                            BOOST_REQUIRE(!rejected);
++                            if (message.m_type == NetMsgType::PONG) {
++                                uint64_t nonce;
++                                message.m_recv >> nonce;
++                                BOOST_CHECK_EQUAL(nonce, 12345U);
++                                pong = true;
++                            }
++                        }
++                    }
++                }
++                if (!pong) std::this_thread::sleep_for(std::chrono::milliseconds{1});
++            }
++            BOOST_REQUIRE(pong);
++            BOOST_CHECK_EQUAL(m_node.mempool->size(), count);
++            for (const auto &tx : txs) BOOST_CHECK(m_node.mempool->exists(tx->GetId()));
++            BOOST_CHECK(!node->fDisconnect);
++            peerman->FinalizeNode(config, *node);
++        }
++        // Stop/join the worker before releasing the node, outside g_msgproc_mutex.
++        peerman.reset();
++        LOCK2(cs_main, m_node.mempool->cs);
++        m_node.mempool->clear();
++    }
++}
++
+ BOOST_AUTO_TEST_CASE(malformed_later_tx_does_not_discard_decoded_prefix) {
+     LOCK(NetEventsInterface::g_msgproc_mutex);
+     const Config &config = m_node.chainman->GetConfig();
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 1086dc10df9caebbb4ecd8c13cd6f9113376e6e1 Mon Sep 17 00:00:00 2001
+From: Canonical patch progression <213740+schancel@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 17:26:05 -0700
+Subject: [PATCH 3/4] fixup! validation(v2): prepare advisory native crypto
+ from immutable snapshots
+
+---
+ src/test/lotus_v2_tests.cpp | 65 +++++++++++++++++++++++++++++++++++++
+ src/validation.cpp          | 40 ++++++++++++++++++-----
+ 2 files changed, 96 insertions(+), 9 deletions(-)
+
+diff --git a/src/test/lotus_v2_tests.cpp b/src/test/lotus_v2_tests.cpp
+index ef5bf13ac7..93bad91c85 100644
+--- a/src/test/lotus_v2_tests.cpp
++++ b/src/test/lotus_v2_tests.cpp
+@@ -692,6 +692,71 @@ BOOST_FIXTURE_TEST_CASE(v2_native_crypto_warmup_keeps_authoritative_context,
+     BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
+ }
+ 
++BOOST_FIXTURE_TEST_CASE(v2_staged_native_signatures_warm_before_authoritative_commit,
++                        TestChain100Setup) {
++    using namespace lotus::v2;
++    const auto program = NativeBenchmarkProgram();
++    Output output;
++    output.value = 1000000;
++    output.branches = {BranchLeaf(program)};
++    output.paths = {{0}};
++    const auto coin = CTxOut::FromV2Output(output);
++    const auto funding = MineV2Coinbase({coin, coin, coin});
++    WITH_LOCK(cs_main, ::node::PublishChainTipSnapshot(
++        *m_node.chainman, m_node.mempool.get()));
++    std::vector<CTransactionRef> txs;
++    for (uint32_t i = 0; i < 3; ++i) {
++        auto tx = NativeBenchmarkSpend(*funding, i,
++            {funding->vout[i].nValue - 10000 * SATOSHI});
++        if (i == 1) tx.vin[0].vWitnesses[0].arguments[0][10] ^= 1;
++        txs.push_back(MakeTransactionRef(std::move(tx)));
++    }
++    auto &cache = m_node.chainman->m_validation_cache.m_signature_cache;
++    std::array<uint256, 3> entries;
++    for (size_t i = 0; i < txs.size(); ++i) {
++        lotus::v2::Hash message{};
++        std::string error;
++        BOOST_REQUIRE_MESSAGE(SigningMessage(
++            txs[i]->ToV2Transaction(), DefaultTxProfile,
++            m_node.chainman->GetParams().V2ChainId(),
++            {funding->vout[i].ToV2Output()}, 0, 0, 0, std::nullopt,
++            message, error), error);
++        cache.ComputeBip340Entry(entries[i], message,
++            txs[i]->vin[0].vWitnesses[0].arguments[0],
++            std::span<const uint8_t>(program.data() + 1, 32), false);
++        BOOST_REQUIRE(!cache.Get(entries[i], false));
++    }
++    StagedAdmissionOptions options;
++    options.script_threads = 2;
++    options.test_between_phases = [&] {
++        AssertLockNotHeld(cs_main);
++        BOOST_CHECK(cache.Get(entries[0], false));
++        BOOST_CHECK(!cache.Get(entries[1], false));
++        BOOST_CHECK(cache.Get(entries[2], false));
++        BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
++        // A valid warmed signature must not authorize a changed input value.
++        LOCK(cs_main);
++        auto &view = m_node.chainman->ActiveChainstate().CoinsTip();
++        const COutPoint previous(funding->GetId(), 2);
++        const auto old = view.GetCoin(previous);
++        BOOST_REQUIRE(old.has_value());
++        auto changed = old->GetTxOut().ToV2Output();
++        --changed.value;
++        BOOST_REQUIRE(view.SpendCoin(previous));
++        view.AddCoin(previous, ::Coin(CTxOut::FromV2Output(changed),
++            old->GetHeight(), old->IsCoinBase()), false);
++    };
++    StagedAdmissionStats stats;
++    const auto results = AcceptToMemoryPoolStaged(*m_node.chainman, txs, options, &stats);
++    BOOST_REQUIRE_EQUAL(results.size(), 3U);
++    for (const auto &result : results) BOOST_REQUIRE(result.has_value());
++    BOOST_CHECK(results[0]->m_result_type == MempoolAcceptResult::ResultType::VALID);
++    BOOST_CHECK(results[1]->m_result_type != MempoolAcceptResult::ResultType::VALID);
++    BOOST_CHECK(results[2]->m_result_type != MempoolAcceptResult::ResultType::VALID);
++    BOOST_CHECK_EQUAL(stats.precomputed, 0U); // Native execution verdicts are not reused.
++    BOOST_CHECK_EQUAL(m_node.mempool->size(), 1U);
++}
++
+ BOOST_FIXTURE_TEST_CASE(v2_snapshot_crypto_warmup_is_advisory,
+                         TestChain100Setup) {
+     using namespace lotus::v2;
+diff --git a/src/validation.cpp b/src/validation.cpp
+index a13257a1cb..9102e969b3 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -3416,20 +3416,24 @@ std::vector<std::optional<MempoolAcceptResult>> AcceptToMemoryPoolStaged(
+     // AcceptToMemoryPool does for the coins it fetches).
+     std::vector<std::vector<COutPoint>> fetched(n);
+     uint32_t script_flags = 0;
++    const CTxMemPool *native_pool = nullptr;
+ 
+-    // Native entries are never eligible for legacy advisory precomputation.
+-    // Mixed batches retain ordinary staging; every batch still runs Phase C.
++    // Native entries never reuse legacy execution verdicts. They may warm
++    // signatures from immutable snapshots; Phase C validates current state.
+     const bool has_legacy = std::any_of(txs.begin(), txs.end(),
+         [](const auto &tx) { return tx->nVersion != 7; });
+-    // Phase A: resolve spent outputs under the locks only when useful.
+-    if (has_legacy) {
++    const bool has_native = std::any_of(txs.begin(), txs.end(),
++        [](const auto &tx) { return tx->nVersion == 7; });
++    // Phase A also captures the node-owned pool for native snapshot identity.
++    if (has_legacy || has_native) {
+         const auto start = SteadyClock::now();
+         LOCK(cs_main);
+         const auto acquired = SteadyClock::now();
+         local.lock_wait += acquired - start;
+         Chainstate &chainstate = chainman.ActiveChainstate();
+         CTxMemPool *pool = chainstate.GetMempool();
+-        if (pool != nullptr) {
++        native_pool = pool;
++        if (pool != nullptr && has_legacy) {
+             script_flags = GetMempoolScriptFlags(chainstate);
+             verify = MemPoolAccept(*pool, chainstate)
+                          .PrepareStaged(txs, checks, fetched, script_flags,
+@@ -3442,11 +3446,12 @@ std::vector<std::optional<MempoolAcceptResult>> AcceptToMemoryPoolStaged(
+     std::vector<size_t> work;
+     work.reserve(n);
+     for (size_t i = 0; i < n; ++i) {
+-        if (verify[i]) {
++        if (verify[i] || (native_pool && txs[i]->nVersion == 7)) {
+             work.push_back(i);
+         }
+     }
+-    local.precomputed = work.size();
++    // Count reusable legacy verdicts, not native signature-only hints.
++    local.precomputed = std::count(verify.begin(), verify.end(), true);
+     if (!work.empty()) {
+         const auto start = SteadyClock::now();
+         ValidationCache &validation_cache = chainman.m_validation_cache;
+@@ -3458,8 +3463,25 @@ std::vector<std::optional<MempoolAcceptResult>> AcceptToMemoryPoolStaged(
+                  k < work.size();
+                  k = next.fetch_add(1, std::memory_order_relaxed)) {
+                 const size_t i = work[k];
+-                ComputeAdmissionChecks(*txs[i], script_flags, validation_cache,
+-                                       checks[i]);
++                if (txs[i]->nVersion == 7) {
++                    std::optional<std::vector<Coin>> coins;
++                    uint32_t native_flags{0};
++                    // Snapshot-only: never take cs_main inside this pool.
++                    // A locked batch caller can itself be waiting for the
++                    // pool dispatcher. Missing coverage stays authoritative
++                    // in Phase C instead of falling back to a lock here.
++                    if (PrepareNativeCryptoFromSnapshot(
++                            chainman, *txs[i], native_pool, options.limits,
++                            coins, native_flags) && coins) {
++                        WarmNativeAdmissionSignatures(
++                            *txs[i], *coins, native_flags,
++                            chainman.GetParams().V2ChainId(),
++                            validation_cache.m_signature_cache);
++                    }
++                } else {
++                    ComputeAdmissionChecks(*txs[i], script_flags, validation_cache,
++                                           checks[i]);
++                }
+             }
+         });
+         local.verify_unlocked = SteadyClock::now() - start;
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 64176c73eb8998359d250e9706c47663e20995b1 Mon Sep 17 00:00:00 2001
+From: Canonical patch progression <213740+schancel@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 17:32:18 -0700
+Subject: [PATCH 4/4] fixup! validation(v2): prepare advisory native crypto
+ from immutable snapshots
+
+---
+ src/net_processing.cpp      | 1 +
+ src/test/lotus_v2_tests.cpp | 1 +
+ src/validation.cpp          | 9 ++++-----
+ src/validation.h            | 3 +++
+ 4 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 2eebf68074..57523d40bd 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -3358,6 +3358,7 @@ void PeerManagerImpl::ThreadTxAdmission() {
+             : size_t(std::max(1U, std::thread::hardware_concurrency()));
+     StagedAdmissionOptions options;
+     options.script_threads = threads;
++    options.expected_mempool = &m_mempool;
+     // Serial handling checks "already have" right before admitting; repeat
+     // that check at the commit point (the transaction may have arrived by
+     // another route since it was queued).
+diff --git a/src/test/lotus_v2_tests.cpp b/src/test/lotus_v2_tests.cpp
+index 93bad91c85..f1f3c78083 100644
+--- a/src/test/lotus_v2_tests.cpp
++++ b/src/test/lotus_v2_tests.cpp
+@@ -728,6 +728,7 @@ BOOST_FIXTURE_TEST_CASE(v2_staged_native_signatures_warm_before_authoritative_co
+     }
+     StagedAdmissionOptions options;
+     options.script_threads = 2;
++    options.expected_mempool = m_node.mempool.get();
+     options.test_between_phases = [&] {
+         AssertLockNotHeld(cs_main);
+         BOOST_CHECK(cache.Get(entries[0], false));
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 9102e969b3..7178ead658 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -3416,16 +3416,15 @@ std::vector<std::optional<MempoolAcceptResult>> AcceptToMemoryPoolStaged(
+     // AcceptToMemoryPool does for the coins it fetches).
+     std::vector<std::vector<COutPoint>> fetched(n);
+     uint32_t script_flags = 0;
+-    const CTxMemPool *native_pool = nullptr;
++    const CTxMemPool *native_pool = options.expected_mempool;
+ 
+     // Native entries never reuse legacy execution verdicts. They may warm
+     // signatures from immutable snapshots; Phase C validates current state.
+     const bool has_legacy = std::any_of(txs.begin(), txs.end(),
+         [](const auto &tx) { return tx->nVersion != 7; });
+-    const bool has_native = std::any_of(txs.begin(), txs.end(),
+-        [](const auto &tx) { return tx->nVersion == 7; });
+-    // Phase A also captures the node-owned pool for native snapshot identity.
+-    if (has_legacy || has_native) {
++    // Native-only batches use the caller-owned pool identity and do not
++    // enter cs_main until authoritative admission in Phase C.
++    if (has_legacy) {
+         const auto start = SteadyClock::now();
+         LOCK(cs_main);
+         const auto acquired = SteadyClock::now();
+diff --git a/src/validation.h b/src/validation.h
+index 79ef3062bd..a83b1b1e62 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -488,6 +488,9 @@ struct StagedAdmissionOptions {
+      * calling thread. 1 verifies on the caller only.
+      */
+     size_t script_threads{1};
++    /** Node-owned pool, kept alive by the caller through this call. Enables
++     * snapshot-only native warming without acquiring cs_main for identity. */
++    const CTxMemPool *expected_mempool{nullptr};
+     /**
+      * Called for each transaction, in order, with cs_main held, right before
+      * it is admitted. Returning true skips it (no result). Lets a caller
+-- 
+2.50.1 (Apple Git-155)
+

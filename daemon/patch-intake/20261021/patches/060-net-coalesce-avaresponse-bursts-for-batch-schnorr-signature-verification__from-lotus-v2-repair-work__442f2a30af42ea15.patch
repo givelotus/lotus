@@ -1,0 +1,350 @@
+From a37c79e607c0a16e51c6696f04e11d3b27d0d16a Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 02:01:43 -0700
+Subject: [PATCH] net: coalesce AVARESPONSE bursts for batch Schnorr signature
+ verification
+
+Original-Commit: b12f2d8eded902f9b57113a9ad94fcf193f6cfc2
+Original-Patch: ecash/047
+Split-Concern: whole
+
+Historical compilation prerequisites are tracked separately in daemon/patch-audit;
+this provenance-preserving split does not imply standalone build validation.
+
+Stack-Repair-Plan-v2: Process every coalesced response individually when no peer key is available. A malformed response is rejected individually while valid prefix/suffix responses continue. Preserve existing signature verification and bounded coalescing.
+
+diff --git a/src/avalanche/test/preconsensus_batch_tests.cpp b/src/avalanche/test/preconsensus_batch_tests.cpp
+index e798d47796f0f21888526c6df027132f1e9a23ea..f172b2c367d5a92be64507ec97c6c179cfb941f9 100644
+--- a/src/avalanche/test/preconsensus_batch_tests.cpp
++++ b/src/avalanche/test/preconsensus_batch_tests.cpp
+@@ -15,6 +15,7 @@
+ #include <consensus/merkle.h>
+ #include <consensus/validation.h>
+ #include <net_processing.h>
++#include <netmessagemaker.h>
+ #include <node/chainstatemanager_args.h>
+ #include <policy/block/parkingpolicy.h>
+ #include <policy/block/preconsensus.h>
+@@ -72,6 +73,58 @@ namespace {
+ 
+ BOOST_AUTO_TEST_SUITE(preconsensus_batch_tests)
+ 
++BOOST_FIXTURE_TEST_CASE(avaresponse_burst_preserves_individual_messages,
++                        AvalancheTestingSetup) {
++    LogInstance().EnableCategory(BCLog::NET);
++    const CKey key = CKey::MakeCompressedKey();
++    for (bool have_pubkey : {false, true}) {
++        auto *node = new CNode(have_pubkey ? 901 : 900, nullptr, CAddress(),
++                              0, 0, 0, CAddress(), "",
++                              ConnectionType::OUTBOUND_FULL_RELAY, false);
++        node->SetCommonVersion(PROTOCOL_VERSION);
++        node->m_has_all_wanted_services = true;
++        m_node.peerman->InitializeNode(config, *node, NODE_NETWORK);
++        node->nVersion = PROTOCOL_VERSION;
++        node->fSuccessfullyConnected = true;
++        node->m_avalanche_enabled = true;
++        if (have_pubkey) {
++            LOCK(node->cs_avalanche_pubkey);
++            node->m_avalanche_pubkey = key.GetPubKey();
++        }
++        m_connman->AddTestNode(*node);
++        constexpr int count = 5;
++        for (int i = 0; i < count; ++i) {
++            Response response(i, 0, {});
++            HashWriter hash;
++            hash << response;
++            SchnorrSig sig;
++            BOOST_REQUIRE(key.SignSchnorr(hash.GetHash(), sig));
++            auto msg = NetMsg::Make(NetMsgType::AVARESPONSE, response, sig);
++            if (have_pubkey && i == 2) msg.data.resize(1);
++            BOOST_REQUIRE(m_connman->ReceiveMsgFrom(*node, msg));
++        }
++        node->fPauseSend = false;
++        int no_pubkey_processed = 0;
++        {
++            DebugLogHelper log("invalid-ava-response-signature",
++                [&](const std::string *line) {
++                    if (line) ++no_pubkey_processed;
++                    return false;
++                });
++            std::atomic<bool> interrupt{false};
++            LOCK(NetEventsInterface::g_msgproc_mutex);
++            m_node.peerman->ProcessMessages(config, node, interrupt);
++        }
++        if (have_pubkey) {
++            // The malformed middle message must not discard either valid
++            // prefix or suffix. Unsolicited valid responses reach registerVotes.
++            BOOST_CHECK_EQUAL(node->m_avalanche_message_fault_counter, count - 1);
++        } else {
++            BOOST_CHECK_EQUAL(no_pubkey_processed, count);
++        }
++    }
++}
++
+ BOOST_FIXTURE_TEST_CASE(preconsensus_defaults_keep_work_based_unparking,
+                         BasicTestingSetup) {
+     kernel::Notifications notifications;
+@@ -682,7 +735,7 @@ BOOST_FIXTURE_TEST_CASE(
+         BOOST_REQUIRE(active_chainstate.ActivateBestChain(state, nullptr,
+                                                           m_node.avalanche.get()));
+         BOOST_CHECK_EQUAL(parks, 1);
+-        m_node.avalanche->updatedBlockTip();
++        AvalancheTest::updatedBlockTip(*m_node.avalanche);
+         BOOST_CHECK(m_node.avalanche->getFinalizedMempoolBatches(
+             chaintip->GetBlockHash()).empty());
+         // A delayed response cannot revive records for the connected parent.
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 80c911b00a7edb78f2f2ce83a8a8b06eac59d6e2..b151bcc1e6671da8e5612de074b33ca2986068c2 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -29,6 +29,7 @@
+ #include <invrequest.h>
+ #include <kernel/chain.h>
+ #include <kernel/mempool_entry.h>
++#include <lotus_v2/signing.h>
+ #include <merkleblock.h>
+ #include <netbase.h>
+ #include <netmessagemaker.h>
+@@ -65,6 +66,7 @@
+ #include <memory>
+ #include <numeric>
+ #include <set>
++#include <span>
+ #include <tuple>
+ #include <typeinfo>
+ #include <unordered_set>
+@@ -1038,6 +1040,15 @@ private:
+         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex,
+                                  !m_recent_confirmed_transactions_mutex,
+                                  g_msgproc_mutex);
++    std::optional<avalanche::Response>
++        m_preverified_ava_response GUARDED_BY(g_msgproc_mutex);
++    void ProcessAvaResponseBatch(const Config &config, CNode &pfrom, Peer &peer,
++                                 std::vector<CNetMessage> &ava_batch,
++                                 const std::atomic<bool> &interruptMsgProc)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex,
++                                 !m_recent_confirmed_transactions_mutex,
++                                 !m_most_recent_block_mutex, !cs_proofrequest,
++                                 !m_headers_presync_mutex, g_msgproc_mutex);
+ 
+     /**
+      * Reconsider orphan transactions after a parent has been accepted to the
+@@ -5272,6 +5283,119 @@ void PeerManagerImpl::ProcessBlock(const Config &config, CNode &node,
+     }
+ }
+ 
++void PeerManagerImpl::ProcessAvaResponseBatch(
++    const Config &config, CNode &pfrom, Peer &peer,
++    std::vector<CNetMessage> &ava_batch,
++    const std::atomic<bool> &interruptMsgProc) {
++    AssertLockHeld(g_msgproc_mutex);
++    if (ava_batch.empty()) {
++        return;
++    }
++    if (!m_avalanche || ava_batch.size() == 1) {
++        for (auto &msg : ava_batch) {
++            if (interruptMsgProc || pfrom.fDisconnect) break;
++            try {
++                ProcessMessage(config, pfrom, msg.m_type, msg.m_recv,
++                               msg.m_time, interruptMsgProc);
++            } catch (const std::ios_base::failure &e) {
++                LogDebug(BCLog::NET, "Malformed avaresponse from peer=%d: %s\n",
++                         pfrom.GetId(), e.what());
++                Misbehaving(peer, "malformed-ava-response");
++            }
++        }
++        return;
++    }
++
++    std::optional<CPubKey> peer_pubkey;
++    {
++        LOCK(pfrom.cs_avalanche_pubkey);
++        peer_pubkey = pfrom.m_avalanche_pubkey;
++    }
++    if (!peer_pubkey.has_value()) {
++        for (auto &msg : ava_batch) {
++            if (interruptMsgProc || pfrom.fDisconnect) break;
++            try {
++                ProcessMessage(config, pfrom, msg.m_type, msg.m_recv,
++                               msg.m_time, interruptMsgProc);
++            } catch (const std::ios_base::failure &e) {
++                LogDebug(BCLog::NET, "Malformed avaresponse from peer=%d: %s\n",
++                         pfrom.GetId(), e.what());
++                Misbehaving(peer, "malformed-ava-response");
++            }
++        }
++        return;
++    }
++
++    struct ParsedAvaResponse {
++        avalanche::Response response;
++        uint256 msg_hash;
++        SchnorrSig sig;
++        std::chrono::microseconds time_received;
++    };
++
++    std::vector<ParsedAvaResponse> parsed;
++    parsed.reserve(ava_batch.size());
++    lotus::v2::BatchSigCollector collector;
++    collector.Reserve(ava_batch.size());
++    bool all_added = true;
++
++    for (CNetMessage &msg : ava_batch) {
++        ParsedAvaResponse item;
++        try {
++            HashVerifier verifier(msg.m_recv);
++            verifier >> item.response;
++            item.msg_hash = verifier.GetHash();
++            msg.m_recv >> item.sig;
++        } catch (const std::ios_base::failure &e) {
++            LogDebug(BCLog::NET, "Malformed avaresponse from peer=%d: %s\n",
++                     pfrom.GetId(), e.what());
++            Misbehaving(peer, "malformed-ava-response");
++            continue;
++        }
++        item.time_received = msg.m_time;
++        if (all_added &&
++            !collector.AddLegacySchnorr(
++                std::span<const uint8_t>{peer_pubkey->data(),
++                                         peer_pubkey->size()},
++                std::span<const uint8_t>{item.sig.data(), item.sig.size()},
++                item.msg_hash.begin())) {
++            all_added = false;
++        }
++        parsed.push_back(std::move(item));
++    }
++
++    const bool batch_valid = all_added && collector.VerifyAll();
++    const std::optional<size_t> first_failing =
++        (!batch_valid && all_added) ? collector.FirstFailingIndex()
++                                    : std::nullopt;
++
++    for (size_t i = 0; i < parsed.size(); ++i) {
++        if (interruptMsgProc || pfrom.fDisconnect) {
++            break;
++        }
++        bool sig_ok = false;
++        if (batch_valid || (first_failing.has_value() && i < *first_failing)) {
++            sig_ok = true;
++        } else if (first_failing.has_value() && i == *first_failing) {
++            sig_ok = false;
++        } else {
++            sig_ok = peer_pubkey->VerifySchnorr(parsed[i].msg_hash,
++                                                parsed[i].sig);
++        }
++
++        if (!sig_ok) {
++            Misbehaving(peer, "invalid-ava-response-signature");
++            return;
++        }
++
++        m_preverified_ava_response.emplace(std::move(parsed[i].response));
++        DataStream empty_recv{};
++        ProcessMessage(config, pfrom, NetMsgType::AVARESPONSE, empty_recv,
++                       parsed[i].time_received, interruptMsgProc);
++        m_preverified_ava_response.reset();
++    }
++}
++
+ void PeerManagerImpl::ProcessMessage(
+     const Config &config, CNode &pfrom, const std::string &msg_type,
+     DataStream &vRecv, const std::chrono::microseconds time_received,
+@@ -6987,23 +7111,28 @@ void PeerManagerImpl::ProcessMessage(
+         if (!m_avalanche) {
+             return;
+         }
+-        // As long as QUIC is not implemented, we need to sign response and
+-        // verify response's signatures in order to avoid any manipulation of
+-        // messages at the transport level.
+-        HashVerifier verifier(vRecv);
+         avalanche::Response response;
+-        verifier >> response;
++        if (m_preverified_ava_response.has_value()) {
++            response = std::move(*m_preverified_ava_response);
++            m_preverified_ava_response.reset();
++        } else {
++            // As long as QUIC is not implemented, we need to sign response and
++            // verify response's signatures in order to avoid any manipulation
++            // of messages at the transport level.
++            HashVerifier verifier(vRecv);
++            verifier >> response;
+ 
+-        SchnorrSig sig;
+-        vRecv >> sig;
++            SchnorrSig sig;
++            vRecv >> sig;
+ 
+-        {
+-            LOCK(pfrom.cs_avalanche_pubkey);
+-            if (!pfrom.m_avalanche_pubkey.has_value() ||
+-                !(*pfrom.m_avalanche_pubkey)
+-                     .VerifySchnorr(verifier.GetHash(), sig)) {
+-                Misbehaving(*peer, "invalid-ava-response-signature");
+-                return;
++            {
++                LOCK(pfrom.cs_avalanche_pubkey);
++                if (!pfrom.m_avalanche_pubkey.has_value() ||
++                    !(*pfrom.m_avalanche_pubkey)
++                         .VerifySchnorr(verifier.GetHash(), sig)) {
++                    Misbehaving(*peer, "invalid-ava-response-signature");
++                    return;
++                }
+             }
+         }
+ 
+@@ -8456,6 +8585,55 @@ bool PeerManagerImpl::ProcessMessages(const Config &config, CNode *pfrom,
+                                trailing_non_tx_msg->m_recv,
+                                trailing_non_tx_msg->m_time, interruptMsgProc);
+             }
++        } else if (msg.m_type == NetMsgType::AVARESPONSE && fMoreWork &&
++                   m_avalanche && pfrom->fSuccessfullyConnected) {
++            static constexpr size_t MAX_COALESCED_AVARESPONSE_MESSAGES = 64;
++            std::vector<CNetMessage> ava_batch;
++            ava_batch.reserve(16);
++            ava_batch.push_back(std::move(msg));
++
++            std::optional<CNetMessage> trailing_non_ava_msg;
++            while (fMoreWork &&
++                   ava_batch.size() < MAX_COALESCED_AVARESPONSE_MESSAGES &&
++                   !interruptMsgProc && !pfrom->fDisconnect &&
++                   !pfrom->fPauseSend) {
++                auto next_poll = pfrom->PollMessage();
++                if (!next_poll) {
++                    fMoreWork = false;
++                    break;
++                }
++                CNetMessage &next_msg = next_poll->first;
++                fMoreWork = next_poll->second;
++
++                TRACE6(net, inbound_message, pfrom->GetId(),
++                       pfrom->m_addr_name.c_str(),
++                       pfrom->ConnectionTypeAsString().c_str(),
++                       next_msg.m_type.c_str(), next_msg.m_recv.size(),
++                       next_msg.m_recv.data());
++
++                if (m_opts.capture_messages) {
++                    CaptureMessage(pfrom->addr, next_msg.m_type,
++                                   MakeUCharSpan(next_msg.m_recv),
++                                   /*is_incoming=*/true);
++                }
++
++                if (next_msg.m_type == NetMsgType::AVARESPONSE) {
++                    ava_batch.push_back(std::move(next_msg));
++                } else {
++                    trailing_non_ava_msg.emplace(std::move(next_msg));
++                    break;
++                }
++            }
++
++            ProcessAvaResponseBatch(config, *pfrom, *peer, ava_batch,
++                                    interruptMsgProc);
++
++            if (trailing_non_ava_msg && !interruptMsgProc &&
++                !pfrom->fDisconnect) {
++                ProcessMessage(config, *pfrom, trailing_non_ava_msg->m_type,
++                               trailing_non_ava_msg->m_recv,
++                               trailing_non_ava_msg->m_time, interruptMsgProc);
++            }
+         } else {
+             ProcessMessage(config, *pfrom, msg.m_type, msg.m_recv, msg.m_time,
+                            interruptMsgProc);

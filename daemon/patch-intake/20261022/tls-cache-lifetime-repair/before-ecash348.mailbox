@@ -1,0 +1,746 @@
+From cc3f3f4dcd97723aa9a1049ff4a64c0c914999f2 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@gmail.com>
+Date: Mon, 19 Oct 2026 19:04:22 -0700
+Subject: [PATCH] validation, net: split admission into reusable phases (no
+ behavior change)
+
+Why: to verify scripts for many transactions outside cs_main and then
+admit them, admission needs (a) a way to hand it script results computed
+elsewhere without trusting them blindly, and (b) the peer-side handling
+of a received transaction split at the admission call, so the verdict can
+be handled later on the message thread. This commit adds both and uses
+neither yet; every existing caller passes nothing and runs exactly the
+previous code.
+
+What:
+- PrecomputedAdmissionChecks / ScriptCheckOutcome (validation.h): the
+  context-free CheckRegularTransaction result and, per flag set (standard,
+  consensus), whether the input scripts passed, the reported failure
+  (result, reason, debug message) and the sigcheck count, together with
+  the spent outputs they were computed against and the txid.
+- ComputeAdmissionChecks: fills that without any lock. It runs the same
+  CScriptCheck sequence as CheckInputScripts (factored into
+  VerifyTxScriptsAgainst, which VerifyTxScriptsFromResolvedCoins now
+  wraps), including the mandatory-flags recheck that tells
+  TX_NOT_STANDARD from TX_CONSENSUS, and stores signatures in the
+  signature cache as admission does. Consensus flags run only after the
+  standard flags pass, as in admission.
+- AcceptToMemoryPool(..., precomputed): PreChecks and
+  ConsensusScriptChecks call CheckInputScriptsReusing, which reuses an
+  outcome only if the txid matches, the flags are equal and every spent
+  output (amount and script) equals what admission resolved itself under
+  the locks; otherwise it calls CheckInputScripts. It consults and
+  updates the script execution cache exactly as CheckInputScripts does
+  (erase on the policy lookup, insert after consensus success), so the
+  cache, verdict and sigcheck count do not depend on which path ran.
+  Script validity is a function of (transaction, spent outputs, flags)
+  only, so a matching outcome cannot change a verdict.
+- GetMempoolScriptFlags exposes the next-block flags admission uses.
+- PeerManagerImpl::ProcessSingleTx is now PrepareTxAdmission (request
+  bookkeeping and the already-have branch) + ProcessTransaction +
+  FinishTxAdmission (relay, orphans, reject filters, conflicting pool,
+  1p1c reconsideration, misbehavior). Same statements, same order, same
+  locks.
+
+Evidence: new mempool_admission_tests (precomputed and ordinary verdicts
+identical for valid ECDSA and Schnorr spends and for a bad signature; a
+matching outcome is what admission reports; outcomes with a different
+amount, script, flags or txid are ignored; a missing input still fails as
+an orphan). mempool_tests, txvalidation_tests, txvalidationcache_tests,
+txpackage_tests, orphanage_tests, denialofservice_tests,
+mempool_overlay_tests pass. Functional p2p_invalid_tx, p2p_orphan_handling,
+p2p_opportunistic_1p1c, p2p_1p1c_network, mempool_accept pass.
+
+How to reproduce:
+    ninja -C build test_bitcoin
+    build/src/test/test_bitcoin --run_test=mempool_admission_tests
+---
+ src/net_processing.cpp               |  50 +++++-
+ src/test/CMakeLists.txt              |   1 +
+ src/test/mempool_admission_tests.cpp | 160 +++++++++++++++++++
+ src/validation.cpp                   | 224 +++++++++++++++++++++++----
+ src/validation.h                     |  65 +++++++-
+ 5 files changed, 465 insertions(+), 35 deletions(-)
+ create mode 100644 src/test/mempool_admission_tests.cpp
+
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index b041660a057464ae555c6c7efdfac2465b2029fa..bb18d4a4c543ceb1e13de4fb2b23790a28eebd79 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -1120,6 +1120,26 @@ private:
+         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex,
+                                  !m_recent_confirmed_transactions_mutex,
+                                  g_msgproc_mutex);
++    /**
++     * The part of handling a received transaction that comes before mempool
++     * admission: request bookkeeping, and the already-have handling (force
++     * relay, reconsiderable 1p1c packages). Returns whether the transaction
++     * should be submitted to the mempool.
++     */
++    bool PrepareTxAdmission(CNode &pfrom, const CTransactionRef &ptx)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex,
++                                 !m_recent_confirmed_transactions_mutex,
++                                 g_msgproc_mutex, cs_main);
++    /**
++     * The part of handling a received transaction that comes after mempool
++     * admission: relay, orphans, reject filters, conflicting pool, package
++     * reconsideration and misbehavior, all driven by `result`.
++     */
++    void FinishTxAdmission(CNode &pfrom, Peer &peer, const CTransactionRef &ptx,
++                           const MempoolAcceptResult &result)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex,
++                                 !m_recent_confirmed_transactions_mutex,
++                                 g_msgproc_mutex, cs_main);
+     void ProcessTxBatch(CNode &pfrom, Peer &peer,
+                         const std::vector<CTransactionRef> &ptxs)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex,
+@@ -5264,12 +5284,24 @@ void PeerManagerImpl::ProcessSingleTx(CNode &pfrom, Peer &peer,
+     if (!ptx) {
+         return;
+     }
+-    const CTransaction &tx = *ptx;
+-    const TxId &txid = tx.GetId();
+-    AddKnownTx(peer, txid);
++    AddKnownTx(peer, ptx->GetId());
+ 
+     LOCK(cs_main);
+ 
++    if (!PrepareTxAdmission(pfrom, ptx)) {
++        return;
++    }
++    const MempoolAcceptResult result = m_chainman.ProcessTransaction(ptx);
++    FinishTxAdmission(pfrom, peer, ptx, result);
++}
++
++bool PeerManagerImpl::PrepareTxAdmission(CNode &pfrom,
++                                         const CTransactionRef &ptx) {
++    AssertLockHeld(g_msgproc_mutex);
++    AssertLockHeld(cs_main);
++    const CTransaction &tx = *ptx;
++    const TxId &txid = tx.GetId();
++
+     m_txrequest.ReceivedResponse(pfrom.GetId(), txid);
+     // Whichever way it came, it answers announcements of its short id.
+     ForgetShortIdRequests(txid);
+@@ -5317,10 +5349,18 @@ void PeerManagerImpl::ProcessSingleTx(CNode &pfrom, Peer &peer,
+                                      package_result);
+             }
+         }
+-        return;
++        return false;
+     }
++    return true;
++}
+ 
+-    const MempoolAcceptResult result = m_chainman.ProcessTransaction(ptx);
++void PeerManagerImpl::FinishTxAdmission(CNode &pfrom, Peer &peer,
++                                        const CTransactionRef &ptx,
++                                        const MempoolAcceptResult &result) {
++    AssertLockHeld(g_msgproc_mutex);
++    AssertLockHeld(cs_main);
++    const CTransaction &tx = *ptx;
++    const TxId &txid = tx.GetId();
+     const TxValidationState &state = result.m_state;
+ 
+     if (result.m_result_type == MempoolAcceptResult::ResultType::VALID) {
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 9e5e2fa5e2bc75cc124c2598dee83ae8926863e5..a598aabb2f0612c7dd8267c9d501d07a8969cb35 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -213,6 +213,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		logging_event_tests.cpp
+ 		logging_tests.cpp
+ 		lotus_tagged_hash_tests.cpp
++		mempool_admission_tests.cpp
+ 		mempool_overlay_tests.cpp
+ 		mempool_tests.cpp
+ 		merkle_tests.cpp
+diff --git a/src/test/mempool_admission_tests.cpp b/src/test/mempool_admission_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..95c27df3de11971aeb83e16e17345f64ef13caa0
+--- /dev/null
++++ b/src/test/mempool_admission_tests.cpp
+@@ -0,0 +1,160 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <coins.h>
++#include <consensus/validation.h>
++#include <test/util/admission.h>
++#include <test/util/setup_common.h>
++#include <txmempool.h>
++#include <util/time.h>
++#include <validation.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <string>
++#include <vector>
++
++using admission_test::SignedSpend;
++using admission_test::Wallet;
++
++namespace {
++
++struct AdmissionSetup : public TestChain100Setup {
++    Wallet wallet{admission_test::MakeWallet()};
++    AdmissionSetup() { admission_test::FundWallet(*this, wallet, 64); }
++
++    Chainstate &Active() { return m_node.chainman->ActiveChainstate(); }
++
++    std::vector<CTxOut> SpentOutputs(const CTransaction &tx) {
++        LOCK2(cs_main, m_node.mempool->cs);
++        CCoinsViewMemPool view(&Active().CoinsTip(), *m_node.mempool);
++        std::vector<CTxOut> out;
++        for (const CTxIn &in : tx.vin) {
++            std::optional<Coin> coin = view.GetCoin(in.prevout);
++            BOOST_REQUIRE(coin.has_value());
++            out.push_back(coin->GetTxOut());
++        }
++        return out;
++    }
++
++    PrecomputedAdmissionChecks Precompute(const CTransactionRef &tx,
++                                          std::vector<CTxOut> spent) {
++        const uint32_t flags =
++            WITH_LOCK(cs_main, return GetMempoolScriptFlags(Active()));
++        PrecomputedAdmissionChecks checks;
++        checks.spent_outputs = std::move(spent);
++        ComputeAdmissionChecks(*tx, flags, m_node.chainman->m_validation_cache,
++                               checks);
++        return checks;
++    }
++
++    MempoolAcceptResult
++    Admit(const CTransactionRef &tx,
++          const PrecomputedAdmissionChecks *checks = nullptr) {
++        LOCK(cs_main);
++        return AcceptToMemoryPool(Active(), tx, GetTime(),
++                                  /*bypass_limits=*/false,
++                                  /*test_accept=*/false, 0, {}, checks);
++    }
++};
++
++CTransactionRef WithBadSignature(const CTransactionRef &tx) {
++    CMutableTransaction mtx(*tx);
++    // Flip a bit inside the first signature push (after the push opcode).
++    mtx.vin[0].scriptSig[5] ^= 0x01;
++    return MakeTransactionRef(std::move(mtx));
++}
++
++void CheckSameResult(const MempoolAcceptResult &a,
++                     const MempoolAcceptResult &b) {
++    BOOST_CHECK(a.m_result_type == b.m_result_type);
++    BOOST_CHECK(a.m_state.GetResult() == b.m_state.GetResult());
++    BOOST_CHECK_EQUAL(a.m_state.GetRejectReason(), b.m_state.GetRejectReason());
++    BOOST_CHECK_EQUAL(a.m_state.GetDebugMessage(), b.m_state.GetDebugMessage());
++    BOOST_CHECK(a.m_vsize == b.m_vsize);
++    BOOST_CHECK(a.m_base_fees == b.m_base_fees);
++}
++
++} // namespace
++
++BOOST_FIXTURE_TEST_SUITE(mempool_admission_tests, AdmissionSetup)
++
++BOOST_AUTO_TEST_CASE(precomputed_checks_give_serial_verdicts) {
++    // A valid ECDSA and a valid Schnorr spend, each admitted once with
++    // checks computed outside the locks and compared with the verdict of an
++    // identical transaction admitted the ordinary way.
++    for (const bool schnorr : {false, true}) {
++        const size_t base = schnorr ? 0 : 2;
++        const auto tx_pre =
++            SignedSpend(wallet, {wallet.outputs[base]}, 2, schnorr);
++        const auto tx_plain =
++            SignedSpend(wallet, {wallet.outputs[base + 1]}, 2, schnorr);
++        const auto checks = Precompute(tx_pre, SpentOutputs(*tx_pre));
++        BOOST_CHECK(checks.standard.ran && !checks.standard.error_result);
++        BOOST_CHECK(checks.consensus.ran && !checks.consensus.error_result);
++        BOOST_CHECK_EQUAL(checks.standard.sigchecks, 1);
++        const auto r_pre = Admit(tx_pre, &checks);
++        const auto r_plain = Admit(tx_plain);
++        BOOST_CHECK(r_pre.m_result_type ==
++                    MempoolAcceptResult::ResultType::VALID);
++        CheckSameResult(r_pre, r_plain);
++        BOOST_CHECK(m_node.mempool->exists(tx_pre->GetId()));
++    }
++
++    // An invalid signature: the precomputed verdict and the ordinary one
++    // carry the same result, reason and debug message.
++    const auto good = SignedSpend(wallet, {wallet.outputs[10]}, 1, false);
++    const auto bad = WithBadSignature(good);
++    const auto checks = Precompute(bad, SpentOutputs(*bad));
++    BOOST_CHECK(checks.standard.error_result.has_value());
++    const auto r_pre = Admit(bad, &checks);
++    const auto r_plain = Admit(bad);
++    BOOST_CHECK(r_pre.m_result_type ==
++                MempoolAcceptResult::ResultType::INVALID);
++    CheckSameResult(r_pre, r_plain);
++    BOOST_CHECK(r_plain.m_state.GetResult() ==
++                TxValidationResult::TX_CONSENSUS);
++}
++
++BOOST_AUTO_TEST_CASE(precomputed_checks_used_only_when_they_match) {
++    const auto tx = SignedSpend(wallet, {wallet.outputs[20]}, 1, true);
++
++    // A matching outcome is what admission uses: a (deliberately false)
++    // recorded failure for exactly these spent outputs and flags is reported.
++    auto forged = Precompute(tx, SpentOutputs(*tx));
++    forged.standard.error_result = TxValidationResult::TX_NOT_STANDARD;
++    forged.standard.error_reason = "forged-for-test";
++    BOOST_CHECK_EQUAL(Admit(tx, &forged).m_state.GetRejectReason(),
++                      "forged-for-test");
++
++    // Different spent outputs (amount, then script): ignored, scripts run.
++    auto wrong_amount = forged;
++    wrong_amount.spent_outputs[0].nValue += SATOSHI;
++    auto wrong_script = forged;
++    wrong_script.spent_outputs[0].scriptPubKey = CScript() << OP_TRUE;
++    // Different flags: ignored.
++    auto wrong_flags = forged;
++    wrong_flags.standard.flags ^= SCRIPT_VERIFY_NULLFAIL;
++    // Checks for a different transaction: ignored.
++    auto wrong_tx = forged;
++    wrong_tx.txid = TxId(uint256::ONE);
++
++    for (const auto *checks :
++         {&wrong_amount, &wrong_script, &wrong_flags, &wrong_tx}) {
++        const auto r = Admit(tx, checks);
++        BOOST_CHECK(r.m_result_type == MempoolAcceptResult::ResultType::VALID);
++        LOCK(m_node.mempool->cs);
++        m_node.mempool->removeRecursive(*tx, MemPoolRemovalReason::CONFLICT);
++    }
++
++    // A missing input still fails as an orphan, whatever was precomputed.
++    const auto parent = SignedSpend(wallet, {wallet.outputs[21]}, 1, false);
++    const auto child = admission_test::SignedChild(wallet, parent, 0, false);
++    auto child_checks = Precompute(child, {parent->vout[0]});
++    BOOST_CHECK(!child_checks.standard.error_result);
++    const auto r = Admit(child, &child_checks);
++    BOOST_CHECK(r.m_state.GetResult() == TxValidationResult::TX_MISSING_INPUTS);
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/validation.cpp b/src/validation.cpp
+index e4447fbda10634f3f05cbdb4f4b8e37e1ffa60aa..6dbeace392015582d6cdf5a81def9eae4fa336c1 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -245,6 +245,15 @@ IsReplayProtectionEnabled(const Consensus::Params &params,
+            activation_time.value_or(params.sandersActivationTime);
+ }
+ 
++namespace {
++bool CheckInputScriptsReusing(
++    const CTransaction &tx, TxValidationState &state,
++    const CCoinsViewCache &inputs, const uint32_t flags, bool sigCacheStore,
++    bool scriptCacheStore, const PrecomputedAdmissionChecks *precomputed,
++    const ScriptCheckOutcome *outcome, ValidationCache &validation_cache,
++    int &nSigChecksOut) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
++} // namespace
++
+ /**
+  * Checks to avoid mempool polluting consensus critical paths since cached
+  * signature and script validity results will be reused if we validate this
+@@ -254,7 +263,8 @@ static bool CheckInputsFromMempoolAndCache(
+     const CTransaction &tx, TxValidationState &state,
+     const CCoinsViewCache &view, const CTxMemPool &pool, const uint32_t flags,
+     const PrecomputedTransactionData &txdata, ValidationCache &validation_cache,
+-    int &nSigChecksOut, CCoinsViewCache &coins_tip)
++    int &nSigChecksOut, CCoinsViewCache &coins_tip,
++    const PrecomputedAdmissionChecks *precomputed)
+     EXCLUSIVE_LOCKS_REQUIRED(cs_main, pool.cs) {
+     AssertLockHeld(cs_main);
+     AssertLockHeld(pool.cs);
+@@ -288,6 +298,12 @@ static bool CheckInputsFromMempoolAndCache(
+ 
+     // Call CheckInputScripts() to cache signature and script validity against
+     // current tip consensus rules.
++    if (precomputed != nullptr) {
++        return CheckInputScriptsReusing(
++            tx, state, view, flags, /*sigCacheStore=*/true,
++            /*scriptCacheStore=*/true, precomputed, &precomputed->consensus,
++            validation_cache, nSigChecksOut);
++    }
+     return CheckInputScripts(tx, state, view, flags, /*sigCacheStore=*/true,
+                              /*scriptCacheStore=*/true, txdata,
+                              validation_cache, nSigChecksOut);
+@@ -302,21 +318,27 @@ struct ParallelTxScriptError {
+     std::string debug_message;
+ };
+ 
+-std::optional<ParallelTxScriptError> VerifyTxScriptsFromResolvedCoins(
+-    const CTransaction &tx, const std::vector<Coin> &resolved_inputs,
+-    const uint32_t flags, bool sigCacheStore,
+-    const PrecomputedTransactionData &txdata, SignatureCache &signature_cache,
+-    int &nSigChecksOut, TxSigCheckLimiter &txLimitSigChecks,
+-    CheckInputsLimiter *pBlockLimitSigChecks,
+-    lotus::v2::BatchSigCollector *sig_collector,
+-    bool consensus_only = false) {
++/**
++ * Run every input script of tx against the outputs it spends, reporting a
++ * failure exactly as CheckInputScripts does (including the mandatory-flags
++ * recheck that distinguishes TX_NOT_STANDARD from TX_CONSENSUS). Takes no
++ * locks. spent_output(i) returns the output spent by input i.
++ */
++template <typename SpentOutput>
++std::optional<ParallelTxScriptError>
++VerifyTxScriptsAgainst(const CTransaction &tx, SpentOutput &&spent_output,
++                       const uint32_t flags, bool sigCacheStore,
++                       const PrecomputedTransactionData &txdata,
++                       SignatureCache &signature_cache, int &nSigChecksOut,
++                       TxSigCheckLimiter &txLimitSigChecks,
++                       CheckInputsLimiter *pBlockLimitSigChecks,
++                       lotus::v2::BatchSigCollector *sig_collector,
++                       bool consensus_only = false) {
+     assert(!tx.IsCoinBase());
+-    assert(resolved_inputs.size() == tx.vin.size());
+ 
+     int nSigChecksTotal = 0;
+     for (size_t i = 0; i < tx.vin.size(); i++) {
+-        assert(!resolved_inputs[i].IsSpent());
+-        const CTxOut &prev_txout = resolved_inputs[i].GetTxOut();
++        const CTxOut &prev_txout = spent_output(i);
+ 
+         CScriptCheck check(prev_txout, tx, signature_cache, i, flags,
+                            sigCacheStore, txdata, &txLimitSigChecks,
+@@ -352,6 +374,87 @@ std::optional<ParallelTxScriptError> VerifyTxScriptsFromResolvedCoins(
+     return std::nullopt;
+ }
+ 
++std::optional<ParallelTxScriptError> VerifyTxScriptsFromResolvedCoins(
++    const CTransaction &tx, const std::vector<Coin> &resolved_inputs,
++    const uint32_t flags, bool sigCacheStore,
++    const PrecomputedTransactionData &txdata, SignatureCache &signature_cache,
++    int &nSigChecksOut, TxSigCheckLimiter &txLimitSigChecks,
++    CheckInputsLimiter *pBlockLimitSigChecks,
++    lotus::v2::BatchSigCollector *sig_collector,
++    bool consensus_only = false) {
++    assert(resolved_inputs.size() == tx.vin.size());
++    return VerifyTxScriptsAgainst(
++        tx,
++        [&](size_t i) -> const CTxOut & {
++            assert(!resolved_inputs[i].IsSpent());
++            return resolved_inputs[i].GetTxOut();
++        },
++        flags, sigCacheStore, txdata, signature_cache, nSigChecksOut,
++        txLimitSigChecks, pBlockLimitSigChecks, sig_collector, consensus_only);
++}
++
++/** Whether every input of tx spends, in view, exactly the given outputs. */
++bool SpentOutputsMatch(const CTransaction &tx, const CCoinsViewCache &view,
++                       const std::vector<CTxOut> &spent_outputs) {
++    if (spent_outputs.size() != tx.vin.size()) {
++        return false;
++    }
++    for (size_t i = 0; i < tx.vin.size(); ++i) {
++        const Coin &coin = view.AccessCoin(tx.vin[i].prevout);
++        if (coin.IsSpent() || !(coin.GetTxOut() == spent_outputs[i])) {
++            return false;
++        }
++    }
++    return true;
++}
++
++/**
++ * CheckInputScripts, but when `outcome` was computed for these flags and for
++ * exactly the outputs `inputs` provides, reuse it instead of executing the
++ * scripts again. The script execution cache is consulted and updated exactly
++ * as CheckInputScripts would, so the verdict, sigcheck count and cache state
++ * are the same either way.
++ */
++bool CheckInputScriptsReusing(
++    const CTransaction &tx, TxValidationState &state,
++    const CCoinsViewCache &inputs, const uint32_t flags, bool sigCacheStore,
++    bool scriptCacheStore, const PrecomputedAdmissionChecks *precomputed,
++    const ScriptCheckOutcome *outcome, ValidationCache &validation_cache,
++    int &nSigChecksOut) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
++    AssertLockHeld(cs_main);
++    if (precomputed == nullptr || outcome == nullptr || !outcome->ran ||
++        outcome->flags != flags ||
++        !SpentOutputsMatch(tx, inputs, precomputed->spent_outputs)) {
++        return CheckInputScripts(tx, state, inputs, flags, sigCacheStore,
++                                 scriptCacheStore, tx.GetPrecomputedData(),
++                                 validation_cache, nSigChecksOut);
++    }
++    ScriptCacheKey hashCacheEntry(
++        tx, flags, validation_cache.ScriptExecutionCacheHasher());
++    ScriptCacheElement elem(hashCacheEntry, 0);
++    const bool found_in_cache = validation_cache.m_script_execution_cache.get(
++        elem, /*erase=*/!scriptCacheStore);
++    nSigChecksOut = elem.nSigChecks;
++    if (found_in_cache) {
++        TxSigCheckLimiter txLimitSigChecks;
++        if (!txLimitSigChecks.consume_and_check(nSigChecksOut)) {
++            return state.Invalid(TxValidationResult::TX_CONSENSUS,
++                                 "too-many-sigchecks");
++        }
++        return true;
++    }
++    if (outcome->error_result.has_value()) {
++        return state.Invalid(*outcome->error_result, outcome->error_reason,
++                             outcome->error_debug);
++    }
++    nSigChecksOut = outcome->sigchecks;
++    if (scriptCacheStore) {
++        validation_cache.m_script_execution_cache.insert(
++            ScriptCacheElement{hashCacheEntry, outcome->sigchecks});
++    }
++    return true;
++}
++
+ class ParallelScriptWorkerPool {
+ public:
+     static ParallelScriptWorkerPool &Instance() {
+@@ -617,8 +720,9 @@ public:
+     };
+ 
+     // Single transaction acceptance
+-    MempoolAcceptResult AcceptSingleTransaction(const CTransactionRef &ptx,
+-                                                ATMPArgs &args)
++    MempoolAcceptResult AcceptSingleTransaction(
++        const CTransactionRef &ptx, ATMPArgs &args,
++        const PrecomputedAdmissionChecks *precomputed = nullptr)
+         EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+ 
+     /**
+@@ -730,6 +834,9 @@ private:
+         std::vector<CTxMemPool::txiter> m_mempool_parent_iters;
+         bool m_has_mempool_parents{false};
+         bool m_inputs_pre_resolved{false};
++
++        // Checks done outside the locks, reused where they match.
++        const PrecomputedAdmissionChecks *m_precomputed{nullptr};
+     };
+ 
+     struct TxIdIndexSlot {
+@@ -1217,9 +1324,11 @@ bool MemPoolAccept::PreChecks(ATMPArgs &args, Workspace &ws,
+     // Validate input scripts against standard script flags.
+     const uint32_t scriptVerifyFlags =
+         ws.m_next_block_script_verify_flags | STANDARD_SCRIPT_VERIFY_FLAGS;
+-    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false,
+-                           tx.GetPrecomputedData(), GetValidationCache(),
+-                           ws.m_sig_checks_standard)) {
++    if (!CheckInputScriptsReusing(
++            tx, state, m_view, scriptVerifyFlags, /*sigCacheStore=*/true,
++            /*scriptCacheStore=*/false, ws.m_precomputed,
++            ws.m_precomputed ? &ws.m_precomputed->standard : nullptr,
++            GetValidationCache(), ws.m_sig_checks_standard)) {
+         // State filled in by CheckInputScripts
+         return false;
+     }
+@@ -1295,7 +1404,7 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs &args, Workspace &ws) {
+     if (!CheckInputsFromMempoolAndCache(
+             tx, state, m_view, m_pool, ws.m_next_block_script_verify_flags,
+             tx.GetPrecomputedData(), GetValidationCache(), nSigChecksConsensus,
+-            m_active_chainstate.CoinsTip())) {
++            m_active_chainstate.CoinsTip(), ws.m_precomputed)) {
+         // This can occur under some circumstances, if the node receives an
+         // unrequested tx which is invalid due to new consensus rules not
+         // being activated yet (during IBD).
+@@ -1448,9 +1557,9 @@ bool MemPoolAccept::SubmitPackage(
+     return all_submitted;
+ }
+ 
+-MempoolAcceptResult
+-MemPoolAccept::AcceptSingleTransaction(const CTransactionRef &ptx,
+-                                       ATMPArgs &args) {
++MempoolAcceptResult MemPoolAccept::AcceptSingleTransaction(
++    const CTransactionRef &ptx, ATMPArgs &args,
++    const PrecomputedAdmissionChecks *precomputed) {
+     AssertLockHeld(cs_main);
+     // mempool "read lock" (held through
+     // m_pool.m_opts.signals->TransactionAddedToMempool())
+@@ -1460,6 +1569,16 @@ MemPoolAccept::AcceptSingleTransaction(const CTransactionRef &ptx,
+ 
+     Workspace ws(ptx,
+                  GetNextBlockScriptFlags(tip, m_active_chainstate.m_chainman));
++    if (precomputed != nullptr && precomputed->txid == ptx->GetId()) {
++        ws.m_precomputed = precomputed;
++        // CheckRegularTransaction is context-free: its result for this
++        // transaction holds whenever it was computed.
++        if (precomputed->regular_tx_checked) {
++            ws.m_regular_tx_checked = true;
++            ws.m_regular_tx_valid = precomputed->regular_tx_valid;
++            ws.m_regular_tx_state = precomputed->regular_tx_state;
++        }
++    }
+ 
+     const std::vector<TxId> single_txid{ws.m_ptx->GetId()};
+ 
+@@ -2368,12 +2487,12 @@ uint64_t GetMempoolAdmissionAttempts() noexcept {
+     return g_mempool_admission_attempts.load(std::memory_order_relaxed);
+ }
+ 
+-MempoolAcceptResult AcceptToMemoryPool(Chainstate &active_chainstate,
+-                                       const CTransactionRef &tx,
+-                                       int64_t accept_time, bool bypass_limits,
+-                                       bool test_accept,
+-                                       unsigned int heightOverride,
+-                                       const MempoolAdmissionLimits &limits) {
++MempoolAcceptResult
++AcceptToMemoryPool(Chainstate &active_chainstate, const CTransactionRef &tx,
++                   int64_t accept_time, bool bypass_limits, bool test_accept,
++                   unsigned int heightOverride,
++                   const MempoolAdmissionLimits &limits,
++                   const PrecomputedAdmissionChecks *precomputed) {
+     AssertLockHeld(::cs_main);
+     g_mempool_admission_attempts.fetch_add(1, std::memory_order_relaxed);
+     assert(active_chainstate.GetMempool() != nullptr);
+@@ -2384,8 +2503,9 @@ MempoolAcceptResult AcceptToMemoryPool(Chainstate &active_chainstate,
+         active_chainstate.m_chainman.GetConfig(), accept_time, bypass_limits,
+         coins_to_uncache, test_accept, heightOverride);
+     args.m_limits = limits;
+-    MempoolAcceptResult result = MemPoolAccept(pool, active_chainstate)
+-                                     .AcceptSingleTransaction(tx, args);
++    MempoolAcceptResult result =
++        MemPoolAccept(pool, active_chainstate)
++            .AcceptSingleTransaction(tx, args, precomputed);
+     if (!test_accept) {
+         RecordMempoolAdmission(result);
+     }
+@@ -2451,6 +2571,52 @@ PackageMempoolAcceptResult ProcessNewPackage(Chainstate &active_chainstate,
+     return result;
+ }
+ 
++uint32_t GetMempoolScriptFlags(const Chainstate &active_chainstate) {
++    AssertLockHeld(cs_main);
++    return GetNextBlockScriptFlags(active_chainstate.m_chain.Tip(),
++                                   active_chainstate.m_chainman);
++}
++
++void ComputeAdmissionChecks(const CTransaction &tx,
++                            uint32_t next_block_script_flags,
++                            ValidationCache &validation_cache,
++                            PrecomputedAdmissionChecks &out) {
++    out.txid = tx.GetId();
++    out.regular_tx_checked = true;
++    out.regular_tx_valid = CheckRegularTransaction(tx, out.regular_tx_state);
++    if (!out.regular_tx_valid || tx.IsCoinBase() ||
++        out.spent_outputs.size() != tx.vin.size()) {
++        return;
++    }
++    const PrecomputedTransactionData &txdata = tx.GetPrecomputedData();
++    auto run = [&](ScriptCheckOutcome &outcome, uint32_t flags) {
++        outcome.flags = flags;
++        outcome.ran = true;
++        TxSigCheckLimiter tx_limit_sigchecks;
++        int sigchecks = 0;
++        auto error = VerifyTxScriptsAgainst(
++            tx,
++            [&](size_t i) -> const CTxOut & { return out.spent_outputs[i]; },
++            flags, /*sigCacheStore=*/true, txdata,
++            validation_cache.m_signature_cache, sigchecks, tx_limit_sigchecks,
++            /*pBlockLimitSigChecks=*/nullptr, /*sig_collector=*/nullptr);
++        if (error.has_value()) {
++            outcome.error_result = error->result;
++            outcome.error_reason = std::move(error->reject_reason);
++            outcome.error_debug = std::move(error->debug_message);
++            outcome.sigchecks = 0;
++        } else {
++            outcome.sigchecks = sigchecks;
++        }
++    };
++    // Same order as admission: policy flags first, consensus flags only for
++    // a transaction that passes them.
++    run(out.standard, next_block_script_flags | STANDARD_SCRIPT_VERIFY_FLAGS);
++    if (!out.standard.error_result.has_value()) {
++        run(out.consensus, next_block_script_flags);
++    }
++}
++
+ void PrecomputeSingleTxData(const CTransaction &tx,
+                             PrecomputedBatchTxData &out) {
+     out.regular_tx_checked = true;
+diff --git a/src/validation.h b/src/validation.h
+index bdada508b0cbe9c07810a37d4c4420cdef9fb55c..a5528286194b727f011301c7146678707a29b7c3 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -334,6 +334,64 @@ struct MempoolAdmissionLimits {
+ /** Diagnostic count of single-transaction admission attempts, including dry runs. */
+ uint64_t GetMempoolAdmissionAttempts() noexcept;
+ 
++class ValidationCache;
++
++/**
++ * The outcome of running a transaction's input scripts with one set of
++ * script verification flags against given spent outputs.
++ */
++struct ScriptCheckOutcome {
++    uint32_t flags{0};
++    bool ran{false};
++    /** Set when a script failed; mirrors what CheckInputScripts reports. */
++    std::optional<TxValidationResult> error_result;
++    std::string error_reason;
++    std::string error_debug;
++    int sigchecks{0};
++};
++
++/**
++ * Admission work for one transaction that can be done without cs_main or
++ * the mempool lock: context-free checks and script verification against the
++ * spent outputs that were current when they were looked up.
++ *
++ * Script validity depends only on the transaction, the outputs it spends and
++ * the verification flags. Admission uses an outcome here only when the flags
++ * and every spent output (amount and scriptPubKey) equal what it resolves
++ * itself under the locks; otherwise it verifies the scripts as usual. Using
++ * a matching outcome therefore cannot change any admission verdict.
++ */
++struct PrecomputedAdmissionChecks {
++    /** The transaction these checks are for; any other is not served. */
++    TxId txid;
++    /** Outputs spent by each input, in input order, when looked up. */
++    std::vector<CTxOut> spent_outputs;
++    bool regular_tx_checked{false};
++    bool regular_tx_valid{false};
++    TxValidationState regular_tx_state;
++    /** next-block flags | STANDARD_SCRIPT_VERIFY_FLAGS (policy checks). */
++    ScriptCheckOutcome standard;
++    /** next-block flags (consensus checks, cached on success). */
++    ScriptCheckOutcome consensus;
++};
++
++/** Script verification flags admission uses for the block after the tip. */
++uint32_t GetMempoolScriptFlags(const Chainstate &active_chainstate)
++    EXCLUSIVE_LOCKS_REQUIRED(cs_main);
++
++/**
++ * Fill `out` for tx: CheckRegularTransaction, then input scripts with the
++ * standard and, if those pass, the consensus flags for the next block.
++ * Takes no locks and touches only thread-safe state (the signature cache and
++ * the transaction's own sighash cache), so it may run concurrently for many
++ * transactions. `out.spent_outputs` must be set by the caller; `out.txid`
++ * is set here.
++ */
++void ComputeAdmissionChecks(const CTransaction &tx,
++                            uint32_t next_block_script_flags,
++                            ValidationCache &validation_cache,
++                            PrecomputedAdmissionChecks &out);
++
+ /**
+  * Try to add a transaction to the mempool. This is an internal function and is
+  * exposed only for testing. Client code should use
+@@ -352,6 +410,10 @@ uint64_t GetMempoolAdmissionAttempts() noexcept;
+  *                                submit to mempool.
+  * @param[in]  heightOverride     Override the block height of the transaction.
+  *                                Used only upon reorg.
++ * @param[in]  limits             Optional caller fee limits.
++ * @param[in]  precomputed        Optional checks done outside the locks; used
++ *                                only where they match (see
++ *                                PrecomputedAdmissionChecks).
+  *
+  * @returns a MempoolAcceptResult indicating whether the transaction was
+  *     accepted/rejected with reason.
+@@ -360,7 +422,8 @@ MempoolAcceptResult
+ AcceptToMemoryPool(Chainstate &active_chainstate, const CTransactionRef &tx,
+                    int64_t accept_time, bool bypass_limits,
+                    bool test_accept = false, unsigned int heightOverride = 0,
+-                   const MempoolAdmissionLimits &limits = {})
++                   const MempoolAdmissionLimits &limits = {},
++                   const PrecomputedAdmissionChecks *precomputed = nullptr)
+     EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+ 
+ /**
+-- 
+2.50.1 (Apple Git-155)
+

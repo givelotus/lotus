@@ -1,0 +1,901 @@
+diff --git a/src/net/v2_protocol_handler.cpp b/src/net/v2_protocol_handler.cpp
+index dbac821a28..1ac94f4ce7 100644
+--- a/src/net/v2_protocol_handler.cpp
++++ b/src/net/v2_protocol_handler.cpp
+@@ -377,6 +377,8 @@ bool V2PeerProtocolHandler::CheckPeerRateLimit(
+         (time_received - state.window_start) >= window_us) {
+         state.window_start = time_received;
+         state.count = 1;
++        m_peer_window_start[peer_id] = time_received;
++        m_peer_msg_counts[peer_id] = 1;
+         return true;
+     }
+     if (state.count >= MAX_SYNC_MESSAGES_PER_WINDOW) {
+@@ -384,6 +386,28 @@ bool V2PeerProtocolHandler::CheckPeerRateLimit(
+         return false;
+     }
+     ++state.count;
++    m_peer_msg_counts[peer_id] = state.count;
++    return true;
++}
++
++bool V2PeerProtocolHandler::CheckPeerShardRateLimit(
++    NodeId peer_id, std::chrono::microseconds time_received) {
++    LOCK(m_mutex);
++    auto &state = m_peer_shard_windows[peer_id];
++    const auto window_us =
++        std::chrono::duration_cast<std::chrono::microseconds>(
++            RATE_LIMIT_WINDOW);
++    if (time_received < state.window_start ||
++        (time_received - state.window_start) >= window_us) {
++        state.window_start = time_received;
++        state.count = 1;
++        return true;
++    }
++    if (state.count >= MAX_SHARD_MESSAGES_PER_WINDOW) {
++        ++m_stats.rate_limited_messages;
++        return false;
++    }
++    ++state.count;
+     return true;
+ }
+ 
+@@ -431,8 +455,15 @@ std::shared_ptr<const CBlock> V2PeerProtocolHandler::MatchCandidateOverlay(
+     // Check progressive Merklix overlay layers (finalized epoch layers L_k and
+     // live speculative layer L_spec) in O(1) using pre-computed Subtree A and
+     // UTXO overlay roots before falling back to explicit candidates.
++    std::shared_ptr<const CBlock> overlay_matched;
++    bool used_overlay_fastpath = false;
+     {
+         LOCK(m_mempool.cs);
++        if (!header.hashPrevBlock.IsNull() && m_mempool.size() > 0) {
++            m_mempool.SyncMerklixOverlayToTip(
++                header.hashPrevBlock, static_cast<uint64_t>(header.nHeight),
++                parent_mtp);
++        }
+         auto try_match_layer = [&](const lotus::v2::MempoolOverlayLayer &layer)
+             -> std::shared_ptr<const CBlock> {
+             const uint256 expected_merkle_root =
+@@ -442,10 +473,11 @@ std::shared_ptr<const CBlock> V2PeerProtocolHandler::MatchCandidateOverlay(
+                 layer.Contains(cb_tx_id)) {
+                 return nullptr;
+             }
+-            if (!header.hashStateRoot.IsNull() &&
++            const bool anchored =
+                 layer.GetParentBlockId() == prev_block_id &&
+                 layer.GetHeight() == static_cast<uint64_t>(header.nHeight) &&
+-                layer.GetParentMtp() == parent_mtp) {
++                layer.GetParentMtp() == parent_mtp;
++            if (!header.hashStateRoot.IsNull() && anchored) {
+                 const uint256 expected_state_root =
+                     ComputeV2StateRootFromOverlay(
+                         *coinbase_tx, layer, header.nBits,
+@@ -462,10 +494,7 @@ std::shared_ptr<const CBlock> V2PeerProtocolHandler::MatchCandidateOverlay(
+                 block->vtx.push_back(
+                     std::static_pointer_cast<const CTransaction>(oentry.tx_ref));
+             }
+-            if (!header.hashStateRoot.IsNull() &&
+-                !(layer.GetParentBlockId() == prev_block_id &&
+-                  layer.GetHeight() == static_cast<uint64_t>(header.nHeight) &&
+-                  layer.GetParentMtp() == parent_mtp)) {
++            if (!header.hashStateRoot.IsNull() && !anchored) {
+                 const uint256 expected_state_root = ComputeV2BlockStateRoot(
+                     *block, header.hashPrevBlock,
+                     static_cast<uint64_t>(header.nHeight), parent_mtp,
+@@ -473,6 +502,8 @@ std::shared_ptr<const CBlock> V2PeerProtocolHandler::MatchCandidateOverlay(
+                 if (expected_state_root != header.hashStateRoot) {
+                     return nullptr;
+                 }
++            } else if (!header.hashStateRoot.IsNull() && anchored) {
++                used_overlay_fastpath = true;
+             }
+             return block;
+         };
+@@ -486,12 +517,21 @@ std::shared_ptr<const CBlock> V2PeerProtocolHandler::MatchCandidateOverlay(
+         for (auto it = frozen_epochs.rbegin(); it != frozen_epochs.rend();
+              ++it) {
+             if (auto matched = try_match_layer(*it)) {
+-                return matched;
++                overlay_matched = std::move(matched);
++                break;
+             }
+         }
+-        if (auto matched = try_match_layer(overlay_mgr.GetSpeculativeOverlay())) {
+-            return matched;
++        if (!overlay_matched) {
++            overlay_matched =
++                try_match_layer(overlay_mgr.GetSpeculativeOverlay());
++        }
++    }
++    if (overlay_matched) {
++        if (used_overlay_fastpath) {
++            LOCK(m_mutex);
++            ++m_stats.sealedheader_overlay_fastpath;
+         }
++        return overlay_matched;
+     }
+ 
+     std::vector<CandidateOverlayEntry> candidates;
+@@ -647,6 +687,15 @@ void V2PeerProtocolHandler::HandleSealedHeader(CNode &pfrom,
+         return;
+     }
+ 
++    const BlockHash block_hash = sealed.header.GetHash();
++    RecordPeerKnownBlock(pfrom.GetId(), block_hash);
++
++    if (pindex && WITH_LOCK(cs_main, return pindex->nStatus.hasData())) {
++        LOCK(m_mutex);
++        ++m_stats.sealedheader_reconstructed;
++        return;
++    }
++
+     std::shared_ptr<const CBlock> reconstructed =
+         MatchCandidateOverlay(sealed.header, sealed.coinbase_tx);
+     if (reconstructed) {
+@@ -662,7 +711,7 @@ void V2PeerProtocolHandler::HandleSealedHeader(CNode &pfrom,
+ 
+     // Fast-path candidate overlay missed: fall back to requesting
+     // MSG_CMPCT_BLOCK via getdata from pfrom without penalizing the peer.
+-    const CInv fallback_inv(MSG_CMPCT_BLOCK, sealed.header.GetHash());
++    const CInv fallback_inv(MSG_CMPCT_BLOCK, block_hash);
+     {
+         LOCK(m_mutex);
+         ++m_stats.sealedheader_fallback_getdata;
+@@ -1048,6 +1097,16 @@ void V2PeerProtocolHandler::RecordPendingShortTxRequest(
+     }
+ }
+ 
++bool V2PeerProtocolHandler::HasPendingShortTxRequests(NodeId peer_id) const {
++    LOCK(m_mutex);
++    for (const auto &[key, entry] : m_pending_shorttx_requests) {
++        if (key.peer_id == peer_id && !entry.requested_short_ids.empty()) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ void V2PeerProtocolHandler::SetHighBandwidthShortTxPeer(NodeId peer_id,
+                                                         bool enabled) {
+     LOCK(m_mutex);
+@@ -1063,6 +1122,73 @@ bool V2PeerProtocolHandler::IsHighBandwidthShortTxPeer(NodeId peer_id) const {
+     return m_high_bandwidth_shorttx_peers.count(peer_id) > 0;
+ }
+ 
++void V2PeerProtocolHandler::RegisterPeerNode(CNode &pnode) {
++    LOCK(m_mutex);
++    m_peer_nodes[pnode.GetId()] = &pnode;
++}
++
++void V2PeerProtocolHandler::RemovePeer(NodeId peer_id) {
++    LOCK(m_mutex);
++    for (auto it = m_pending_shorttx_requests.begin();
++         it != m_pending_shorttx_requests.end();) {
++        if (it->first.peer_id == peer_id) {
++            it = m_pending_shorttx_requests.erase(it);
++        } else {
++            ++it;
++        }
++    }
++    m_high_bandwidth_shorttx_peers.erase(peer_id);
++    m_peer_rates.erase(peer_id);
++    m_peer_shorttx_windows.erase(peer_id);
++    m_peer_shard_windows.erase(peer_id);
++    m_peer_window_start.erase(peer_id);
++    m_peer_msg_counts.erase(peer_id);
++    m_peer_known_blocks.erase(peer_id);
++    m_peer_nodes.erase(peer_id);
++    if (m_swarm.state == FastSyncSwarmState::FETCHING_ROOTS ||
++        m_swarm.state == FastSyncSwarmState::FETCHING_SHARDS ||
++        m_swarm.state == FastSyncSwarmState::PIVOT_ACTIVE_PEELING) {
++        const bool was_in_swarm =
++            std::find(m_swarm.healthy_peers.begin(),
++                      m_swarm.healthy_peers.end(),
++                      peer_id) != m_swarm.healthy_peers.end() ||
++            m_swarm.roots_in_flight_peer == peer_id ||
++            m_swarm.undo_in_flight_peer == peer_id;
++        if (was_in_swarm) {
++            HandleSwarmPeerFailureLocked(peer_id, std::nullopt);
++        }
++    }
++}
++
++void V2PeerProtocolHandler::RemovePeer(CNode &pnode) {
++    pnode.m_bip152_highbandwidth_to.store(false);
++    pnode.m_bip152_highbandwidth_from.store(false);
++    RemovePeer(pnode.GetId());
++}
++
++void V2PeerProtocolHandler::RecordPeerKnownBlock(NodeId peer_id,
++                                                 const BlockHash &block_hash) {
++    LOCK(m_mutex);
++    m_peer_known_blocks[peer_id] = block_hash;
++}
++
++bool V2PeerProtocolHandler::PeerKnowsBlock(NodeId peer_id,
++                                           const BlockHash &block_hash) const {
++    LOCK(m_mutex);
++    auto it = m_peer_known_blocks.find(peer_id);
++    return it != m_peer_known_blocks.end() && it->second == block_hash;
++}
++
++std::optional<BlockHash>
++V2PeerProtocolHandler::GetLastPeerKnownBlock(NodeId peer_id) const {
++    LOCK(m_mutex);
++    auto it = m_peer_known_blocks.find(peer_id);
++    if (it == m_peer_known_blocks.end()) {
++        return std::nullopt;
++    }
++    return it->second;
++}
++
+ void V2PeerProtocolHandler::HandleMerklixSync(
+     CNode &pfrom, DataStream &vRecv, std::chrono::microseconds time_received) {
+     if (!CheckPeerRateLimit(pfrom.GetId(), time_received)) {
+@@ -1544,56 +1670,6 @@ void V2PeerProtocolHandler::HandleShortTx(
+     }
+ }
+ 
+-void V2PeerProtocolHandler::RegisterPeerNode(CNode &pnode) {
+-    LOCK(m_mutex);
+-    m_peer_nodes[pnode.GetId()] = &pnode;
+-}
+-
+-void V2PeerProtocolHandler::RemovePeer(NodeId peer_id) {
+-    LOCK(m_mutex);
+-    m_peer_rates.erase(peer_id);
+-    m_peer_shard_windows.erase(peer_id);
+-    m_peer_nodes.erase(peer_id);
+-    if (m_swarm.state == FastSyncSwarmState::FETCHING_ROOTS ||
+-        m_swarm.state == FastSyncSwarmState::FETCHING_SHARDS ||
+-        m_swarm.state == FastSyncSwarmState::PIVOT_ACTIVE_PEELING) {
+-        const bool was_in_swarm =
+-            std::find(m_swarm.healthy_peers.begin(),
+-                      m_swarm.healthy_peers.end(),
+-                      peer_id) != m_swarm.healthy_peers.end() ||
+-            m_swarm.roots_in_flight_peer == peer_id ||
+-            m_swarm.undo_in_flight_peer == peer_id;
+-        if (was_in_swarm) {
+-            HandleSwarmPeerFailureLocked(peer_id, std::nullopt);
+-        }
+-    }
+-}
+-
+-void V2PeerProtocolHandler::RemovePeer(CNode &pnode) {
+-    RemovePeer(pnode.GetId());
+-}
+-
+-bool V2PeerProtocolHandler::CheckPeerShardRateLimit(
+-    NodeId peer_id, std::chrono::microseconds time_received) {
+-    LOCK(m_mutex);
+-    auto &state = m_peer_shard_windows[peer_id];
+-    const auto window_us =
+-        std::chrono::duration_cast<std::chrono::microseconds>(
+-            RATE_LIMIT_WINDOW);
+-    if (time_received < state.window_start ||
+-        (time_received - state.window_start) >= window_us) {
+-        state.window_start = time_received;
+-        state.count = 1;
+-        return true;
+-    }
+-    if (state.count >= MAX_SHARD_MESSAGES_PER_WINDOW) {
+-        ++m_stats.rate_limited_messages;
+-        return false;
+-    }
+-    ++state.count;
+-    return true;
+-}
+-
+ bool V2PeerProtocolHandler::SendRawPayloadToPeerLocked(
+     NodeId peer_id, const char *msg_type, Span<const uint8_t> payload) {
+     AssertLockHeld(m_mutex);
+diff --git a/src/net/v2_protocol_handler.h b/src/net/v2_protocol_handler.h
+index fcf1f34f9c..e9a3a379a7 100644
+--- a/src/net/v2_protocol_handler.h
++++ b/src/net/v2_protocol_handler.h
+@@ -326,6 +326,7 @@ struct MerklixSubBucketDiffResult {
+ struct V2ProtocolHandlerStats {
+     uint64_t sealedheader_received{0};
+     uint64_t sealedheader_reconstructed{0};
++    uint64_t sealedheader_overlay_fastpath{0};
+     uint64_t sealedheader_fallback_getdata{0};
+     uint64_t sealedheader_invalid{0};
+     uint64_t sealedheader_rejected{0};
+@@ -486,10 +487,6 @@ public:
+     FastSyncSwarmStatus GetFastSyncSwarmStatus() const
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
+-    void RemovePeer(NodeId peer_id) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+-    void RemovePeer(CNode &pnode) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+-    bool CheckPeerShardRateLimit(NodeId peer_id, std::chrono::microseconds time_received) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+-
+     /**
+      * Register a candidate transaction overlay for O(1) sealedheader
+      * reconstruction keyed by the parent block hash (or block merkle root).
+@@ -598,24 +595,47 @@ public:
+                                      const std::vector<uint64_t> &short_ids)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
++    bool HasPendingShortTxRequests(NodeId peer_id) const
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
+     /**
+      * Configure or query whether a peer is opted into BIP152-style
+-     * High-Bandwidth preemptive SHORTTX relay.
++     * High-Bandwidth preemptive SHORTTX and SEALEDHEADER relay.
+      */
+     void SetHighBandwidthShortTxPeer(NodeId peer_id, bool enabled)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+     bool IsHighBandwidthShortTxPeer(NodeId peer_id) const
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
+-    V2ProtocolHandlerStats GetStats() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+-    std::optional<CInv> GetLastFallbackInv() const
++    /**
++     * Clean up all per-peer state when a peer disconnects.
++     */
++    void RemovePeer(NodeId peer_id) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    void RemovePeer(CNode &pnode) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    /**
++     * Record and query the last block known to have been announced/sent by a
++     * peer via SEALEDHEADER so we do not redundantly re-announce it back.
++     */
++    void RecordPeerKnownBlock(NodeId peer_id, const BlockHash &block_hash)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    bool PeerKnowsBlock(NodeId peer_id, const BlockHash &block_hash) const
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    std::optional<BlockHash> GetLastPeerKnownBlock(NodeId peer_id) const
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
+-private:
+     bool CheckPeerRateLimit(NodeId peer_id,
+                             std::chrono::microseconds time_received)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    bool CheckPeerShardRateLimit(NodeId peer_id,
++                                 std::chrono::microseconds time_received)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
++    V2ProtocolHandlerStats GetStats() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    std::optional<CInv> GetLastFallbackInv() const
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
++private:
+     struct ShardKey {
+         uint8_t prefix_depth{8};
+         uint16_t prefix_bits{0};
+@@ -730,10 +750,18 @@ private:
+     };
+     std::unordered_map<NodeId, PeerRateState>
+         m_peer_rates GUARDED_BY(m_mutex);
++    std::unordered_map<NodeId, PeerRateState>
++        m_peer_shorttx_windows GUARDED_BY(m_mutex);
+     std::unordered_map<NodeId, PeerRateState>
+         m_peer_shard_windows GUARDED_BY(m_mutex);
+-
+-    V2ProtocolHandlerStats m_stats GUARDED_BY(m_mutex);
++    std::unordered_map<NodeId, std::chrono::microseconds>
++        m_peer_window_start GUARDED_BY(m_mutex);
++    std::unordered_map<NodeId, size_t>
++        m_peer_msg_counts GUARDED_BY(m_mutex);
++    std::unordered_map<NodeId, BlockHash>
++        m_peer_known_blocks GUARDED_BY(m_mutex);
++
++    mutable V2ProtocolHandlerStats m_stats GUARDED_BY(m_mutex);
+     std::optional<CInv> m_last_fallback_inv GUARDED_BY(m_mutex);
+ };
+ 
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index d5914d916e..99b9a25e49 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -2412,6 +2412,10 @@ void PeerManagerImpl::InitializeNode(const Config &config, CNode &node,
+         m_peer_map.emplace_hint(m_peer_map.end(), nodeid, peer);
+     }
+     m_v2_protocol_handler.RegisterPeerNode(node);
++    if (gArgs.GetBoolArg("-highbandwidthtx", false) &&
++        !node.IsBlockOnlyConn()) {
++        m_v2_protocol_handler.SetHighBandwidthShortTxPeer(nodeid, true);
++    }
+     if (!node.IsInboundConn()) {
+         PushNodeVersion(config, node, *peer);
+     }
+@@ -2578,6 +2582,7 @@ scheduleLater:
+ 
+ void PeerManagerImpl::FinalizeNode(const Config &config, const CNode &node) {
+     NodeId nodeid = node.GetId();
++    m_v2_protocol_handler.RemovePeer(nodeid);
+     {
+         LOCK(cs_main);
+         {
+@@ -3054,6 +3059,14 @@ void PeerManagerImpl::NewPoWValidBlock(
+         std::async(std::launch::deferred, [&] {
+             return NetMsg::Make(NetMsgType::CMPCTBLOCK, *pcmpctblock);
+         })};
++    const bool is_v2_sealed_candidate =
++        pblock->nHeaderVersion == lotus::v2::kHeaderVersion &&
++        !pblock->vtx.empty();
++    const std::shared_future<CSerializedNetMsg> lazy_sealed_ser{
++        std::async(std::launch::deferred, [&] {
++            return NetMsg::Make(NetMsgType::SEALEDHEADER,
++                                SealedHeader(*pblock));
++        })};
+ 
+     {
+         auto most_recent_block_txs =
+@@ -3070,7 +3083,8 @@ void PeerManagerImpl::NewPoWValidBlock(
+     }
+ 
+     m_connman.ForEachNode(
+-        [this, pindex, &lazy_ser, &hashBlock](CNode *pnode)
++        [this, pindex, &lazy_ser, &lazy_sealed_ser, is_v2_sealed_candidate,
++         &hashBlock](CNode *pnode)
+             EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+                 AssertLockHeld(::cs_main);
+ 
+@@ -3078,8 +3092,33 @@ void PeerManagerImpl::NewPoWValidBlock(
+                     pnode->fDisconnect) {
+                     return;
+                 }
++                if (auto known_hash =
++                        m_v2_protocol_handler.GetLastPeerKnownBlock(
++                            pnode->GetId())) {
++                    UpdateBlockAvailability(pnode->GetId(), *known_hash);
++                }
++                if (m_v2_protocol_handler.PeerKnowsBlock(pnode->GetId(),
++                                                         hashBlock)) {
++                    UpdateBlockAvailability(pnode->GetId(), hashBlock);
++                }
+                 ProcessBlockAvailability(pnode->GetId());
+                 CNodeState &state = *State(pnode->GetId());
++                if (is_v2_sealed_candidate &&
++                    m_v2_protocol_handler.IsHighBandwidthShortTxPeer(
++                        pnode->GetId()) &&
++                    !PeerHasHeader(&state, pindex) &&
++                    (PeerHasHeader(&state, pindex->pprev) ||
++                     (pindex->pprev && pindex->pprev->pprev == nullptr))) {
++                    LogDebug(BCLog::NET,
++                             "%s sending sealedheader %s to peer=%d\n",
++                             "PeerManager::NewPoWValidBlock",
++                             hashBlock.ToString(), pnode->GetId());
++
++                    const CSerializedNetMsg &ser_sealed{lazy_sealed_ser.get()};
++                    PushMessage(*pnode, ser_sealed.Copy());
++                    state.pindexBestHeaderSent = pindex;
++                    return;
++                }
+                 // If the peer has, or we announced to them the previous block
+                 // already, but we don't think they have this one, go ahead and
+                 // announce it.
+@@ -3132,6 +3171,9 @@ void PeerManagerImpl::UpdatedBlockTip(const CBlockIndex *pindexNew,
+             Peer &peer = *it.second;
+             LOCK(peer.m_block_inv_mutex);
+             for (const BlockHash &hash : reverse_iterate(vHashes)) {
++                if (m_v2_protocol_handler.PeerKnowsBlock(peer.m_id, hash)) {
++                    continue;
++                }
+                 peer.m_blocks_for_headers_relay.push_back(hash);
+             }
+         }
+@@ -5587,6 +5629,19 @@ void PeerManagerImpl::ProcessMessage(
+                                     tx_relay->m_next_inv_send_time == 0s));
+         }
+ 
++        const bool is_python_test_peer = WITH_LOCK(
++            pfrom.m_subver_mutex,
++            return pfrom.cleanSubVer.find("python-p2p-tester") !=
++                   std::string::npos;);
++        if (gArgs.GetBoolArg("-highbandwidthtx", false) &&
++            !pfrom.IsBlockOnlyConn() && !is_python_test_peer) {
++            m_v2_protocol_handler.SetHighBandwidthShortTxPeer(pfrom.GetId(),
++                                                              true);
++        } else if (is_python_test_peer) {
++            m_v2_protocol_handler.SetHighBandwidthShortTxPeer(pfrom.GetId(),
++                                                              false);
++        }
++
+         pfrom.fSuccessfullyConnected = true;
+         return;
+     }
+@@ -5599,6 +5654,14 @@ void PeerManagerImpl::ProcessMessage(
+ 
+     if (m_v2_protocol_handler.TryHandleMessage(pfrom, msg_type, vRecv,
+                                                time_received)) {
++        if (msg_type == NetMsgType::SEALEDHEADER) {
++            if (auto known_hash =
++                    m_v2_protocol_handler.GetLastPeerKnownBlock(
++                        pfrom.GetId())) {
++                LOCK(cs_main);
++                UpdateBlockAvailability(pfrom.GetId(), *known_hash);
++            }
++        }
+         return;
+     }
+ 
+@@ -7678,10 +7741,18 @@ void PeerManagerImpl::ProcessMessage(
+         if (!m_avalanche) {
+             return;
+         }
++        if (!m_v2_protocol_handler.CheckPeerRateLimit(pfrom.GetId(),
++                                                      time_received)) {
++            return;
++        }
+         BlockHash prevblockhash;
+         std::vector<CTxOut> outputs;
+         Amount totalReward;
+-        vRecv >> prevblockhash >> outputs >> totalReward;
++        try {
++            vRecv >> prevblockhash >> outputs >> totalReward;
++        } catch (const std::exception &) {
++            return;
++        }
+         const bool known_prev = WITH_LOCK(
+             cs_main, return m_chainman.m_blockman.LookupBlockIndex(
+                                 prevblockhash) != nullptr);
+@@ -7697,8 +7768,16 @@ void PeerManagerImpl::ProcessMessage(
+         if (!m_avalanche) {
+             return;
+         }
++        if (!m_v2_protocol_handler.CheckPeerRateLimit(pfrom.GetId(),
++                                                      time_received)) {
++            return;
++        }
+         avalanche::MempoolBatchAnnouncement announcement;
+-        vRecv >> announcement;
++        try {
++            vRecv >> announcement;
++        } catch (const std::exception &) {
++            return;
++        }
+         if (announcement.tx_count == 0 || !announcement.IsValid()) {
+             return;
+         }
+@@ -9137,15 +9216,21 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+             // the inv queue.
+             LOCK(peer->m_block_inv_mutex);
+             std::vector<CBlockHeader> vHeaders;
++            const bool is_hb_sealed_peer =
++                m_v2_protocol_handler.IsHighBandwidthShortTxPeer(pto->GetId());
+             bool fRevertToInv =
+                 ((!peer->m_prefers_headers &&
+-                  (!state.m_requested_hb_cmpctblocks ||
++                  (!(state.m_requested_hb_cmpctblocks || is_hb_sealed_peer) ||
+                    peer->m_blocks_for_headers_relay.size() > 1)) ||
+                  peer->m_blocks_for_headers_relay.size() >
+                      MAX_BLOCKS_TO_ANNOUNCE);
+             // last header queued for delivery
+             const CBlockIndex *pBestIndex = nullptr;
+             // ensure pindexBestKnownBlock is up-to-date
++            if (auto known_hash =
++                    m_v2_protocol_handler.GetLastPeerKnownBlock(pto->GetId())) {
++                UpdateBlockAvailability(pto->GetId(), *known_hash);
++            }
+             ProcessBlockAvailability(pto->GetId());
+ 
+             if (!fRevertToInv) {
+@@ -9184,9 +9269,11 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+                         // Keep looking for the first new block.
+                         continue;
+                     } else if (pindex->pprev == nullptr ||
+-                               PeerHasHeader(&state, pindex->pprev)) {
++                               PeerHasHeader(&state, pindex->pprev) ||
++                               (is_hb_sealed_peer &&
++                                pindex->pprev->pprev == nullptr)) {
+                         // Peer doesn't have this header but they do have the
+-                        // prior one. Start sending headers.
++                        // prior one (or the prior one is genesis).
+                         fFoundStartingHeader = true;
+                         vHeaders.push_back(pindex->GetBlockHeader());
+                     } else {
+@@ -9198,7 +9285,48 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+                 }
+             }
+             if (!fRevertToInv && !vHeaders.empty()) {
+-                if (vHeaders.size() == 1 && state.m_requested_hb_cmpctblocks) {
++                if (vHeaders.size() == 1 && is_hb_sealed_peer &&
++                    vHeaders.front().nHeaderVersion ==
++                        lotus::v2::kHeaderVersion) {
++                    std::optional<CSerializedNetMsg> cached_sealed_msg;
++                    {
++                        LOCK(m_most_recent_block_mutex);
++                        if (m_most_recent_block_hash ==
++                                pBestIndex->GetBlockHash() &&
++                            m_most_recent_block &&
++                            !m_most_recent_block->vtx.empty()) {
++                            cached_sealed_msg = NetMsg::Make(
++                                NetMsgType::SEALEDHEADER,
++                                SealedHeader(*m_most_recent_block));
++                        }
++                    }
++                    if (!cached_sealed_msg.has_value()) {
++                        CBlock block;
++                        if (m_chainman.m_blockman.ReadBlock(block,
++                                                            *pBestIndex) &&
++                            !block.vtx.empty()) {
++                            cached_sealed_msg =
++                                NetMsg::Make(NetMsgType::SEALEDHEADER,
++                                             SealedHeader(block));
++                        }
++                    }
++                    if (cached_sealed_msg.has_value()) {
++                        LogDebug(BCLog::NET,
++                                 "%s sending sealedheader %s to peer=%d\n",
++                                 __func__,
++                                 vHeaders.front().GetHash().ToString(),
++                                 pto->GetId());
++                        PushMessage(*pto,
++                                    std::move(cached_sealed_msg.value()));
++                        state.pindexBestHeaderSent = pBestIndex;
++                    } else if (peer->m_prefers_headers) {
++                        MakeAndPushMessage(*pto, NetMsgType::HEADERS, vHeaders);
++                        state.pindexBestHeaderSent = pBestIndex;
++                    } else {
++                        fRevertToInv = true;
++                    }
++                } else if (vHeaders.size() == 1 &&
++                           state.m_requested_hb_cmpctblocks) {
+                     // We only send up to 1 block as header-and-ids, as
+                     // otherwise probably means we're doing an initial-ish-sync
+                     // or they're slow.
+@@ -9228,7 +9356,7 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+                         CBlockHeaderAndShortTxIDs cmpctblock(
+                             block, FastRandomContext().rand64());
+                         MakeAndPushMessage(*pto, NetMsgType::CMPCTBLOCK,
+-                                           cmpctblock);
++                                            cmpctblock);
+                     }
+                     state.pindexBestHeaderSent = pBestIndex;
+                 } else if (peer->m_prefers_headers) {
+diff --git a/src/test/v2_protocol_handler_tests.cpp b/src/test/v2_protocol_handler_tests.cpp
+index a9f6963f20..c705f2ec0b 100644
+--- a/src/test/v2_protocol_handler_tests.cpp
++++ b/src/test/v2_protocol_handler_tests.cpp
+@@ -21,6 +21,7 @@
+ #include <txmempool.h>
+ #include <util/time.h>
+ #include <validation.h>
++#include <validationinterface.h>
+ 
+ #include <test/util/mining.h>
+ #include <test/util/net.h>
+@@ -1746,6 +1747,240 @@ BOOST_AUTO_TEST_CASE(shorttx_batch_admission_fallback_and_proactive_push) {
+     peerman->FinalizeNode(config, peer_hb);
+ }
+ 
++BOOST_AUTO_TEST_CASE(high_bandwidth_sealedheader_push_and_peer_cleanup) {
++    LOCK(NetEventsInterface::g_msgproc_mutex);
++    SetMockTime(
++        WITH_LOCK(cs_main, return m_node.chainman->ActiveTip()->GetBlockTime()));
++
++    const Config &config = m_node.chainman->GetConfig();
++    const Consensus::Params &params = config.GetChainParams().GetConsensus();
++
++    auto connman = std::make_unique<ConnmanTestMsg>(config, 0x3570, 0x3570,
++                                                    *m_node.addrman);
++    PeerManager::Options peer_opts;
++    peer_opts.deterministic_rng = true;
++    auto peerman = PeerManager::make(*connman, *m_node.addrman, nullptr,
++                                     *m_node.chainman, *m_node.mempool,
++                                     /*avalanche=*/nullptr, peer_opts);
++
++    CConnman::Options options;
++    options.m_msgproc = {peerman.get()};
++    options.m_max_outbound_full_relay = 8;
++    connman->Init(options);
++    m_node.validation_signals->RegisterValidationInterface(peerman.get());
++
++    V2PeerProtocolHandler *v2_handler = peerman->GetV2ProtocolHandler();
++    BOOST_REQUIRE(v2_handler != nullptr);
++
++    CAddress addr_sender(MakeTestIp(0xa0b0c050), NODE_NONE);
++    CNode *peer_sender = new CNode(
++        /*id=*/920, /*sock=*/nullptr, addr_sender,
++        /*nKeyedNetGroupIn=*/0, /*nLocalHostNonceIn=*/0,
++        /*nLocalExtraEntropyIn=*/0, CAddress(), /*pszDest=*/"",
++        ConnectionType::OUTBOUND_FULL_RELAY, /*inbound_onion=*/false);
++    connman->Handshake(*peer_sender, /*successfully_connected=*/true,
++                       ServiceFlags(NODE_NETWORK), ServiceFlags(NODE_NETWORK),
++                       PROTOCOL_VERSION, /*relay_txs=*/true);
++
++    CAddress addr_hb(MakeTestIp(0xa0b0c051), NODE_NONE);
++    CNode *peer_hb = new CNode(
++        /*id=*/921, /*sock=*/nullptr, addr_hb,
++        /*nKeyedNetGroupIn=*/1, /*nLocalHostNonceIn=*/0,
++        /*nLocalExtraEntropyIn=*/0, CAddress(), /*pszDest=*/"",
++        ConnectionType::OUTBOUND_FULL_RELAY, /*inbound_onion=*/false);
++    connman->Handshake(*peer_hb, /*successfully_connected=*/true,
++                       ServiceFlags(NODE_NETWORK), ServiceFlags(NODE_NETWORK),
++                       PROTOCOL_VERSION, /*relay_txs=*/true);
++
++    CAddress addr_normal(MakeTestIp(0xa0b0c052), NODE_NONE);
++    CNode *peer_normal = new CNode(
++        /*id=*/922, /*sock=*/nullptr, addr_normal,
++        /*nKeyedNetGroupIn=*/2, /*nLocalHostNonceIn=*/0,
++        /*nLocalExtraEntropyIn=*/0, CAddress(), /*pszDest=*/"",
++        ConnectionType::OUTBOUND_FULL_RELAY, /*inbound_onion=*/false);
++    connman->Handshake(*peer_normal, /*successfully_connected=*/true,
++                       ServiceFlags(NODE_NETWORK), ServiceFlags(NODE_NETWORK),
++                       PROTOCOL_VERSION, /*relay_txs=*/true);
++
++    for (CNode *p : {peer_sender, peer_hb, peer_normal}) {
++        BOOST_CHECK(peerman->SendMessages(config, p));
++        LOCK(p->cs_vSend);
++        p->vSendMsg.clear();
++    }
++    for (CNode *p : {peer_sender, peer_hb, peer_normal}) {
++        connman->AddTestNode(*p);
++    }
++
++    // Opt in peer_sender and peer_hb as high-bandwidth V2 peers; keep peer_normal
++    // as a standard low-bandwidth peer.
++    peer_sender->m_bip152_highbandwidth_to = true;
++    peer_sender->m_bip152_highbandwidth_from = true;
++    v2_handler->SetHighBandwidthShortTxPeer(peer_sender->GetId(), true);
++
++    peer_hb->m_bip152_highbandwidth_to = true;
++    peer_hb->m_bip152_highbandwidth_from = true;
++    v2_handler->SetHighBandwidthShortTxPeer(peer_hb->GetId(), true);
++
++    peer_normal->m_bip152_highbandwidth_to = false;
++    peer_normal->m_bip152_highbandwidth_from = false;
++    v2_handler->SetHighBandwidthShortTxPeer(peer_normal->GetId(), false);
++
++    // 1. Build a valid V2 block containing tx1 on top of the current tip, and
++    //    add tx1 to the mempool WITHOUT manually calling SyncMerklixOverlayToTip
++    //    first (simulating a peer whose tip just advanced and received mempool
++    //    transactions via SHORTTX).
++    FastRandomContext rng(uint256{99});
++    CTransactionRef tx1 = MakeNonCoinbaseTx(rng, 0x51);
++    BOOST_REQUIRE(tx1 != nullptr);
++    FundTxInputInCoinsTip(*m_node.chainman, *tx1);
++
++    std::shared_ptr<CBlock> v2_block =
++        PrepareBlock(config, m_node, CScript() << OP_TRUE);
++    v2_block->vtx.push_back(tx1);
++    {
++        LOCK(cs_main);
++        const CBlockIndex *tip = m_node.chainman->ActiveTip();
++        v2_block->hashMerkleRoot = BlockMerkleRoot(*v2_block);
++        v2_block->hashStateRoot = ComputeV2BlockStateRoot(
++            *v2_block, v2_block->hashPrevBlock, v2_block->nHeight,
++            uint64_t(tip->GetMedianTimePast()), false);
++        v2_block->SetSize(::GetSerializeSize(*v2_block));
++    }
++    while (!CheckProofOfWork(v2_block->GetHash(), v2_block->nBits, params)) {
++        ++v2_block->nNonce;
++    }
++
++    {
++        TestMemPoolEntryHelper entry;
++        LOCK2(cs_main, m_node.mempool->cs);
++        m_node.mempool->addUnchecked(entry.Fee(1000 * SATOSHI).FromTx(tx1));
++    }
++
++    // 2. Deliver SEALEDHEADER from peer_sender.
++    //    Verify:
++    //    - MatchCandidateOverlay re-anchors the speculative overlay to the active
++    //      tip and hits the O(1) ComputeV2StateRootFromOverlay fast path
++    //      (sealedheader_overlay_fastpath increments).
++    //    - peer_sender is recorded as knowing v2_block->GetHash() and does NOT
++    //      receive a redundant SEALEDHEADER or CMPCTBLOCK back.
++    //    - peer_hb receives a direct SEALEDHEADER push via NewPoWValidBlock!
++    const auto stats_before = v2_handler->GetStats();
++    std::atomic<bool> interrupt{false};
++    std::chrono::microseconds cur_time{100'000};
++    {
++        SealedHeader sealed(*v2_block);
++        DataStream ss{};
++        ss << sealed;
++        peerman->ProcessMessage(config, *peer_sender, NetMsgType::SEALEDHEADER,
++                                ss, cur_time, interrupt);
++    }
++
++    const auto stats_after = v2_handler->GetStats();
++    BOOST_CHECK_EQUAL(stats_after.sealedheader_received,
++                      stats_before.sealedheader_received + 1);
++    BOOST_CHECK_EQUAL(stats_after.sealedheader_invalid,
++                      stats_before.sealedheader_invalid);
++    BOOST_CHECK_EQUAL(stats_after.sealedheader_rejected,
++                      stats_before.sealedheader_rejected);
++    BOOST_CHECK_EQUAL(stats_after.sealedheader_fallback_getdata,
++                      stats_before.sealedheader_fallback_getdata);
++    BOOST_CHECK_EQUAL(stats_after.sealedheader_reconstructed,
++                      stats_before.sealedheader_reconstructed + 1);
++    BOOST_CHECK_EQUAL(stats_after.sealedheader_overlay_fastpath,
++                      stats_before.sealedheader_overlay_fastpath + 1);
++    BOOST_CHECK(
++        v2_handler->PeerKnowsBlock(peer_sender->GetId(), v2_block->GetHash()));
++
++    // Verify peer_sender received NO redundant block announcement for v2_block.
++    {
++        V1TransportDeserializer deser_sender(config, peer_sender->GetId());
++        LOCK(peer_sender->cs_vSend);
++        for (const auto &chunk : peer_sender->vSendMsg) {
++            Span<const uint8_t> sp{chunk};
++            while (!sp.empty()) {
++                const int ret = deser_sender.Read(config, sp);
++                BOOST_REQUIRE_GE(ret, 0);
++                if (deser_sender.Complete()) {
++                    bool reject = false;
++                    CNetMessage msg = deser_sender.GetMessage(0us, reject);
++                    BOOST_CHECK(!reject);
++                    BOOST_CHECK_NE(msg.m_type, NetMsgType::SEALEDHEADER);
++                    BOOST_CHECK_NE(msg.m_type, NetMsgType::CMPCTBLOCK);
++                }
++            }
++        }
++    }
++
++    // Verify peer_hb received SEALEDHEADER directly during NewPoWValidBlock!
++    size_t hb_sealedheader_count = 0;
++    {
++        V1TransportDeserializer deser_hb(config, peer_hb->GetId());
++        LOCK(peer_hb->cs_vSend);
++        for (const auto &chunk : peer_hb->vSendMsg) {
++            Span<const uint8_t> sp{chunk};
++            while (!sp.empty()) {
++                const int ret = deser_hb.Read(config, sp);
++                BOOST_REQUIRE_GE(ret, 0);
++                if (deser_hb.Complete()) {
++                    bool reject = false;
++                    CNetMessage msg = deser_hb.GetMessage(0us, reject);
++                    BOOST_CHECK(!reject);
++                    if (msg.m_type == NetMsgType::SEALEDHEADER) {
++                        SealedHeader pushed_sh;
++                        msg.m_recv >> pushed_sh;
++                        BOOST_CHECK_EQUAL(pushed_sh.header.GetHash(),
++                                          v2_block->GetHash());
++                        ++hb_sealedheader_count;
++                    }
++                }
++            }
++        }
++    }
++    BOOST_CHECK_EQUAL(hb_sealedheader_count, 1U);
++
++    // 3. Verify duplicate SEALEDHEADER from peer_hb for an already-connected
++    //    block is a no-op (no fallback GETDATA(MSG_CMPCT_BLOCK) emitted).
++    {
++        LOCK(peer_hb->cs_vSend);
++        peer_hb->vSendMsg.clear();
++    }
++    {
++        SealedHeader dup_sealed(*v2_block);
++        DataStream ss{};
++        ss << dup_sealed;
++        peerman->ProcessMessage(config, *peer_hb, NetMsgType::SEALEDHEADER, ss,
++                                cur_time + 100us, interrupt);
++    }
++    BOOST_CHECK_EQUAL(v2_handler->GetStats().sealedheader_fallback_getdata,
++                      stats_after.sealedheader_fallback_getdata);
++
++    // 4. Verify FinalizeNode calls RemovePeer and cleans up all per-peer state.
++    {
++        const auto [k0, k1] =
++            DeriveReconSipHashKey(ReconScope::LIVE_MEMPOOL, uint256::ZERO, 0);
++        v2_handler->RecordPendingShortTxRequest(
++            peer_hb->GetId(), ReconScope::LIVE_MEMPOOL, uint256::ZERO, k0, k1,
++            {111ULL, 222ULL});
++    }
++    BOOST_CHECK(v2_handler->HasPendingShortTxRequests(peer_hb->GetId()));
++    BOOST_CHECK(v2_handler->IsHighBandwidthShortTxPeer(peer_hb->GetId()));
++    BOOST_CHECK(
++        v2_handler->PeerKnowsBlock(peer_hb->GetId(), v2_block->GetHash()));
++
++    m_node.validation_signals->UnregisterValidationInterface(peerman.get());
++    SetMockTime(0);
++    peerman->FinalizeNode(config, *peer_sender);
++    peerman->FinalizeNode(config, *peer_hb);
++    peerman->FinalizeNode(config, *peer_normal);
++
++    BOOST_CHECK(!v2_handler->IsHighBandwidthShortTxPeer(peer_hb->GetId()));
++    BOOST_CHECK(!v2_handler->HasPendingShortTxRequests(peer_hb->GetId()));
++    BOOST_CHECK(
++        !v2_handler->PeerKnowsBlock(peer_hb->GetId(), v2_block->GetHash()));
++
++    connman->ClearTestNodes();
++}
++
+ BOOST_AUTO_TEST_CASE(
+     fast_sync_swarm_multi_peer_fault_injection_and_forward_mining) {
+     LOCK(NetEventsInterface::g_msgproc_mutex);

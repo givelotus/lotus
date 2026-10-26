@@ -1,0 +1,5147 @@
+From 3c592c54cf1c06b66e3ad7b4ddb3067b9ae41fa1 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 08:24:24 -0700
+Subject: [PATCH] chronik: native V2 v2_index env and branch, explorer and
+ asset DB
+
+Port of chronik-db mdbx.rs, v2_branch.rs, v2_explorer.rs and v2_asset.rs
+(design C1 section 4, V2 tier): the v2_index MDBX env (schema 3, 16
+named DBIs, v2_tx_NNNNN.dat flat files), postcard records byte-identical
+to Rust, the committed-block transitions (genesis, connect, disconnect
+with undo), read snapshots for branch postings/UTXOs, explorer
+blocks/txs/inputs/witnesses/wire slices and asset summaries/events/
+outputs, with the Rust tests ported (env, branch incl. crash recovery,
+asset, explorer model).
+
+The env is MDBX-only like Rust's, so the V2 service is built only with
+CHRONIK_NATIVE_MDBX. Errors are V2Error exceptions carrying the Rust
+Display text; MDBX error texts use the native store's format.
+
+Tier: V2
+---
+ chronik/native/ext/lotus_v2/db/asset.cpp      |  341 +++++
+ chronik/native/ext/lotus_v2/db/asset.h        |   77 ++
+ chronik/native/ext/lotus_v2/db/branch.cpp     | 1131 +++++++++++++++++
+ chronik/native/ext/lotus_v2/db/branch.h       |  164 +++
+ chronik/native/ext/lotus_v2/db/env.cpp        |  528 ++++++++
+ chronik/native/ext/lotus_v2/db/env.h          |  188 +++
+ chronik/native/ext/lotus_v2/db/explorer.cpp   |  632 +++++++++
+ chronik/native/ext/lotus_v2/db/explorer.h     |   82 ++
+ chronik/native/ext/lotus_v2/db/model.cpp      |  255 ++++
+ chronik/native/ext/lotus_v2/db/model.h        |  370 ++++++
+ chronik/native/ext/lotus_v2/db/sources.cmake  |   24 +
+ .../ext/lotus_v2/db/test/v2_asset_tests.cpp   |  259 ++++
+ .../ext/lotus_v2/db/test/v2_branch_tests.cpp  |  458 +++++++
+ .../ext/lotus_v2/db/test/v2_env_tests.cpp     |  115 ++
+ .../db/test/v2_explorer_model_tests.cpp       |  179 +++
+ .../ext/lotus_v2/db/test/v2_test_util.h       |  190 +++
+ 16 files changed, 4993 insertions(+)
+ create mode 100644 chronik/native/ext/lotus_v2/db/asset.cpp
+ create mode 100644 chronik/native/ext/lotus_v2/db/asset.h
+ create mode 100644 chronik/native/ext/lotus_v2/db/branch.cpp
+ create mode 100644 chronik/native/ext/lotus_v2/db/branch.h
+ create mode 100644 chronik/native/ext/lotus_v2/db/env.cpp
+ create mode 100644 chronik/native/ext/lotus_v2/db/env.h
+ create mode 100644 chronik/native/ext/lotus_v2/db/explorer.cpp
+ create mode 100644 chronik/native/ext/lotus_v2/db/explorer.h
+ create mode 100644 chronik/native/ext/lotus_v2/db/model.cpp
+ create mode 100644 chronik/native/ext/lotus_v2/db/model.h
+ create mode 100644 chronik/native/ext/lotus_v2/db/sources.cmake
+ create mode 100644 chronik/native/ext/lotus_v2/db/test/v2_asset_tests.cpp
+ create mode 100644 chronik/native/ext/lotus_v2/db/test/v2_branch_tests.cpp
+ create mode 100644 chronik/native/ext/lotus_v2/db/test/v2_env_tests.cpp
+ create mode 100644 chronik/native/ext/lotus_v2/db/test/v2_explorer_model_tests.cpp
+ create mode 100644 chronik/native/ext/lotus_v2/db/test/v2_test_util.h
+
+diff --git a/chronik/native/ext/lotus_v2/db/asset.cpp b/chronik/native/ext/lotus_v2/db/asset.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9dc4b61d41be80d57aa2c6efaa394328528b4d4
+--- /dev/null
++++ b/chronik/native/ext/lotus_v2/db/asset.cpp
+@@ -0,0 +1,341 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <ext/lotus_v2/db/asset.h>
++
++#include <ext/lotus_v2/db/branch.h>
++
++#include <algorithm>
++#include <set>
++#include <tuple>
++
++namespace chronik::native::lotus_v2 {
++
++namespace {
++
++void PushBe(Bytes &k, uint64_t v, int bytes) {
++    for (int i = bytes - 1; i >= 0; --i) {
++        k.push_back(uint8_t(v >> (8 * i)));
++    }
++}
++
++uint64_t BeU64(const uint8_t *p) {
++    uint64_t v = 0;
++    for (int i = 0; i < 8; ++i) {
++        v = v << 8 | p[i];
++    }
++    return v;
++}
++
++U128 SaturatingSub(U128 a, U128 b) { return a > b ? a - b : 0; }
++
++} // namespace
++
++void AssetAddUnits(U128 &total, uint64_t value) {
++    const U128 max = ~U128(0);
++    if (max - total < value) {
++        ThrowInvalid("asset amount overflow");
++    }
++    total += value;
++}
++
++size_t PreflightAssetTx(const AssetTxView &view) {
++    const size_t count = view.outputs.size() + view.resolved_spends.size() +
++                         view.mint_token_ids.size();
++    if (count > MAX_BATCH_BYTES / 4096) {
++        ThrowInvalid("asset capacity");
++    }
++    return count * 4096;
++}
++
++std::vector<AssetEvent> DeriveAssetEvents(const AssetTxView &view) {
++    PreflightAssetTx(view);
++    // token -> (spent, output, explicit burn)
++    std::map<Hash32, std::tuple<U128, U128, U128>> totals;
++    std::set<OutPoint> spent;
++    for (const ResolvedCreation &coin : view.resolved_spends) {
++        if (!spent.insert(coin.outpoint).second || coin.output.IsBurn()) {
++            ThrowInvalid("duplicate or burned asset spend");
++        }
++        if (coin.output.Validate()) {
++            ThrowInvalid("asset spend output");
++        }
++        if (coin.output.HasToken()) {
++            AssetAddUnits(std::get<0>(totals[coin.output.token_id]),
++                          coin.output.value);
++        }
++    }
++    for (const Output &output : view.outputs) {
++        if (output.Validate()) {
++            ThrowInvalid("asset output");
++        }
++        if (output.HasToken()) {
++            auto &total = totals[output.token_id];
++            AssetAddUnits(std::get<1>(total), output.value);
++            if (output.IsBurn()) {
++                AssetAddUnits(std::get<2>(total), output.value);
++            }
++        }
++    }
++    std::set<Hash32> mints;
++    for (const Hash32 &token : view.mint_token_ids) {
++        if (token == Hash32{} || !mints.insert(token).second) {
++            ThrowInvalid("duplicate or zero asset mint selector");
++        }
++        totals[token];
++    }
++    std::vector<AssetEvent> events;
++    for (const auto &[token_id, total] : totals) {
++        const auto &[spent_units, output_units, explicit_burn_units] = total;
++        const U128 minted_units = SaturatingSub(output_units, spent_units);
++        const bool has_mint_input = mints.count(token_id) > 0;
++        if ((minted_units > 0) != has_mint_input) {
++            ThrowInvalid("asset mint/delta mismatch");
++        }
++        events.push_back(AssetEvent{
++            token_id, view.location, spent_units, output_units,
++            explicit_burn_units, minted_units,
++            SaturatingSub(spent_units, output_units), has_mint_input});
++    }
++    return events;
++}
++
++Bytes AssetSummaryKey(const Hash32 &token) {
++    Bytes k{'e', 'A'};
++    k.insert(k.end(), token.b.begin(), token.b.end());
++    return k;
++}
++
++Bytes AssetEventKey(const Hash32 &token, const TxLocation &location) {
++    Bytes k{'e', 'E'};
++    k.insert(k.end(), token.b.begin(), token.b.end());
++    PushBe(k, location.height, 8);
++    PushBe(k, location.tx_index, 4);
++    return k;
++}
++
++Bytes AssetOutputKey(const Hash32 &token, const TxLocation &location,
++                     uint32_t out_idx) {
++    Bytes k{'e', 'P'};
++    k.insert(k.end(), token.b.begin(), token.b.end());
++    PushBe(k, location.height, 8);
++    PushBe(k, location.tx_index, 4);
++    PushBe(k, out_idx, 4);
++    return k;
++}
++
++Bytes EncodeAssetSummary(const AssetSummary &summary) {
++    return AssetEncode(summary);
++}
++
++AssetSummary DecodeAssetSummary(ByteView bytes) {
++    auto summary = AssetDecode<AssetSummary>(bytes);
++    if (summary.token_id == Hash32{} || summary.event_count == 0) {
++        ThrowCorrupt();
++    }
++    return summary;
++}
++
++std::vector<std::pair<Bytes, Bytes>>
++PlanAssetTx(const AssetTxView &view, const OldAssetSummaries &old) {
++    PreflightAssetTx(view);
++    const auto events = DeriveAssetEvents(view);
++    std::vector<std::pair<Bytes, Bytes>> writes;
++    std::map<Hash32, uint64_t> counts;
++    for (const Output &output : view.outputs) {
++        if (!output.HasToken()) {
++            continue;
++        }
++        uint64_t &count = counts[output.token_id];
++        if (count == UINT64_MAX) {
++            ThrowInvalid("asset output count");
++        }
++        ++count;
++    }
++    for (const AssetEvent &event : events) {
++        const auto it_count = counts.find(event.token_id);
++        const uint64_t count = it_count == counts.end() ? 0 : it_count->second;
++        const auto it = old.find(event.token_id);
++        if (it == old.end()) {
++            ThrowInvalid("missing old asset summary");
++        }
++        AssetSummary summary;
++        if (const auto &s = it->second) {
++            if (s->token_id != event.token_id || s->event_count == 0 ||
++                std::make_pair(s->first_seen.height, s->first_seen.tx_index) >
++                    std::make_pair(view.location.height,
++                                   view.location.tx_index)) {
++                ThrowCorrupt();
++            }
++            if (s->event_count == UINT64_MAX) {
++                ThrowInvalid("asset event count overflow");
++            }
++            if (s->output_count > UINT64_MAX - count) {
++                ThrowInvalid("asset output count overflow");
++            }
++            summary = *s;
++            summary.event_count = s->event_count + 1;
++            summary.output_count = s->output_count + count;
++        } else {
++            summary = AssetSummary{event.token_id, view.location, 1, count};
++        }
++        writes.emplace_back(AssetSummaryKey(event.token_id),
++                            AssetEncode(summary));
++        writes.emplace_back(AssetEventKey(event.token_id, view.location),
++                            AssetEncode(event));
++    }
++    for (size_t index = 0; index < view.outputs.size(); ++index) {
++        const Output &output = view.outputs[index];
++        if (!output.HasToken()) {
++            continue;
++        }
++        if (index > UINT32_MAX) {
++            ThrowInvalid("asset output ordinal");
++        }
++        Bytes op(view.location.txid.hash.b.begin(),
++                 view.location.txid.hash.b.end());
++        PushBe(op, index, 4);
++        writes.emplace_back(
++            AssetOutputKey(output.token_id, view.location, uint32_t(index)),
++            std::move(op));
++    }
++    return writes;
++}
++
++// ---- ReadSnapshot asset readers ----
++
++void ReadSnapshot::AssetCanonicalLocation(const TxLocation &location,
++                                          AssetReadBudget &budget) const {
++    if (TransactionCounted(location.txid, budget) != location) {
++        ThrowCorrupt();
++    }
++}
++
++std::optional<AssetSummary>
++ReadSnapshot::GetAssetSummary(const Hash32 &token) const {
++    AssetReadBudget budget(SIZE_MAX);
++    return AssetSummaryCounted(token, budget);
++}
++
++std::optional<AssetSummary>
++ReadSnapshot::AssetSummaryCounted(const Hash32 &token,
++                                  AssetReadBudget &budget) const {
++    budget.Charge();
++    const auto bytes = m_inner.Get(AssetSummaryKey(token));
++    if (!bytes) {
++        return std::nullopt;
++    }
++    const auto s = AssetDecode<AssetSummary>(*bytes);
++    if (token == Hash32{} || s.token_id != token || s.event_count == 0 ||
++        s.first_seen.height > anchor.height) {
++        ThrowCorrupt();
++    }
++    AssetCanonicalLocation(s.first_seen, budget);
++    return s;
++}
++
++std::optional<std::pair<Bytes, Bytes>>
++ReadSnapshot::NextAssetRaw(ByteView prefix, size_t key_len,
++                           std::optional<ByteView> after,
++                           AssetReadBudget &budget) const {
++    if (after && (after->size() != key_len ||
++                  !std::equal(prefix.begin(), prefix.end(), after->begin()))) {
++        ThrowInvalid("asset cursor key");
++    }
++    auto item =
++        m_inner.SeekNextRegular(prefix, after, [&] { budget.Charge(); });
++    if (!item) {
++        return std::nullopt;
++    }
++    if (item->first.size() != key_len ||
++        item->second.size() > MAX_ASSET_RECORD_BYTES) {
++        ThrowCorrupt();
++    }
++    return item;
++}
++
++std::optional<std::pair<Bytes, AssetSummary>>
++ReadSnapshot::NextAssetSummary(std::optional<ByteView> after) const {
++    AssetReadBudget budget(SIZE_MAX);
++    return NextAssetSummaryCounted(after, budget);
++}
++
++std::optional<std::pair<Bytes, AssetSummary>>
++ReadSnapshot::NextAssetSummaryCounted(std::optional<ByteView> after,
++                                      AssetReadBudget &budget) const {
++    static const uint8_t prefix[] = {'e', 'A'};
++    auto item = NextAssetRaw(prefix, 34, after, budget);
++    if (!item) {
++        return std::nullopt;
++    }
++    const auto s = AssetDecode<AssetSummary>(item->second);
++    if (s.token_id == Hash32{} ||
++        !std::equal(s.token_id.b.begin(), s.token_id.b.end(),
++                    item->first.begin() + 2) ||
++        s.event_count == 0 || s.first_seen.height > anchor.height) {
++        ThrowCorrupt();
++    }
++    AssetCanonicalLocation(s.first_seen, budget);
++    return std::make_pair(std::move(item->first), s);
++}
++
++std::optional<std::pair<Bytes, AssetEvent>>
++ReadSnapshot::NextAssetEvent(const Hash32 &token,
++                             std::optional<ByteView> after) const {
++    AssetReadBudget budget(SIZE_MAX);
++    return NextAssetEventCounted(token, after, budget);
++}
++
++std::optional<std::pair<Bytes, AssetEvent>>
++ReadSnapshot::NextAssetEventCounted(const Hash32 &token,
++                                    std::optional<ByteView> after,
++                                    AssetReadBudget &budget) const {
++    Bytes prefix{'e', 'E'};
++    prefix.insert(prefix.end(), token.b.begin(), token.b.end());
++    auto item = NextAssetRaw(prefix, 46, after, budget);
++    if (!item) {
++        return std::nullopt;
++    }
++    const auto e = AssetDecode<AssetEvent>(item->second);
++    if (token == Hash32{} || e.token_id != token ||
++        item->first != AssetEventKey(token, e.location) ||
++        e.location.height > anchor.height ||
++        e.explicit_burn_units > e.output_units ||
++        e.minted_units != SaturatingSub(e.output_units, e.spent_units) ||
++        e.implicit_burn_units != SaturatingSub(e.spent_units, e.output_units) ||
++        e.has_mint_input != (e.minted_units > 0)) {
++        ThrowCorrupt();
++    }
++    AssetCanonicalLocation(e.location, budget);
++    return std::make_pair(std::move(item->first), e);
++}
++
++std::optional<std::pair<Bytes, OutPoint>>
++ReadSnapshot::NextAssetOutput(const Hash32 &token,
++                              std::optional<ByteView> after) const {
++    AssetReadBudget budget(SIZE_MAX);
++    return NextAssetOutputCounted(token, after, budget);
++}
++
++std::optional<std::pair<Bytes, OutPoint>>
++ReadSnapshot::NextAssetOutputCounted(const Hash32 &token,
++                                     std::optional<ByteView> after,
++                                     AssetReadBudget &budget) const {
++    Bytes prefix{'e', 'P'};
++    prefix.insert(prefix.end(), token.b.begin(), token.b.end());
++    auto item = NextAssetRaw(prefix, 50, after, budget);
++    if (!item) {
++        return std::nullopt;
++    }
++    const Bytes &key = item->first;
++    const Bytes &bytes = item->second;
++    if (token == Hash32{} || bytes.size() != 36 ||
++        !std::equal(bytes.begin() + 32, bytes.end(), key.begin() + 46) ||
++        BeU64(key.data() + 34) > anchor.height) {
++        ThrowCorrupt();
++    }
++    return std::make_pair(std::move(item->first), OutPointDecode(bytes));
++}
++
++} // namespace chronik::native::lotus_v2
+diff --git a/chronik/native/ext/lotus_v2/db/asset.h b/chronik/native/ext/lotus_v2/db/asset.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9fce3541942fb79eed48c3acbd4783edd5c4c56
+--- /dev/null
++++ b/chronik/native/ext/lotus_v2/db/asset.h
+@@ -0,0 +1,77 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef CHRONIK_NATIVE_EXT_LOTUS_V2_DB_ASSET_H
++#define CHRONIK_NATIVE_EXT_LOTUS_V2_DB_ASSET_H
++
++#include <ext/lotus_v2/db/model.h>
++
++#include <map>
++#include <optional>
++#include <span>
++#include <utility>
++#include <vector>
++
++/**
++ * Pure native asset accounting and its index plans (port of
++ * chronik-db/src/v2_asset.rs). The transition owner applies these plans in
++ * its receipt/undo batch; this module never writes. The ReadSnapshot readers
++ * are declared in branch.h.
++ */
++namespace chronik::native::lotus_v2 {
++
++/** Maximum serialized asset record. */
++inline constexpr size_t MAX_ASSET_RECORD_BYTES = 512;
++
++/** Immutable facts resolved by the transition owner before spending. */
++struct AssetTxView {
++    /** Exact confirmed transaction position. */
++    TxLocation location;
++    /** All outputs, including native outputs, zero units, and burns. */
++    std::span<const Output> outputs;
++    /** Frozen prior creations; not the runtime's current UTXO view. */
++    std::span<const ResolvedCreation> resolved_spends;
++    /** One selector per mint input; duplicates must remain visible. */
++    std::span<const Hash32> mint_token_ids;
++};
++
++/** total += value; Invalid("asset amount overflow") leaves total unchanged. */
++void AssetAddUnits(U128 &total, uint64_t value);
++/** Full token union with the positive-delta/mint bijection enforced. */
++std::vector<AssetEvent> DeriveAssetEvents(const AssetTxView &view);
++/** Conservative reservation for this module's maps and writes. */
++size_t PreflightAssetTx(const AssetTxView &view);
++
++Bytes AssetSummaryKey(const Hash32 &token);
++Bytes AssetEventKey(const Hash32 &token, const TxLocation &location);
++Bytes AssetOutputKey(const Hash32 &token, const TxLocation &location,
++                     uint32_t out_idx);
++
++/** Bounded asset record codec (512 bytes): Invalid("asset record limit"). */
++template <typename T> Bytes AssetEncode(const T &value) {
++    Bytes bytes = codec::Encode(value);
++    if (bytes.size() > MAX_ASSET_RECORD_BYTES) {
++        ThrowInvalid("asset record limit");
++    }
++    return bytes;
++}
++template <typename T> T AssetDecode(ByteView bytes) {
++    if (bytes.size() > MAX_ASSET_RECORD_BYTES) {
++        ThrowCorrupt();
++    }
++    return codec::Decode<T>(bytes);
++}
++
++Bytes EncodeAssetSummary(const AssetSummary &summary);
++/** Rejects a zero token or zero event count as Corrupt. */
++AssetSummary DecodeAssetSummary(ByteView bytes);
++
++using OldAssetSummaries = std::map<Hash32, std::optional<AssetSummary>>;
++/** Pure complete write plan; old summaries must come from staged state. */
++std::vector<std::pair<Bytes, Bytes>>
++PlanAssetTx(const AssetTxView &view, const OldAssetSummaries &old);
++
++} // namespace chronik::native::lotus_v2
++
++#endif // CHRONIK_NATIVE_EXT_LOTUS_V2_DB_ASSET_H
+diff --git a/chronik/native/ext/lotus_v2/db/branch.cpp b/chronik/native/ext/lotus_v2/db/branch.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..718951d9cd29fb87d237c06228750a1e2d305eac
+--- /dev/null
++++ b/chronik/native/ext/lotus_v2/db/branch.cpp
+@@ -0,0 +1,1131 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <ext/lotus_v2/db/branch.h>
++
++#include <chronik/native/codec/seahash.h>
++#include <ext/lotus_v2/db/asset.h>
++#include <ext/lotus_v2/db/explorer.h>
++
++#include <algorithm>
++#include <map>
++#include <set>
++#include <tuple>
++
++namespace chronik::native::lotus_v2 {
++
++using codec::Reader;
++using codec::Writer;
++
++namespace {
++
++using FlatPos = std::pair<uint32_t, uint64_t>;
++
++/** v2_branch.rs `Record`. */
++struct Record {
++    Bytes output;
++    TxLocation creation;
++    std::optional<std::pair<TxLocation, uint32_t>> spend;
++};
++
++/** v2_branch.rs `ReceiptTx`. */
++struct ReceiptTx {
++    TxLocation location;
++    std::vector<Bytes> outputs;
++    std::vector<std::tuple<Bytes32, uint32_t, uint32_t>> spends;
++    uint64_t lock = 0;
++    std::vector<InputFact> inputs;
++    uint32_t file_num = 0;
++    uint64_t data_pos = 0;
++    uint64_t wire_size = 0;
++    uint64_t wire_checksum = 0;
++};
++
++/** The block receipt tuple (anchor, parent, explorer, transactions). */
++struct Receipt {
++    Anchor anchor;
++    Anchor parent;
++    ExplorerBlockFacts explorer;
++    std::vector<ReceiptTx> transactions;
++};
++
++/** v2_branch.rs `Undo`. */
++struct Undo {
++    Binding binding;
++    Anchor anchor;
++    std::optional<Anchor> parent;
++    FlatPos prev_flat_pos;
++    std::vector<std::pair<Bytes, std::optional<Bytes>>> entries;
++};
++
++void Write(Writer &w, const Record &v) {
++    w.ByteVec(v.output);
++    codec::Write(w, v.creation);
++    w.OptionTag(v.spend.has_value());
++    if (v.spend) {
++        codec::Write(w, v.spend->first);
++        w.U32(v.spend->second);
++    }
++}
++void Read(Reader &r, Record &v) {
++    v.output = r.ByteVec();
++    codec::Read(r, v.creation);
++    v.spend.reset();
++    if (r.OptionTag()) {
++        TxLocation loc;
++        codec::Read(r, loc);
++        v.spend.emplace(loc, r.U32());
++    }
++}
++void Write(Writer &w, const FlatPos &v) {
++    w.U32(v.first);
++    w.U64(v.second);
++}
++void Read(Reader &r, FlatPos &v) {
++    v.first = r.U32();
++    v.second = r.U64();
++}
++void Write(Writer &w, const ReceiptTx &v) {
++    codec::Write(w, v.location);
++    w.SeqLen(v.outputs.size());
++    for (const Bytes &o : v.outputs) {
++        w.ByteVec(o);
++    }
++    w.SeqLen(v.spends.size());
++    for (const auto &[txid, out_idx, input_index] : v.spends) {
++        w.Raw(txid);
++        w.U32(out_idx);
++        w.U32(input_index);
++    }
++    w.U64(v.lock);
++    codec::Write(w, v.inputs);
++    w.U32(v.file_num);
++    w.U64(v.data_pos);
++    w.U64(v.wire_size);
++    w.U64(v.wire_checksum);
++}
++void Read(Reader &r, ReceiptTx &v) {
++    codec::Read(r, v.location);
++    v.outputs.clear();
++    for (uint64_t n = r.SeqLen(), i = 0; i < n; ++i) {
++        v.outputs.push_back(r.ByteVec());
++    }
++    v.spends.clear();
++    for (uint64_t n = r.SeqLen(), i = 0; i < n; ++i) {
++        const Bytes32 txid = r.Array<32>();
++        const uint32_t out_idx = r.U32();
++        v.spends.emplace_back(txid, out_idx, r.U32());
++    }
++    v.lock = r.U64();
++    codec::Read(r, v.inputs);
++    v.file_num = r.U32();
++    v.data_pos = r.U64();
++    v.wire_size = r.U64();
++    v.wire_checksum = r.U64();
++}
++void Write(Writer &w, const Receipt &v) {
++    codec::Write(w, v.anchor);
++    codec::Write(w, v.parent);
++    codec::Write(w, v.explorer);
++    w.SeqLen(v.transactions.size());
++    for (const ReceiptTx &tx : v.transactions) {
++        Write(w, tx);
++    }
++}
++void Read(Reader &r, Receipt &v) {
++    codec::Read(r, v.anchor);
++    codec::Read(r, v.parent);
++    codec::Read(r, v.explorer);
++    v.transactions.clear();
++    for (uint64_t n = r.SeqLen(), i = 0; i < n; ++i) {
++        ReceiptTx tx;
++        Read(r, tx);
++        v.transactions.push_back(std::move(tx));
++    }
++}
++void Write(Writer &w, const Undo &v) {
++    codec::Write(w, v.binding);
++    codec::Write(w, v.anchor);
++    codec::Write(w, v.parent);
++    Write(w, v.prev_flat_pos);
++    w.SeqLen(v.entries.size());
++    for (const auto &[k, value] : v.entries) {
++        w.ByteVec(k);
++        w.OptionTag(value.has_value());
++        if (value) {
++            w.ByteVec(*value);
++        }
++    }
++}
++void Read(Reader &r, Undo &v) {
++    codec::Read(r, v.binding);
++    codec::Read(r, v.anchor);
++    codec::Read(r, v.parent);
++    Read(r, v.prev_flat_pos);
++    v.entries.clear();
++    for (uint64_t n = r.SeqLen(), i = 0; i < n; ++i) {
++        Bytes k = r.ByteVec();
++        std::optional<Bytes> value;
++        if (r.OptionTag()) {
++            value = r.ByteVec();
++        }
++        v.entries.emplace_back(std::move(k), std::move(value));
++    }
++}
++
++template <typename T> Bytes Enc(const T &v) {
++    Bytes out;
++    Writer w(out);
++    Write(w, v);
++    return out;
++}
++template <typename T> T Dec(ByteView bytes) {
++    T v{};
++    try {
++        Reader r(bytes);
++        Read(r, v);
++    } catch (const postcard::Error &) {
++        ThrowCorrupt();
++    }
++    return v;
++}
++
++Bytes Identity(const Binding &binding) {
++    Bytes out;
++    Writer w(out);
++    w.U32(SCHEMA_VERSION);
++    codec::Write(w, binding);
++    return out;
++}
++
++ByteView Str(std::string_view s) {
++    return ByteView(reinterpret_cast<const uint8_t *>(s.data()), s.size());
++}
++Bytes StrBytes(std::string_view s) { return Bytes(s.begin(), s.end()); }
++
++bool StartsWith(ByteView bytes, std::string_view prefix) {
++    return bytes.size() >= prefix.size() &&
++           std::equal(prefix.begin(), prefix.end(), bytes.begin());
++}
++
++Output DecodeOutputOrCorrupt(ByteView wire) {
++    auto output = Output::Decode(wire);
++    if (!output) {
++        ThrowCorrupt();
++    }
++    return std::move(*output);
++}
++
++Bytes EncodeOutputOr(const Output &output, std::string_view invalid) {
++    auto bytes = output.Encode();
++    if (!bytes) {
++        if (invalid.empty()) {
++            ThrowCorrupt();
++        }
++        ThrowInvalid(invalid);
++    }
++    return std::move(*bytes);
++}
++
++/** Bounded record decode: checks the cap BEFORE vector allocation. */
++Record DecodeRecord(ByteView bytes) {
++    if (bytes.size() > MAX_BRANCH_RECORD_BYTES) {
++        ThrowCorrupt();
++    }
++    Record record = Dec<Record>(bytes);
++    DecodeOutputOrCorrupt(record.output);
++    return record;
++}
++
++OutputRecord Public(Record record, const OutPoint &outpoint) {
++    if (record.creation.txid != outpoint.txid) {
++        ThrowCorrupt();
++    }
++    OutputRecord out{outpoint, DecodeOutputOrCorrupt(record.output),
++                     record.creation, std::nullopt};
++    if (record.spend) {
++        out.spend = SpendLocation{record.spend->first, record.spend->second};
++    }
++    return out;
++}
++
++void Reserve(size_t &total, size_t bytes) {
++    if (bytes > MAX_BATCH_BYTES || total + bytes > MAX_BATCH_BYTES) {
++        ThrowInvalid("staging capacity");
++    }
++    total += bytes;
++}
++
++void WriteBatch(V2Env &db, const V2WriteBatch &batch) {
++    if (batch.SizeInBytes() > MAX_BATCH_BYTES) {
++        ThrowInvalid("serialized batch bound");
++    }
++    db.Write(batch);
++}
++
++Bytes PostingKey(const Hash32 &root, uint8_t position, const OutPoint &op) {
++    Bytes k = PostingPrefix(root, position);
++    const Bytes ob = OutPointBytes(op);
++    k.insert(k.end(), ob.begin(), ob.end());
++    return k;
++}
++
++std::vector<SpentInput> ReceiptSpends(const ReceiptTx &tx) {
++    std::vector<SpentInput> out;
++    for (const auto &[txid, out_idx, input_index] : tx.spends) {
++        out.push_back(SpentInput{OutPoint{TxId{H(txid)}, out_idx}, input_index});
++    }
++    return out;
++}
++
++using OldValueFn = std::function<std::optional<Bytes>(const Bytes &)>;
++
++std::map<Bytes, Bytes> AssetEntries(const CommittedBlock &block,
++                                    const OldValueFn &old_value) {
++    std::map<Bytes, Bytes> entries;
++    for (const ConfirmedTx &tx : block.transactions) {
++        std::vector<ResolvedCreation> resolved_spends;
++        std::vector<Hash32> mint_token_ids;
++        for (const InputFact &input : tx.explorer.inputs) {
++            if (input.resolved_creation) {
++                resolved_spends.push_back(*input.resolved_creation);
++            }
++            if (input.flags == 3) {
++                mint_token_ids.push_back(H(input.prev_txid));
++            }
++        }
++        const AssetTxView view{tx.location, tx.outputs, resolved_spends,
++                               mint_token_ids};
++        OldAssetSummaries summaries;
++        for (const AssetEvent &event : DeriveAssetEvents(view)) {
++            const Bytes k = AssetSummaryKey(event.token_id);
++            std::optional<Bytes> bytes;
++            if (auto it = entries.find(k); it != entries.end()) {
++                bytes = it->second;
++            } else {
++                bytes = old_value(k);
++            }
++            summaries[event.token_id] =
++                bytes ? std::optional<AssetSummary>(DecodeAssetSummary(*bytes))
++                      : std::nullopt;
++        }
++        for (auto &[k, v] : PlanAssetTx(view, summaries)) {
++            entries[k] = std::move(v);
++        }
++    }
++    return entries;
++}
++
++/** Validates the stored undo of the tip block before applying it. */
++void ValidateUndo(const V2Env &db, const Binding &binding, const Anchor &anchor,
++                  const Undo &undo) {
++    if (!undo.parent) {
++        ThrowCorrupt();
++    }
++    const Anchor parent = *undo.parent;
++    if (undo.binding != binding || undo.anchor != anchor ||
++        parent.height == UINT64_MAX || parent.height + 1 != anchor.height ||
++        (parent.height == 0 && parent.block_id != binding.genesis) ||
++        undo.entries.size() > MAX_BATCH_BYTES / 40) {
++        ThrowCorrupt();
++    }
++    const auto receipt_bytes = db.Get(PrefixKey('b', anchor.block_id));
++    if (!receipt_bytes || receipt_bytes->size() > MAX_BATCH_BYTES) {
++        ThrowCorrupt();
++    }
++    const Receipt receipt = Dec<Receipt>(*receipt_bytes);
++    const auto &transactions = receipt.transactions;
++    if (receipt.anchor != anchor || receipt.parent != parent ||
++        transactions.size() > MAX_TRANSACTIONS) {
++        ThrowCorrupt();
++    }
++    auto reserve = [](size_t &total, size_t bytes) {
++        try {
++            Reserve(total, bytes);
++        } catch (const V2Error &) {
++            ThrowCorrupt();
++        }
++    };
++    std::set<Bytes> expected;
++    size_t reservation = 1024;
++    for (size_t index = 0; index < transactions.size(); ++index) {
++        const ReceiptTx &tx = transactions[index];
++        if (tx.location.block_id.b != anchor.block_id ||
++            tx.location.height != anchor.height ||
++            tx.location.tx_index != index) {
++            ThrowCorrupt();
++        }
++        constexpr size_t per_spend = 6 * MAX_BRANCH_RECORD_BYTES + 1024;
++        if (tx.spends.size() > SIZE_MAX / per_spend) {
++            ThrowCorrupt();
++        }
++        reserve(reservation, 512 + tx.spends.size() * per_spend);
++        if (!expected.insert(PrefixKey('t', tx.location.txid.hash.b)).second) {
++            ThrowCorrupt();
++        }
++        for (const auto &[txid, out_idx, input_index] : tx.spends) {
++            (void)input_index;
++            expected.insert(
++                PrefixKey('o', OutPointBytes(OutPoint{TxId{H(txid)}, out_idx})));
++        }
++        for (size_t i = 0; i < tx.outputs.size(); ++i) {
++            const Output output = DecodeOutputOrCorrupt(tx.outputs[i]);
++            reserve(reservation, 6 * MAX_BRANCH_RECORD_BYTES +
++                                     output.branches.size() * 2 * 512);
++            if (i > UINT32_MAX) {
++                ThrowCorrupt();
++            }
++            const OutPoint op{tx.location.txid, uint32_t(i)};
++            expected.insert(PrefixKey('o', OutPointBytes(op)));
++            for (size_t position = 0; position < output.branches.size();
++                 ++position) {
++                for (uint8_t pos : {uint8_t(position), uint8_t(255)}) {
++                    expected.insert(
++                        PostingKey(output.branches[position], pos, op));
++                }
++            }
++        }
++    }
++    CommittedBlock restored{anchor, parent, {}, receipt.explorer};
++    for (const ReceiptTx &tx : transactions) {
++        if (tx.wire_size == 0 || tx.wire_size > MAX_BATCH_BYTES) {
++            ThrowCorrupt();
++        }
++        Bytes wire;
++        try {
++            wire = db.Flat().ReadAt(tx.file_num, tx.data_pos,
++                                    size_t(tx.wire_size));
++        } catch (const V2Error &) {
++            ThrowCorrupt();
++        }
++        if (SeaHash(wire) != tx.wire_checksum) {
++            ThrowCorrupt();
++        }
++        ConfirmedTx ctx;
++        ctx.location = tx.location;
++        for (const Bytes &o : tx.outputs) {
++            ctx.outputs.push_back(DecodeOutputOrCorrupt(o));
++        }
++        ctx.spends = ReceiptSpends(tx);
++        ctx.explorer = ExplorerTxFacts{std::move(wire), tx.lock, tx.inputs};
++        restored.transactions.push_back(std::move(ctx));
++    }
++    reserve(reservation, PreflightExplorerBlock(restored));
++    std::map<Bytes, Bytes> legacy_current;
++    std::map<Bytes, std::optional<Bytes>> legacy_previous;
++    for (const ConfirmedTx &tx : restored.transactions) {
++        const Bytes tk = PrefixKey('t', tx.location.txid.hash.b);
++        legacy_current[tk] = codec::Encode(tx.location);
++        legacy_previous[tk] = std::nullopt;
++        for (const SpentInput &spend : tx.spends) {
++            if (spend.input_index >= tx.explorer.inputs.size() ||
++                !tx.explorer.inputs[spend.input_index].resolved_creation) {
++                ThrowCorrupt();
++            }
++            const ResolvedCreation &creation =
++                *tx.explorer.inputs[spend.input_index].resolved_creation;
++            if (creation.outpoint != spend.outpoint) {
++                ThrowCorrupt();
++            }
++            const Bytes k = PrefixKey('o', OutPointBytes(spend.outpoint));
++            Record record{EncodeOutputOr(creation.output, ""),
++                          creation.creation, std::nullopt};
++            if (!legacy_previous.count(k)) {
++                legacy_previous[k] = Enc(record);
++            }
++            record.spend = std::make_pair(tx.location, spend.input_index);
++            legacy_current[k] = Enc(record);
++        }
++        for (size_t i = 0; i < tx.outputs.size(); ++i) {
++            const Output &output = tx.outputs[i];
++            const OutPoint op{tx.location.txid, uint32_t(i)};
++            const Bytes k = PrefixKey('o', OutPointBytes(op));
++            legacy_previous[k] = std::nullopt;
++            legacy_current[k] =
++                Enc(Record{EncodeOutputOr(output, ""), tx.location, {}});
++            for (size_t b = 0; b < output.branches.size(); ++b) {
++                for (uint8_t pos : {uint8_t(b), uint8_t(255)}) {
++                    const Bytes pk = PostingKey(output.branches[b], pos, op);
++                    legacy_previous[pk] = std::nullopt;
++                    legacy_current[pk] = Bytes{};
++                }
++            }
++        }
++    }
++    for (const auto &[k, v] : legacy_current) {
++        if (db.Get(k) != v) {
++            ThrowCorrupt();
++        }
++    }
++    const ExplorerPlan planned = PlanExplorerBlockAt(
++        restored, undo.prev_flat_pos.first, undo.prev_flat_pos.second);
++    const auto flat_bytes = db.Get(Str("flat_pos"));
++    if (!flat_bytes) {
++        ThrowCorrupt();
++    }
++    if (Dec<FlatPos>(*flat_bytes) != planned.next_flat_pos) {
++        ThrowCorrupt();
++    }
++    for (size_t i = 0;
++         i < transactions.size() && i < planned.flat_writes.size(); ++i) {
++        if (transactions[i].file_num != planned.flat_writes[i].file_num ||
++            transactions[i].data_pos != planned.flat_writes[i].data_pos) {
++            ThrowCorrupt();
++        }
++    }
++    const std::map<Bytes, Bytes> explorer_entries(planned.entries.begin(),
++                                                  planned.entries.end());
++    std::map<Bytes, std::optional<Bytes>> undo_map;
++    for (const auto &[k, v] : undo.entries) {
++        undo_map.emplace(k, v);
++    }
++    const auto asset_entries =
++        AssetEntries(restored, [&](const Bytes &k) -> std::optional<Bytes> {
++            auto it = undo_map.find(k);
++            return it == undo_map.end() ? std::nullopt : it->second;
++        });
++    for (const auto &[k, v] : asset_entries) {
++        if (!expected.insert(k).second || db.Get(k) != v) {
++            ThrowCorrupt();
++        }
++    }
++    for (const auto &[k, v] : explorer_entries) {
++        if (!expected.insert(k).second || db.Get(k) != v) {
++            ThrowCorrupt();
++        }
++    }
++    if (expected.size() != undo.entries.size()) {
++        ThrowCorrupt();
++    }
++    std::set<Bytes> seen;
++    for (const auto &[k, previous] : undo.entries) {
++        if (!expected.count(k) || !seen.insert(k).second) {
++            ThrowCorrupt();
++        }
++        if (auto it = legacy_previous.find(k); it != legacy_previous.end()) {
++            if (previous != it->second) {
++                ThrowCorrupt();
++            }
++        }
++        if (asset_entries.count(k)) {
++            if (!StartsWith(k, "eA") && previous) {
++                ThrowCorrupt();
++            }
++            continue;
++        }
++        if (explorer_entries.count(k)) {
++            if (previous) {
++                ThrowCorrupt();
++            }
++            continue;
++        }
++        if (!k.empty() && k[0] == 'o' && k.size() == 37) {
++            const OutPoint op = OutPointDecode(ByteView(k).subspan(1));
++            const auto cur_bytes = db.Get(k);
++            if (!cur_bytes) {
++                ThrowCorrupt();
++            }
++            const Record current = DecodeRecord(*cur_bytes);
++            if (current.creation.txid != op.txid) {
++                ThrowCorrupt();
++            }
++            if (!previous) {
++                if (current.creation.block_id.b != anchor.block_id ||
++                    current.creation.height != anchor.height) {
++                    ThrowCorrupt();
++                }
++            } else {
++                const Record old = DecodeRecord(*previous);
++                if (old.creation.txid != op.txid ||
++                    old.creation.height > parent.height || old.spend ||
++                    DecodeOutputOrCorrupt(old.output).IsBurn() ||
++                    codec::Encode(old.creation) !=
++                        codec::Encode(current.creation) ||
++                    old.output != current.output || !current.spend ||
++                    current.spend->first.block_id.b != anchor.block_id ||
++                    current.spend->first.height != anchor.height) {
++                    ThrowCorrupt();
++                }
++            }
++        } else if (!k.empty() && k[0] == 't' && k.size() == 33 && !previous) {
++            const auto value = db.Get(k);
++            if (!value || value->size() > 128) {
++                ThrowCorrupt();
++            }
++            const auto loc = codec::Decode<TxLocation>(*value);
++            if (!std::equal(loc.txid.hash.b.begin(), loc.txid.hash.b.end(),
++                            k.begin() + 1) ||
++                loc.block_id.b != anchor.block_id ||
++                loc.height != anchor.height) {
++                ThrowCorrupt();
++            }
++        } else if (!k.empty() && k[0] == 'p' && k.size() == 70 && !previous) {
++            const OutPoint op = OutPointDecode(ByteView(k).subspan(34));
++            const auto rec_bytes = db.Get(PrefixKey('o', OutPointBytes(op)));
++            if (!rec_bytes) {
++                ThrowCorrupt();
++            }
++            const Record record = DecodeRecord(*rec_bytes);
++            const Output output = DecodeOutputOrCorrupt(record.output);
++            const Hash32 root = Hash32::FromBytes(ByteView(k).subspan(1, 32));
++            const uint8_t position = k[33];
++            const bool root_ok =
++                position == 255
++                    ? std::find(output.branches.begin(), output.branches.end(),
++                                root) != output.branches.end()
++                    : position < output.branches.size() &&
++                          output.branches[position] == root;
++            const auto posting = db.Get(k);
++            if (record.creation.block_id.b != anchor.block_id ||
++                record.creation.height != anchor.height || !root_ok ||
++                !posting || !posting->empty()) {
++                ThrowCorrupt();
++            }
++        } else {
++            ThrowCorrupt();
++        }
++    }
++}
++
++} // namespace
++
++Bytes OutPointBytes(const OutPoint &op) {
++    Bytes b(op.txid.hash.b.begin(), op.txid.hash.b.end());
++    for (int i = 3; i >= 0; --i) {
++        b.push_back(uint8_t(op.out_idx >> (8 * i)));
++    }
++    return b;
++}
++
++OutPoint OutPointDecode(ByteView b) {
++    if (b.size() != 36) {
++        ThrowCorrupt();
++    }
++    OutPoint op;
++    op.txid.hash = Hash32::FromBytes(b.first(32));
++    op.out_idx = uint32_t(b[32]) << 24 | uint32_t(b[33]) << 16 |
++                 uint32_t(b[34]) << 8 | uint32_t(b[35]);
++    return op;
++}
++
++Bytes PrefixKey(uint8_t prefix, ByteView bytes) {
++    Bytes k{prefix};
++    k.insert(k.end(), bytes.begin(), bytes.end());
++    return k;
++}
++
++Bytes PostingPrefix(const Hash32 &root, std::optional<uint8_t> position) {
++    Bytes k = PrefixKey('p', root.b);
++    k.push_back(position.value_or(255));
++    return k;
++}
++
++// ---- V2Db ----
++
++V2Db::V2Db(const std::filesystem::path &path, const Binding &binding)
++    : m_db(std::make_unique<V2Env>(path)), m_binding(binding) {
++    const Bytes identity = Identity(binding);
++    const auto existing = m_db->Get(Str("v2-binding"));
++    if (existing) {
++        if (*existing != identity) {
++            ThrowInvalid("binding/schema mismatch");
++        }
++        return;
++    }
++    if (!m_db->IsEmpty()) {
++        ThrowInvalid("nonempty foreign database");
++    }
++    V2WriteBatch batch;
++    batch.Put(StrBytes("v2-binding"), identity);
++    WriteBatch(*m_db, batch);
++}
++
++std::optional<Anchor> V2Db::Checkpoint() const {
++    const auto bytes = m_db->Get(Str("tip"));
++    if (!bytes) {
++        return std::nullopt;
++    }
++    return codec::Decode<Anchor>(*bytes);
++}
++
++void V2Db::InitializeGenesis(const CommittedBlock &block) {
++    if (block.parent != block.anchor) {
++        ThrowInvalid("genesis parent");
++    }
++    ConnectImpl(block, true);
++}
++
++ReadSnapshot V2Db::Snapshot() const {
++    V2EnvSnapshot inner = m_db->Snapshot();
++    const auto tip = inner.Get(Str("tip"));
++    if (!tip) {
++        ThrowInvalid("uninitialized index");
++    }
++    const Anchor anchor = codec::Decode<Anchor>(*tip);
++    return ReadSnapshot(std::move(inner), anchor, m_binding);
++}
++
++void V2Db::Connect(const CommittedBlock &block) { ConnectImpl(block, false); }
++
++void V2Db::ConnectImpl(const CommittedBlock &block, bool genesis) {
++    if (block.transactions.size() > MAX_TRANSACTIONS) {
++        ThrowInvalid("transaction bound");
++    }
++    if ((!genesis &&
++         (block.parent.height == UINT64_MAX ||
++          block.parent.height + 1 != block.anchor.height ||
++          block.anchor.block_id == block.parent.block_id)) ||
++        (genesis && (block.anchor.height != 0 ||
++                     block.anchor.block_id != m_binding.genesis))) {
++        ThrowInvalid("block identity");
++    }
++    // Conservative staging reservation includes receipt, old/new records,
++    // map nodes, posting keys, undo encoding and batch framing. Reject before
++    // allocating receipt/maps rather than constructing a huge rejected batch.
++    size_t reserved = 1024;
++    Reserve(reserved, PreflightExplorerBlock(block));
++    for (const ConfirmedTx &tx : block.transactions) {
++        Reserve(reserved, 512);
++        const size_t items = tx.outputs.size() + tx.spends.size() +
++                             tx.explorer.inputs.size();
++        if (items > SIZE_MAX / 8192) {
++            ThrowInvalid("asset staging capacity");
++        }
++        Reserve(reserved, items * 8192);
++        constexpr size_t per_spend = 6 * MAX_BRANCH_RECORD_BYTES + 1024;
++        if (tx.spends.size() > SIZE_MAX / per_spend) {
++            ThrowInvalid("staging capacity");
++        }
++        Reserve(reserved, tx.spends.size() * per_spend);
++        for (const Output &output : tx.outputs) {
++            if (output.Validate()) {
++                ThrowInvalid("output");
++            }
++            Reserve(reserved, 6 * MAX_BRANCH_RECORD_BYTES +
++                                  output.branches.size() * 2 * 512);
++        }
++    }
++    size_t changes = 0;
++    std::set<TxId> txids;
++    std::vector<ReceiptTx> receipt;
++    for (size_t i = 0; i < block.transactions.size(); ++i) {
++        const ConfirmedTx &tx = block.transactions[i];
++        changes += tx.outputs.size() + tx.spends.size();
++        if (changes > MAX_CHANGES) {
++            ThrowInvalid("change bound");
++        }
++        if (tx.location.block_id.b != block.anchor.block_id ||
++            tx.location.height != block.anchor.height ||
++            tx.location.tx_index != i ||
++            !txids.insert(tx.location.txid).second) {
++            ThrowInvalid("transaction identity/order");
++        }
++        ReceiptTx r;
++        r.location = tx.location;
++        for (const Output &o : tx.outputs) {
++            r.outputs.push_back(EncodeOutputOr(o, "output"));
++        }
++        for (const SpentInput &s : tx.spends) {
++            r.spends.emplace_back(s.outpoint.txid.hash.b, s.outpoint.out_idx,
++                                  s.input_index);
++        }
++        r.lock = tx.explorer.lock;
++        r.inputs = tx.explorer.inputs;
++        r.wire_size = tx.explorer.wire.size();
++        r.wire_checksum = SeaHash(tx.explorer.wire);
++        receipt.push_back(std::move(r));
++    }
++    const auto tip = Checkpoint();
++    const Bytes block_key = PrefixKey('b', block.anchor.block_id);
++    if (tip == block.anchor) {
++        const auto stored = m_db->Get(block_key);
++        if (!stored || stored->size() > MAX_BATCH_BYTES) {
++            ThrowCorrupt();
++        }
++        Receipt prior = Dec<Receipt>(*stored);
++        if (prior.transactions.size() != receipt.size()) {
++            ThrowInvalid("conflicting replay");
++        }
++        for (size_t i = 0; i < receipt.size(); ++i) {
++            ReceiptTx &incoming = receipt[i];
++            ReceiptTx &old = prior.transactions[i];
++            if (incoming.inputs.size() != old.inputs.size() ||
++                incoming.wire_size != old.wire_size ||
++                incoming.wire_checksum != old.wire_checksum) {
++                ThrowInvalid("conflicting replay");
++            }
++            Bytes disk_wire;
++            try {
++                disk_wire = m_db->Flat().ReadAt(old.file_num, old.data_pos,
++                                                size_t(old.wire_size));
++            } catch (const V2Error &) {
++                ThrowCorrupt();
++            }
++            if (disk_wire != block.transactions[i].explorer.wire) {
++                ThrowInvalid("conflicting replay");
++            }
++            incoming.file_num = old.file_num;
++            incoming.data_pos = old.data_pos;
++            for (size_t j = 0; j < incoming.inputs.size(); ++j) {
++                auto &input = incoming.inputs[j];
++                auto &old_input = old.inputs[j];
++                if (input.resolved_creation &&
++                    input.resolved_creation != old_input.resolved_creation) {
++                    ThrowInvalid("caller resolved coin");
++                }
++                input.resolved_creation = old_input.resolved_creation;
++            }
++        }
++        if (Enc(Receipt{block.anchor, block.parent, block.explorer,
++                        std::move(receipt)}) != *stored) {
++            ThrowInvalid("conflicting replay");
++        }
++        return;
++    }
++    CommittedBlock resolved = block;
++    std::map<OutPoint, ResolvedCreation> creations;
++    for (ConfirmedTx &tx : resolved.transactions) {
++        for (size_t index = 0; index < tx.explorer.inputs.size(); ++index) {
++            InputFact &input = tx.explorer.inputs[index];
++            if (input.flags == 1) {
++                const OutPoint op{TxId{H(input.prev_txid)}, input.prev_index};
++                if (std::none_of(tx.spends.begin(), tx.spends.end(),
++                                 [&](const SpentInput &s) {
++                                     return s.input_index == index &&
++                                            s.outpoint == op;
++                                 })) {
++                    ThrowInvalid("full spend mismatch");
++                }
++                ResolvedCreation creation;
++                if (auto it = creations.find(op); it != creations.end()) {
++                    creation = it->second;
++                } else {
++                    const auto bytes =
++                        m_db->Get(PrefixKey('o', OutPointBytes(op)));
++                    if (!bytes) {
++                        ThrowInvalid("missing coin");
++                    }
++                    OutputRecord r = Public(DecodeRecord(*bytes), op);
++                    creation = ResolvedCreation{op, std::move(r.output),
++                                                r.creation};
++                }
++                if (input.resolved_creation &&
++                    *input.resolved_creation != creation) {
++                    ThrowInvalid("caller resolved coin");
++                }
++                input.resolved_creation = std::move(creation);
++            } else if (input.resolved_creation) {
++                ThrowInvalid("nonspend resolved coin");
++            }
++        }
++        for (const SpentInput &s : tx.spends) {
++            if (s.input_index >= tx.explorer.inputs.size() ||
++                tx.explorer.inputs[s.input_index].flags != 1) {
++                ThrowInvalid("full spend missing");
++            }
++        }
++        for (size_t i = 0; i < tx.outputs.size(); ++i) {
++            const OutPoint op{tx.location.txid, uint32_t(i)};
++            creations[op] = ResolvedCreation{op, tx.outputs[i], tx.location};
++        }
++    }
++    if ((genesis ? tip.has_value() : tip != block.parent) ||
++        m_db->Get(block_key)) {
++        ThrowInvalid("checkpoint/duplicate block");
++    }
++    FlatPos prev_flat_pos{0, 0};
++    if (const auto bytes = m_db->Get(Str("flat_pos"))) {
++        prev_flat_pos = Dec<FlatPos>(*bytes);
++    }
++    ExplorerPlan plan = PlanExplorerBlockAt(resolved, prev_flat_pos.first,
++                                            prev_flat_pos.second);
++    for (size_t i = 0;
++         i < receipt.size() && i < plan.flat_writes.size(); ++i) {
++        receipt[i].inputs = resolved.transactions[i].explorer.inputs;
++        receipt[i].file_num = plan.flat_writes[i].file_num;
++        receipt[i].data_pos = plan.flat_writes[i].data_pos;
++    }
++    const Bytes receipt_bytes =
++        Enc(Receipt{block.anchor, block.parent, block.explorer, receipt});
++    if (receipt_bytes.size() > MAX_BATCH_BYTES) {
++        ThrowInvalid("receipt bound");
++    }
++    std::map<Bytes, std::optional<Bytes>> state;
++    std::map<Bytes, std::optional<Bytes>> undo;
++    std::set<OutPoint> spent;
++    for (const ConfirmedTx &tx : block.transactions) {
++        const Bytes tx_key = PrefixKey('t', tx.location.txid.hash.b);
++        if (m_db->Get(tx_key)) {
++            ThrowInvalid("duplicate transaction");
++        }
++        undo[tx_key] = std::nullopt;
++        state[tx_key] = codec::Encode(tx.location);
++        for (size_t i = 1; i < tx.spends.size(); ++i) {
++            if (tx.spends[i - 1].input_index >= tx.spends[i].input_index) {
++                ThrowInvalid("input ordinal order");
++            }
++        }
++        std::set<uint32_t> input_ordinals;
++        for (const SpentInput &input : tx.spends) {
++            const OutPoint &op = input.outpoint;
++            if (!input_ordinals.insert(input.input_index).second) {
++                ThrowInvalid("duplicate input ordinal");
++            }
++            if (!spent.insert(op).second) {
++                ThrowInvalid("double spend");
++            }
++            const Bytes k = PrefixKey('o', OutPointBytes(op));
++            std::optional<Bytes> previous;
++            if (auto it = state.find(k); it != state.end()) {
++                previous = it->second;
++            } else {
++                previous = m_db->Get(k);
++            }
++            if (!previous) {
++                ThrowInvalid("missing coin");
++            }
++            Record record = DecodeRecord(*previous);
++            if (record.spend || DecodeOutputOrCorrupt(record.output).IsBurn()) {
++                ThrowInvalid("spent/burn coin");
++            }
++            if (!undo.count(k)) {
++                undo[k] = m_db->Get(k);
++            }
++            record.spend = std::make_pair(tx.location, input.input_index);
++            state[k] = Enc(record);
++        }
++        for (size_t i = 0; i < tx.outputs.size(); ++i) {
++            const Output &output = tx.outputs[i];
++            if (i > UINT32_MAX) {
++                ThrowInvalid("output index");
++            }
++            const OutPoint op{tx.location.txid, uint32_t(i)};
++            const Bytes k = PrefixKey('o', OutPointBytes(op));
++            if (state.count(k) || m_db->Get(k)) {
++                ThrowInvalid("duplicate outpoint");
++            }
++            undo[k] = std::nullopt;
++            state[k] = Enc(Record{EncodeOutputOr(output, "output"),
++                                  tx.location, std::nullopt});
++            for (size_t position = 0; position < output.branches.size();
++                 ++position) {
++                for (uint8_t pos : {uint8_t(position), uint8_t(255)}) {
++                    const Bytes pk =
++                        PostingKey(output.branches[position], pos, op);
++                    undo[pk] = std::nullopt;
++                    state[pk] = Bytes{};
++                }
++            }
++        }
++    }
++    for (auto &[k, v] : plan.entries) {
++        if (state.count(k) || m_db->Get(k)) {
++            ThrowInvalid("duplicate explorer key");
++        }
++        undo[k] = std::nullopt;
++        state[k] = std::move(v);
++    }
++    for (auto &[k, v] : AssetEntries(resolved, [&](const Bytes &key) {
++             return m_db->Get(key);
++         })) {
++        auto old = m_db->Get(k);
++        if (!StartsWith(k, "eA") && old) {
++            ThrowInvalid("duplicate asset entry");
++        }
++        if (!undo.count(k)) {
++            undo[k] = std::move(old);
++        }
++        state[k] = std::move(v);
++    }
++    Undo undo_record{m_binding,
++                     block.anchor,
++                     genesis ? std::nullopt : std::optional<Anchor>(block.parent),
++                     prev_flat_pos,
++                     {}};
++    for (auto &[k, v] : undo) {
++        undo_record.entries.emplace_back(k, std::move(v));
++    }
++    const Bytes undo_bytes = Enc(undo_record);
++    size_t flat_bytes = 0;
++    for (const FlatWrite &w : plan.flat_writes) {
++        flat_bytes += w.wire.size();
++    }
++    size_t size = receipt_bytes.size() + undo_bytes.size() + flat_bytes;
++    for (const auto &[k, v] : state) {
++        size += k.size() + (v ? v->size() : 0);
++    }
++    if (size > MAX_BATCH_BYTES) {
++        ThrowInvalid("batch bound");
++    }
++    std::set<uint32_t> synced_files;
++    for (const FlatWrite &w : plan.flat_writes) {
++        m_db->Flat().WriteAt(w.file_num, w.data_pos, w.wire);
++        synced_files.insert(w.file_num);
++    }
++    for (uint32_t file_num : synced_files) {
++        m_db->Flat().SyncFile(file_num);
++    }
++    V2WriteBatch batch;
++    for (auto &[k, v] : state) {
++        if (v) {
++            batch.Put(k, std::move(*v));
++        }
++    }
++    batch.Put(block_key, receipt_bytes);
++    batch.Put(PrefixKey('u', block.anchor.block_id), undo_bytes);
++    batch.Put(StrBytes("flat_pos"), Enc(plan.next_flat_pos));
++    batch.Put(StrBytes("tip"), codec::Encode(block.anchor));
++    batch.Delete(StrBytes("disconnected"));
++    WriteBatch(*m_db, batch);
++}
++
++void V2Db::Disconnect(const Anchor &anchor) {
++    if (anchor.height == 0) {
++        ThrowInvalid("genesis disconnect");
++    }
++    const Anchor tip = Snapshot().anchor;
++    if (tip != anchor) {
++        if (m_db->Get(Str("disconnected")) == codec::Encode(anchor)) {
++            return;
++        }
++        ThrowInvalid("disconnect checkpoint");
++    }
++    const auto bytes = m_db->Get(PrefixKey('u', anchor.block_id));
++    if (!bytes) {
++        ThrowInvalid("missing undo");
++    }
++    if (bytes->size() > MAX_BATCH_BYTES) {
++        ThrowCorrupt();
++    }
++    Undo undo = Dec<Undo>(*bytes);
++    ValidateUndo(*m_db, m_binding, anchor, undo);
++    if (!undo.parent) {
++        ThrowCorrupt();
++    }
++    const Anchor parent = *undo.parent;
++    V2WriteBatch batch;
++    for (auto &[k, v] : undo.entries) {
++        if (v) {
++            batch.Put(k, std::move(*v));
++        } else {
++            batch.Delete(k);
++        }
++    }
++    batch.Delete(PrefixKey('b', anchor.block_id));
++    batch.Delete(PrefixKey('u', anchor.block_id));
++    batch.Put(StrBytes("flat_pos"), Enc(undo.prev_flat_pos));
++    batch.Put(StrBytes("tip"), codec::Encode(parent));
++    batch.Put(StrBytes("disconnected"), codec::Encode(anchor));
++    WriteBatch(*m_db, batch);
++    m_db->Flat().TruncateTo(undo.prev_flat_pos.first,
++                            undo.prev_flat_pos.second);
++}
++
++// ---- ReadSnapshot branch readers ----
++
++std::optional<TxLocation> ReadSnapshot::Transaction(const TxId &txid) const {
++    AssetReadBudget budget(SIZE_MAX);
++    return TransactionCounted(txid, budget);
++}
++
++std::optional<TxLocation>
++ReadSnapshot::TransactionCounted(const TxId &txid,
++                                 AssetReadBudget &budget) const {
++    budget.Charge();
++    const auto bytes = m_inner.Get(PrefixKey('t', txid.hash.b));
++    if (!bytes) {
++        return std::nullopt;
++    }
++    if (bytes->size() > 128) {
++        ThrowCorrupt();
++    }
++    const auto location = codec::Decode<TxLocation>(*bytes);
++    if (location.txid != txid || location.height > anchor.height) {
++        ThrowCorrupt();
++    }
++    budget.Charge();
++    const auto block = m_inner.Get(HeightKey(location.height));
++    if (!block || !std::ranges::equal(*block, location.block_id.b)) {
++        ThrowCorrupt();
++    }
++    return location;
++}
++
++std::optional<OutputRecord> ReadSnapshot::GetOutput(const OutPoint &op) const {
++    AssetReadBudget budget(SIZE_MAX);
++    return OutputCounted(op, budget);
++}
++
++std::optional<OutputRecord>
++ReadSnapshot::OutputCounted(const OutPoint &op, AssetReadBudget &budget) const {
++    budget.Charge();
++    const auto bytes = m_inner.Get(PrefixKey('o', OutPointBytes(op)));
++    if (!bytes) {
++        return std::nullopt;
++    }
++    OutputRecord record = Public(DecodeRecord(*bytes), op);
++    if (TransactionCounted(record.creation.txid, budget) != record.creation ||
++        record.creation.height > anchor.height) {
++        ThrowCorrupt();
++    }
++    if (record.spend) {
++        const TxLocation &spender = record.spend->transaction;
++        if (TransactionCounted(spender.txid, budget) != spender ||
++            spender.height > anchor.height) {
++            ThrowCorrupt();
++        }
++    }
++    return record;
++}
++
++std::optional<OutputRecord> ReadSnapshot::Utxo(const OutPoint &op) const {
++    auto record = GetOutput(op);
++    if (record && (record->spend || record->output.IsBurn())) {
++        return std::nullopt;
++    }
++    return record;
++}
++
++namespace {
++std::optional<std::array<uint8_t, 36>>
++OpArray(const std::optional<OutPoint> &op) {
++    if (!op) {
++        return std::nullopt;
++    }
++    const Bytes b = OutPointBytes(*op);
++    std::array<uint8_t, 36> a;
++    std::copy(b.begin(), b.end(), a.begin());
++    return a;
++}
++} // namespace
++
++std::optional<OutPoint>
++ReadSnapshot::NextPosting(const Hash32 &root, std::optional<uint8_t> position,
++                          std::optional<OutPoint> after) const {
++    if (position && *position >= 16) {
++        ThrowInvalid("position");
++    }
++    const auto bytes = m_inner.NextPostingDupfixed(
++        root.b, position.value_or(255), OpArray(after));
++    if (!bytes) {
++        return std::nullopt;
++    }
++    return OutPointDecode(*bytes);
++}
++
++std::vector<OutPoint>
++ReadSnapshot::PostingsAfter(const Hash32 &root, std::optional<uint8_t> position,
++                            std::optional<OutPoint> after) const {
++    if (position && *position >= 16) {
++        ThrowInvalid("position");
++    }
++    std::vector<OutPoint> out;
++    for (const auto &raw : m_inner.PostingsDupfixedAfter(
++             root.b, position.value_or(255), OpArray(after))) {
++        out.push_back(OutPointDecode(raw));
++    }
++    return out;
++}
++
++} // namespace chronik::native::lotus_v2
+diff --git a/chronik/native/ext/lotus_v2/db/branch.h b/chronik/native/ext/lotus_v2/db/branch.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a66e0b6c584d1f9f7340ebc19dc77715c68b06a
+--- /dev/null
++++ b/chronik/native/ext/lotus_v2/db/branch.h
+@@ -0,0 +1,164 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef CHRONIK_NATIVE_EXT_LOTUS_V2_DB_BRANCH_H
++#define CHRONIK_NATIVE_EXT_LOTUS_V2_DB_BRANCH_H
++
++#include <ext/lotus_v2/db/env.h>
++#include <ext/lotus_v2/db/model.h>
++
++#include <filesystem>
++#include <memory>
++#include <optional>
++#include <utility>
++#include <vector>
++
++/**
++ * Separate, versioned V2 confirmed branch database (port of
++ * chronik-db/src/v2_branch.rs). Callers supply only authoritative committed
++ * transitions. One synced write batch commits records, history postings,
++ * explorer and asset facts, receipt, undo and checkpoint together; the flat
++ * wire segments are written and synced before it.
++ *
++ * Errors are thrown as V2Error.
++ */
++namespace chronik::native::lotus_v2 {
++
++/** Max serialized output record (output <= 812 B plus two locations). */
++inline constexpr size_t MAX_BRANCH_RECORD_BYTES = 1200;
++
++/** "Loc"/TxLocation key helpers shared with the explorer/asset modules. */
++Bytes OutPointBytes(const OutPoint &op);
++OutPoint OutPointDecode(ByteView b);
++Bytes PrefixKey(uint8_t prefix, ByteView bytes);
++/** 'p' || root || (position or 255) */
++Bytes PostingPrefix(const Hash32 &root, std::optional<uint8_t> position);
++
++class ReadSnapshot;
++
++/** Owns a dedicated database. Mutations require exclusive access. */
++class V2Db {
++public:
++    /** Open or create a dedicated V2 directory; reject foreign schema. */
++    V2Db(const std::filesystem::path &path, const Binding &binding);
++
++    const Binding &GetBinding() const { return m_binding; }
++    /** Last fully indexed block; a new database has no checkpoint. */
++    std::optional<Anchor> Checkpoint() const;
++    /** Index the caller-authenticated committed genesis. */
++    void InitializeGenesis(const CommittedBlock &block);
++    /**
++     * Stable MVCC snapshot and its checkpoint; Invalid("uninitialized index")
++     * until genesis. The snapshot must not outlive this V2Db.
++     */
++    ReadSnapshot Snapshot() const;
++    /** Atomically index one committed child block; exact replay is a no-op. */
++    void Connect(const CommittedBlock &block);
++    /** Atomically undo the current block; repeating it is idempotent. */
++    void Disconnect(const Anchor &anchor);
++
++    /** The env itself (Rust's pub(crate) `db`, for tests and tooling). */
++    V2Env &Env() { return *m_db; }
++    const V2Env &Env() const { return *m_db; }
++
++private:
++    void ConnectImpl(const CommittedBlock &block, bool genesis);
++
++    std::unique_ptr<V2Env> m_db;
++    Binding m_binding;
++};
++
++/**
++ * Bounded read facade over one MVCC snapshot: each call returns at most one
++ * record/posting; consumers enforce request budgets.
++ */
++class ReadSnapshot {
++public:
++    ReadSnapshot(V2EnvSnapshot inner, Anchor anchor, Binding binding)
++        : anchor(anchor), binding(binding), m_inner(std::move(inner)) {}
++
++    /** Checkpoint matching this snapshot. */
++    Anchor anchor;
++    /** Immutable schema deployment binding. */
++    Binding binding;
++
++    const V2EnvSnapshot &Inner() const { return m_inner; }
++
++    // ---- Branch records (v2_branch.rs) ----
++    std::optional<TxLocation> Transaction(const TxId &txid) const;
++    std::optional<TxLocation> TransactionCounted(const TxId &txid,
++                                                 AssetReadBudget &budget) const;
++    /** Full output with creation/spend history. Burns remain queryable. */
++    std::optional<OutputRecord> GetOutput(const OutPoint &op) const;
++    std::optional<OutputRecord> OutputCounted(const OutPoint &op,
++                                              AssetReadBudget &budget) const;
++    /** Unspent spendable output; burns are always excluded. */
++    std::optional<OutputRecord> Utxo(const OutPoint &op) const;
++    /** Strictly ordered next outpoint for root and optional position. */
++    std::optional<OutPoint> NextPosting(const Hash32 &root,
++                                        std::optional<uint8_t> position,
++                                        std::optional<OutPoint> after) const;
++    std::vector<OutPoint> PostingsAfter(const Hash32 &root,
++                                        std::optional<uint8_t> position,
++                                        std::optional<OutPoint> after) const;
++
++    // ---- Explorer (v2_explorer.rs) ----
++    std::optional<BlockMeta> ExplorerBlock(const Hash32 &id) const;
++    std::optional<BlockMeta> ExplorerBlockAtHeight(uint64_t height) const;
++    std::optional<TxMeta> ExplorerTx(const TxId &id) const;
++    std::optional<TxMeta> ExplorerTxByHash(const TxHash &hash) const;
++    std::optional<std::pair<TxId, TxHash>>
++    ExplorerBlockTx(const Hash32 &block, uint32_t index) const;
++    std::optional<InputMeta> ExplorerInput(const TxId &id,
++                                           uint32_t index) const;
++    std::optional<WitnessFact> ExplorerWitness(const TxId &id,
++                                               uint32_t input_index,
++                                               uint32_t index) const;
++    /** [offset, min(offset + length, wire_size)) of the exact frame. */
++    std::optional<Bytes> ExplorerWireSlice(const TxId &id, uint64_t offset,
++                                           uint64_t length) const;
++    /** 32 KiB chunk `index` of the exact frame. */
++    std::optional<Bytes> ExplorerWireChunk(const TxId &id,
++                                           uint32_t index) const;
++    /** Exclusive bounded seek in eH/eO/eI/eW with an exact key width. */
++    std::optional<std::pair<Bytes, Bytes>>
++    ExplorerNextRaw(ByteView prefix, size_t key_len,
++                    std::optional<ByteView> after) const;
++
++    // ---- Assets (v2_asset.rs) ----
++    std::optional<AssetSummary> GetAssetSummary(const Hash32 &token) const;
++    std::optional<AssetSummary>
++    AssetSummaryCounted(const Hash32 &token, AssetReadBudget &budget) const;
++    std::optional<std::pair<Bytes, AssetSummary>>
++    NextAssetSummary(std::optional<ByteView> after) const;
++    std::optional<std::pair<Bytes, AssetSummary>>
++    NextAssetSummaryCounted(std::optional<ByteView> after,
++                            AssetReadBudget &budget) const;
++    std::optional<std::pair<Bytes, AssetEvent>>
++    NextAssetEvent(const Hash32 &token, std::optional<ByteView> after) const;
++    std::optional<std::pair<Bytes, AssetEvent>>
++    NextAssetEventCounted(const Hash32 &token, std::optional<ByteView> after,
++                          AssetReadBudget &budget) const;
++    std::optional<std::pair<Bytes, OutPoint>>
++    NextAssetOutput(const Hash32 &token, std::optional<ByteView> after) const;
++    std::optional<std::pair<Bytes, OutPoint>>
++    NextAssetOutputCounted(const Hash32 &token, std::optional<ByteView> after,
++                           AssetReadBudget &budget) const;
++
++private:
++    std::pair<uint64_t, uint64_t>
++    ExplorerTableCount(const TxId &id, uint64_t wire_size,
++                       const WireRange &range) const;
++    void AssetCanonicalLocation(const TxLocation &location,
++                                AssetReadBudget &budget) const;
++    std::optional<std::pair<Bytes, Bytes>>
++    NextAssetRaw(ByteView prefix, size_t key_len,
++                 std::optional<ByteView> after, AssetReadBudget &budget) const;
++
++    V2EnvSnapshot m_inner;
++};
++
++} // namespace chronik::native::lotus_v2
++
++#endif // CHRONIK_NATIVE_EXT_LOTUS_V2_DB_BRANCH_H
+diff --git a/chronik/native/ext/lotus_v2/db/env.cpp b/chronik/native/ext/lotus_v2/db/env.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..61c6410d109dfc63923a02907029b85ead93e187
+--- /dev/null
++++ b/chronik/native/ext/lotus_v2/db/env.cpp
+@@ -0,0 +1,528 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <ext/lotus_v2/db/env.h>
++
++#include <chronik/native/mdbx_store.h>
++
++#include <algorithm>
++#include <cerrno>
++#include <cstdio>
++#include <cstring>
++
++#include <fcntl.h>
++#include <unistd.h>
++
++namespace chronik::native::lotus_v2 {
++
++namespace {
++
++constexpr TableSpec kTables[] = {
++    {"meta"},
++    {"block_receipts"},
++    {"undo"},
++    {"tx_locations"},
++    {"outputs"},
++    {"postings", TableSpec::Kind::Dup, 36},
++    {"explorer_height"},
++    {"explorer_block"},
++    {"explorer_block_tx"},
++    {"explorer_tx"},
++    {"explorer_txhash"},
++    {"explorer_input"},
++    {"explorer_witness"},
++    {"asset_summary"},
++    {"asset_event"},
++    {"asset_output"},
++};
++static_assert(std::size(kTables) == V2Env::N_TABLES);
++
++/** The Rust v2_index env (chronik-db/src/mdbx.rs MdbxEnv::open). */
++MdbxEnvProfile V2IndexProfile() {
++    MdbxEnvProfile p;
++    p.size_lower = -1;
++    p.size_now = -1;
++    p.size_upper = int64_t(16) << 30;
++    p.growth_step = 16 << 20;
++    p.shrink_threshold = 64 << 20;
++    p.pagesize = 4096;
++    // Durable: only NOSTICKYTHREADS | LIFORECLAIM.
++    p.safe_nosync = false;
++    p.nometasync = false;
++    p.liforeclaim = true;
++    p.nostickythreads = true;
++    p.nomeminit = false;
++    p.mode = 0644;
++    p.max_readers = 256;
++    p.max_dbs = 32;
++    p.sync_bytes = std::nullopt;
++    p.sync_period = std::nullopt;
++    p.sync_after_open = false;
++    return p;
++}
++
++/** Rust io::Error Display: "<description> (os error N)". */
++std::string IoError(int err) {
++    return std::string(std::strerror(err)) + " (os error " +
++           std::to_string(err) + ")";
++}
++
++[[noreturn]] void ThrowDb(const std::string &msg) { throw V2Error::Db(msg); }
++
++/** Native backend failures become V2 storage errors. */
++template <typename F> auto Guard(F &&f) -> decltype(f()) {
++    try {
++        return f();
++    } catch (const V2Error &) {
++        throw;
++    } catch (const ChronikError &e) {
++        ThrowDb(e.what());
++    }
++}
++
++bool StartsWith(ByteView bytes, ByteView prefix) {
++    return bytes.size() >= prefix.size() &&
++           std::equal(prefix.begin(), prefix.end(), bytes.begin());
++}
++
++Bytes Concat(ByteView a, ByteView b) {
++    Bytes out(a.begin(), a.end());
++    out.insert(out.end(), b.begin(), b.end());
++    return out;
++}
++
++ByteView Str(std::string_view s) {
++    return ByteView(reinterpret_cast<const uint8_t *>(s.data()), s.size());
++}
++
++std::array<uint8_t, 33> PostingKey(const Bytes32 &root, uint8_t pos) {
++    std::array<uint8_t, 33> k;
++    std::copy(root.begin(), root.end(), k.begin());
++    k[32] = pos;
++    return k;
++}
++
++std::array<uint8_t, 36> Dup36(ByteView v) {
++    if (v.size() != 36) {
++        ThrowDb("dupfixed posting value has length " +
++                std::to_string(v.size()));
++    }
++    std::array<uint8_t, 36> out;
++    std::copy(v.begin(), v.end(), out.begin());
++    return out;
++}
++
++int DataSync(int fd) {
++#ifdef __APPLE__
++    return fcntl(fd, F_FULLFSYNC);
++#else
++    return fdatasync(fd);
++#endif
++}
++
++} // namespace
++
++// ---- Flat files ----
++
++FlatFileStore::File::~File() {
++    if (fd >= 0) {
++        ::close(fd);
++    }
++}
++
++std::filesystem::path FlatFileStore::SegmentPath(uint32_t file_num) const {
++    char name[32];
++    std::snprintf(name, sizeof(name), "v2_tx_%05u.dat", unsigned(file_num));
++    return m_dir / name;
++}
++
++std::shared_ptr<FlatFileStore::File>
++FlatFileStore::GetOrOpen(uint32_t file_num, bool create) const {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    if (auto it = m_files.find(file_num); it != m_files.end()) {
++        return it->second;
++    }
++    const auto path = SegmentPath(file_num);
++    const int fd =
++        ::open(path.c_str(), O_RDWR | O_CLOEXEC | (create ? O_CREAT : 0), 0666);
++    if (fd < 0) {
++        ThrowDb("open " + path.string() + ": " + IoError(errno));
++    }
++    auto file = std::make_shared<File>();
++    file->fd = fd;
++    m_files.emplace(file_num, file);
++    return file;
++}
++
++void FlatFileStore::WriteAt(uint32_t file_num, uint64_t offset,
++                            ByteView bytes) const {
++    auto file = GetOrOpen(file_num, true);
++    size_t done = 0;
++    while (done < bytes.size()) {
++        const ssize_t n = ::pwrite(file->fd, bytes.data() + done,
++                                   bytes.size() - done, off_t(offset + done));
++        if (n < 0 && errno == EINTR) {
++            continue;
++        }
++        if (n <= 0) {
++            const std::string err =
++                n == 0 ? std::string("failed to write whole buffer")
++                       : IoError(errno);
++            ThrowDb("pwrite flat file " + std::to_string(file_num) + "@" +
++                    std::to_string(offset) + ": " + err);
++        }
++        done += size_t(n);
++    }
++}
++
++void FlatFileStore::SyncFile(uint32_t file_num) const {
++    auto file = GetOrOpen(file_num, true);
++    if (DataSync(file->fd) != 0) {
++        ThrowDb("fdatasync flat file " + std::to_string(file_num) + ": " +
++                IoError(errno));
++    }
++}
++
++Bytes FlatFileStore::ReadAt(uint32_t file_num, uint64_t offset,
++                            size_t len) const {
++    if (len == 0) {
++        return {};
++    }
++    auto file = GetOrOpen(file_num, false);
++    Bytes buf(len);
++    size_t done = 0;
++    while (done < len) {
++        const ssize_t n = ::pread(file->fd, buf.data() + done, len - done,
++                                  off_t(offset + done));
++        if (n < 0 && errno == EINTR) {
++            continue;
++        }
++        if (n <= 0) {
++            const std::string err =
++                n == 0 ? std::string("failed to fill whole buffer")
++                       : IoError(errno);
++            ThrowDb("pread flat file " + std::to_string(file_num) + "@" +
++                    std::to_string(offset) + "+" + std::to_string(len) +
++                    ": " + err);
++        }
++        done += size_t(n);
++    }
++    return buf;
++}
++
++void FlatFileStore::TruncateTo(uint32_t file_num, uint64_t write_pos) const {
++    std::shared_ptr<File> file;
++    try {
++        file = GetOrOpen(file_num, false);
++    } catch (const V2Error &) {
++    }
++    if (file) {
++        if (::ftruncate(file->fd, off_t(write_pos)) != 0) {
++            ThrowDb("truncate flat file " + std::to_string(file_num) +
++                    " to " + std::to_string(write_pos) + ": " +
++                    IoError(errno));
++        }
++        if (DataSync(file->fd) != 0) {
++            ThrowDb("sync truncated flat file " + std::to_string(file_num) +
++                    ": " + IoError(errno));
++        }
++    }
++    std::lock_guard<std::mutex> lock(m_mutex);
++    for (auto it = m_files.upper_bound(file_num); it != m_files.end();) {
++        std::error_code ec;
++        std::filesystem::remove(SegmentPath(it->first), ec);
++        it = m_files.erase(it);
++    }
++}
++
++// ---- Env ----
++
++std::span<const TableSpec> V2Env::Tables() { return kTables; }
++
++V2Env::Route V2Env::RouteKey(ByteView key) {
++    auto meta = [&](std::string_view name) {
++        return key.size() == name.size() && StartsWith(key, Str(name));
++    };
++    if (meta("v2-binding") || meta("tip") || meta("disconnected") ||
++        meta("flat_pos")) {
++        return {META, key, std::nullopt};
++    }
++    if (key.size() >= 1) {
++        const ByteView rest = key.subspan(1);
++        switch (key[0]) {
++            case 'b':
++                if (rest.size() == 32) return {BLOCK_RECEIPTS, rest, {}};
++                break;
++            case 'u':
++                if (rest.size() == 32) return {UNDO, rest, {}};
++                break;
++            case 't':
++                if (rest.size() == 32) return {TX_LOCATIONS, rest, {}};
++                break;
++            case 'o':
++                if (rest.size() == 36) return {OUTPUTS, rest, {}};
++                break;
++            case 'p':
++                if (rest.size() == 69) {
++                    return {POSTINGS, rest.first(33), rest.subspan(33)};
++                }
++                break;
++            default:
++                break;
++        }
++    }
++    if (key.size() >= 2 && key[0] == 'e') {
++        const ByteView rest = key.subspan(2);
++        const struct {
++            char c;
++            size_t len;
++            Table table;
++        } families[] = {
++            {'H', 8, EXPLORER_HEIGHT},    {'B', 32, EXPLORER_BLOCK},
++            {'O', 36, EXPLORER_BLOCK_TX}, {'T', 32, EXPLORER_TX},
++            {'X', 32, EXPLORER_TXHASH},   {'I', 36, EXPLORER_INPUT},
++            {'W', 40, EXPLORER_WITNESS},  {'A', 32, ASSET_SUMMARY},
++            {'E', 44, ASSET_EVENT},       {'P', 48, ASSET_OUTPUT},
++        };
++        for (const auto &f : families) {
++            if (key[1] == uint8_t(f.c) && rest.size() == f.len) {
++                return {f.table, rest, {}};
++            }
++        }
++    }
++    ThrowDb("unrecognized logical key of length " + std::to_string(key.size()));
++}
++
++V2Env::V2Env(const std::filesystem::path &dir) : m_flat(dir) {
++    std::error_code ec;
++    std::filesystem::create_directories(dir, ec);
++    if (ec) {
++        ThrowDb("create_dir_all " + dir.string() + ": " +
++                IoError(ec.value()));
++    }
++    m_store = Guard([&] {
++        return OpenMdbxStore(dir, kTables, StoreOptions{}, V2IndexProfile());
++    });
++}
++
++V2Env::~V2Env() = default;
++
++std::optional<Bytes> V2Env::Get(ByteView key) const {
++    return Snapshot().Get(key);
++}
++
++void V2Env::Put(ByteView key, ByteView value) {
++    V2WriteBatch batch;
++    batch.Put(Bytes(key.begin(), key.end()), Bytes(value.begin(), value.end()));
++    Write(batch);
++}
++
++void V2Env::Write(const V2WriteBatch &batch) {
++    Guard([&] {
++        auto txn = m_store->BeginWrite();
++        for (const auto &[key, value] : batch.m_ops) {
++            const Route route = RouteKey(key);
++            if (route.dup) {
++                if (value) {
++                    if (!value->empty()) {
++                        ThrowDb("dupfixed posting entry must have empty "
++                                "payload");
++                    }
++                    txn->PutDup(route.table, route.subkey, *route.dup);
++                } else {
++                    txn->DelDup(route.table, route.subkey, *route.dup);
++                }
++            } else if (value) {
++                txn->Put(route.table, route.subkey, *value);
++            } else {
++                txn->Del(route.table, route.subkey);
++            }
++        }
++        txn->Commit();
++    });
++}
++
++V2EnvSnapshot V2Env::Snapshot() const {
++    return V2EnvSnapshot(*this, Guard([&] { return m_store->BeginRead(); }));
++}
++
++std::vector<std::pair<Bytes, Bytes>> V2Env::DumpAll() const {
++    return Snapshot().DumpAll();
++}
++
++bool V2Env::IsEmpty() const { return DumpAll().empty(); }
++
++// ---- Snapshot ----
++
++V2EnvSnapshot::V2EnvSnapshot(const V2Env &env, std::unique_ptr<ReadTxn> txn)
++    : m_env(&env), m_txn(std::move(txn)) {}
++V2EnvSnapshot::V2EnvSnapshot(V2EnvSnapshot &&) noexcept = default;
++V2EnvSnapshot &V2EnvSnapshot::operator=(V2EnvSnapshot &&) noexcept = default;
++V2EnvSnapshot::~V2EnvSnapshot() = default;
++
++std::optional<Bytes> V2EnvSnapshot::Get(ByteView key) const {
++    const V2Env::Route route = V2Env::RouteKey(key);
++    return Guard([&]() -> std::optional<Bytes> {
++        if (route.dup) {
++            auto cursor = m_txn->OpenDupCursor(route.table);
++            if (cursor->SeekValueGe(route.subkey, *route.dup) &&
++                std::ranges::equal(cursor->Value(), *route.dup)) {
++                return Bytes{};
++            }
++            return std::nullopt;
++        }
++        auto value = m_txn->Get(route.table, route.subkey);
++        if (!value) {
++            return std::nullopt;
++        }
++        return Bytes(value->begin(), value->end());
++    });
++}
++
++Bytes V2EnvSnapshot::ReadFlat(uint32_t file_num, uint64_t offset,
++                              size_t len) const {
++    return m_env->Flat().ReadAt(file_num, offset, len);
++}
++
++std::optional<std::array<uint8_t, 36>> V2EnvSnapshot::NextPostingDupfixed(
++    const Bytes32 &root, uint8_t pos,
++    const std::optional<std::array<uint8_t, 36>> &after) const {
++    const auto key = PostingKey(root, pos);
++    return Guard([&]() -> std::optional<std::array<uint8_t, 36>> {
++        auto cursor = m_txn->OpenDupCursor(V2Env::POSTINGS);
++        const bool found = after ? cursor->SeekValueGe(key, *after)
++                                 : cursor->Seek(key);
++        if (!found) {
++            return std::nullopt;
++        }
++        if (after && std::ranges::equal(cursor->Value(), *after) &&
++            !cursor->Next()) {
++            return std::nullopt;
++        }
++        return Dup36(cursor->Value());
++    });
++}
++
++std::vector<std::array<uint8_t, 36>> V2EnvSnapshot::PostingsDupfixedAfter(
++    const Bytes32 &root, uint8_t pos,
++    const std::optional<std::array<uint8_t, 36>> &after) const {
++    const auto key = PostingKey(root, pos);
++    return Guard([&] {
++        std::vector<std::array<uint8_t, 36>> out;
++        auto cursor = m_txn->OpenDupCursor(V2Env::POSTINGS);
++        bool valid = after ? cursor->SeekValueGe(key, *after)
++                           : cursor->Seek(key);
++        if (valid && after && std::ranges::equal(cursor->Value(), *after)) {
++            valid = cursor->Next();
++        }
++        while (valid) {
++            out.push_back(Dup36(cursor->Value()));
++            valid = cursor->Next();
++        }
++        return out;
++    });
++}
++
++std::optional<std::pair<Bytes, Bytes>>
++V2EnvSnapshot::SeekNextRegular(ByteView prefix, std::optional<ByteView> after,
++                               const std::function<void()> &charge) const {
++    TableId table;
++    const std::string_view family =
++        prefix.size() >= 2
++            ? std::string_view(reinterpret_cast<const char *>(prefix.data()),
++                               2)
++            : std::string_view();
++    if (family == "eH") {
++        table = V2Env::EXPLORER_HEIGHT;
++    } else if (family == "eO") {
++        table = V2Env::EXPLORER_BLOCK_TX;
++    } else if (family == "eI") {
++        table = V2Env::EXPLORER_INPUT;
++    } else if (family == "eW") {
++        table = V2Env::EXPLORER_WITNESS;
++    } else if (family == "eA") {
++        table = V2Env::ASSET_SUMMARY;
++    } else if (family == "eE") {
++        table = V2Env::ASSET_EVENT;
++    } else if (family == "eP") {
++        table = V2Env::ASSET_OUTPUT;
++    } else {
++        ThrowDb("invalid regular seek family prefix");
++    }
++    const ByteView family_prefix = prefix.first(2);
++    const ByteView sub_prefix = prefix.subspan(2);
++    std::optional<ByteView> after_subkey;
++    if (after) {
++        after_subkey = after->subspan(2);
++    }
++    auto cursor = Guard([&] { return m_txn->OpenCursor(table); });
++    charge();
++    const ByteView start = after_subkey ? *after_subkey : sub_prefix;
++    bool found = Guard([&] {
++        return start.empty() ? cursor->SeekFirst() : cursor->SeekGe(start);
++    });
++    if (!found) {
++        return std::nullopt;
++    }
++    if (after_subkey && std::ranges::equal(cursor->Key(), *after_subkey)) {
++        charge();
++        if (!Guard([&] { return cursor->Next(); })) {
++            return std::nullopt;
++        }
++    }
++    if (!StartsWith(cursor->Key(), sub_prefix)) {
++        return std::nullopt;
++    }
++    return std::make_pair(Concat(family_prefix, cursor->Key()),
++                          Bytes(cursor->Value().begin(),
++                                cursor->Value().end()));
++}
++
++std::vector<std::pair<Bytes, Bytes>> V2EnvSnapshot::DumpAll() const {
++    static const struct {
++        V2Env::Table table;
++        std::string_view prefix;
++    } regular[] = {
++        {V2Env::META, ""},
++        {V2Env::BLOCK_RECEIPTS, "b"},
++        {V2Env::UNDO, "u"},
++        {V2Env::TX_LOCATIONS, "t"},
++        {V2Env::OUTPUTS, "o"},
++        {V2Env::EXPLORER_HEIGHT, "eH"},
++        {V2Env::EXPLORER_BLOCK, "eB"},
++        {V2Env::EXPLORER_BLOCK_TX, "eO"},
++        {V2Env::EXPLORER_TX, "eT"},
++        {V2Env::EXPLORER_TXHASH, "eX"},
++        {V2Env::EXPLORER_INPUT, "eI"},
++        {V2Env::EXPLORER_WITNESS, "eW"},
++        {V2Env::ASSET_SUMMARY, "eA"},
++        {V2Env::ASSET_EVENT, "eE"},
++        {V2Env::ASSET_OUTPUT, "eP"},
++    };
++    return Guard([&] {
++        std::vector<std::pair<Bytes, Bytes>> out;
++        for (const auto &t : regular) {
++            auto cursor = m_txn->OpenCursor(t.table);
++            for (bool ok = cursor->SeekFirst(); ok; ok = cursor->Next()) {
++                out.emplace_back(Concat(Str(t.prefix), cursor->Key()),
++                                 Bytes(cursor->Value().begin(),
++                                       cursor->Value().end()));
++            }
++        }
++        // A plain cursor over the DUPSORT table visits every dup.
++        auto cursor = m_txn->OpenCursor(V2Env::POSTINGS);
++        for (bool ok = cursor->SeekFirst(); ok; ok = cursor->Next()) {
++            Bytes key{'p'};
++            key.insert(key.end(), cursor->Key().begin(), cursor->Key().end());
++            key.insert(key.end(), cursor->Value().begin(),
++                       cursor->Value().end());
++            out.emplace_back(std::move(key), Bytes{});
++        }
++        std::sort(out.begin(), out.end(),
++                  [](const auto &a, const auto &b) { return a.first < b.first; });
++        return out;
++    });
++}
++
++} // namespace chronik::native::lotus_v2
+diff --git a/chronik/native/ext/lotus_v2/db/env.h b/chronik/native/ext/lotus_v2/db/env.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6abf283b50210021bff622a288e981584469fdd1
+--- /dev/null
++++ b/chronik/native/ext/lotus_v2/db/env.h
+@@ -0,0 +1,188 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef CHRONIK_NATIVE_EXT_LOTUS_V2_DB_ENV_H
++#define CHRONIK_NATIVE_EXT_LOTUS_V2_DB_ENV_H
++
++#include <chronik/native/store.h>
++#include <ext/lotus_v2/db/model.h>
++
++#include <array>
++#include <cstdint>
++#include <filesystem>
++#include <functional>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <span>
++#include <utility>
++#include <vector>
++
++/**
++ * The dedicated `v2_index` env (port of chronik-db/src/mdbx.rs), on the native
++ * MDBX backend with the Rust env's exact profile and named subdatabases, plus
++ * the append-only flat segment files `v2_tx_NNNNN.dat` in the same directory.
++ *
++ * Callers use the Rust logical keys; RouteKey() maps each to its subdatabase
++ * and subkey ("v2-binding"/"tip"/"disconnected"/"flat_pos" -> meta, 'b'+32,
++ * 'u'+32, 't'+32, 'o'+36, 'p'+69 (postings, DUPFIXED 36-byte outpoint dup),
++ * "eH"+8, "eB"+32, "eO"+36, "eT"+32, "eX"+32, "eI"+36, "eW"+40, "eA"+32,
++ * "eE"+44, "eP"+48). All errors are V2Error::Db with the Rust MdbxError text,
++ * except that MDBX return codes are reported in the native backend's format.
++ */
++namespace chronik::native::lotus_v2 {
++
++/** Maximum byte size per flat transaction wire segment file. */
++inline constexpr uint64_t MAX_FLAT_SEGMENT_BYTES = uint64_t(2) << 30;
++
++/** Append-only flat segment files of exact transaction wire bytes. */
++class FlatFileStore {
++public:
++    explicit FlatFileStore(std::filesystem::path dir) : m_dir(std::move(dir)) {}
++
++    std::filesystem::path SegmentPath(uint32_t file_num) const;
++    /** pwrite at (file_num, offset); empty bytes only open/create. */
++    void WriteAt(uint32_t file_num, uint64_t offset, ByteView bytes) const;
++    /** fdatasync (F_FULLFSYNC on Apple, like Rust's sync_data). */
++    void SyncFile(uint32_t file_num) const;
++    /** Exact pread; a short read is an error. */
++    Bytes ReadAt(uint32_t file_num, uint64_t offset, size_t len) const;
++    /**
++     * Truncate segment file_num to write_pos (if it exists), then drop and
++     * delete every cached higher segment.
++     */
++    void TruncateTo(uint32_t file_num, uint64_t write_pos) const;
++
++private:
++    struct File {
++        int fd = -1;
++        ~File();
++    };
++    std::shared_ptr<File> GetOrOpen(uint32_t file_num, bool create) const;
++
++    std::filesystem::path m_dir;
++    mutable std::mutex m_mutex;
++    mutable std::map<uint32_t, std::shared_ptr<File>> m_files;
++};
++
++/** Staged write batch for atomic commit across subdatabases. */
++class V2WriteBatch {
++public:
++    void Put(Bytes key, Bytes value) {
++        m_bytes += key.size() + value.size();
++        m_ops.push_back({std::move(key), std::move(value)});
++    }
++    void Delete(Bytes key) {
++        m_bytes += key.size();
++        m_ops.push_back({std::move(key), std::nullopt});
++    }
++    /** Approximate serialized size: key + value bytes of every op. */
++    size_t SizeInBytes() const { return m_bytes; }
++
++private:
++    friend class V2Env;
++    std::vector<std::pair<Bytes, std::optional<Bytes>>> m_ops;
++    size_t m_bytes = 0;
++};
++
++class V2Env;
++
++/** Consistent MVCC read-only snapshot (one MDBX read txn). */
++class V2EnvSnapshot {
++public:
++    V2EnvSnapshot(const V2Env &env, std::unique_ptr<ReadTxn> txn);
++    V2EnvSnapshot(V2EnvSnapshot &&) noexcept;
++    V2EnvSnapshot &operator=(V2EnvSnapshot &&) noexcept;
++    ~V2EnvSnapshot();
++
++    std::optional<Bytes> Get(ByteView key) const;
++    /** (file_num, offset, len) of the flat segment store. */
++    Bytes ReadFlat(uint32_t file_num, uint64_t offset, size_t len) const;
++    /** Next 36-byte posting strictly after `after` (or the first). */
++    std::optional<std::array<uint8_t, 36>>
++    NextPostingDupfixed(const Bytes32 &root, uint8_t pos,
++                        const std::optional<std::array<uint8_t, 36>> &after)
++        const;
++    /** Every posting strictly after `after` (or all). */
++    std::vector<std::array<uint8_t, 36>> PostingsDupfixedAfter(
++        const Bytes32 &root, uint8_t pos,
++        const std::optional<std::array<uint8_t, 36>> &after) const;
++    /**
++     * Exclusive bounded seek in one regular family (eH/eO/eI/eW/eA/eE/eP)
++     * under `prefix`. charge() runs once before the initial seek and once more
++     * before stepping past an exact `after` match. Returns the logical key.
++     */
++    std::optional<std::pair<Bytes, Bytes>>
++    SeekNextRegular(ByteView prefix, std::optional<ByteView> after,
++                    const std::function<void()> &charge) const;
++    /** Every logical (key, value), postings as 'p'||key33||dup36 -> "". */
++    std::vector<std::pair<Bytes, Bytes>> DumpAll() const;
++
++private:
++    const V2Env *m_env;
++    std::unique_ptr<ReadTxn> m_txn;
++};
++
++class V2Env {
++public:
++    /** Opens (creating the directory and tables) the env at dir. */
++    explicit V2Env(const std::filesystem::path &dir);
++    ~V2Env();
++    V2Env(const V2Env &) = delete;
++    V2Env &operator=(const V2Env &) = delete;
++
++    /** Point read on a fresh snapshot. */
++    std::optional<Bytes> Get(ByteView key) const;
++    /** Single-key write transaction. */
++    void Put(ByteView key, ByteView value);
++    /** Applies the ops in order in one write transaction. */
++    void Write(const V2WriteBatch &batch);
++    V2EnvSnapshot Snapshot() const;
++    std::vector<std::pair<Bytes, Bytes>> DumpAll() const;
++    bool IsEmpty() const;
++    const FlatFileStore &Flat() const { return m_flat; }
++
++    /** The underlying native store (tests and the dump tool). */
++    const KvStore &Store() const { return *m_store; }
++
++    enum Table : TableId {
++        META,
++        BLOCK_RECEIPTS,
++        UNDO,
++        TX_LOCATIONS,
++        OUTPUTS,
++        POSTINGS,
++        EXPLORER_HEIGHT,
++        EXPLORER_BLOCK,
++        EXPLORER_BLOCK_TX,
++        EXPLORER_TX,
++        EXPLORER_TXHASH,
++        EXPLORER_INPUT,
++        EXPLORER_WITNESS,
++        ASSET_SUMMARY,
++        ASSET_EVENT,
++        ASSET_OUTPUT,
++        N_TABLES,
++    };
++    /** Table specs, in the Rust DBI open order. */
++    static std::span<const TableSpec> Tables();
++
++    struct Route {
++        TableId table;
++        ByteView subkey;
++        /** Postings only: the 36-byte dup value. */
++        std::optional<ByteView> dup;
++    };
++    /** Throws Db("unrecognized logical key of length N"). */
++    static Route RouteKey(ByteView key);
++
++private:
++    std::unique_ptr<KvStore> m_store;
++    FlatFileStore m_flat;
++};
++
++} // namespace chronik::native::lotus_v2
++
++#endif // CHRONIK_NATIVE_EXT_LOTUS_V2_DB_ENV_H
+diff --git a/chronik/native/ext/lotus_v2/db/explorer.cpp b/chronik/native/ext/lotus_v2/db/explorer.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9464fcf9097d155a14351827c7ecb162579e157
+--- /dev/null
++++ b/chronik/native/ext/lotus_v2/db/explorer.cpp
+@@ -0,0 +1,632 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <ext/lotus_v2/db/explorer.h>
++
++#include <chronik/native/codec/seahash.h>
++#include <ext/lotus_v2/db/branch.h>
++#include <ext/lotus_v2/db/env.h>
++
++#include <algorithm>
++
++namespace chronik::native::lotus_v2 {
++
++namespace {
++
++Bytes Key2(std::string_view prefix, ByteView suffix) {
++    Bytes k(prefix.begin(), prefix.end());
++    k.insert(k.end(), suffix.begin(), suffix.end());
++    return k;
++}
++
++void PushBe32(Bytes &k, uint32_t v) {
++    for (int i = 3; i >= 0; --i) {
++        k.push_back(uint8_t(v >> (8 * i)));
++    }
++}
++
++uint64_t LeU64(const uint8_t *p) {
++    uint64_t v = 0;
++    for (int i = 0; i < 8; ++i) {
++        v |= uint64_t(p[i]) << (8 * i);
++    }
++    return v;
++}
++
++void AddSize(size_t &total, size_t amount) {
++    if (amount > MAX_BATCH_BYTES || total + amount > MAX_BATCH_BYTES) {
++        ThrowInvalid("explorer batch bound");
++    }
++    total += amount;
++}
++
++/** Owner-side input checks before entries are planned. */
++void ValidateInput(const InputFact &input, uint64_t size) {
++    if (input.flags < 1 || input.flags > 3) {
++        ThrowInvalid("input flags");
++    }
++    input.coinbase_data.Validate(size);
++    if (!input.has_coinbase_data && input.coinbase_data != WireRange{}) {
++        ThrowInvalid("absent coinbase range");
++    }
++    const auto &coin = input.resolved_creation;
++    const bool frozen_ok =
++        input.flags == 1
++            ? coin && coin->outpoint.txid.hash.b == input.prev_txid &&
++                  coin->outpoint.out_idx == input.prev_index &&
++                  coin->creation.txid == coin->outpoint.txid &&
++                  !coin->output.IsBurn()
++            : !coin;
++    if (!frozen_ok) {
++        ThrowInvalid("frozen spend creation");
++    }
++    for (const WitnessFact &witness : input.witnesses) {
++        witness.script.Validate(size);
++        witness.siblings_table.Validate(size);
++        witness.arguments_table.Validate(size);
++        if (witness.siblings_table.length == 0 ||
++            witness.arguments_table.length == 0) {
++            ThrowInvalid("missing witness table framing");
++        }
++    }
++}
++
++bool ValidRange(const WireRange &range, uint64_t wire_size) {
++    try {
++        range.Validate(wire_size);
++        return true;
++    } catch (const V2Error &) {
++        return false;
++    }
++}
++
++} // namespace
++
++Bytes HeightKey(uint64_t height) {
++    Bytes k{'e', 'H'};
++    for (int i = 7; i >= 0; --i) {
++        k.push_back(uint8_t(height >> (8 * i)));
++    }
++    return k;
++}
++Bytes BlockKey(const Hash32 &id) { return Key2("eB", id.b); }
++Bytes BlockTxKey(const Hash32 &id, uint32_t index) {
++    Bytes k = Key2("eO", id.b);
++    PushBe32(k, index);
++    return k;
++}
++Bytes TxKey(const TxId &id) { return Key2("eT", id.hash.b); }
++Bytes TxHashKey(const TxHash &id) { return Key2("eX", id.hash.b); }
++Bytes InputKey(const TxId &id, uint32_t index) {
++    Bytes k = Key2("eI", id.hash.b);
++    PushBe32(k, index);
++    return k;
++}
++Bytes WitnessKey(const TxId &id, uint32_t input, uint32_t index) {
++    Bytes k = Key2("eW", id.hash.b);
++    PushBe32(k, input);
++    PushBe32(k, index);
++    return k;
++}
++
++size_t PreflightExplorerBlock(const CommittedBlock &block) {
++    size_t size = 4096;
++    for (const ConfirmedTx &tx : block.transactions) {
++        const size_t wire = tx.explorer.wire.size();
++        if (wire > SIZE_MAX / 6) {
++            ThrowInvalid("wire bound");
++        }
++        AddSize(size, wire * 6);
++        AddSize(size, 4096);
++        for (const InputFact &input : tx.explorer.inputs) {
++            AddSize(size, 8192);
++            if (input.witnesses.size() > SIZE_MAX / 2048) {
++                ThrowInvalid("witness bound");
++            }
++            AddSize(size, input.witnesses.size() * 2048);
++        }
++        AddSize(size, (wire / WIRE_CHUNK_BYTES + 1) * 1024);
++    }
++    return size;
++}
++
++void ValidateInputMeta(const InputMeta &input, uint64_t wire_size) {
++    if (!ValidRange(input.coinbase_data, wire_size)) {
++        ThrowCorrupt();
++    }
++    if (!input.has_coinbase_data && input.coinbase_data != WireRange{}) {
++        ThrowCorrupt();
++    }
++    bool valid = false;
++    switch (input.flags) {
++        case 1: {
++            const auto &coin = input.resolved_creation;
++            valid = !input.has_coinbase_data && input.path_index < 16 &&
++                    input.witness_count >= 1 && input.witness_count <= 16 &&
++                    (input.sequence == UINT32_MAX ||
++                     (input.sequence & ~uint32_t(0x40ffff)) == 0) &&
++                    coin && coin->outpoint.txid.hash.b == input.prev_txid &&
++                    coin->outpoint.out_idx == input.prev_index &&
++                    coin->creation.txid == coin->outpoint.txid &&
++                    !coin->output.IsBurn() && !coin->output.Validate();
++            break;
++        }
++        case 2:
++            valid = input.path_index == 0 && input.sequence == UINT32_MAX &&
++                    input.witness_count == 0 && !input.resolved_creation &&
++                    (!input.has_coinbase_data ||
++                     (input.coinbase_data.length >= 1 &&
++                      input.coinbase_data.length <= 8192));
++            break;
++        case 3:
++            valid = input.path_index == 0 && input.sequence == UINT32_MAX &&
++                    input.witness_count == 1 && input.prev_index == 0 &&
++                    input.prev_txid != Bytes32{} &&
++                    !input.has_coinbase_data && !input.resolved_creation;
++            break;
++        default:
++            break;
++    }
++    if (!valid) {
++        ThrowCorrupt();
++    }
++}
++
++void ValidateWitnessFact(const WitnessFact &witness, uint64_t wire_size) {
++    for (const WireRange *range :
++         {&witness.script, &witness.siblings_table, &witness.arguments_table}) {
++        if (!ValidRange(*range, wire_size)) {
++            ThrowCorrupt();
++        }
++    }
++    if (witness.siblings_count > 64 || witness.arguments_count > 65535 ||
++        witness.siblings_table.length == 0 ||
++        witness.arguments_table.length == 0 ||
++        uint64_t(witness.arguments_count) >
++            witness.arguments_table.length - 1) {
++        ThrowCorrupt();
++    }
++}
++
++ExplorerPlan PlanExplorerBlockAt(const CommittedBlock &block,
++                                 uint32_t start_file_num,
++                                 uint64_t start_data_pos) {
++    PreflightExplorerBlock(block);
++    const HeaderWire &h = block.explorer.header_wire;
++    if (LeU64(h.data() + 62) != block.anchor.height) {
++        ThrowInvalid("explorer header height");
++    }
++    const bool zero_parent =
++        std::all_of(h.begin(), h.begin() + 32, [](uint8_t b) { return !b; });
++    if ((block.anchor.height == 0 && !zero_parent) ||
++        (block.anchor.height != 0 &&
++         !std::equal(h.begin(), h.begin() + 32,
++                     block.parent.block_id.begin()))) {
++        ThrowInvalid("explorer header parent");
++    }
++    if (block.transactions.size() > UINT32_MAX) {
++        ThrowInvalid("transaction count");
++    }
++    ExplorerPlan plan;
++    auto &entries = plan.entries;
++    entries.emplace_back(HeightKey(block.anchor.height),
++                         Bytes(block.anchor.block_id.begin(),
++                               block.anchor.block_id.end()));
++    entries.emplace_back(
++        BlockKey(H(block.anchor.block_id)),
++        EncodeRecord(BlockMeta{block.anchor, h,
++                               uint32_t(block.transactions.size())}));
++    plan.flat_writes.reserve(block.transactions.size());
++    uint32_t cur_file_num = start_file_num;
++    uint64_t cur_data_pos = start_data_pos;
++    for (size_t index = 0; index < block.transactions.size(); ++index) {
++        const ConfirmedTx &tx = block.transactions[index];
++        const TxLocation &loc = tx.location;
++        if (loc.block_id.b != block.anchor.block_id ||
++            loc.height != block.anchor.height || loc.tx_index != index) {
++            ThrowInvalid("explorer transaction location");
++        }
++        const ExplorerTxFacts &facts = tx.explorer;
++        if (facts.wire.empty()) {
++            ThrowInvalid("empty transaction frame");
++        }
++        const uint64_t wire_size = facts.wire.size();
++        const uint64_t end = cur_data_pos > UINT64_MAX - wire_size
++                                 ? UINT64_MAX
++                                 : cur_data_pos + wire_size;
++        if (cur_data_pos > 0 && end > MAX_FLAT_SEGMENT_BYTES) {
++            if (cur_file_num == UINT32_MAX) {
++                ThrowInvalid("flat file segment overflow");
++            }
++            ++cur_file_num;
++            cur_data_pos = 0;
++        }
++        const uint32_t file_num = cur_file_num;
++        const uint64_t data_pos = cur_data_pos;
++        const uint64_t wire_checksum = SeaHash(facts.wire);
++        if (cur_data_pos > UINT64_MAX - wire_size) {
++            ThrowInvalid("flat file offset overflow");
++        }
++        cur_data_pos += wire_size;
++        plan.flat_writes.push_back({file_num, data_pos, facts.wire});
++
++        if (facts.inputs.size() > UINT32_MAX) {
++            ThrowInvalid("input count");
++        }
++        if (tx.outputs.size() > UINT32_MAX) {
++            ThrowInvalid("output count");
++        }
++        const TxMeta meta{loc,
++                          facts.lock,
++                          uint32_t(facts.inputs.size()),
++                          uint32_t(tx.outputs.size()),
++                          file_num,
++                          data_pos,
++                          wire_size,
++                          wire_checksum};
++        entries.emplace_back(TxKey(loc.txid), EncodeRecord(meta));
++        entries.emplace_back(TxHashKey(loc.txhash),
++                             Bytes(loc.txid.hash.b.begin(),
++                                   loc.txid.hash.b.end()));
++        Bytes ids(loc.txid.hash.b.begin(), loc.txid.hash.b.end());
++        ids.insert(ids.end(), loc.txhash.hash.b.begin(),
++                   loc.txhash.hash.b.end());
++        entries.emplace_back(BlockTxKey(loc.block_id, loc.tx_index),
++                             std::move(ids));
++        // The spends must be exactly the flags==1 inputs, in order.
++        size_t n_spends = 0;
++        bool subset_ok = true;
++        for (size_t i = 0; i < facts.inputs.size(); ++i) {
++            const InputFact &input = facts.inputs[i];
++            if (input.flags != 1) {
++                continue;
++            }
++            if (n_spends >= tx.spends.size() ||
++                tx.spends[n_spends].input_index != uint32_t(i) ||
++                tx.spends[n_spends].outpoint !=
++                    OutPoint{TxId{H(input.prev_txid)}, input.prev_index}) {
++                subset_ok = false;
++            }
++            ++n_spends;
++        }
++        if (!subset_ok || n_spends != tx.spends.size()) {
++            ThrowInvalid("explorer spend subset");
++        }
++        for (size_t i = 0; i < facts.inputs.size(); ++i) {
++            const InputFact &input = facts.inputs[i];
++            ValidateInput(input, meta.wire_size);
++            entries.emplace_back(InputKey(loc.txid, uint32_t(i)),
++                                 EncodeRecord(input.Metadata()));
++            for (size_t w = 0; w < input.witnesses.size(); ++w) {
++                entries.emplace_back(
++                    WitnessKey(loc.txid, uint32_t(i), uint32_t(w)),
++                    EncodeRecord(input.witnesses[w]));
++            }
++        }
++    }
++    std::stable_sort(entries.begin(), entries.end(),
++                     [](const auto &a, const auto &b) {
++                         return a.first < b.first;
++                     });
++    for (size_t i = 1; i < entries.size(); ++i) {
++        if (entries[i - 1].first == entries[i].first) {
++            ThrowInvalid("duplicate explorer identity");
++        }
++    }
++    plan.next_flat_pos = {cur_file_num, cur_data_pos};
++    return plan;
++}
++
++std::vector<std::pair<Bytes, Bytes>>
++PlanExplorerBlock(const CommittedBlock &block) {
++    return PlanExplorerBlockAt(block, 0, 0).entries;
++}
++
++// ---- ReadSnapshot explorer readers ----
++
++std::optional<BlockMeta> ReadSnapshot::ExplorerBlock(const Hash32 &id) const {
++    const auto bytes = m_inner.Get(BlockKey(id));
++    if (!bytes) {
++        return std::nullopt;
++    }
++    const auto meta = DecodeRecord<BlockMeta>(*bytes);
++    if (meta.anchor.block_id != id.b || meta.anchor.height > anchor.height) {
++        ThrowCorrupt();
++    }
++    const auto at_height = m_inner.Get(HeightKey(meta.anchor.height));
++    if (!at_height || !std::ranges::equal(*at_height, id.b)) {
++        ThrowCorrupt();
++    }
++    if (LeU64(meta.header_wire.data() + 62) != meta.anchor.height) {
++        ThrowCorrupt();
++    }
++    if (meta.anchor.height == 0) {
++        if (!std::all_of(meta.header_wire.begin(),
++                         meta.header_wire.begin() + 32,
++                         [](uint8_t b) { return !b; })) {
++            ThrowCorrupt();
++        }
++    } else {
++        const auto parent = m_inner.Get(HeightKey(meta.anchor.height - 1));
++        if (!parent ||
++            !std::ranges::equal(*parent, ByteView(meta.header_wire.data(), 32))) {
++            ThrowCorrupt();
++        }
++    }
++    return meta;
++}
++
++std::optional<BlockMeta>
++ReadSnapshot::ExplorerBlockAtHeight(uint64_t height) const {
++    const auto bytes = m_inner.Get(HeightKey(height));
++    if (!bytes) {
++        return std::nullopt;
++    }
++    if (bytes->size() != 32) {
++        ThrowCorrupt();
++    }
++    const auto meta = ExplorerBlock(Hash32::FromBytes(*bytes));
++    if (!meta || meta->anchor.height != height) {
++        ThrowCorrupt();
++    }
++    return meta;
++}
++
++std::optional<TxMeta> ReadSnapshot::ExplorerTx(const TxId &id) const {
++    const auto bytes = m_inner.Get(TxKey(id));
++    if (!bytes) {
++        return std::nullopt;
++    }
++    const auto meta = DecodeRecord<TxMeta>(*bytes);
++    const TxLocation &loc = meta.location;
++    if (meta.input_count > 65535 || meta.output_count > 65535 ||
++        meta.wire_size == 0 || meta.wire_size > MAX_BATCH_BYTES) {
++        ThrowCorrupt();
++    }
++    if (loc.txid != id || Transaction(id) != loc) {
++        ThrowCorrupt();
++    }
++    const auto block = ExplorerBlock(loc.block_id);
++    if (!block) {
++        ThrowCorrupt();
++    }
++    if (block->anchor.height != loc.height || loc.tx_index >= block->tx_count ||
++        ExplorerBlockTx(loc.block_id, loc.tx_index) !=
++            std::make_pair(id, loc.txhash)) {
++        ThrowCorrupt();
++    }
++    return meta;
++}
++
++std::optional<TxMeta>
++ReadSnapshot::ExplorerTxByHash(const TxHash &hash) const {
++    const auto bytes = m_inner.Get(TxHashKey(hash));
++    if (!bytes) {
++        return std::nullopt;
++    }
++    if (bytes->size() != 32) {
++        ThrowCorrupt();
++    }
++    const auto meta = ExplorerTx(TxId{Hash32::FromBytes(*bytes)});
++    if (!meta || meta->location.txhash != hash) {
++        ThrowCorrupt();
++    }
++    return meta;
++}
++
++std::optional<std::pair<TxId, TxHash>>
++ReadSnapshot::ExplorerBlockTx(const Hash32 &block, uint32_t index) const {
++    const auto bytes = m_inner.Get(BlockTxKey(block, index));
++    if (!bytes) {
++        return std::nullopt;
++    }
++    if (bytes->size() != 64) {
++        ThrowCorrupt();
++    }
++    return std::make_pair(
++        TxId{Hash32::FromBytes(ByteView(*bytes).first(32))},
++        TxHash{Hash32::FromBytes(ByteView(*bytes).subspan(32))});
++}
++
++std::optional<InputMeta> ReadSnapshot::ExplorerInput(const TxId &id,
++                                                     uint32_t index) const {
++    const auto tx = ExplorerTx(id);
++    if (!tx) {
++        return std::nullopt;
++    }
++    const auto bytes = m_inner.Get(InputKey(id, index));
++    if (!bytes) {
++        if (index < tx->input_count) {
++            ThrowCorrupt();
++        }
++        return std::nullopt;
++    }
++    if (index >= tx->input_count) {
++        ThrowCorrupt();
++    }
++    const auto input = DecodeRecord<InputMeta>(*bytes);
++    ValidateInputMeta(input, tx->wire_size);
++    // A descriptor count must reach an existing final ordinal and stop at
++    // the next key. Missing interior ordinals fail when that page is read.
++    if (input.witness_count > 0) {
++        const auto last =
++            m_inner.Get(WitnessKey(id, index, input.witness_count - 1));
++        if (!last) {
++            ThrowCorrupt();
++        }
++        ValidateWitnessFact(DecodeRecord<WitnessFact>(*last), tx->wire_size);
++    }
++    if (m_inner.Get(WitnessKey(id, index, input.witness_count))) {
++        ThrowCorrupt();
++    }
++    if (const auto &coin = input.resolved_creation) {
++        const auto historical = GetOutput(coin->outpoint);
++        if (!historical) {
++            ThrowCorrupt();
++        }
++        if (historical->output != coin->output ||
++            historical->creation != coin->creation ||
++            !historical->spend ||
++            historical->spend->transaction != tx->location ||
++            historical->spend->input_index != index) {
++            ThrowCorrupt();
++        }
++        const auto creation_tx = ExplorerTx(coin->creation.txid);
++        if (!creation_tx || creation_tx->location != coin->creation ||
++            coin->outpoint.out_idx >= creation_tx->output_count ||
++            std::make_pair(coin->creation.height, coin->creation.tx_index) >=
++                std::make_pair(tx->location.height, tx->location.tx_index)) {
++            ThrowCorrupt();
++        }
++    }
++    return input;
++}
++
++std::optional<WitnessFact>
++ReadSnapshot::ExplorerWitness(const TxId &id, uint32_t input_index,
++                              uint32_t index) const {
++    const auto input = ExplorerInput(id, input_index);
++    if (!input) {
++        return std::nullopt;
++    }
++    const auto bytes = m_inner.Get(WitnessKey(id, input_index, index));
++    if (!bytes) {
++        if (index < input->witness_count) {
++            ThrowCorrupt();
++        }
++        return std::nullopt;
++    }
++    if (index >= input->witness_count) {
++        ThrowCorrupt();
++    }
++    const auto tx = ExplorerTx(id);
++    if (!tx) {
++        ThrowCorrupt();
++    }
++    const auto witness = DecodeRecord<WitnessFact>(*bytes);
++    ValidateWitnessFact(witness, tx->wire_size);
++    const auto [siblings, count_bytes] =
++        ExplorerTableCount(id, tx->wire_size, witness.siblings_table);
++    const auto [arguments, unused] =
++        ExplorerTableCount(id, tx->wire_size, witness.arguments_table);
++    (void)unused;
++    const bool table_ok =
++        siblings <= (UINT64_MAX - count_bytes) / 32 &&
++        siblings * 32 + count_bytes == witness.siblings_table.length;
++    if (siblings != witness.siblings_count ||
++        arguments != witness.arguments_count || !table_ok) {
++        ThrowCorrupt();
++    }
++    return witness;
++}
++
++std::pair<uint64_t, uint64_t>
++ReadSnapshot::ExplorerTableCount(const TxId &id, uint64_t wire_size,
++                                 const WireRange &range) const {
++    if (!ValidRange(range, wire_size) || range.length == 0) {
++        ThrowCorrupt();
++    }
++    const size_t needed = size_t(std::min<uint64_t>(range.length, 9));
++    const auto slice = ExplorerWireSlice(id, range.offset, needed);
++    if (!slice || slice->size() != needed) {
++        ThrowCorrupt();
++    }
++    uint8_t b[9] = {};
++    std::copy(slice->begin(), slice->end(), b);
++    uint64_t value = 0;
++    uint64_t width = 0;
++    if (b[0] <= 252) {
++        value = b[0];
++        width = 1;
++    } else if (b[0] == 253 && needed >= 3) {
++        value = uint64_t(b[1]) | uint64_t(b[2]) << 8;
++        width = 3;
++    } else if (b[0] == 254 && needed >= 5) {
++        for (int i = 0; i < 4; ++i) {
++            value |= uint64_t(b[1 + i]) << (8 * i);
++        }
++        width = 5;
++    } else if (b[0] == 255 && needed >= 9) {
++        value = LeU64(b + 1);
++        width = 9;
++    } else {
++        ThrowCorrupt();
++    }
++    if ((width == 3 && value < 253) || (width == 5 && value <= UINT16_MAX) ||
++        (width == 9 && value <= UINT32_MAX)) {
++        ThrowCorrupt();
++    }
++    return {value, width};
++}
++
++std::optional<Bytes> ReadSnapshot::ExplorerWireSlice(const TxId &id,
++                                                     uint64_t offset,
++                                                     uint64_t length) const {
++    const auto tx = ExplorerTx(id);
++    if (!tx) {
++        return std::nullopt;
++    }
++    if (offset > tx->wire_size) {
++        ThrowCorrupt();
++    }
++    Bytes full;
++    try {
++        full = m_inner.ReadFlat(tx->file_num, tx->data_pos,
++                                size_t(tx->wire_size));
++    } catch (const V2Error &) {
++        ThrowCorrupt();
++    }
++    if (SeaHash(full) != tx->wire_checksum) {
++        ThrowCorrupt();
++    }
++    const uint64_t end =
++        std::min(offset > UINT64_MAX - length ? UINT64_MAX : offset + length,
++                 tx->wire_size);
++    return Bytes(full.begin() + offset, full.begin() + end);
++}
++
++std::optional<Bytes> ReadSnapshot::ExplorerWireChunk(const TxId &id,
++                                                     uint32_t index) const {
++    const auto tx = ExplorerTx(id);
++    if (!tx) {
++        return std::nullopt;
++    }
++    const uint64_t start = uint64_t(index) * WIRE_CHUNK_BYTES;
++    if (start >= tx->wire_size) {
++        return std::nullopt;
++    }
++    auto bytes = ExplorerWireSlice(id, start, WIRE_CHUNK_BYTES);
++    if (bytes && (bytes->empty() || bytes->size() > WIRE_CHUNK_BYTES)) {
++        ThrowCorrupt();
++    }
++    return bytes;
++}
++
++std::optional<std::pair<Bytes, Bytes>>
++ReadSnapshot::ExplorerNextRaw(ByteView prefix, size_t key_len,
++                              std::optional<ByteView> after) const {
++    auto family = [&](std::string_view f, size_t plen, size_t klen) {
++        return prefix.size() == plen && key_len == klen &&
++               prefix[0] == uint8_t(f[0]) && prefix[1] == uint8_t(f[1]);
++    };
++    const bool allowed = family("eH", 2, 10) || family("eO", 34, 38) ||
++                         family("eI", 34, 38) || family("eW", 38, 42);
++    if (!allowed ||
++        (after && (after->size() != key_len ||
++                   !std::equal(prefix.begin(), prefix.end(),
++                               after->begin())))) {
++        ThrowInvalid("explorer continuation key");
++    }
++    auto item = m_inner.SeekNextRegular(prefix, after, [] {});
++    if (!item) {
++        return std::nullopt;
++    }
++    if (item->first.size() != key_len ||
++        item->second.size() > MAX_EXPLORER_RECORD_BYTES) {
++        ThrowCorrupt();
++    }
++    return item;
++}
++
++} // namespace chronik::native::lotus_v2
+diff --git a/chronik/native/ext/lotus_v2/db/explorer.h b/chronik/native/ext/lotus_v2/db/explorer.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6139a339eb122c5015342e988afc1e7c33b8437
+--- /dev/null
++++ b/chronik/native/ext/lotus_v2/db/explorer.h
+@@ -0,0 +1,82 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef CHRONIK_NATIVE_EXT_LOTUS_V2_DB_EXPLORER_H
++#define CHRONIK_NATIVE_EXT_LOTUS_V2_DB_EXPLORER_H
++
++#include <ext/lotus_v2/db/model.h>
++
++#include <cstdint>
++#include <utility>
++#include <vector>
++
++/**
++ * Complete native explorer facts (port of chronik-db/src/v2_explorer.rs):
++ * the explorer_* subdatabases and the flat segment (file_num, data_pos,
++ * wire_size) pointers. Only the V2 DB owner commits these entries, together
++ * with its receipt, checkpoint and undo. The ReadSnapshot readers are
++ * declared in branch.h.
++ */
++namespace chronik::native::lotus_v2 {
++
++/** Maximum wire slice size per HTTP wire request (32 KiB). */
++inline constexpr size_t WIRE_CHUNK_BYTES = 32768;
++/** Maximum serialized individual explorer metadata record. */
++inline constexpr size_t MAX_EXPLORER_RECORD_BYTES = 16 * 1024;
++
++/** Bounded record encoder: Invalid("explorer record bound") if too large. */
++template <typename T> Bytes EncodeRecord(const T &value) {
++    Bytes bytes = codec::Encode(value);
++    if (bytes.size() > MAX_EXPLORER_RECORD_BYTES) {
++        ThrowInvalid("explorer record bound");
++    }
++    return bytes;
++}
++/** Stored record decoder; rejects excessive records before decoding. */
++template <typename T> T DecodeRecord(ByteView bytes) {
++    if (bytes.size() > MAX_EXPLORER_RECORD_BYTES) {
++        ThrowCorrupt();
++    }
++    return codec::Decode<T>(bytes);
++}
++
++Bytes HeightKey(uint64_t height);
++Bytes BlockKey(const Hash32 &id);
++Bytes BlockTxKey(const Hash32 &id, uint32_t index);
++Bytes TxKey(const TxId &id);
++Bytes TxHashKey(const TxHash &id);
++Bytes InputKey(const TxId &id, uint32_t index);
++Bytes WitnessKey(const TxId &id, uint32_t input, uint32_t index);
++
++/** Conservative reservation before any planner allocation. */
++size_t PreflightExplorerBlock(const CommittedBlock &block);
++/** Validate a bounded stored input descriptor (shape only); else Corrupt. */
++void ValidateInputMeta(const InputMeta &input, uint64_t wire_size);
++/** Check witness ranges without allocating; else Corrupt. */
++void ValidateWitnessFact(const WitnessFact &witness, uint64_t wire_size);
++
++struct FlatWrite {
++    uint32_t file_num = 0;
++    uint64_t data_pos = 0;
++    Bytes wire;
++};
++struct ExplorerPlan {
++    /** Sorted, unique (key, value) entries. */
++    std::vector<std::pair<Bytes, Bytes>> entries;
++    /** One per transaction, in block order. */
++    std::vector<FlatWrite> flat_writes;
++    /** Flat position after the block. */
++    std::pair<uint32_t, uint64_t> next_flat_pos;
++};
++/** Deterministic exact entries and flat writes from (file, pos). */
++ExplorerPlan PlanExplorerBlockAt(const CommittedBlock &block,
++                                 uint32_t start_file_num,
++                                 uint64_t start_data_pos);
++/** Entries starting at flat position (0, 0). */
++std::vector<std::pair<Bytes, Bytes>>
++PlanExplorerBlock(const CommittedBlock &block);
++
++} // namespace chronik::native::lotus_v2
++
++#endif // CHRONIK_NATIVE_EXT_LOTUS_V2_DB_EXPLORER_H
+diff --git a/chronik/native/ext/lotus_v2/db/model.cpp b/chronik/native/ext/lotus_v2/db/model.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e51242223d76850bfdbe2777e6c9bff32d2dd5af
+--- /dev/null
++++ b/chronik/native/ext/lotus_v2/db/model.cpp
+@@ -0,0 +1,255 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <ext/lotus_v2/db/model.h>
++
++namespace chronik::native::lotus_v2 {
++
++void WireRange::Validate(uint64_t wire_size) const {
++    if (offset > UINT64_MAX - length || offset + length > wire_size) {
++        ThrowInvalid("explorer wire range");
++    }
++}
++
++InputMeta InputFact::Metadata() const {
++    if (witnesses.size() > UINT32_MAX) {
++        ThrowInvalid("witness count");
++    }
++    return InputMeta{prev_txid,
++                     prev_index,
++                     sequence,
++                     flags,
++                     path_index,
++                     has_coinbase_data,
++                     coinbase_data,
++                     uint32_t(witnesses.size()),
++                     resolved_creation};
++}
++
++namespace codec {
++
++void Write(Writer &w, const Output &v) {
++    auto bytes = v.Encode();
++    if (!bytes) {
++        ThrowCorrupt();
++    }
++    w.ByteVec(*bytes);
++}
++void Write(Writer &w, const OutPoint &v) {
++    Write(w, v.txid.hash);
++    w.U32(v.out_idx);
++}
++void Write(Writer &w, const TxLocation &v) {
++    Write(w, v.block_id);
++    w.U64(v.height);
++    w.U32(v.tx_index);
++    Write(w, v.txid.hash);
++    Write(w, v.txhash.hash);
++}
++void Write(Writer &w, const Binding &v) {
++    Write(w, v.chain_id);
++    Write(w, v.genesis);
++    Write(w, v.profile);
++}
++void Write(Writer &w, const Anchor &v) {
++    Write(w, v.block_id);
++    w.U64(v.height);
++}
++void Write(Writer &w, const WireRange &v) {
++    w.U64(v.offset);
++    w.U64(v.length);
++}
++void Write(Writer &w, const WitnessFact &v) {
++    Write(w, v.script);
++    Write(w, v.siblings_table);
++    w.U32(v.siblings_count);
++    Write(w, v.arguments_table);
++    w.U32(v.arguments_count);
++}
++void Write(Writer &w, const ResolvedCreation &v) {
++    Write(w, v.outpoint);
++    Write(w, v.output);
++    Write(w, v.creation);
++}
++void Write(Writer &w, const InputFact &v) {
++    Write(w, v.prev_txid);
++    w.U32(v.prev_index);
++    w.U32(v.sequence);
++    w.U8(v.flags);
++    w.U8(v.path_index);
++    w.Bool(v.has_coinbase_data);
++    Write(w, v.coinbase_data);
++    Write(w, v.witnesses);
++    Write(w, v.resolved_creation);
++}
++void Write(Writer &w, const ExplorerTxFacts &v) {
++    w.ByteVec(v.wire);
++    w.U64(v.lock);
++    Write(w, v.inputs);
++}
++void Write(Writer &w, const ExplorerBlockFacts &v) {
++    // native_serde::header uses serialize_bytes: length then bytes.
++    w.ByteVec(v.header_wire);
++}
++void Write(Writer &w, const TxMeta &v) {
++    Write(w, v.location);
++    w.U64(v.lock);
++    w.U32(v.input_count);
++    w.U32(v.output_count);
++    w.U32(v.file_num);
++    w.U64(v.data_pos);
++    w.U64(v.wire_size);
++    w.U64(v.wire_checksum);
++}
++void Write(Writer &w, const BlockMeta &v) {
++    Write(w, v.anchor);
++    w.ByteVec(v.header_wire);
++    w.U32(v.tx_count);
++}
++void Write(Writer &w, const InputMeta &v) {
++    Write(w, v.prev_txid);
++    w.U32(v.prev_index);
++    w.U32(v.sequence);
++    w.U8(v.flags);
++    w.U8(v.path_index);
++    w.Bool(v.has_coinbase_data);
++    Write(w, v.coinbase_data);
++    w.U32(v.witness_count);
++    Write(w, v.resolved_creation);
++}
++void Write(Writer &w, const AssetEvent &v) {
++    Write(w, v.token_id);
++    Write(w, v.location);
++    w.U128(v.spent_units);
++    w.U128(v.output_units);
++    w.U128(v.explicit_burn_units);
++    w.U128(v.minted_units);
++    w.U128(v.implicit_burn_units);
++    w.Bool(v.has_mint_input);
++}
++void Write(Writer &w, const AssetSummary &v) {
++    Write(w, v.token_id);
++    Write(w, v.first_seen);
++    w.U64(v.event_count);
++    w.U64(v.output_count);
++}
++
++void Read(Reader &r, Bytes32 &v) { v = r.Array<32>(); }
++void Read(Reader &r, Hash32 &v) { v.b = r.Array<32>(); }
++void Read(Reader &r, Output &v) {
++    const Bytes bytes = r.ByteVec();
++    auto output = Output::Decode(bytes);
++    if (!output) {
++        ThrowCorrupt();
++    }
++    v = std::move(*output);
++}
++void Read(Reader &r, OutPoint &v) {
++    Read(r, v.txid.hash);
++    v.out_idx = r.U32();
++}
++void Read(Reader &r, TxLocation &v) {
++    Read(r, v.block_id);
++    v.height = r.U64();
++    v.tx_index = r.U32();
++    Read(r, v.txid.hash);
++    Read(r, v.txhash.hash);
++}
++void Read(Reader &r, Binding &v) {
++    Read(r, v.chain_id);
++    Read(r, v.genesis);
++    Read(r, v.profile);
++}
++void Read(Reader &r, Anchor &v) {
++    Read(r, v.block_id);
++    v.height = r.U64();
++}
++void Read(Reader &r, WireRange &v) {
++    v.offset = r.U64();
++    v.length = r.U64();
++}
++void Read(Reader &r, WitnessFact &v) {
++    Read(r, v.script);
++    Read(r, v.siblings_table);
++    v.siblings_count = r.U32();
++    Read(r, v.arguments_table);
++    v.arguments_count = r.U32();
++}
++void Read(Reader &r, ResolvedCreation &v) {
++    Read(r, v.outpoint);
++    Read(r, v.output);
++    Read(r, v.creation);
++}
++void Read(Reader &r, InputFact &v) {
++    Read(r, v.prev_txid);
++    v.prev_index = r.U32();
++    v.sequence = r.U32();
++    v.flags = r.U8();
++    v.path_index = r.U8();
++    v.has_coinbase_data = r.Bool();
++    Read(r, v.coinbase_data);
++    Read(r, v.witnesses);
++    Read(r, v.resolved_creation);
++}
++void Read(Reader &r, ExplorerTxFacts &v) {
++    v.wire = r.ByteVec();
++    v.lock = r.U64();
++    Read(r, v.inputs);
++}
++namespace {
++void ReadHeader(Reader &r, HeaderWire &v) {
++    const Bytes bytes = r.ByteVec();
++    if (bytes.size() != HEADER_BYTES) {
++        // serde custom "header length"
++        throw postcard::Error(std::string(postcard::kSerdeDeCustom));
++    }
++    std::copy(bytes.begin(), bytes.end(), v.begin());
++}
++} // namespace
++void Read(Reader &r, ExplorerBlockFacts &v) { ReadHeader(r, v.header_wire); }
++void Read(Reader &r, TxMeta &v) {
++    Read(r, v.location);
++    v.lock = r.U64();
++    v.input_count = r.U32();
++    v.output_count = r.U32();
++    v.file_num = r.U32();
++    v.data_pos = r.U64();
++    v.wire_size = r.U64();
++    v.wire_checksum = r.U64();
++}
++void Read(Reader &r, BlockMeta &v) {
++    Read(r, v.anchor);
++    ReadHeader(r, v.header_wire);
++    v.tx_count = r.U32();
++}
++void Read(Reader &r, InputMeta &v) {
++    Read(r, v.prev_txid);
++    v.prev_index = r.U32();
++    v.sequence = r.U32();
++    v.flags = r.U8();
++    v.path_index = r.U8();
++    v.has_coinbase_data = r.Bool();
++    Read(r, v.coinbase_data);
++    v.witness_count = r.U32();
++    Read(r, v.resolved_creation);
++}
++void Read(Reader &r, AssetEvent &v) {
++    Read(r, v.token_id);
++    Read(r, v.location);
++    v.spent_units = r.U128();
++    v.output_units = r.U128();
++    v.explicit_burn_units = r.U128();
++    v.minted_units = r.U128();
++    v.implicit_burn_units = r.U128();
++    v.has_mint_input = r.Bool();
++}
++void Read(Reader &r, AssetSummary &v) {
++    Read(r, v.token_id);
++    Read(r, v.first_seen);
++    v.event_count = r.U64();
++    v.output_count = r.U64();
++}
++
++} // namespace codec
++} // namespace chronik::native::lotus_v2
+diff --git a/chronik/native/ext/lotus_v2/db/model.h b/chronik/native/ext/lotus_v2/db/model.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c3658886fcf04b7bf320c9faf6d2612a3dcff42
+--- /dev/null
++++ b/chronik/native/ext/lotus_v2/db/model.h
+@@ -0,0 +1,370 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef CHRONIK_NATIVE_EXT_LOTUS_V2_DB_MODEL_H
++#define CHRONIK_NATIVE_EXT_LOTUS_V2_DB_MODEL_H
++
++#include <chronik/native/codec/postcard.h>
++#include <chronik/native/error.h>
++#include <ext/lotus_v2/types.h>
++
++#include <array>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++/**
++ * Plain records of the Lotus V2 confirmed index (the `v2_index` env), ports
++ * of chronik-db/src/v2_branch.rs, v2_explorer.rs and v2_asset.rs, with their
++ * postcard encodings. Every encoding is byte-identical to Rust, since the
++ * env is shared with (and dump-diffed against) the Rust Chronik.
++ */
++namespace chronik::native::lotus_v2 {
++
++using Bytes32 = std::array<uint8_t, 32>;
++
++/** Schema cannot share a legacy Chronik database directory. */
++inline constexpr uint32_t SCHEMA_VERSION = 3;
++/** Maximum transactions accepted per committed batch. */
++inline constexpr size_t MAX_TRANSACTIONS = 4096;
++/** Maximum total created and consumed outputs in one batch. */
++inline constexpr size_t MAX_CHANGES = 65536;
++/** Bound on receipt, undo, and total write data respectively. */
++inline constexpr size_t MAX_BATCH_BYTES = 32 * 1024 * 1024;
++
++/**
++ * v2_branch::Error. what() is the Rust Display text:
++ *   Db       "V2 database: mdbx storage error: <detail>"
++ *   Invalid  "invalid V2 index transition: <detail>"
++ *   Corrupt  "corrupt V2 index encoding"
++ */
++class V2Error : public ChronikError {
++public:
++    enum class Kind { Db, Invalid, Corrupt };
++
++    static V2Error Db(const std::string &detail) {
++        return V2Error(Kind::Db, detail,
++                       "V2 database: mdbx storage error: " + detail);
++    }
++    static V2Error Invalid(std::string_view detail) {
++        return V2Error(Kind::Invalid, std::string(detail),
++                       "invalid V2 index transition: " + std::string(detail));
++    }
++    static V2Error Corrupt() {
++        return V2Error(Kind::Corrupt, "", "corrupt V2 index encoding");
++    }
++
++    Kind kind() const { return m_kind; }
++    /** MdbxError text (Db) or the static reason (Invalid); empty if Corrupt. */
++    const std::string &detail() const { return m_detail; }
++    bool IsInvalid(std::string_view detail) const {
++        return m_kind == Kind::Invalid && m_detail == detail;
++    }
++
++private:
++    V2Error(Kind kind, std::string detail, const std::string &msg)
++        : ChronikError(msg), m_kind(kind), m_detail(std::move(detail)) {}
++
++    Kind m_kind;
++    std::string m_detail;
++};
++
++[[noreturn]] inline void ThrowInvalid(std::string_view detail) {
++    throw V2Error::Invalid(detail);
++}
++[[noreturn]] inline void ThrowCorrupt() { throw V2Error::Corrupt(); }
++
++/** Immutable deployment binding; all bytes are native V2 wire order. */
++struct Binding {
++    Bytes32 chain_id{};
++    Bytes32 genesis{};
++    Bytes32 profile{};
++    bool operator==(const Binding &) const = default;
++};
++
++/** Confirmed checkpoint, including the explicitly indexed genesis. */
++struct Anchor {
++    Bytes32 block_id{};
++    uint64_t height = 0;
++    bool operator==(const Anchor &) const = default;
++};
++
++/** Payload or native framed-table byte interval in the exact transaction. */
++struct WireRange {
++    uint64_t offset = 0;
++    uint64_t length = 0;
++    bool operator==(const WireRange &) const = default;
++    /** Throws Invalid("explorer wire range") on overflow or out of frame. */
++    void Validate(uint64_t wire_size) const;
++};
++
++/** One native public witness, represented without large inline vectors. */
++struct WitnessFact {
++    WireRange script;
++    WireRange siblings_table;
++    uint32_t siblings_count = 0;
++    WireRange arguments_table;
++    uint32_t arguments_count = 0;
++    bool operator==(const WitnessFact &) const = default;
++};
++
++/** Immutable creation fact resolved by the single DB owner before a spend. */
++struct ResolvedCreation {
++    OutPoint outpoint;
++    Output output;
++    TxLocation creation;
++    bool operator==(const ResolvedCreation &) const = default;
++};
++
++struct InputMeta;
++
++/** Complete native input facts; selectors retain their raw meaning by flags. */
++struct InputFact {
++    Bytes32 prev_txid{};
++    uint32_t prev_index = 0;
++    uint32_t sequence = 0;
++    uint8_t flags = 0;
++    uint8_t path_index = 0;
++    bool has_coinbase_data = false;
++    WireRange coinbase_data;
++    std::vector<WitnessFact> witnesses;
++    std::optional<ResolvedCreation> resolved_creation;
++    bool operator==(const InputFact &) const = default;
++    /** Bounded persisted descriptor. */
++    InputMeta Metadata() const;
++};
++
++/** Required native transaction frame, never reconstructed from records. */
++struct ExplorerTxFacts {
++    Bytes wire;
++    uint64_t lock = 0;
++    std::vector<InputFact> inputs;
++    bool operator==(const ExplorerTxFacts &) const = default;
++};
++
++/** Native header length. */
++inline constexpr size_t HEADER_BYTES = 134;
++using HeaderWire = std::array<uint8_t, HEADER_BYTES>;
++
++/** Exact authenticated native header (genesis keeps a zero predecessor). */
++struct ExplorerBlockFacts {
++    HeaderWire header_wire{};
++    bool operator==(const ExplorerBlockFacts &) const = default;
++};
++
++/**
++ * Fixed transaction metadata with a compact (file_num, data_pos, wire_size)
++ * pointer into the append-only flat segment file (v2_tx_NNNNN.dat).
++ */
++struct TxMeta {
++    TxLocation location;
++    uint64_t lock = 0;
++    uint32_t input_count = 0;
++    uint32_t output_count = 0;
++    uint32_t file_num = 0;
++    uint64_t data_pos = 0;
++    uint64_t wire_size = 0;
++    uint64_t wire_checksum = 0;
++    bool operator==(const TxMeta &) const = default;
++};
++
++/** Fixed block metadata joined to canonical height. */
++struct BlockMeta {
++    Anchor anchor;
++    HeaderWire header_wire{};
++    uint32_t tx_count = 0;
++    bool operator==(const BlockMeta &) const = default;
++};
++
++/** Input descriptor with a count instead of an unbounded witness vector. */
++struct InputMeta {
++    Bytes32 prev_txid{};
++    uint32_t prev_index = 0;
++    uint32_t sequence = 0;
++    uint8_t flags = 0;
++    uint8_t path_index = 0;
++    bool has_coinbase_data = false;
++    WireRange coinbase_data;
++    uint32_t witness_count = 0;
++    std::optional<ResolvedCreation> resolved_creation;
++    bool operator==(const InputMeta &) const = default;
++};
++
++/** Confirmed native spend input, preserving its original input ordinal. */
++struct SpentInput {
++    OutPoint outpoint;
++    uint32_t input_index = 0;
++    bool operator==(const SpentInput &) const = default;
++};
++
++/** A transaction from the authoritative committed block, in block order. */
++struct ConfirmedTx {
++    TxLocation location;
++    std::vector<Output> outputs;
++    std::vector<SpentInput> spends;
++    ExplorerTxFacts explorer;
++    bool operator==(const ConfirmedTx &) const = default;
++};
++
++/** Confirmed-only transition. */
++struct CommittedBlock {
++    Anchor anchor;
++    Anchor parent;
++    std::vector<ConfirmedTx> transactions;
++    ExplorerBlockFacts explorer;
++    bool operator==(const CommittedBlock &) const = default;
++};
++
++using U128 = unsigned __int128;
++
++/** Aggregate effects for one token in one canonical transaction. */
++struct AssetEvent {
++    Hash32 token_id;
++    TxLocation location;
++    U128 spent_units = 0;
++    U128 output_units = 0;
++    U128 explicit_burn_units = 0;
++    U128 minted_units = 0;
++    U128 implicit_burn_units = 0;
++    bool has_mint_input = false;
++    bool operator==(const AssetEvent &) const = default;
++};
++
++/** Covered-history occurrence counts. */
++struct AssetSummary {
++    Hash32 token_id;
++    TxLocation first_seen;
++    uint64_t event_count = 0;
++    uint64_t output_count = 0;
++    bool operator==(const AssetSummary &) const = default;
++};
++
++/**
++ * Storage-read budget, shared by initial existence joins and page reads.
++ * Every charge happens before the corresponding get/iterator advancement.
++ */
++class AssetReadBudget {
++public:
++    explicit AssetReadBudget(size_t limit) : m_limit(limit) {}
++    size_t Reads() const { return m_reads; }
++    size_t Remaining() const { return m_limit - m_reads; }
++    /** Throws Invalid("asset read budget") when exhausted. */
++    void Charge() {
++        if (m_reads == m_limit) {
++            ThrowInvalid("asset read budget");
++        }
++        ++m_reads;
++    }
++
++private:
++    size_t m_limit;
++    size_t m_reads = 0;
++};
++
++/**
++ * Postcard (serde) codecs, field order as the Rust derives. Write() of an
++ * invalid Output throws Corrupt (its serde adapter fails); Read() throws
++ * postcard::Error on malformed input and Corrupt on an invalid Output frame.
++ */
++namespace codec {
++using postcard::Reader;
++using postcard::Writer;
++
++inline void Write(Writer &w, const Bytes32 &v) { w.Raw(v); }
++inline void Write(Writer &w, const Hash32 &v) { w.Raw(v.b); }
++void Write(Writer &w, const Output &v);
++void Write(Writer &w, const OutPoint &v);
++/** native_serde::location == v2_branch::Loc: (block, height, idx, txid, hash) */
++void Write(Writer &w, const TxLocation &v);
++void Write(Writer &w, const Binding &v);
++void Write(Writer &w, const Anchor &v);
++void Write(Writer &w, const WireRange &v);
++void Write(Writer &w, const WitnessFact &v);
++void Write(Writer &w, const ResolvedCreation &v);
++void Write(Writer &w, const InputFact &v);
++void Write(Writer &w, const ExplorerTxFacts &v);
++void Write(Writer &w, const ExplorerBlockFacts &v);
++void Write(Writer &w, const TxMeta &v);
++void Write(Writer &w, const BlockMeta &v);
++void Write(Writer &w, const InputMeta &v);
++void Write(Writer &w, const AssetEvent &v);
++void Write(Writer &w, const AssetSummary &v);
++
++void Read(Reader &r, Bytes32 &v);
++void Read(Reader &r, Hash32 &v);
++void Read(Reader &r, Output &v);
++void Read(Reader &r, OutPoint &v);
++void Read(Reader &r, TxLocation &v);
++void Read(Reader &r, Binding &v);
++void Read(Reader &r, Anchor &v);
++void Read(Reader &r, WireRange &v);
++void Read(Reader &r, WitnessFact &v);
++void Read(Reader &r, ResolvedCreation &v);
++void Read(Reader &r, InputFact &v);
++void Read(Reader &r, ExplorerTxFacts &v);
++void Read(Reader &r, ExplorerBlockFacts &v);
++void Read(Reader &r, TxMeta &v);
++void Read(Reader &r, BlockMeta &v);
++void Read(Reader &r, InputMeta &v);
++void Read(Reader &r, AssetEvent &v);
++void Read(Reader &r, AssetSummary &v);
++
++template <typename T> void Write(Writer &w, const std::vector<T> &v) {
++    w.SeqLen(v.size());
++    for (const T &item : v) {
++        Write(w, item);
++    }
++}
++template <typename T> void Read(Reader &r, std::vector<T> &v) {
++    const uint64_t n = r.SeqLen();
++    v.clear();
++    for (uint64_t i = 0; i < n; ++i) {
++        T item{};
++        Read(r, item);
++        v.push_back(std::move(item));
++    }
++}
++template <typename T> void Write(Writer &w, const std::optional<T> &v) {
++    w.OptionTag(v.has_value());
++    if (v) {
++        Write(w, *v);
++    }
++}
++template <typename T> void Read(Reader &r, std::optional<T> &v) {
++    v.reset();
++    if (r.OptionTag()) {
++        T item{};
++        Read(r, item);
++        v = std::move(item);
++    }
++}
++
++/** postcard::to_allocvec */
++template <typename T> Bytes Encode(const T &v) {
++    Bytes out;
++    Writer w(out);
++    Write(w, v);
++    return out;
++}
++/** postcard::from_bytes (trailing bytes ignored); failure is Corrupt. */
++template <typename T> T Decode(ByteView bytes) {
++    T v{};
++    try {
++        Reader r(bytes);
++        Read(r, v);
++    } catch (const postcard::Error &) {
++        ThrowCorrupt();
++    }
++    return v;
++}
++} // namespace codec
++
++/** Hash32 from a 32-byte array (and back). */
++inline Hash32 H(const Bytes32 &b) { return Hash32{b}; }
++
++} // namespace chronik::native::lotus_v2
++
++#endif // CHRONIK_NATIVE_EXT_LOTUS_V2_DB_MODEL_H
+diff --git a/chronik/native/ext/lotus_v2/db/sources.cmake b/chronik/native/ext/lotus_v2/db/sources.cmake
+new file mode 100644
+index 0000000000000000000000000000000000000000..0ec5e3494068f791d43e589383e625737573f7c4
+--- /dev/null
++++ b/chronik/native/ext/lotus_v2/db/sources.cmake
+@@ -0,0 +1,24 @@
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++# The v2_index env (design 060): flat segment files and named MDBX
++# subdatabases, the V2 branch DB, explorer and asset facts.
++# The service needs the MDBX store: Rust's v2_index layout is an MDBX env
++# (16 named DBIs plus flat files). Builds without MDBX have no V2 service.
++if(CHRONIK_NATIVE_MDBX)
++    list(APPEND CHRONIK_NATIVE_LOTUS_V2_SOURCES
++        "${CHRONIK_NATIVE_LOTUS_V2_ROOT}/db/asset.cpp"
++        "${CHRONIK_NATIVE_LOTUS_V2_ROOT}/db/branch.cpp"
++        "${CHRONIK_NATIVE_LOTUS_V2_ROOT}/db/env.cpp"
++        "${CHRONIK_NATIVE_LOTUS_V2_ROOT}/db/explorer.cpp"
++        "${CHRONIK_NATIVE_LOTUS_V2_ROOT}/db/model.cpp"
++    )
++    list(APPEND CHRONIK_NATIVE_LOTUS_V2_TEST_SOURCES
++        "${CHRONIK_NATIVE_LOTUS_V2_ROOT}/db/test/v2_asset_tests.cpp"
++        "${CHRONIK_NATIVE_LOTUS_V2_ROOT}/db/test/v2_branch_tests.cpp"
++        "${CHRONIK_NATIVE_LOTUS_V2_ROOT}/db/test/v2_env_tests.cpp"
++        "${CHRONIK_NATIVE_LOTUS_V2_ROOT}/db/test/v2_explorer_model_tests.cpp"
++    )
++    list(APPEND CHRONIK_NATIVE_LOTUS_V2_LIBRARIES chronik_native_store_mdbx)
++endif()
+diff --git a/chronik/native/ext/lotus_v2/db/test/v2_asset_tests.cpp b/chronik/native/ext/lotus_v2/db/test/v2_asset_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..1fd92cf0f6a7385bc7005b646dbf4426991e7841
+--- /dev/null
++++ b/chronik/native/ext/lotus_v2/db/test/v2_asset_tests.cpp
+@@ -0,0 +1,259 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++// Port of the chronik-db/src/v2_asset_test.rs tests.
++
++#include <ext/lotus_v2/db/asset.h>
++#include <ext/lotus_v2/db/branch.h>
++#include <ext/lotus_v2/db/test/v2_test_util.h>
++
++#include <boost/test/unit_test.hpp>
++
++using namespace chronik::native::lotus_v2;
++using namespace chronik::native::lotus_v2::test;
++
++namespace {
++
++TxLocation Location(uint32_t index) {
++    return TxLocation{Fill(9), 7, index, TxId{Fill(uint8_t(index + 10))},
++                      TxHash{Fill(uint8_t(index + 20))}};
++}
++
++Output AssetOutput(uint8_t token, uint64_t value, bool burn) {
++    Output o;
++    o.flags = burn ? 3 : 1;
++    o.value = value;
++    o.token_id = Fill(token);
++    o.branches = {Fill(8)};
++    if (!burn) {
++        o.paths = {{0}};
++    }
++    return o;
++}
++
++ResolvedCreation Coin(uint8_t token, uint64_t value, uint32_t index) {
++    return ResolvedCreation{OutPoint{Location(0).txid, index},
++                            AssetOutput(token, value, false), Location(0)};
++}
++
++AssetTxView View(std::span<const Output> outputs,
++                 std::span<const ResolvedCreation> spends,
++                 std::span<const Hash32> mints) {
++    return AssetTxView{Location(1), outputs, spends, mints};
++}
++
++bool Throws(const std::function<void()> &f) { return ThrowsV2(f); }
++
++void PutLocation(V2Env &db, const TxLocation &loc) {
++    Bytes height_key{'e', 'H'};
++    for (int i = 7; i >= 0; --i) {
++        height_key.push_back(uint8_t(loc.height >> (8 * i)));
++    }
++    db.Put(height_key, loc.block_id.b);
++    db.Put(PrefixKey('t', loc.txid.hash.b), codec::Encode(loc));
++}
++
++ReadSnapshot MakeReadSnapshot(const V2Env &db) {
++    return ReadSnapshot(db.Snapshot(), Anchor{B32(9), 7}, TestBinding());
++}
++
++} // namespace
++
++BOOST_AUTO_TEST_SUITE(lotus_v2_asset_tests)
++
++BOOST_AUTO_TEST_CASE(full_union_input_only_implicit_burn_and_exact_positions) {
++    const std::vector<Output> outputs{AssetOutput(2, 0, true),
++                                      AssetOutput(3, 12, false),
++                                      AssetOutput(3, 8, true)};
++    const std::vector<ResolvedCreation> spends{Coin(1, 55, 0), Coin(3, 13, 1)};
++    const std::vector<Hash32> mints{Fill(3)};
++    const auto events = DeriveAssetEvents(View(outputs, spends, mints));
++    BOOST_REQUIRE_EQUAL(events.size(), 3u);
++    for (size_t i = 0; i < 3; ++i) {
++        BOOST_CHECK_EQUAL(events[i].token_id.b[0], i + 1);
++    }
++    BOOST_CHECK(events[0].spent_units == 55);
++    BOOST_CHECK(events[0].implicit_burn_units == 55);
++    BOOST_CHECK(events[0].output_units == 0);
++    BOOST_CHECK(events[2].minted_units == 7);
++    BOOST_CHECK(events[2].explicit_burn_units == 8);
++    for (const AssetEvent &e : events) {
++        BOOST_CHECK(e.location == Location(1));
++    }
++    OldAssetSummaries old;
++    for (const AssetEvent &e : events) {
++        old.emplace(e.token_id, std::nullopt);
++    }
++    const auto plan = PlanAssetTx(View(outputs, spends, mints), old);
++    BOOST_CHECK_EQUAL(plan.size(), 9u);
++    const Bytes key = AssetOutputKey(Fill(3), Location(1), 2);
++    const auto it = std::find_if(plan.begin(), plan.end(),
++                                 [&](const auto &kv) { return kv.first == key; });
++    BOOST_REQUIRE(it != plan.end());
++    const Bytes &bytes = it->second;
++    BOOST_REQUIRE_EQUAL(bytes.size(), 36u);
++    BOOST_CHECK(std::equal(bytes.begin(), bytes.begin() + 32,
++                           Location(1).txid.hash.b.begin()));
++    BOOST_CHECK(Bytes(bytes.begin() + 32, bytes.end()) == (Bytes{0, 0, 0, 2}));
++}
++
++BOOST_AUTO_TEST_CASE(multimint_and_quantities_exceeding_u64_are_exact) {
++    const std::vector<Output> outputs{AssetOutput(2, UINT64_MAX, false),
++                                      AssetOutput(2, UINT64_MAX, true),
++                                      AssetOutput(1, 1, false)};
++    const std::vector<Hash32> mints{Fill(2), Fill(1)};
++    const auto events = DeriveAssetEvents(View(outputs, {}, mints));
++    BOOST_CHECK(events[1].minted_units == 2 * U128(UINT64_MAX));
++    BOOST_CHECK(events[1].explicit_burn_units == U128(UINT64_MAX));
++    BOOST_CHECK(events[0].minted_units == 1);
++}
++
++BOOST_AUTO_TEST_CASE(
++    mint_bijection_rejects_duplicate_missing_extra_and_zero_selectors) {
++    const std::vector<Output> outputs{AssetOutput(1, 1, false)};
++    for (const std::vector<Hash32> &mints : std::vector<std::vector<Hash32>>{
++             {}, {Fill(1), Fill(1)}, {Fill(1), Fill(2)}, {Hash32{}}}) {
++        BOOST_CHECK(Throws([&] { DeriveAssetEvents(View(outputs, {}, mints)); }));
++    }
++    const std::vector<Output> burn{AssetOutput(1, 0, true)};
++    const std::vector<Hash32> one{Fill(1)};
++    BOOST_CHECK(Throws([&] { DeriveAssetEvents(View(burn, {}, one)); }));
++}
++
++BOOST_AUTO_TEST_CASE(explicit_and_implicit_burns_remain_distinct) {
++    const std::vector<Output> burn{AssetOutput(1, 4, true)};
++    const std::vector<ResolvedCreation> spends{Coin(1, 10, 0)};
++    const auto events = DeriveAssetEvents(View(burn, spends, {}));
++    BOOST_CHECK(events[0].spent_units == 10);
++    BOOST_CHECK(events[0].output_units == 4);
++    BOOST_CHECK(events[0].explicit_burn_units == 4);
++    BOOST_CHECK(events[0].implicit_burn_units == 6);
++    const std::vector<Output> zero_burn{AssetOutput(2, 0, true)};
++    const auto zero = DeriveAssetEvents(View(zero_burn, {}, {}));
++    BOOST_REQUIRE_EQUAL(zero.size(), 1u);
++    BOOST_CHECK(zero[0].output_units == 0);
++}
++
++BOOST_AUTO_TEST_CASE(malformed_duplicate_spends_and_burn_inputs_are_rejected) {
++    ResolvedCreation c = Coin(1, 0, 0);
++    const std::vector<ResolvedCreation> dup{c, c};
++    BOOST_CHECK(Throws([&] { DeriveAssetEvents(View({}, dup, {})); }));
++    c.output = AssetOutput(1, 0, true);
++    const std::vector<ResolvedCreation> burn_input{c};
++    BOOST_CHECK(Throws([&] { DeriveAssetEvents(View({}, burn_input, {})); }));
++    Output malformed = AssetOutput(1, 0, false);
++    malformed.flags |= 4;
++    const std::vector<Output> bad{malformed};
++    BOOST_CHECK(Throws([&] { DeriveAssetEvents(View(bad, {}, {})); }));
++}
++
++BOOST_AUTO_TEST_CASE(
++    summary_checked_counts_first_seen_and_reconnect_plan_parity) {
++    const std::vector<Output> outputs{AssetOutput(1, 0, true),
++                                      AssetOutput(1, 0, false)};
++    const AssetTxView tx = View(outputs, {}, {});
++    const Hash32 token = Fill(1);
++    const OldAssetSummaries old{{token, std::nullopt}};
++    const auto initial = PlanAssetTx(tx, old);
++    // Disconnect restores the exact old values, then reconnect recomputes the
++    // identical plan. This is model parity; the parent owns durable undo tests.
++    BOOST_CHECK(initial == PlanAssetTx(tx, old));
++    const AssetSummary summary =
++        AssetDecode<AssetSummary>(initial[0].second);
++    BOOST_CHECK_EQUAL(summary.event_count, 1u);
++    BOOST_CHECK_EQUAL(summary.output_count, 2u);
++    AssetTxView later = tx;
++    later.location = Location(2);
++    const auto updated = PlanAssetTx(later, {{token, summary}});
++    const AssetSummary next = AssetDecode<AssetSummary>(updated[0].second);
++    BOOST_CHECK(next.first_seen == summary.first_seen);
++    BOOST_CHECK_EQUAL(next.event_count, 2u);
++    BOOST_CHECK_EQUAL(next.output_count, 4u);
++    AssetSummary bad = summary;
++    bad.event_count = UINT64_MAX;
++    BOOST_CHECK(Throws([&] { PlanAssetTx(later, {{token, bad}}); }));
++    bad = summary;
++    bad.output_count = UINT64_MAX;
++    BOOST_CHECK(Throws([&] { PlanAssetTx(later, {{token, bad}}); }));
++}
++
++BOOST_AUTO_TEST_CASE(amount_addition_detects_u128_overflow) {
++    U128 units = ~U128(0);
++    BOOST_CHECK(Throws([&] { AssetAddUnits(units, 1); }));
++    BOOST_CHECK(units == ~U128(0));
++}
++
++// Dedicated temporary storage fixtures exercise the real persisted reader
++// boundary; they do not open any application index or production directory.
++BOOST_AUTO_TEST_CASE(
++    persisted_summary_and_event_reject_forged_same_position_identity) {
++    V2TempDir dir("v2-asset-canonical-join");
++    V2Env db(dir.path);
++    const TxLocation canonical = Location(1);
++    PutLocation(db, canonical);
++    const Hash32 token = Fill(1);
++    for (int field = 0; field < 3; ++field) {
++        TxLocation forged = canonical;
++        switch (field) {
++            case 0:
++                forged.block_id = Fill(99);
++                break;
++            case 1:
++                forged.txid = TxId{Fill(99)};
++                break;
++            default:
++                forged.txhash = TxHash{Fill(99)};
++        }
++        db.Put(AssetSummaryKey(token),
++               AssetEncode(AssetSummary{token, forged, 1, 1}));
++        AssetEvent event;
++        event.token_id = token;
++        event.location = forged;
++        event.spent_units = 1;
++        event.output_units = 1;
++        db.Put(AssetEventKey(token, forged), AssetEncode(event));
++        const ReadSnapshot snapshot = MakeReadSnapshot(db);
++        BOOST_CHECK(ThrowsCorrupt([&] { snapshot.GetAssetSummary(token); }));
++        BOOST_CHECK(
++            ThrowsCorrupt([&] { snapshot.NextAssetSummary(std::nullopt); }));
++        BOOST_CHECK(ThrowsCorrupt(
++            [&] { snapshot.NextAssetEvent(token, std::nullopt); }));
++    }
++}
++
++BOOST_AUTO_TEST_CASE(
++    persisted_iterator_budget_counts_initial_join_and_exclusive_reread) {
++    V2TempDir dir("v2-asset-read-budget");
++    V2Env db(dir.path);
++    const TxLocation loc = Location(1);
++    PutLocation(db, loc);
++    for (uint8_t byte = 1; byte <= 2; ++byte) {
++        const Hash32 token = Fill(byte);
++        db.Put(AssetSummaryKey(token),
++               AssetEncode(AssetSummary{token, loc, 1, 0}));
++    }
++    const ReadSnapshot snapshot = MakeReadSnapshot(db);
++    AssetReadBudget budget(9);
++    const auto first = snapshot.NextAssetSummaryCounted(std::nullopt, budget);
++    BOOST_REQUIRE(first);
++    // First iterator item + canonical transaction/height gets.
++    BOOST_CHECK_EQUAL(budget.Reads(), 3u);
++    const auto second =
++        snapshot.NextAssetSummaryCounted(ByteView(first->first), budget);
++    BOOST_REQUIRE(second);
++    // Exclusive reread + next item + canonical transaction/height gets.
++    BOOST_CHECK_EQUAL(budget.Reads(), 7u);
++    BOOST_CHECK(
++        !snapshot.NextAssetSummaryCounted(ByteView(second->first), budget));
++    // Exclusive reread + exhausted next.
++    BOOST_CHECK_EQUAL(budget.Reads(), 9u);
++    BOOST_CHECK_EQUAL(budget.Remaining(), 0u);
++    AssetReadBudget short_budget(1);
++    BOOST_CHECK(
++        Throws([&] { snapshot.AssetSummaryCounted(Fill(1), short_budget); }));
++    // Canonical read refused before storage.
++    BOOST_CHECK_EQUAL(short_budget.Reads(), 1u);
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/chronik/native/ext/lotus_v2/db/test/v2_branch_tests.cpp b/chronik/native/ext/lotus_v2/db/test/v2_branch_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..8e76f1fdf63df2cbfda7484641317b2e2114c201
+--- /dev/null
++++ b/chronik/native/ext/lotus_v2/db/test/v2_branch_tests.cpp
+@@ -0,0 +1,458 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++// Port of the chronik-db/src/v2_branch.rs tests (and crash_tests).
++
++#include <ext/lotus_v2/db/asset.h>
++#include <ext/lotus_v2/db/branch.h>
++#include <ext/lotus_v2/db/explorer.h>
++#include <ext/lotus_v2/db/test/v2_test_util.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <sys/wait.h>
++#include <unistd.h>
++
++using namespace chronik::native::lotus_v2;
++using namespace chronik::native::lotus_v2::test;
++
++namespace {
++
++/** The private v2_branch.rs Record: re-encode with its creation tampered. */
++Bytes TamperRecordCreationHash(ByteView saved) {
++    postcard::Reader r(saved);
++    const Bytes output = r.ByteVec();
++    TxLocation creation;
++    codec::Read(r, creation);
++    creation.txhash.hash.b[0] ^= 1;
++    Bytes out;
++    postcard::Writer w(out);
++    w.ByteVec(output);
++    codec::Write(w, creation);
++    w.Raw(r.Remaining());
++    return out;
++}
++
++/** The private v2_branch.rs Undo with one extra (key, Some(value)) entry. */
++Bytes UndoWithExtraEntry(ByteView saved, ByteView key, ByteView value) {
++    postcard::Reader r(saved);
++    Binding binding;
++    Anchor anchor;
++    std::optional<Anchor> parent;
++    codec::Read(r, binding);
++    codec::Read(r, anchor);
++    codec::Read(r, parent);
++    const uint32_t file_num = r.U32();
++    const uint64_t pos = r.U64();
++    const uint64_t n = r.SeqLen();
++    Bytes out;
++    postcard::Writer w(out);
++    codec::Write(w, binding);
++    codec::Write(w, anchor);
++    codec::Write(w, parent);
++    w.U32(file_num);
++    w.U64(pos);
++    w.SeqLen(n + 1);
++    w.Raw(r.Remaining());
++    w.ByteVec(key);
++    w.OptionTag(true);
++    w.ByteVec(value);
++    return out;
++}
++
++/** Undo's binding is its first field: 3 raw 32-byte arrays. */
++Bytes UndoWithProfile(ByteView saved, uint8_t profile) {
++    Bytes out(saved.begin(), saved.end());
++    std::fill(out.begin() + 64, out.begin() + 96, profile);
++    return out;
++}
++
++Bytes RecordKey(const OutPoint &op) {
++    return PrefixKey('o', OutPointBytes(op));
++}
++
++} // namespace
++
++BOOST_AUTO_TEST_SUITE(lotus_v2_branch_tests)
++
++BOOST_AUTO_TEST_CASE(schema3_complete_facts_atomic_replay_and_tamper) {
++    V2TempDir dir("v2-schema3");
++    std::optional<V2Db> db;
++    db.emplace(dir.path, TestBinding());
++    db->InitializeGenesis(FixtureGenesis({}));
++    const Anchor genesis = *db->Checkpoint();
++    Output token = TestOutput(5, false);
++    token.flags = 1;
++    token.token_id = Fill(77);
++    const auto baseline = db->Env().DumpAll();
++    CommittedBlock first = TestBlock(genesis, 10, 20, {token}, {});
++    first.transactions[0].explorer.wire = Bytes(65537, 0);
++    db->Connect(first);
++    const CommittedBlock second =
++        TestBlock(first.anchor, 11, 22, {}, {Op(20, 0)});
++    db->Connect(second);
++    db->Connect(second); // frozen inputs must survive exact replay
++    {
++        const ReadSnapshot view = db->Snapshot();
++        BOOST_CHECK(view.ExplorerBlockAtHeight(2)->anchor == second.anchor);
++        BOOST_CHECK(view.ExplorerTxByHash(TxHash{Fill(23)})->location.txid ==
++                    TxId{Fill(22)});
++        const InputMeta input = *view.ExplorerInput(TxId{Fill(22)}, 0);
++        BOOST_CHECK(input.resolved_creation->output == token);
++        BOOST_CHECK_EQUAL(view.GetAssetSummary(Fill(77))->event_count, 2u);
++    }
++    V2Env &env = db->Env();
++
++    const Bytes input_key = InputKey(TxId{Fill(22)}, 0);
++    Bytes saved = *env.Get(input_key);
++    InputMeta corrupted_input = DecodeRecord<InputMeta>(saved);
++    corrupted_input.flags = 255;
++    env.Put(input_key, EncodeRecord(corrupted_input));
++    BOOST_CHECK(ThrowsV2(
++        [&] { db->Snapshot().ExplorerInput(TxId{Fill(22)}, 0); }));
++    env.Put(input_key, saved);
++    corrupted_input = DecodeRecord<InputMeta>(saved);
++    corrupted_input.coinbase_data = WireRange{UINT64_MAX, 1};
++    env.Put(input_key, EncodeRecord(corrupted_input));
++    BOOST_CHECK(ThrowsV2(
++        [&] { db->Snapshot().ExplorerInput(TxId{Fill(22)}, 0); }));
++    env.Put(input_key, saved);
++
++    const Bytes witness_key = WitnessKey(TxId{Fill(20)}, 0, 0);
++    saved = *env.Get(witness_key);
++    WitnessFact corrupted_witness = DecodeRecord<WitnessFact>(saved);
++    corrupted_witness.script = WireRange{65537, 1};
++    env.Put(witness_key, EncodeRecord(corrupted_witness));
++    BOOST_CHECK(ThrowsV2(
++        [&] { db->Snapshot().ExplorerWitness(TxId{Fill(20)}, 0, 0); }));
++    env.Put(witness_key, saved);
++
++    const Bytes block_key = BlockKey(H(second.anchor.block_id));
++    saved = *env.Get(block_key);
++    BlockMeta corrupted_block = DecodeRecord<BlockMeta>(saved);
++    corrupted_block.header_wire[0] ^= 1;
++    env.Put(block_key, EncodeRecord(corrupted_block));
++    BOOST_CHECK(ThrowsV2(
++        [&] { db->Snapshot().ExplorerBlock(H(second.anchor.block_id)); }));
++    env.Put(block_key, saved);
++
++    const Bytes record_key = RecordKey(Op(20, 0));
++    saved = *env.Get(record_key);
++    env.Put(record_key, TamperRecordCreationHash(saved));
++    BOOST_CHECK(ThrowsV2([&] { db->Snapshot().GetOutput(Op(20, 0)); }));
++    env.Put(record_key, saved);
++
++    const Bytes summary_key = AssetSummaryKey(Fill(77));
++    saved = *env.Get(summary_key);
++    AssetSummary corrupted_summary = DecodeAssetSummary(saved);
++    corrupted_summary.first_seen.txhash = TxHash{Fill(88)};
++    env.Put(summary_key, EncodeAssetSummary(corrupted_summary));
++    BOOST_CHECK(
++        ThrowsV2([&] { db->Snapshot().GetAssetSummary(Fill(77)); }));
++    env.Put(summary_key, saved);
++
++    const Bytes event_key =
++        AssetEventKey(Fill(77), second.transactions[0].location);
++    saved = *env.Get(event_key);
++    AssetEvent corrupted_event = DecodeRecord<AssetEvent>(saved);
++    corrupted_event.location.block_id = Fill(88);
++    env.Put(event_key, EncodeRecord(corrupted_event));
++    const Bytes previous =
++        AssetEventKey(Fill(77), first.transactions[0].location);
++    BOOST_CHECK(ThrowsV2([&] {
++        db->Snapshot().NextAssetEvent(Fill(77), ByteView(previous));
++    }));
++    env.Put(event_key, saved);
++
++    CommittedBlock conflicting = second;
++    conflicting.transactions[0].explorer.wire.push_back(1);
++    BOOST_CHECK(ThrowsV2([&] { db->Connect(conflicting); }));
++    const TxMeta tx_meta =
++        DecodeRecord<TxMeta>(*env.Get(TxKey(TxId{Fill(22)})));
++    const Bytes original = env.Flat().ReadAt(
++        tx_meta.file_num, tx_meta.data_pos, size_t(tx_meta.wire_size));
++    const uint8_t one = 1;
++    env.Flat().WriteAt(tx_meta.file_num, tx_meta.data_pos, ByteView(&one, 1));
++    BOOST_CHECK(ThrowsV2(
++        [&] { db->Snapshot().ExplorerWireSlice(TxId{Fill(22)}, 0, 1); }));
++    BOOST_CHECK(ThrowsV2([&] { db->Disconnect(second.anchor); }));
++    BOOST_CHECK(db->Checkpoint() == second.anchor);
++    env.Flat().WriteAt(tx_meta.file_num, tx_meta.data_pos, original);
++    db->Disconnect(second.anchor);
++    BOOST_CHECK(!db->Snapshot().ExplorerTx(TxId{Fill(22)}));
++    BOOST_CHECK(!env.Get(
++        AssetEventKey(Fill(77), second.transactions[0].location)));
++    BOOST_CHECK_EQUAL(db->Snapshot().GetAssetSummary(Fill(77))->event_count,
++                      1u);
++    db->Connect(second);
++    db->Disconnect(second.anchor);
++    db->Disconnect(first.anchor);
++    BOOST_CHECK(!db->Snapshot().GetAssetSummary(Fill(77)));
++    auto after = env.DumpAll();
++    const Bytes disconnected{'d', 'i', 's', 'c', 'o', 'n',
++                             'n', 'e', 'c', 't', 'e', 'd'};
++    std::erase_if(after,
++                  [&](const auto &kv) { return kv.first == disconnected; });
++    // Every e-family, receipt and undo restored exactly.
++    BOOST_CHECK(after == baseline);
++
++    db.reset();
++    {
++        V2Env raw(dir.path);
++        Bytes identity;
++        postcard::Writer w(identity);
++        w.U32(2);
++        codec::Write(w, TestBinding());
++        raw.Put(Str("v2-binding"), identity);
++    }
++    BOOST_CHECK(ThrowsInvalid([&] { V2Db(dir.path, TestBinding()); },
++                              "binding/schema mismatch"));
++}
++
++BOOST_AUTO_TEST_CASE(restart_inverse_burns_and_replay) {
++    V2TempDir dir("v2-index");
++    std::optional<V2Db> db;
++    db.emplace(dir.path, TestBinding());
++    db->InitializeGenesis(FixtureGenesis({}));
++    const Anchor genesis = db->Snapshot().anchor;
++    const CommittedBlock first = TestBlock(
++        genesis, 10, 20, {TestOutput(5, false), TestOutput(6, true)}, {});
++    db->Connect(first);
++    db->Connect(first);
++    std::optional<OutputRecord> original;
++    {
++        const ReadSnapshot before = db->Snapshot();
++        original = before.GetOutput(Op(20, 0));
++        BOOST_REQUIRE(original);
++        BOOST_CHECK(before.Utxo(Op(20, 0)));
++        BOOST_CHECK(!before.Utxo(Op(20, 1)));
++        BOOST_CHECK(before.NextPosting(Fill(6), std::nullopt, std::nullopt) ==
++                    Op(20, 1));
++    }
++    const CommittedBlock second = TestBlock(
++        first.anchor, 11, 22, {TestOutput(7, false)}, {Op(20, 0)});
++    db->Connect(second);
++    {
++        const ReadSnapshot anchored = db->Snapshot();
++        const OutputRecord spent = *anchored.GetOutput(Op(20, 0));
++        BOOST_CHECK(!anchored.Utxo(Op(20, 0)));
++        BOOST_CHECK(spent.spend->transaction.txid == TxId{Fill(22)});
++        BOOST_CHECK(anchored.NextPosting(Fill(5), 0, std::nullopt) ==
++                    Op(20, 0));
++    }
++    db.reset();
++    db.emplace(dir.path, TestBinding());
++    BOOST_CHECK(db->Snapshot().anchor == second.anchor);
++    db->Connect(second);
++    db->Disconnect(second.anchor);
++    db->Disconnect(second.anchor);
++    BOOST_CHECK(db->Snapshot().GetOutput(Op(20, 0)) == original);
++    BOOST_CHECK(!db->Snapshot().GetOutput(Op(22, 0)));
++    db->Connect(second);
++    db->Disconnect(second.anchor);
++    db->Disconnect(first.anchor);
++    BOOST_CHECK(db->Snapshot().anchor == genesis);
++    BOOST_CHECK(
++        !db->Snapshot().NextPosting(Fill(6), std::nullopt, std::nullopt));
++    db.reset();
++    Binding other = TestBinding();
++    other.profile = B32(4);
++    BOOST_CHECK(ThrowsInvalid([&] { V2Db(dir.path, other); },
++                              "binding/schema mismatch"));
++}
++
++BOOST_AUTO_TEST_CASE(explicit_genesis_history_and_coins) {
++    V2TempDir dir("v2-genesis");
++    std::optional<V2Db> db;
++    db.emplace(dir.path, TestBinding());
++    BOOST_CHECK(!db->Checkpoint());
++    BOOST_CHECK(ThrowsV2([&] { db->Snapshot(); }));
++    const Anchor genesis{TestBinding().genesis, 0};
++    ConfirmedTx tx =
++        TestBlock(genesis, 10, 20, {TestOutput(5, false), TestOutput(6, true)},
++                  {})
++            .transactions[0];
++    const ConfirmedTx wrong = tx;
++    BOOST_CHECK(
++        ThrowsV2([&] { db->InitializeGenesis(FixtureGenesis({wrong})); }));
++    BOOST_CHECK(!db->Checkpoint());
++    tx.location.block_id = H(TestBinding().genesis);
++    tx.location.height = 0;
++    db->InitializeGenesis(FixtureGenesis({tx}));
++    db->InitializeGenesis(FixtureGenesis({tx}));
++    BOOST_CHECK(db->Snapshot().NextPosting(Fill(6), std::nullopt,
++                                           std::nullopt) == Op(20, 1));
++    BOOST_CHECK(!db->Snapshot().Utxo(Op(20, 1)));
++    const CommittedBlock child = TestBlock(genesis, 11, 22, {}, {Op(20, 0)});
++    db->Connect(child);
++    db->Disconnect(child.anchor);
++    BOOST_CHECK(db->Snapshot().Utxo(Op(20, 0)));
++    BOOST_CHECK(ThrowsV2([&] { db->Disconnect(genesis); }));
++    db.reset();
++    BOOST_CHECK(V2Db(dir.path, TestBinding()).Checkpoint() == genesis);
++}
++
++BOOST_AUTO_TEST_CASE(early_capacity_and_corrupt_storage_fail_closed) {
++    V2TempDir dir("v2-capacity");
++    V2Db db(dir.path, TestBinding());
++    db.InitializeGenesis(FixtureGenesis({}));
++    const Anchor genesis = *db.Checkpoint();
++    Output wide = TestOutput(5, false);
++    wide.branches.clear();
++    for (uint8_t i = 0; i < 16; ++i) {
++        wide.branches.push_back(Fill(i));
++    }
++    wide.paths = {{0}};
++    const CommittedBlock oversized =
++        TestBlock(genesis, 10, 20, std::vector<Output>(2000, wide), {});
++    BOOST_CHECK(
++        ThrowsInvalid([&] { db.Connect(oversized); }, "staging capacity"));
++    BOOST_CHECK(db.Checkpoint() == genesis);
++    const CommittedBlock first =
++        TestBlock(genesis, 10, 20, {TestOutput(5, false)}, {});
++    db.Connect(first);
++    V2Env &env = db.Env();
++    const Bytes record_key = RecordKey(Op(20, 0));
++    const Bytes original = *env.Get(record_key);
++    env.Put(record_key, Bytes(MAX_BRANCH_RECORD_BYTES + 1, 0));
++    BOOST_CHECK(ThrowsCorrupt([&] { db.Snapshot().GetOutput(Op(20, 0)); }));
++    env.Put(record_key, original);
++    const Bytes undo_key = PrefixKey('u', first.anchor.block_id);
++    const Bytes original_undo = *env.Get(undo_key);
++    env.Put(undo_key, UndoWithExtraEntry(original_undo, Str("tip"),
++                                         codec::Encode(genesis)));
++    BOOST_CHECK(ThrowsCorrupt([&] { db.Disconnect(first.anchor); }));
++    BOOST_CHECK(db.Checkpoint() == first.anchor);
++    env.Put(undo_key, UndoWithProfile(original_undo, 99));
++    BOOST_CHECK(ThrowsCorrupt([&] { db.Disconnect(first.anchor); }));
++    env.Put(undo_key, original_undo);
++    db.Disconnect(first.anchor);
++}
++
++BOOST_AUTO_TEST_CASE(complete_token_policy_and_sixteen_positions) {
++    V2TempDir dir("v2-policy");
++    V2Db db(dir.path, TestBinding());
++    db.InitializeGenesis(FixtureGenesis({}));
++    const Anchor genesis = db.Snapshot().anchor;
++    Output policy;
++    policy.flags = 1;
++    policy.value = UINT64_MAX;
++    policy.token_id = Fill(77);
++    std::vector<uint8_t> path;
++    for (uint8_t i = 0; i < 16; ++i) {
++        policy.branches.push_back(Fill(i));
++        path.push_back(i);
++    }
++    policy.paths = {path};
++    const CommittedBlock first = TestBlock(genesis, 10, 20, {policy}, {});
++    db.Connect(first);
++    for (uint8_t position = 0; position < 16; ++position) {
++        BOOST_CHECK(db.Snapshot().NextPosting(Fill(position), position,
++                                              std::nullopt) == Op(20, 0));
++    }
++    const CommittedBlock second =
++        TestBlock(first.anchor, 11, 22, {}, {Op(20, 0)});
++    db.Connect(second);
++    db.Disconnect(second.anchor);
++    const OutputRecord restored = *db.Snapshot().GetOutput(Op(20, 0));
++    BOOST_CHECK(restored.output == policy);
++    BOOST_CHECK(!restored.spend);
++}
++
++BOOST_AUTO_TEST_CASE(invalid_transitions_leave_checkpoint_unchanged) {
++    V2TempDir dir("v2-invalid");
++    V2Db db(dir.path, TestBinding());
++    db.InitializeGenesis(FixtureGenesis({}));
++    const Anchor genesis = db.Snapshot().anchor;
++    const CommittedBlock first = TestBlock(
++        genesis, 10, 20, {TestOutput(5, false), TestOutput(6, true)}, {});
++    db.Connect(first);
++    for (const auto &inputs : std::vector<std::vector<OutPoint>>{
++             {Op(20, 0), Op(20, 0)}, {Op(20, 1)}, {Op(99, 0)}}) {
++        BOOST_CHECK(ThrowsV2(
++            [&] { db.Connect(TestBlock(first.anchor, 11, 22, {}, inputs)); }));
++        BOOST_CHECK(db.Snapshot().anchor == first.anchor);
++        BOOST_CHECK(!db.Snapshot().GetOutput(Op(20, 0))->spend);
++    }
++    CommittedBlock malformed = TestBlock(first.anchor, 11, 22, {}, {});
++    malformed.transactions[0].location.block_id = Fill(99);
++    BOOST_CHECK(ThrowsV2([&] { db.Connect(malformed); }));
++    CommittedBlock replay = first;
++    replay.transactions[0].outputs[0].value = 101;
++    BOOST_CHECK(ThrowsV2([&] { db.Connect(replay); }));
++    const CommittedBlock duplicate = TestBlock(first.anchor, 11, 20, {}, {});
++    BOOST_CHECK(ThrowsV2([&] { db.Connect(duplicate); }));
++    CommittedBlock overflow = TestBlock(first.anchor, 11, 22, {}, {});
++    overflow.transactions = std::vector<ConfirmedTx>(
++        MAX_TRANSACTIONS + 1, overflow.transactions[0]);
++    BOOST_CHECK(ThrowsV2([&] { db.Connect(overflow); }));
++    BOOST_CHECK(ThrowsV2([&] {
++        db.Snapshot().NextPosting(Fill(5), 16, std::nullopt);
++    }));
++}
++
++BOOST_AUTO_TEST_CASE(intra_block_spend_and_snapshot_isolation) {
++    V2TempDir dir("v2-intra");
++    V2Db db(dir.path, TestBinding());
++    db.InitializeGenesis(FixtureGenesis({}));
++    const Anchor genesis = db.Snapshot().anchor;
++    CommittedBlock first =
++        TestBlock(genesis, 10, 20, {TestOutput(5, false)}, {});
++    ConfirmedTx child = first.transactions[0];
++    child.location.tx_index = 1;
++    child.location.txid = TxId{Fill(22)};
++    child.location.txhash = TxHash{Fill(23)};
++    child.spends = {SpentInput{Op(20, 0), 3}};
++    child.explorer = FixtureFacts(child.spends, child.outputs);
++    first.transactions.push_back(child);
++    db.Connect(first);
++    BOOST_CHECK_EQUAL(db.Snapshot().GetOutput(Op(20, 0))->spend->input_index,
++                      3u);
++    {
++        const ReadSnapshot snapshot = db.Snapshot();
++        BOOST_CHECK(snapshot.NextPosting(Fill(5), std::nullopt, Op(20, 0)) ==
++                    Op(22, 0));
++        BOOST_CHECK(!snapshot.NextPosting(Fill(5), std::nullopt, Op(22, 0)));
++    }
++    db.Disconnect(first.anchor);
++    BOOST_CHECK(!db.Snapshot().GetOutput(Op(20, 0)));
++    BOOST_CHECK(!db.Snapshot().GetOutput(Op(22, 0)));
++}
++
++// crash_tests::durable_checkpoint_without_clean_shutdown: the Rust test
++// re-executes itself; here a fork()ed child commits then _exit(77)s,
++// bypassing destructors, so durability must come from the synced commit.
++BOOST_AUTO_TEST_CASE(durable_checkpoint_without_clean_shutdown) {
++    const Binding binding = TestBinding();
++    const Anchor parent{binding.genesis, 0};
++    const Anchor anchor{B32(8), 1};
++    const CommittedBlock block{anchor, parent, {},
++                               FixtureHeader(anchor, parent)};
++    V2TempDir dir("v2-durable");
++    const pid_t pid = fork();
++    BOOST_REQUIRE(pid >= 0);
++    if (pid == 0) {
++        int code = 1;
++        try {
++            // Deliberately leaked: no destructor may run before _exit.
++            auto *db = new V2Db(dir.path, binding);
++            db->InitializeGenesis(FixtureGenesis({}));
++            db->Connect(block);
++            code = 77;
++        } catch (...) {
++        }
++        _exit(code);
++    }
++    int status = 0;
++    BOOST_REQUIRE(waitpid(pid, &status, 0) == pid);
++    BOOST_REQUIRE(WIFEXITED(status));
++    BOOST_CHECK_EQUAL(WEXITSTATUS(status), 77);
++    V2Db db(dir.path, binding);
++    BOOST_CHECK(db.Snapshot().anchor == block.anchor);
++    db.Connect(block);
++    db.Disconnect(block.anchor);
++    BOOST_CHECK(db.Snapshot().anchor == parent);
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/chronik/native/ext/lotus_v2/db/test/v2_env_tests.cpp b/chronik/native/ext/lotus_v2/db/test/v2_env_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b32910c9e8abb99260904cf844e3b790b2689df
+--- /dev/null
++++ b/chronik/native/ext/lotus_v2/db/test/v2_env_tests.cpp
+@@ -0,0 +1,115 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++// Port of the chronik-db/src/mdbx.rs tests.
++
++#include <ext/lotus_v2/db/env.h>
++#include <ext/lotus_v2/db/test/v2_test_util.h>
++
++#include <boost/test/unit_test.hpp>
++
++using namespace chronik::native::lotus_v2;
++using namespace chronik::native::lotus_v2::test;
++
++namespace {
++using Op36 = std::array<uint8_t, 36>;
++
++Op36 Fill36(uint8_t b) {
++    Op36 a;
++    a.fill(b);
++    return a;
++}
++
++Bytes PostingKey(const Bytes32 &root, uint8_t pos, const Op36 &op) {
++    Bytes k{'p'};
++    k.insert(k.end(), root.begin(), root.end());
++    k.push_back(pos);
++    k.insert(k.end(), op.begin(), op.end());
++    return k;
++}
++
++Bytes B(std::string_view s) { return Bytes(s.begin(), s.end()); }
++} // namespace
++
++BOOST_AUTO_TEST_SUITE(lotus_v2_env_tests)
++
++BOOST_AUTO_TEST_CASE(named_subdatabases_dupfixed_postings_and_flat_files) {
++    V2TempDir dir("mdbx-v2-unit");
++    V2Env env(dir.path);
++    BOOST_CHECK(env.IsEmpty());
++    BOOST_CHECK(std::filesystem::is_regular_file(dir.path / "mdbx.dat"));
++
++    const Bytes32 root = B32(7);
++    const uint8_t pos = 3;
++    const Op36 op1 = Fill36(1), op2 = Fill36(2), op3 = Fill36(3);
++    V2WriteBatch batch;
++    batch.Put(PostingKey(root, pos, op2), {});
++    batch.Put(PostingKey(root, pos, op1), {});
++    batch.Put(PostingKey(root, pos, op3), {});
++    batch.Put(B("tip"), B("anchor-bytes"));
++    env.Write(batch);
++
++    std::optional<V2EnvSnapshot> snap(env.Snapshot());
++    BOOST_CHECK(snap->Get(Str("tip")) == B("anchor-bytes"));
++    BOOST_CHECK(snap->NextPostingDupfixed(root, pos, std::nullopt) == op1);
++    BOOST_CHECK(snap->NextPostingDupfixed(root, pos, op1) == op2);
++    Op36 between = op2;
++    between[35] = 99;
++    BOOST_CHECK(snap->NextPostingDupfixed(root, pos, between) == op3);
++    BOOST_CHECK(!snap->NextPostingDupfixed(root, pos, op3));
++
++    // Delete the middle duplicate value without affecting op1 and op3.
++    V2WriteBatch del_batch;
++    del_batch.Delete(PostingKey(root, pos, op2));
++    env.Write(del_batch);
++
++    std::optional<V2EnvSnapshot> snap2(env.Snapshot());
++    BOOST_CHECK(snap2->NextPostingDupfixed(root, pos, op1) == op3);
++    // The old MVCC snapshot still sees op2.
++    BOOST_CHECK(snap->NextPostingDupfixed(root, pos, op1) == op2);
++    snap.reset();
++    snap2.reset();
++
++    // Multi-page dups (300 x 36B > 4096B page size).
++    const Bytes32 root_multi = B32(9);
++    V2WriteBatch multi_batch;
++    std::vector<Op36> expected_ops;
++    for (uint32_t i = 0; i < 300; ++i) {
++        Op36 op{};
++        for (int b = 0; b < 4; ++b) {
++            op[b] = uint8_t(i >> (24 - 8 * b));
++        }
++        expected_ops.push_back(op);
++        multi_batch.Put(PostingKey(root_multi, pos, op), {});
++    }
++    env.Write(multi_batch);
++
++    const V2EnvSnapshot snap3 = env.Snapshot();
++    BOOST_CHECK(snap3.PostingsDupfixedAfter(root_multi, pos, std::nullopt) ==
++                expected_ops);
++    BOOST_CHECK(snap3.PostingsDupfixedAfter(root_multi, pos,
++                                            expected_ops[150]) ==
++                std::vector<Op36>(expected_ops.begin() + 151,
++                                  expected_ops.end()));
++    std::vector<Op36> iter_ops;
++    std::optional<Op36> cursor_op;
++    while (auto next_op =
++               snap3.NextPostingDupfixed(root_multi, pos, cursor_op)) {
++        iter_ops.push_back(*next_op);
++        cursor_op = next_op;
++    }
++    BOOST_CHECK(iter_ops == expected_ops);
++
++    // Flat file append, pread, and truncate.
++    env.Flat().WriteAt(0, 0, Str("hello "));
++    env.Flat().WriteAt(0, 6, Str("world!"));
++    env.Flat().SyncFile(0);
++    BOOST_CHECK(env.Flat().ReadAt(0, 0, 12) == B("hello world!"));
++    BOOST_CHECK(env.Flat().ReadAt(0, 6, 5) == B("world"));
++    env.Flat().TruncateTo(0, 5);
++    BOOST_CHECK(env.Flat().ReadAt(0, 0, 5) == B("hello"));
++    BOOST_CHECK(ThrowsV2([&] { env.Flat().ReadAt(0, 0, 6); }));
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/chronik/native/ext/lotus_v2/db/test/v2_explorer_model_tests.cpp b/chronik/native/ext/lotus_v2/db/test/v2_explorer_model_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..37fcaed1a027e15f3ab60dfa5165563299e71a07
+--- /dev/null
++++ b/chronik/native/ext/lotus_v2/db/test/v2_explorer_model_tests.cpp
+@@ -0,0 +1,179 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++// Port of the chronik-db/src/v2_explorer_model_tests.rs tests.
++
++#include <chronik/native/codec/seahash.h>
++#include <ext/lotus_v2/db/explorer.h>
++#include <ext/lotus_v2/db/test/v2_test_util.h>
++
++#include <boost/test/unit_test.hpp>
++
++using namespace chronik::native::lotus_v2;
++using namespace chronik::native::lotus_v2::test;
++
++namespace {
++
++CommittedBlock Fixture() {
++    const Anchor anchor{B32(3), 1};
++    const Anchor parent{B32(2), 0};
++    ExplorerBlockFacts header;
++    std::copy(parent.block_id.begin(), parent.block_id.end(),
++              header.header_wire.begin());
++    header.header_wire[62] = 1;
++    const TxLocation location{H(anchor.block_id), 1, 0, TxId{Fill(4)},
++                              TxHash{Fill(5)}};
++    InputFact input;
++    input.prev_txid = B32(2);
++    input.prev_index = 1;
++    input.sequence = UINT32_MAX;
++    input.flags = 2;
++    input.path_index = 255;
++    input.has_coinbase_data = true;
++    input.coinbase_data = WireRange{WIRE_CHUNK_BYTES, 3};
++    input.witnesses = {WitnessFact{WireRange{20, 0}, WireRange{21, 1}, 0,
++                                   WireRange{22, 1}, 0}};
++    ConfirmedTx tx{location,
++                   {},
++                   {},
++                   ExplorerTxFacts{Bytes(WIRE_CHUNK_BYTES + 3, 42), UINT64_MAX,
++                                   {input}}};
++    return CommittedBlock{anchor, parent, {tx}, header};
++}
++
++} // namespace
++
++BOOST_AUTO_TEST_SUITE(lotus_v2_explorer_model_tests)
++
++BOOST_AUTO_TEST_CASE(complete_native_facts_and_chunk_entries_roundtrip) {
++    const CommittedBlock block = Fixture();
++    const ExplorerTxFacts &facts = block.transactions[0].explorer;
++    BOOST_CHECK(codec::Decode<ExplorerTxFacts>(codec::Encode(facts)) == facts);
++    BOOST_CHECK(codec::Decode<ExplorerBlockFacts>(
++                    codec::Encode(block.explorer)) == block.explorer);
++    const ExplorerPlan plan = PlanExplorerBlockAt(block, 0, 128);
++    const TxId id = block.transactions[0].location.txid;
++    const auto find = [&](const Bytes &key) {
++        const auto it =
++            std::find_if(plan.entries.begin(), plan.entries.end(),
++                         [&](const auto &kv) { return kv.first == key; });
++        BOOST_REQUIRE(it != plan.entries.end());
++        return it->second;
++    };
++    BOOST_REQUIRE_EQUAL(plan.flat_writes.size(), 1u);
++    BOOST_CHECK_EQUAL(plan.flat_writes[0].file_num, 0u);
++    BOOST_CHECK_EQUAL(plan.flat_writes[0].data_pos, 128u);
++    BOOST_CHECK(plan.flat_writes[0].wire == facts.wire);
++    BOOST_CHECK(plan.next_flat_pos ==
++                std::make_pair(uint32_t(0), uint64_t(128 + facts.wire.size())));
++    const TxMeta tx_meta = DecodeRecord<TxMeta>(find(TxKey(id)));
++    BOOST_CHECK_EQUAL(tx_meta.file_num, 0u);
++    BOOST_CHECK_EQUAL(tx_meta.data_pos, 128u);
++    BOOST_CHECK_EQUAL(tx_meta.wire_size, facts.wire.size());
++    BOOST_CHECK_EQUAL(tx_meta.wire_checksum, chronik::native::SeaHash(facts.wire));
++    BOOST_CHECK(std::none_of(
++        plan.entries.begin(), plan.entries.end(), [](const auto &kv) {
++            return kv.first.size() >= 2 && kv.first[0] == 'e' &&
++                   kv.first[1] == 'R';
++        }));
++    BOOST_CHECK(id.hash != block.transactions[0].location.txhash.hash);
++    const Bytes by_hash =
++        find(TxHashKey(block.transactions[0].location.txhash));
++    BOOST_CHECK(Bytes(id.hash.b.begin(), id.hash.b.end()) == by_hash);
++    const InputMeta input = DecodeRecord<InputMeta>(find(InputKey(id, 0)));
++    BOOST_CHECK_EQUAL(input.sequence, UINT32_MAX);
++    BOOST_CHECK_EQUAL(input.witness_count, 1u);
++    BOOST_CHECK_EQUAL(input.coinbase_data.offset, WIRE_CHUNK_BYTES);
++    BOOST_CHECK(PreflightExplorerBlock(block) > facts.wire.size() * 3);
++}
++
++BOOST_AUTO_TEST_CASE(ranges_and_incomplete_spends_fail_before_entries) {
++    CommittedBlock block = Fixture();
++    block.transactions[0].explorer.inputs[0].coinbase_data =
++        WireRange{UINT64_MAX, 2};
++    BOOST_CHECK(ThrowsV2([&] { PlanExplorerBlock(block); }));
++    block = Fixture();
++    block.transactions[0].explorer.inputs[0].flags = 1;
++    BOOST_CHECK_NO_THROW(PreflightExplorerBlock(block));
++    BOOST_CHECK(ThrowsV2([&] { PlanExplorerBlock(block); }));
++    block = Fixture();
++    block.explorer.header_wire[62] = 2;
++    BOOST_CHECK(ThrowsV2([&] { PlanExplorerBlock(block); }));
++}
++
++BOOST_AUTO_TEST_CASE(frozen_creation_is_serialized_without_spend_state) {
++    CommittedBlock block = Fixture();
++    InputFact &input = block.transactions[0].explorer.inputs[0];
++    input.flags = 1;
++    Output output;
++    output.value = UINT64_MAX;
++    output.branches = {Fill(7)};
++    output.paths = {{0}};
++    const ResolvedCreation coin{
++        OutPoint{TxId{H(input.prev_txid)}, input.prev_index}, output,
++        TxLocation{Fill(2), 0, 2, TxId{H(input.prev_txid)}, TxHash{Fill(8)}}};
++    input.resolved_creation = coin;
++    block.transactions[0].spends.push_back(SpentInput{coin.outpoint, 0});
++    BOOST_CHECK_NO_THROW(PlanExplorerBlock(block));
++    const Bytes encoded = EncodeRecord(coin);
++    BOOST_CHECK(DecodeRecord<ResolvedCreation>(encoded) == coin);
++    BOOST_CHECK_EQUAL(coin.output.value, UINT64_MAX);
++}
++
++BOOST_AUTO_TEST_CASE(reservation_and_metadata_bounds_reject_oversize) {
++    CommittedBlock block = Fixture();
++    block.transactions[0].explorer.wire.resize(MAX_BATCH_BYTES / 6, 0);
++    BOOST_CHECK(ThrowsV2([&] { PreflightExplorerBlock(block); }));
++    BOOST_CHECK(ThrowsV2([&] {
++        DecodeRecord<TxMeta>(Bytes(MAX_EXPLORER_RECORD_BYTES + 1, 0));
++    }));
++}
++
++BOOST_AUTO_TEST_CASE(
++    valid_postcard_corrupt_input_fields_are_rejected_at_read_validation) {
++    InputMeta input;
++    input.prev_txid = B32(2);
++    input.prev_index = 1;
++    input.sequence = UINT32_MAX;
++    input.flags = 2;
++    input.has_coinbase_data = true;
++    input.coinbase_data = WireRange{20, 3};
++    ValidateInputMeta(input, 100);
++    InputMeta bad = input;
++    bad.flags = 255;
++    bad = DecodeRecord<InputMeta>(EncodeRecord(bad));
++    BOOST_CHECK(ThrowsCorrupt([&] { ValidateInputMeta(bad, 100); }));
++    bad = input;
++    bad.coinbase_data = WireRange{UINT64_MAX, 1};
++    bad = DecodeRecord<InputMeta>(EncodeRecord(bad));
++    BOOST_CHECK(ThrowsCorrupt([&] { ValidateInputMeta(bad, 100); }));
++    bad = input;
++    bad.witness_count = 1;
++    BOOST_CHECK(ThrowsCorrupt([&] { ValidateInputMeta(bad, 100); }));
++    bad = input;
++    bad.flags = 1;
++    bad.has_coinbase_data = false;
++    bad.coinbase_data = WireRange{};
++    bad.witness_count = 1;
++    BOOST_CHECK(ThrowsCorrupt([&] { ValidateInputMeta(bad, 100); }));
++}
++
++BOOST_AUTO_TEST_CASE(
++    valid_postcard_corrupt_witness_tables_are_rejected_at_read_validation) {
++    const WitnessFact witness{WireRange{5, 3}, WireRange{9, 1}, 0,
++                              WireRange{10, 1}, 0};
++    ValidateWitnessFact(witness, 20);
++    WitnessFact bad = witness;
++    bad.arguments_table = WireRange{UINT64_MAX, 1};
++    bad = DecodeRecord<WitnessFact>(EncodeRecord(bad));
++    BOOST_CHECK(ThrowsCorrupt([&] { ValidateWitnessFact(bad, 20); }));
++    bad = witness;
++    bad.siblings_table.length = 0;
++    BOOST_CHECK(ThrowsCorrupt([&] { ValidateWitnessFact(bad, 20); }));
++    bad = witness;
++    bad.arguments_count = 1;
++    BOOST_CHECK(ThrowsCorrupt([&] { ValidateWitnessFact(bad, 20); }));
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/chronik/native/ext/lotus_v2/db/test/v2_test_util.h b/chronik/native/ext/lotus_v2/db/test/v2_test_util.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..4dee9b62db29541efac34cf187b6a456203c2e59
+--- /dev/null
++++ b/chronik/native/ext/lotus_v2/db/test/v2_test_util.h
+@@ -0,0 +1,190 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef CHRONIK_NATIVE_EXT_LOTUS_V2_DB_TEST_V2_TEST_UTIL_H
++#define CHRONIK_NATIVE_EXT_LOTUS_V2_DB_TEST_V2_TEST_UTIL_H
++
++#include <ext/lotus_v2/db/branch.h>
++#include <ext/lotus_v2/db/model.h>
++
++#include <atomic>
++#include <filesystem>
++#include <functional>
++#include <random>
++#include <string>
++#include <string_view>
++#include <vector>
++
++/**
++ * Fixtures of the Rust V2 tests: v2_branch.rs fixture_header/fixture_witness/
++ * fixture_facts/fixture_genesis and the tests' binding/output/block/op.
++ */
++namespace chronik::native::lotus_v2::test {
++
++// Test files use lotus_v2 and this namespace, not chronik::native, since
++// chronik::native has its own OutPoint/TxId.
++using native::Bytes;
++using native::ByteView;
++namespace postcard = native::postcard;
++
++/** Fresh temporary directory, removed on destruction. */
++struct V2TempDir {
++    std::filesystem::path path;
++    explicit V2TempDir(const std::string &name) {
++        static std::atomic<int> counter{0};
++        std::random_device rd;
++        path = std::filesystem::temp_directory_path() /
++               ("chronik-native-v2-" + name + "-" + std::to_string(rd()) +
++                "-" + std::to_string(counter++));
++        std::filesystem::remove_all(path);
++    }
++    ~V2TempDir() {
++        std::error_code ec;
++        std::filesystem::remove_all(path, ec);
++    }
++};
++
++inline Bytes32 B32(uint8_t b) {
++    Bytes32 a;
++    a.fill(b);
++    return a;
++}
++inline Hash32 Fill(uint8_t b) { return Hash32{B32(b)}; }
++
++inline ByteView Str(std::string_view s) {
++    return ByteView(reinterpret_cast<const uint8_t *>(s.data()), s.size());
++}
++
++/** Whether f() throws a V2Error (optionally of kind/detail). */
++inline bool ThrowsV2(const std::function<void()> &f) {
++    try {
++        f();
++    } catch (const V2Error &) {
++        return true;
++    }
++    return false;
++}
++inline bool ThrowsInvalid(const std::function<void()> &f,
++                          std::string_view detail) {
++    try {
++        f();
++    } catch (const V2Error &e) {
++        return e.IsInvalid(detail);
++    }
++    return false;
++}
++inline bool ThrowsCorrupt(const std::function<void()> &f) {
++    try {
++        f();
++    } catch (const V2Error &e) {
++        return e.kind() == V2Error::Kind::Corrupt;
++    }
++    return false;
++}
++
++inline Binding TestBinding() { return Binding{B32(1), B32(2), B32(3)}; }
++
++inline ExplorerBlockFacts FixtureHeader(const Anchor &anchor,
++                                        const Anchor &parent) {
++    ExplorerBlockFacts facts;
++    if (anchor.height > 0) {
++        std::copy(parent.block_id.begin(), parent.block_id.end(),
++                  facts.header_wire.begin());
++    }
++    for (int i = 0; i < 8; ++i) {
++        facts.header_wire[62 + i] = uint8_t(anchor.height >> (8 * i));
++        facts.header_wire[54 + i] = uint8_t(uint64_t(134) >> (8 * i));
++    }
++    return facts;
++}
++
++inline WitnessFact FixtureWitness() {
++    return WitnessFact{WireRange{0, 0}, WireRange{0, 1}, 0, WireRange{0, 1},
++                       0};
++}
++
++inline InputFact CoinbaseInput() {
++    InputFact i;
++    i.sequence = UINT32_MAX;
++    i.flags = 2;
++    return i;
++}
++
++inline ExplorerTxFacts FixtureFacts(const std::vector<SpentInput> &spends,
++                                    const std::vector<Output> &outputs) {
++    std::vector<InputFact> inputs;
++    for (const SpentInput &spend : spends) {
++        while (inputs.size() < spend.input_index) {
++            inputs.push_back(CoinbaseInput());
++        }
++        InputFact i;
++        i.prev_txid = spend.outpoint.txid.hash.b;
++        i.prev_index = spend.outpoint.out_idx;
++        i.sequence = 0;
++        i.flags = 1;
++        i.witnesses = {FixtureWitness()};
++        inputs.push_back(std::move(i));
++    }
++    if (spends.empty()) {
++        for (const Output &output : outputs) {
++            if (!output.HasToken()) {
++                continue;
++            }
++            if (std::any_of(inputs.begin(), inputs.end(),
++                            [&](const InputFact &i) {
++                                return i.prev_txid == output.token_id.b;
++                            })) {
++                continue;
++            }
++            InputFact i;
++            i.prev_txid = output.token_id.b;
++            i.sequence = UINT32_MAX;
++            i.flags = 3;
++            i.witnesses = {FixtureWitness()};
++            inputs.push_back(std::move(i));
++        }
++    }
++    return ExplorerTxFacts{Bytes{0}, 0, std::move(inputs)};
++}
++
++inline CommittedBlock FixtureGenesis(std::vector<ConfirmedTx> transactions) {
++    const Anchor anchor{B32(2), 0};
++    return CommittedBlock{anchor, anchor, std::move(transactions),
++                          FixtureHeader(anchor, anchor)};
++}
++
++inline Output TestOutput(uint8_t root, bool burn) {
++    Output o;
++    o.flags = burn ? 2 : 0;
++    o.value = 100;
++    o.branches = {Fill(root)};
++    if (!burn) {
++        o.paths = {{0}};
++    }
++    return o;
++}
++
++inline OutPoint Op(uint8_t txid, uint32_t index) {
++    return OutPoint{TxId{Fill(txid)}, index};
++}
++
++inline CommittedBlock TestBlock(const Anchor &parent, uint8_t id,
++                                uint8_t txid, std::vector<Output> outputs,
++                                const std::vector<OutPoint> &spent) {
++    const Anchor anchor{B32(id), parent.height + 1};
++    std::vector<SpentInput> spends;
++    for (size_t i = 0; i < spent.size(); ++i) {
++        spends.push_back(SpentInput{spent[i], uint32_t(i)});
++    }
++    ExplorerTxFacts explorer = FixtureFacts(spends, outputs);
++    ConfirmedTx tx{TxLocation{H(anchor.block_id), anchor.height, 0,
++                              TxId{Fill(txid)}, TxHash{Fill(txid + 1)}},
++                   std::move(outputs), std::move(spends), std::move(explorer)};
++    return CommittedBlock{anchor, parent, {std::move(tx)},
++                          FixtureHeader(anchor, parent)};
++}
++
++} // namespace chronik::native::lotus_v2::test
++
++#endif // CHRONIK_NATIVE_EXT_LOTUS_V2_DB_TEST_V2_TEST_UTIL_H
+-- 
+2.50.1 (Apple Git-155)
+

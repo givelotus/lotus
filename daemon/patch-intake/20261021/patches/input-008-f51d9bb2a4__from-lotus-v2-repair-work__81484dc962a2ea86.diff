@@ -1,0 +1,135 @@
+diff --git a/src/node/miner.cpp b/src/node/miner.cpp
+index 5cddb87881..c9a868221e 100644
+--- a/src/node/miner.cpp
++++ b/src/node/miner.cpp
+@@ -131,17 +131,78 @@ BlockAssembler::CreateNewBlock(const CScript &scriptPubKeyIn) {
+         m_avalanche && add_finalized_txs &&
+         m_avalanche->isPreconsensusActivated(pindexPrev);
+ 
++    bool use_speculative_overlay = false;
++
+     if (m_mempool) {
+         LOCK(m_mempool->cs);
+-        if (shouldAddFinalizedTxs) {
+-            addFinalizedTxs(*m_mempool);
+-        } else {
+-            addTxs(*m_mempool);
++        m_mempool->SyncMerklixOverlayToTip(
++            pindexPrev->GetBlockHash(), uint64_t(nHeight),
++            uint64_t(pindexPrev->GetMedianTimePast()));
++        const auto &spec_overlay =
++            m_mempool->GetMerklixOverlay().GetSpeculativeOverlay();
++        if (!shouldAddFinalizedTxs &&
++            IsMagneticAnomalyEnabled(consensusParams, pindexPrev) &&
++            !fPrintPriority &&
++            m_mempool->mapDeltas.empty() && !spec_overlay.HasDoubleSpends() &&
++            spec_overlay.GetTxCount() > 0 &&
++            spec_overlay.GetTxCount() == m_mempool->size() &&
++            blockFitter.testTxFits(m_mempool->GetTotalTxSize(),
++                                   spec_overlay.GetTotalSigChecks())) {
++            bool all_overlay_txs_eligible = true;
++            for (const auto &[_, oentry] : spec_overlay.GetOrderedTxs()) {
++                const auto tx = std::static_pointer_cast<const CTransaction>(
++                    oentry.tx_ref);
++                if (!tx ||
++                    blockFitter.isBelowBlockMinFeeRate(
++                        CFeeRate(oentry.fee_sats * SATOSHI,
++                                 tx->GetTotalSize())) ||
++                    (tx->nLockTime != 0 && !CheckTx(*tx))) {
++                    all_overlay_txs_eligible = false;
++                    break;
++                }
++            }
++            if (all_overlay_txs_eligible) {
++                use_speculative_overlay = true;
++                pblocktemplate->entries.reserve(spec_overlay.GetTxCount() + 1);
++                for (const auto &[_, oentry] : spec_overlay.GetOrderedTxs()) {
++                    auto tx = std::static_pointer_cast<const CTransaction>(
++                        oentry.tx_ref);
++                    const Amount fee = oentry.fee_sats * SATOSHI;
++                    pblocktemplate->entries.emplace_back(tx, fee,
++                                                         oentry.sigchecks);
++                    blockFitter.addTx(tx->GetTotalSize(), oentry.sigchecks,
++                                      fee);
++                }
++            }
++        }
++        if (!use_speculative_overlay) {
++            if (shouldAddFinalizedTxs) {
++                addFinalizedTxs(*m_mempool);
++            } else {
++                addTxs(*m_mempool);
++            }
++            if (!spec_overlay.HasDoubleSpends() &&
++                IsMagneticAnomalyEnabled(consensusParams, pindexPrev) &&
++                pblocktemplate->entries.size() - 1 ==
++                    spec_overlay.GetTxCount()) {
++                use_speculative_overlay = true;
++                if (!shouldAddFinalizedTxs && spec_overlay.GetTxCount() > 0) {
++                    size_t idx = 1;
++                    for (const auto &[_, oentry] :
++                         spec_overlay.GetOrderedTxs()) {
++                        pblocktemplate->entries[idx++] = CBlockTemplateEntry(
++                            std::static_pointer_cast<const CTransaction>(
++                                oentry.tx_ref),
++                            oentry.fee_sats * SATOSHI, oentry.sigchecks);
++                    }
++                }
++            }
+         }
+     }
+ 
+-    // Canonical ordering is naturally enforced when using the radix tree
+-    if (!shouldAddFinalizedTxs &&
++    // Canonical ordering is naturally enforced when using the radix tree or
++    // the CTOR-sorted Merklix speculative overlay.
++    if (!shouldAddFinalizedTxs && !use_speculative_overlay &&
+         IsMagneticAnomalyEnabled(consensusParams, pindexPrev)) {
+         // If magnetic anomaly is enabled, we make sure transaction are
+         // canonically ordered.
+@@ -204,7 +265,10 @@ BlockAssembler::CreateNewBlock(const CScript &scriptPubKeyIn) {
+     pblocktemplate->entries[0].fees = -1 * blockFitter.nFees;
+     pblock->vtx[0] = pblocktemplate->entries[0].tx;
+ 
+-    uint64_t nSerializeSize = GetSerializeSize(*pblock);
++    uint64_t nSerializeSize =
++        80 + GetSizeOfCompactSize(pblock->vtx.size()) +
++        pblock->vtx[0]->GetTotalSize() +
++        (blockFitter.nBlockSize - BlockFitter::COINBASE_RESERVED_SIZE);
+ 
+     LogPrintf(
+         "CreateNewBlock(): total size: %u txs: %u fees: %ld sigChecks %d\n",
+@@ -217,6 +281,18 @@ BlockAssembler::CreateNewBlock(const CScript &scriptPubKeyIn) {
+                TicksSinceEpoch<std::chrono::seconds>(GetAdjustedTime()));
+     pblock->nBits = GetNextWorkRequired(pindexPrev, pblock, chainParams);
+     pblock->nNonce = 0;
++    if (use_speculative_overlay && m_mempool) {
++        LOCK(m_mempool->cs);
++        const auto &spec_overlay =
++            m_mempool->GetMerklixOverlay().GetSpeculativeOverlay();
++        lotus::v2::Hash cb_txid{};
++        std::memcpy(cb_txid.data(), pblock->vtx[0]->GetId().begin(), 32);
++        const lotus::v2::Hash mroot =
++            spec_overlay.ComputePositionalMerkleRoot(cb_txid);
++        std::memcpy(pblock->hashMerkleRoot.begin(), mroot.data(), 32);
++    } else {
++        pblock->hashMerkleRoot = BlockMerkleRoot(*pblock);
++    }
+     pblocktemplate->entries[0].sigChecks = 0;
+ 
+     BlockValidationState state;
+diff --git a/src/test/util/mining.cpp b/src/test/util/mining.cpp
+index 44da1beba8..b60095383a 100644
+--- a/src/test/util/mining.cpp
++++ b/src/test/util/mining.cpp
+@@ -61,7 +61,9 @@ PrepareBlock(const Config &config, const NodeContext &node,
+ 
+     LOCK(cs_main);
+     block->nTime = Assert(node.chainman)->ActiveTip()->GetMedianTimePast() + 1;
+-    block->hashMerkleRoot = BlockMerkleRoot(*block);
++    if (block->hashMerkleRoot.IsNull()) {
++        block->hashMerkleRoot = BlockMerkleRoot(*block);
++    }
+ 
+     return block;
+ }

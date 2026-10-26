@@ -1,0 +1,1608 @@
+From c9060c2cbaa71b7844ccd3001c8239861d297190 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 01:33:29 -0700
+Subject: [PATCH] rpc: publish immutable chain and mempool snapshots
+
+Read RPCs need a coherent generation without taking chain or mempool locks.
+Publish chain metadata and an immutable entry tree using ABC's existing
+copy-on-write RadixTree. Mutation hooks capture changed entry values; lazy
+vectors enumerate only their pinned tree, even after the live pool changes.
+Coalesce nested removal/trim/expiry scopes, publish fee/freeze changes, and
+avoid publication for no-op prioritisation or unbroadcast updates.
+
+Retain only the current atomic snapshot pointer; readers own older generations.
+Atomic shared_ptr and RCU synchronization are not claimed to be wait-free.
+Chain index updates and lazy vector construction remain linear where stated.
+Mining assembly, RPC consumers, batch submission and their native fixtures
+belong to their own feature patches. V2 monetary/state-template fields and
+future fee-hysteresis policy are not prerequisites of this eCash foundation.
+
+Native regressions retain historical snapshots across insertion, fee changes,
+unbroadcast updates and clearing; verify readers avoid chain/pool locks and
+batch removal publishes once. Compact-block reference counts still use exact
+equality and now identify the additional immutable transaction owner.
+
+Original-Commit: 399c3d5cf2aa9602aff967024c7f4053b06d206c
+Original-Patch: ecash/014
+Historical-Split-Commit: 07c03546d4aadb62b81d04e2fa2e0b3f1efd5e05
+Canonical-Concern: immutable snapshot publication
+Candidate-Repair: Complete first-owner build/mutation dependencies; repair
+lazy-generation coherence; relocate later consumers and all original tests.
+This changes historical intermediate trees and requires new validation.
+
+Candidate-Repair: Keep readers on the prior coherent chain+mempool generation while ActivateBestChainStep or block unwinding temporarily imports, clears and re-admits the pool. Nested chain publication scopes publish once after cleanup. New native regression fails four assertions with prior immediate publication and passes with the guard; full selected native suites and unchanged mempool_reorg.py pass. Fold into snapshot foundation rather than a later fixup.
+---
+ src/CMakeLists.txt                       |   1 +
+ src/avalanche/processor.cpp              |   6 +-
+ src/kernel/disconnected_transactions.cpp |   1 +
+ src/node/context.cpp                     |   3 +-
+ src/node/context.h                       |   2 +
+ src/node/snapshot.cpp                    | 442 +++++++++++++++++++++++
+ src/node/snapshot.h                      | 261 +++++++++++++
+ src/test/CMakeLists.txt                  |   1 +
+ src/test/blockencodings_tests.cpp        |  14 +-
+ src/test/snapshot_rcu_tests.cpp          | 360 ++++++++++++++++++
+ src/txmempool.cpp                        |  50 ++-
+ src/txmempool.h                          |  47 ++-
+ src/validation.cpp                       |  10 +
+ 13 files changed, 1182 insertions(+), 16 deletions(-)
+ create mode 100644 src/node/snapshot.cpp
+ create mode 100644 src/node/snapshot.h
+ create mode 100644 src/test/snapshot_rcu_tests.cpp
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index a251dc97ac..7df5fe61d7 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -668,6 +668,7 @@ add_library(server
+ 	node/coins_view_args.cpp
+ 	node/connection_types.cpp
+ 	node/context.cpp
++	node/snapshot.cpp
+ 	node/database_args.cpp
+ 	node/eviction.cpp
+ 	node/interfaces.cpp
+diff --git a/src/avalanche/processor.cpp b/src/avalanche/processor.cpp
+index c36cf4daa1..b061fcbee5 100644
+--- a/src/avalanche/processor.cpp
++++ b/src/avalanche/processor.cpp
+@@ -1596,7 +1596,7 @@ void Processor::finalizeMempoolBatch(const uint256 &batchId) {
+                 overlay_mgr.GetSpeculativeOverlay().GetParentBlockId() == expectedParentBlock &&
+                 overlay_mgr.GetSpeculativeOverlay().GetSubtreeARoot() ==
+                     target_root) {
+-                overlay_mgr.FreezeEpochBatch();
++                mempool->FreezeEpochBatch();
+             }
+ 
+             // Event-driven back-to-back pipelining: if the speculative overlay
+@@ -1612,7 +1612,7 @@ void Processor::finalizeMempoolBatch(const uint256 &batchId) {
+                 const auto now = Now<SteadyMilliseconds>();
+                 if (m_adaptiveEpochController.shouldPipelineNextBatch(
+                         tailTxCount, now)) {
+-                    const auto &nextLayer = overlay_mgr.FreezeEpochBatch();
++                    const auto &nextLayer = mempool->FreezeEpochBatch();
+                     pipelinedNextBatch = BuildBatchAnnouncementFromLayer(
+                         batch.prev_block_hash, batch.epoch_seq + 1, batchId,
+                         nextLayer);
+@@ -1673,7 +1673,7 @@ bool Processor::tryFreezeAndRegisterNextEpochBatch(
+                           tailTxCount, now)) {
+             return false;
+         }
+-        const auto &frozenLayer = overlay_mgr.FreezeEpochBatch();
++        const auto &frozenLayer = mempool->FreezeEpochBatch();
+         createdBatch = BuildBatchAnnouncementFromLayer(
+             prevBlockHash, nextEpochSeq, parentBatchId, frozenLayer);
+         m_adaptiveEpochController.recordBatchFrozen(now);
+diff --git a/src/kernel/disconnected_transactions.cpp b/src/kernel/disconnected_transactions.cpp
+index 6c4b572cca..6c441ae558 100644
+--- a/src/kernel/disconnected_transactions.cpp
++++ b/src/kernel/disconnected_transactions.cpp
+@@ -143,6 +143,7 @@ void DisconnectedBlockTransactions::addForBlock(
+ void DisconnectedBlockTransactions::removeForBlock(
+     const std::vector<CTransactionRef> &vtx, CTxMemPool &pool) {
+     AssertLockHeld(pool.cs);
++    CTxMemPool::ScopedSnapshotDefer snapshot_defer(pool);
+ 
+     if (pool.mapTx.empty() && pool.mapDeltas.empty()) {
+         // fast-path for IBD and/or when mempool is empty; there is no need to
+diff --git a/src/node/context.cpp b/src/node/context.cpp
+index 60e83588d5..133b585c18 100644
+--- a/src/node/context.cpp
++++ b/src/node/context.cpp
+@@ -12,11 +12,12 @@
+ #include <net.h>
+ #include <net_processing.h>
+ #include <node/kernel_notifications.h>
++#include <node/snapshot.h>
+ #include <scheduler.h>
+ #include <txmempool.h>
+ #include <validation.h>
+ 
+ namespace node {
+-NodeContext::NodeContext() = default;
++NodeContext::NodeContext() : snapshot_publisher(GetGlobalSnapshotPublisherPtr()) {}
+ NodeContext::~NodeContext() = default;
+ } // namespace node
+diff --git a/src/node/context.h b/src/node/context.h
+index b65e9aac76..58712c19d1 100644
+--- a/src/node/context.h
++++ b/src/node/context.h
+@@ -35,6 +35,7 @@ class Processor;
+ } // namespace avalanche
+ 
+ namespace node {
++class SnapshotPublisher;
+ class KernelNotifications;
+ 
+ //! NodeContext struct containing references to chain state and connection
+@@ -48,6 +49,7 @@ class KernelNotifications;
+ //! any member functions. It should just be a collection of references that can
+ //! be used without pulling in unwanted dependencies or functionality.
+ struct NodeContext {
++    std::shared_ptr<SnapshotPublisher> snapshot_publisher;
+     //! libbitcoin_kernel context
+     std::unique_ptr<kernel::Context> kernel;
+     std::unique_ptr<AddrMan> addrman;
+diff --git a/src/node/snapshot.cpp b/src/node/snapshot.cpp
+new file mode 100644
+index 0000000000..436af48faa
+--- /dev/null
++++ b/src/node/snapshot.cpp
+@@ -0,0 +1,442 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <node/snapshot.h>
++
++#include <arith_uint256.h>
++#include <chain.h>
++#include <chainparams.h>
++#include <common/args.h>
++#include <config.h>
++#include <consensus/consensus.h>
++#include <consensus/tx_verify.h>
++#include <consensus/validation.h>
++#include <crypto/sha256.h>
++#include <lotus_v2/mempool_overlay.h>
++#include <node/blockstorage.h>
++#include <policy/policy.h>
++#include <pow/pow.h>
++#include <streams.h>
++#include <timedata.h>
++#include <txmempool.h>
++#include <util/strencodings.h>
++#include <validation.h>
++
++#include <algorithm>
++#include <cstring>
++#include <queue>
++#include <set>
++#include <unordered_map>
++
++namespace node {
++namespace {
++
++struct ChainPublicationScope {
++    unsigned depth{0};
++    ChainstateManager *chainman{nullptr};
++    const CTxMemPool *mempool{nullptr};
++    bool dirty{false};
++};
++thread_local ChainPublicationScope g_chain_publication;
++
++double ComputeDifficultyFromBits(uint32_t nBits) {
++    int nShift = (nBits >> 24) & 0xff;
++    double dDiff = double(0x0000ffff) / double(nBits & 0x00ffffff);
++    while (nShift < 29) {
++        dDiff *= 256.0;
++        nShift++;
++    }
++    while (nShift > 29) {
++        dDiff /= 256.0;
++        nShift--;
++    }
++    return dDiff;
++}
++
++std::optional<int> ComputePruneHeight(const BlockManager &blockman,
++                                      const CChain &chain)
++    EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
++    AssertLockHeld(::cs_main);
++    const CBlockIndex *first_block{chain[1]};
++    const CBlockIndex *chain_tip{chain.Tip()};
++    if (!first_block || !chain_tip) {
++        return std::nullopt;
++    }
++    if (!(chain_tip->nStatus.hasData() && chain_tip->nStatus.hasUndo())) {
++        return chain_tip->nHeight;
++    }
++    const CBlockIndex *first_unpruned{
++        blockman.GetFirstBlock(*chain_tip, [](const BlockStatus &status) {
++            return status.hasData() && status.hasUndo();
++        })};
++    if (!first_unpruned || first_unpruned == first_block ||
++        !first_unpruned->pprev) {
++        return std::nullopt;
++    }
++    return first_unpruned->pprev->nHeight;
++}
++
++BlockHeaderSnapshot MakeBlockHeaderSnapshot(const CBlockIndex &blockindex)
++    EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
++    AssertLockHeld(::cs_main);
++    BlockHeaderSnapshot hdr{};
++    hdr.hash = blockindex.GetBlockHash();
++    hdr.header = blockindex.GetBlockHeader();
++    hdr.height = blockindex.nHeight;
++    hdr.time = blockindex.GetBlockTime();
++    hdr.mediantime = blockindex.GetMedianTimePast();
++    hdr.difficulty = ComputeDifficultyFromBits(blockindex.nBits);
++    hdr.chainwork = ArithToUint256(blockindex.nChainWork);
++    hdr.nTx = blockindex.nTx;
++    hdr.data_pos = blockindex.GetBlockPos();
++    hdr.has_data = blockindex.nStatus.hasData();
++    return hdr;
++}
++
++void PopulateMempoolScalarsLocked(ChainAndMempoolSnapshot &snap,
++                                  const CTxMemPool &mempool)
++    EXCLUSIVE_LOCKS_REQUIRED(mempool.cs) {
++    snap.mempool_ptr = &mempool;
++    snap.mempool_valid = true;
++    snap.mempool_loaded = mempool.GetLoadTried();
++    snap.mempool_size = mempool.size();
++    snap.mempool_bytes = mempool.GetTotalTxSize();
++    snap.finalized_txs_size = mempool.GetFinalizedTxCount();
++    snap.finalized_txs_bytes = mempool.GetTotalFinalizedTxSize();
++    snap.finalized_txs_sigchecks = mempool.GetTotalFinalizedTxSigchecks();
++    snap.mempool_usage = mempool.DynamicMemoryUsage();
++    snap.total_fee = mempool.GetTotalFee();
++    snap.max_mempool = mempool.m_opts.max_size_bytes;
++    snap.min_relay_tx_fee = mempool.m_opts.min_relay_feerate;
++    const CFeeRate current_min_fee = mempool.GetMinFee();
++    snap.mempool_min_fee =
++        std::max(current_min_fee, mempool.m_opts.min_relay_feerate);
++    snap.rolling_minimum_fee_rate = mempool.GetRollingMinimumFeeRate();
++    snap.last_rolling_fee_update = mempool.GetLastRollingFeeUpdate();
++    snap.block_since_last_rolling_fee_bump =
++        mempool.GetBlockSinceLastRollingFeeBump();
++    snap.unbroadcast_count = mempool.GetUnbroadcastTxs().size();
++    snap.transactions_updated = mempool.GetTransactionsUpdated();
++    snap.mempool_sequence = mempool.GetSequence();
++
++}
++
++MempoolEntrySnapshot MakeMempoolEntrySnapshot(const CTxMemPoolEntry &e,
++                                              const CTxMemPool &mempool)
++    EXCLUSIVE_LOCKS_REQUIRED(mempool.cs) {
++    MempoolEntrySnapshot entry_snap{};
++    entry_snap.txid = e.GetTx().GetId();
++    entry_snap.tx = e.GetSharedTx();
++    entry_snap.fee = e.GetFee();
++    entry_snap.modified_fee = e.GetModifiedFee();
++    entry_snap.tx_size = e.GetTxSize();
++    entry_snap.time = count_seconds(e.GetTime());
++    entry_snap.height = static_cast<int>(e.GetHeight());
++
++    const auto &parents = e.GetMemPoolParentsConst();
++    if (!parents.empty()) {
++        std::set<std::string> set_depends;
++        for (const auto &parent : parents) {
++            set_depends.insert(parent.get()->GetTx().GetId().ToString());
++        }
++        entry_snap.depends.assign(set_depends.begin(), set_depends.end());
++    }
++
++    const auto &children = e.GetMemPoolChildrenConst();
++    entry_snap.spentby.reserve(children.size());
++    for (const auto &child : children) {
++        entry_snap.spentby.push_back(
++            child.get()->GetTx().GetId().ToString());
++    }
++    entry_snap.unbroadcast = mempool.IsUnbroadcastTx(entry_snap.txid);
++    return entry_snap;
++}
++
++void CaptureMempoolEntriesLocked(ChainAndMempoolSnapshot &snap,
++                                 const CTxMemPool &mempool,
++                                 const ChainAndMempoolSnapshot *prev)
++    EXCLUSIVE_LOCKS_REQUIRED(mempool.cs) {
++    const bool full = mempool.SnapshotNeedsReset() || !prev ||
++                      prev->mempool_ptr != &mempool || !prev->entry_tree;
++    if (!full && mempool.SnapshotChangedEntries().empty()) {
++        snap.entry_tree = prev->entry_tree;
++        return;
++    }
++    auto tree = full ? std::make_shared<MempoolSnapshotTree>()
++                     : std::make_shared<MempoolSnapshotTree>(*prev->entry_tree);
++    auto capture = [&](const CTxMemPoolEntry &entry) EXCLUSIVE_LOCKS_REQUIRED(mempool.cs) {
++        tree->insert(RCUPtr<ImmutableMempoolEntry>::make(
++            MakeMempoolEntrySnapshot(entry, mempool)));
++    };
++    if (full) {
++        for (const auto &entry : mempool.mapTx) capture(*entry);
++    } else {
++        for (const TxId &id : mempool.SnapshotChangedEntries()) {
++            tree->remove(Uint256RadixKey(id));
++            const auto it = mempool.mapTx.find(id);
++            if (it != mempool.mapTx.end()) capture(**it);
++        }
++    }
++    snap.entry_tree = std::move(tree);
++    mempool.ClearSnapshotChanges();
++}
++
++std::shared_ptr<ChainAndMempoolSnapshot>
++CloneChainStateOnly(const ChainAndMempoolSnapshot *prev) {
++    auto next = std::make_shared<ChainAndMempoolSnapshot>();
++    if (!prev) {
++        return next;
++    }
++    next->chainman_ptr = prev->chainman_ptr;
++    next->mempool_ptr = prev->mempool_ptr;
++    next->chain_valid = prev->chain_valid;
++    next->height = prev->height;
++    next->headers_height = prev->headers_height;
++    next->best_block_hash = prev->best_block_hash;
++    next->finalized_block_hash = prev->finalized_block_hash;
++    next->difficulty = prev->difficulty;
++    next->time = prev->time;
++    next->mediantime = prev->mediantime;
++    next->verification_progress = prev->verification_progress;
++    next->initial_block_download = prev->initial_block_download;
++    next->chainwork = prev->chainwork;
++    next->size_on_disk = prev->size_on_disk;
++    next->pruned = prev->pruned;
++    next->has_prune_height = prev->has_prune_height;
++    next->prune_height = prev->prune_height;
++    next->automatic_pruning = prev->automatic_pruning;
++    next->prune_target_size = prev->prune_target_size;
++    next->fast_sync_active = prev->fast_sync_active;
++    next->earliest_verified_height = prev->earliest_verified_height;
++    next->chain_type_string = prev->chain_type_string;
++    next->nBits = prev->nBits;
++    next->next_nBits = prev->next_nBits;
++    next->next_subsidy = prev->next_subsidy;
++    next->consensus_params = prev->consensus_params;
++    next->prev_header_received_time = prev->prev_header_received_time;
++    next->active_chain = prev->active_chain;
++    return next;
++}
++
++} // namespace
++
++void ChainAndMempoolSnapshot::EnsureMempoolVectors() const {
++    std::lock_guard<std::mutex> lock(*mempool_vectors_mutex);
++    if (mempool_vectors_ready) return;
++    if (entry_tree) {
++        entry_tree->forEachLeaf([&](const auto &value) {
++            const auto &entry = value->entry;
++            mempool_txids.push_back(entry.txid);
++            mempool_entries.push_back(entry);
++            for (const auto &input : entry.tx->vin)
++                mempool_spent_outpoints.push_back(input.prevout);
++            return true;
++        });
++    }
++    std::sort(mempool_txids.begin(), mempool_txids.end());
++    std::sort(mempool_entries.begin(), mempool_entries.end(),
++              [](const auto &a, const auto &b) { return a.txid < b.txid; });
++    std::sort(mempool_spent_outpoints.begin(), mempool_spent_outpoints.end());
++    mempool_vectors_ready = true;
++}
++
++ScopedChainSnapshotDefer::ScopedChainSnapshotDefer(
++    ChainstateManager &chainman, const CTxMemPool *mempool) {
++    AssertLockHeld(::cs_main);
++    if (mempool) AssertLockHeld(mempool->cs);
++    auto &scope = g_chain_publication;
++    if (scope.depth++ == 0) {
++        scope.chainman = &chainman;
++        scope.mempool = mempool;
++        scope.dirty = false;
++    } else {
++        assert(scope.chainman == &chainman && scope.mempool == mempool);
++    }
++}
++
++ScopedChainSnapshotDefer::~ScopedChainSnapshotDefer() {
++    AssertLockHeld(::cs_main);
++    auto &scope = g_chain_publication;
++    assert(scope.depth > 0);
++    if (--scope.depth != 0) return;
++    const auto completed = scope;
++    scope = {};
++    if (completed.dirty) {
++        PublishChainTipSnapshot(*completed.chainman, completed.mempool);
++    }
++}
++
++SnapshotPublisher::SnapshotPublisher()
++    : m_current(std::make_shared<const ChainAndMempoolSnapshot>()) {}
++
++void SnapshotPublisher::Publish(std::shared_ptr<const ChainAndMempoolSnapshot> next) {
++    if (!next) return;
++    std::atomic_store_explicit(&m_current, std::move(next), std::memory_order_release);
++    m_publications.fetch_add(1);
++}
++
++std::shared_ptr<SnapshotPublisher> GetGlobalSnapshotPublisherPtr() {
++    static auto g_publisher = std::make_shared<SnapshotPublisher>();
++    return g_publisher;
++}
++
++SnapshotPublisher &GetGlobalSnapshotPublisher() {
++    return *GetGlobalSnapshotPublisherPtr();
++}
++
++void PublishChainTipSnapshot(ChainstateManager &chainman,
++                             const CTxMemPool *mempool)
++    NO_THREAD_SAFETY_ANALYSIS {
++    AssertLockHeld(::cs_main);
++    if (g_chain_publication.depth && g_chain_publication.chainman == &chainman) {
++        assert(g_chain_publication.mempool == mempool);
++        g_chain_publication.dirty = true;
++        return;
++    }
++    SnapshotPublisher &publisher = GetGlobalSnapshotPublisher();
++    auto prev = publisher.Load();
++    auto next = CloneChainStateOnly(prev.get());
++
++    Chainstate &active_chainstate = chainman.ActiveChainstate();
++    const CBlockIndex *tip = active_chainstate.m_chain.Tip();
++    if (!tip) {
++        return;
++    }
++
++    const CChainParams &chainparams = chainman.GetParams();
++    next->chainman_ptr = &chainman;
++    next->chain_valid = true;
++    next->height = tip->nHeight;
++    next->headers_height =
++        chainman.m_best_header ? chainman.m_best_header->nHeight : -1;
++    next->best_block_hash = tip->GetBlockHash();
++    const CBlockIndex *avalanche_finalized_tip =
++        chainman.GetAvalancheFinalizedTip();
++    next->finalized_block_hash =
++        avalanche_finalized_tip ? avalanche_finalized_tip->GetBlockHash()
++                                : chainparams.GenesisBlock().GetHash();
++    next->difficulty = ComputeDifficultyFromBits(tip->nBits);
++    next->time = tip->GetBlockTime();
++    next->mediantime = tip->GetMedianTimePast();
++    next->verification_progress =
++        GuessVerificationProgress(chainparams.TxData(), tip);
++    next->initial_block_download = chainman.IsInitialBlockDownload();
++    next->chainwork = ArithToUint256(tip->nChainWork);
++    next->size_on_disk = chainman.m_blockman.CalculateCurrentUsage();
++    next->pruned = chainman.m_blockman.IsPruneMode();
++    if (next->pruned) {
++        const auto prune_height =
++            ComputePruneHeight(chainman.m_blockman, active_chainstate.m_chain);
++        next->has_prune_height = true;
++        next->prune_height = prune_height ? prune_height.value() + 1 : 0;
++        next->automatic_pruning =
++            chainman.m_blockman.GetPruneTarget() !=
++            BlockManager::PRUNE_TARGET_MANUAL;
++        if (next->automatic_pruning) {
++            next->prune_target_size = chainman.m_blockman.GetPruneTarget();
++        }
++    } else {
++        next->has_prune_height = false;
++        next->prune_height = 0;
++        next->automatic_pruning = false;
++        next->prune_target_size = 0;
++    }
++    next->fast_sync_active = false;
++    next->earliest_verified_height = 0;
++    next->chain_type_string = chainparams.GetChainTypeString();
++    next->nBits = tip->nBits;
++    next->consensus_params = chainparams.GetConsensus();
++
++    CBlockHeader dummyHeader;
++    dummyHeader.hashPrevBlock = tip->GetBlockHash();
++    const int64_t now_time =
++        TicksSinceEpoch<std::chrono::seconds>(GetAdjustedTime());
++    dummyHeader.nTime =
++        static_cast<uint32_t>(std::max<int64_t>(tip->GetMedianTimePast() + 1, now_time));
++    next->next_nBits = GetNextWorkRequired(tip, &dummyHeader, chainparams);
++    next->next_subsidy =
++        GetBlockSubsidy(tip->nHeight + 1, *next->consensus_params);
++
++    next->prev_header_received_time.fill(0);
++    const CBlockIndex *prev_idx = tip;
++    for (size_t i = 1; i < 18 && prev_idx != nullptr; ++i) {
++        next->prev_header_received_time[i] =
++            prev_idx->GetHeaderReceivedTime();
++        prev_idx = prev_idx->pprev;
++    }
++
++    std::shared_ptr<ActiveChainSnapshot> active_chain_snap;
++    const int tip_height = tip->nHeight;
++    if (tip_height >= 1 && tip->pprev && prev && prev->active_chain &&
++        prev->chainman_ptr == &chainman && !next->pruned &&
++        prev->active_chain->by_height.size() ==
++            static_cast<size_t>(tip_height) &&
++        prev->active_chain->by_height.back().hash ==
++            tip->pprev->GetBlockHash()) {
++        active_chain_snap =
++            std::make_shared<ActiveChainSnapshot>(*prev->active_chain);
++        BlockHeaderSnapshot tip_hdr = MakeBlockHeaderSnapshot(*tip);
++        active_chain_snap->height_by_hash.emplace(tip_hdr.hash, tip_height);
++        active_chain_snap->by_height.push_back(std::move(tip_hdr));
++    } else {
++        active_chain_snap = std::make_shared<ActiveChainSnapshot>();
++        if (tip_height >= 0) {
++            active_chain_snap->by_height.reserve(
++                static_cast<size_t>(tip_height) + 1);
++            active_chain_snap->height_by_hash.reserve(
++                static_cast<size_t>(tip_height) + 1);
++            for (int h = 0; h <= tip_height; ++h) {
++                const CBlockIndex *pindex = active_chainstate.m_chain[h];
++                BlockHeaderSnapshot hdr = MakeBlockHeaderSnapshot(*pindex);
++                active_chain_snap->height_by_hash.emplace(hdr.hash, h);
++                active_chain_snap->by_height.push_back(std::move(hdr));
++            }
++        }
++    }
++    next->active_chain = std::move(active_chain_snap);
++
++    if (mempool) {
++        LOCK(mempool->cs);
++        mempool->ClearSnapshotDirty();
++        mempool->SyncMerklixOverlayToTip(
++            tip->GetBlockHash(), uint64_t(tip->nHeight + 1),
++            uint64_t(tip->GetMedianTimePast()));
++        PopulateMempoolScalarsLocked(*next, *mempool);
++        CaptureMempoolEntriesLocked(*next, *mempool, prev.get());
++    }
++
++    publisher.Publish(std::move(next));
++}
++
++void PublishMempoolSnapshot(const CTxMemPool &mempool)
++    NO_THREAD_SAFETY_ANALYSIS {
++    AssertLockHeld(mempool.cs);
++    if (g_chain_publication.depth && g_chain_publication.mempool == &mempool) {
++        g_chain_publication.dirty = true;
++        return;
++    }
++    if (mempool.DeferSnapshotIfActive()) {
++        return;
++    }
++    SnapshotPublisher &publisher = GetGlobalSnapshotPublisher();
++    auto prev = publisher.Load();
++    auto next = mempool.HasSnapshotState() && prev && prev->mempool_ptr == &mempool
++                    ? CloneChainStateOnly(prev.get())
++                    : std::make_shared<ChainAndMempoolSnapshot>();
++
++    PopulateMempoolScalarsLocked(*next, mempool);
++    next->mempool_vectors_ready = false;
++    CaptureMempoolEntriesLocked(*next, mempool, prev.get());
++
++    publisher.Publish(std::move(next));
++}
++
++void PublishMempoolUnbroadcastSnapshot(const CTxMemPool &mempool,
++                                       const TxId &txid, bool unbroadcast)
++    EXCLUSIVE_LOCKS_REQUIRED(mempool.cs) {
++    mempool.MarkSnapshotEntryChanged(txid);
++    PublishMempoolSnapshot(mempool);
++}
++
++} // namespace node
+diff --git a/src/node/snapshot.h b/src/node/snapshot.h
+new file mode 100644
+index 0000000000..82445fd5fc
+--- /dev/null
++++ b/src/node/snapshot.h
+@@ -0,0 +1,261 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_NODE_SNAPSHOT_H
++#define BITCOIN_NODE_SNAPSHOT_H
++
++#include <consensus/amount.h>
++#include <consensus/params.h>
++#include <feerate.h>
++#include <flatfile.h>
++#include <primitives/block.h>
++#include <primitives/blockhash.h>
++#include <primitives/transaction.h>
++#include <radix.h>
++#include <uint256radixkey.h>
++#include <uint256.h>
++#include <util/hasher.h>
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++class ChainstateManager;
++class CTxMemPool;
++
++namespace node {
++
++/**
++ * Snapshot of a single mempool entry for getmempoolentry,
++ * getrawmempool(verbose=true), getrawtransaction, and gettxout.
++ */
++struct MempoolEntrySnapshot {
++    TxId txid{};
++    CTransactionRef tx;
++    Amount fee{Amount::zero()};
++    Amount modified_fee{Amount::zero()};
++    size_t tx_size{0};
++    int64_t time{0};
++    int height{0};
++    std::vector<std::string> depends;
++    std::vector<std::string> spentby;
++    bool unbroadcast{false};
++};
++
++/**
++ * Snapshot of a single active-chain block header and disk location for
++ * getblockhash, getblockheader, and getrawtransaction without chain locks.
++ */
++struct BlockHeaderSnapshot {
++    BlockHash hash{};
++    CBlockHeader header{};
++    int height{0};
++    int64_t time{0};
++    int64_t mediantime{0};
++    double difficulty{0.0};
++    uint256 chainwork{};
++    unsigned int nTx{0};
++    FlatFilePos data_pos{};
++    bool has_data{false};
++};
++
++/**
++ * Immutable active-chain header index shared across mempool snapshots in O(1)
++ * and updated when the active chain tip changes.
++ */
++struct ActiveChainSnapshot {
++    std::vector<BlockHeaderSnapshot> by_height;
++    std::unordered_map<BlockHash, int, SaltedBlockHashHasher> height_by_hash;
++
++    const BlockHeaderSnapshot *FindByHeight(int height) const noexcept {
++        if (height < 0 ||
++            static_cast<size_t>(height) >= by_height.size()) {
++            return nullptr;
++        }
++        return &by_height[static_cast<size_t>(height)];
++    }
++
++    const BlockHeaderSnapshot *FindByHash(const BlockHash &hash) const noexcept {
++        const auto it = height_by_hash.find(hash);
++        if (it == height_by_hash.end()) {
++            return nullptr;
++        }
++        return FindByHeight(it->second);
++    }
++};
++
++/** An immutable value. Updating an entry creates a new value; readers never
++ * retain mutable CTxMemPoolEntry objects. The existing ABC radix tree supplies
++ * copy-on-write paths and RCU lifetime management. */
++struct ImmutableMempoolEntry {
++    const MempoolEntrySnapshot entry;
++    explicit ImmutableMempoolEntry(MempoolEntrySnapshot value)
++        : entry(std::move(value)) {}
++    IMPLEMENT_RCU_REFCOUNT(uint32_t);
++};
++struct SnapshotEntryAdapter {
++    Uint256RadixKey getId(const ImmutableMempoolEntry &value) const {
++        return value.entry.txid;
++    }
++};
++using MempoolSnapshotTree = RadixTree<ImmutableMempoolEntry, SnapshotEntryAdapter>;
++
++/** Published chain and mempool state. Lazy vectors derive exclusively from
++ * the pinned immutable entry tree, never from the live mempool. */
++struct ChainAndMempoolSnapshot {
++    const ChainstateManager *chainman_ptr{nullptr};
++    const CTxMemPool *mempool_ptr{nullptr};
++
++    // Chain tip state
++    bool chain_valid{false};
++    int height{-1};
++    int headers_height{-1};
++    BlockHash best_block_hash{};
++    BlockHash finalized_block_hash{};
++    double difficulty{0.0};
++    int64_t time{0};
++    int64_t mediantime{0};
++    double verification_progress{0.0};
++    bool initial_block_download{false};
++    uint256 chainwork{};
++    uint64_t size_on_disk{0};
++    bool pruned{false};
++    bool has_prune_height{false};
++    int prune_height{0};
++    bool automatic_pruning{false};
++    uint64_t prune_target_size{0};
++    bool fast_sync_active{false};
++    int earliest_verified_height{0};
++    std::string chain_type_string;
++    uint32_t nBits{0};
++    uint32_t next_nBits{0};
++    Amount next_subsidy{Amount::zero()};
++    std::optional<Consensus::Params> consensus_params;
++    std::array<int64_t, 18> prev_header_received_time{};
++    std::shared_ptr<const ActiveChainSnapshot> active_chain;
++
++    // Mempool state
++    bool mempool_valid{false};
++    bool mempool_loaded{false};
++    size_t mempool_size{0};
++    size_t mempool_bytes{0};
++    size_t finalized_txs_size{0};
++    size_t finalized_txs_bytes{0};
++    int64_t finalized_txs_sigchecks{0};
++    size_t mempool_usage{0};
++    Amount total_fee{Amount::zero()};
++    size_t max_mempool{0};
++    CFeeRate mempool_min_fee{};
++    CFeeRate min_relay_tx_fee{};
++    double rolling_minimum_fee_rate{0.0};
++    int64_t last_rolling_fee_update{0};
++    bool block_since_last_rolling_fee_bump{false};
++    size_t unbroadcast_count{0};
++    unsigned int transactions_updated{0};
++    uint64_t mempool_sequence{0};
++    std::shared_ptr<const MempoolSnapshotTree> entry_tree;
++    mutable std::vector<TxId> mempool_txids;
++    mutable std::vector<MempoolEntrySnapshot> mempool_entries;
++    mutable std::vector<COutPoint> mempool_spent_outpoints;
++    mutable bool mempool_vectors_ready{false};
++    std::shared_ptr<std::mutex> mempool_vectors_mutex{
++        std::make_shared<std::mutex>()};
++
++    void EnsureMempoolVectors() const;
++
++    const MempoolEntrySnapshot *FindMempoolEntry(const TxId &txid) const {
++        EnsureMempoolVectors();
++        const auto it = std::lower_bound(
++            mempool_entries.begin(), mempool_entries.end(), txid,
++            [](const MempoolEntrySnapshot &entry, const TxId &id) {
++                return entry.txid < id;
++            });
++        if (it != mempool_entries.end() && it->txid == txid) {
++            return &(*it);
++        }
++        return nullptr;
++    }
++
++    bool IsSpentInMempool(const COutPoint &outpoint) const {
++        EnsureMempoolVectors();
++        return std::binary_search(mempool_spent_outpoints.begin(),
++                                  mempool_spent_outpoints.end(), outpoint);
++    }
++};
++
++using ChainTipSnapshot = ChainAndMempoolSnapshot;
++
++/** Atomic publication keeps RPC readers independent of chain/mempool locks.
++ * Standard atomic shared_ptr operations may internally synchronize; this API
++ * does not promise wait freedom or a platform-independent lock-free primitive.
++ * Only readers retain older snapshots, avoiding a ring of 1024 chain indexes. */
++class SnapshotPublisher {
++    std::shared_ptr<const ChainAndMempoolSnapshot> m_current;
++    std::atomic<uint64_t> m_publications{0};
++public:
++    SnapshotPublisher();
++    std::shared_ptr<const ChainAndMempoolSnapshot> Load() const noexcept {
++        return std::atomic_load_explicit(&m_current, std::memory_order_acquire);
++    }
++    void Publish(std::shared_ptr<const ChainAndMempoolSnapshot> next);
++    uint64_t PublicationCount() const noexcept { return m_publications.load(); }
++};
++
++/** Keep readers on the last coherent generation while chain activation or
++ * unwinding temporarily clears/rebuilds the mempool. Construct and destroy
++ * under cs_main and the pool lock; the outer scope publishes their final state. */
++class ScopedChainSnapshotDefer {
++public:
++    ScopedChainSnapshotDefer(ChainstateManager &chainman, const CTxMemPool *mempool);
++    ~ScopedChainSnapshotDefer();
++    ScopedChainSnapshotDefer(const ScopedChainSnapshotDefer &) = delete;
++    ScopedChainSnapshotDefer &operator=(const ScopedChainSnapshotDefer &) = delete;
++};
++
++/** Return the process-wide SnapshotPublisher shared by NodeContext and validation/mempool hooks. */
++std::shared_ptr<SnapshotPublisher> GetGlobalSnapshotPublisherPtr();
++SnapshotPublisher &GetGlobalSnapshotPublisher();
++
++inline std::shared_ptr<const ChainTipSnapshot> GetChainTipSnapshot() noexcept {
++    return GetGlobalSnapshotPublisher().Load();
++}
++
++/**
++ * Publish an updated chain snapshot when the active tip changes.
++ * Must be called with ::cs_main held.
++ */
++void PublishChainTipSnapshot(ChainstateManager &chainman,
++                             const CTxMemPool *mempool);
++
++inline void UpdateChainTipSnapshot(ChainstateManager &chainman,
++                                   const CTxMemPool *mempool) {
++    PublishChainTipSnapshot(chainman, mempool);
++}
++
++/**
++ * Publish an updated mempool snapshot when the mempool changes.
++ * Must be called with mempool.cs held.
++ */
++void PublishMempoolSnapshot(const CTxMemPool &mempool);
++
++/**
++ * [Patch 034 optimization] Publish a lightweight RCU snapshot update when only
++ * a transaction's unbroadcast state changes, avoiding a full template rebuild.
++ * Must be called with mempool.cs held.
++ */
++void PublishMempoolUnbroadcastSnapshot(const CTxMemPool &mempool,
++                                       const TxId &txid,
++                                       bool unbroadcast);
++
++} // namespace node
++
++#endif // BITCOIN_NODE_SNAPSHOT_H
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 03cbd723ce..ecf6cd63eb 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -218,6 +218,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		result_tests.cpp
+ 		reverselock_tests.cpp
+ 		rpc_tests.cpp
++		snapshot_rcu_tests.cpp
+ 		rpc_server_tests.cpp
+ 		rtt_tests.cpp
+ 		rwcollection_tests.cpp
+diff --git a/src/test/blockencodings_tests.cpp b/src/test/blockencodings_tests.cpp
+index f7eb1a64c9..84cabda972 100644
+--- a/src/test/blockencodings_tests.cpp
++++ b/src/test/blockencodings_tests.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <chainparams.h>
+ #include <config.h>
++#include <node/snapshot.h>
+ #include <consensus/merkle.h>
+ #include <lotus_v2/blocksnap.h>
+ #include <lotus_v2/mempool_overlay.h>
+@@ -69,14 +70,23 @@ static CBlock BuildBlockTestCase(FastRandomContext &ctx) {
+ }
+ 
+ // Number of shared use_counts we expect for a tx we haven't touched
+-// (block + mempool + pending_overlay_adds + our copy from the GetSharedTx call)
+-constexpr long SHARED_TX_OFFSET{4};
++// (block + mempool + shared overlay + immutable snapshot entry + the
++// temporary copy from GetSharedTx). The snapshot deliberately owns its tx so
++// an old generation remains valid after removal from the live mempool.
++constexpr long SHARED_TX_OFFSET{5};
+ 
+ static void expectUseCount(const CTxMemPool &pool, const CTransaction *tx,
+                            long expectedCount)
+     EXCLUSIVE_LOCKS_REQUIRED(pool.cs) {
+     AssertLockHeld(pool.cs);
+ 
++    const auto snapshot = node::GetGlobalSnapshotPublisher().Load();
++    BOOST_REQUIRE(snapshot && snapshot->mempool_ptr == &pool);
++    BOOST_REQUIRE(snapshot->entry_tree);
++    const auto pinned = snapshot->entry_tree->get(Uint256RadixKey(tx->GetId()));
++    BOOST_REQUIRE(pinned);
++    BOOST_CHECK_EQUAL(pinned->entry.tx.get(), tx);
++
+     // Account for the number of shared references in mapNextTx. This should be
+     // equal to the number of inputs for this tx.
+     BOOST_CHECK_EQUAL(
+diff --git a/src/test/snapshot_rcu_tests.cpp b/src/test/snapshot_rcu_tests.cpp
+new file mode 100644
+index 0000000000..bdb6435b03
+--- /dev/null
++++ b/src/test/snapshot_rcu_tests.cpp
+@@ -0,0 +1,360 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <config.h>
++#include <consensus/amount.h>
++#include <consensus/tx_check.h>
++#include <core_io.h>
++#include <kernel/disconnected_transactions.h>
++#include <key_io.h>
++#include <minerfund.h>
++#include <node/snapshot.h>
++#include <pow/pow.h>
++#include <primitives/block.h>
++#include <rpc/blockchain.h>
++#include <rpc/server.h>
++#include <script/standard.h>
++#include <streams.h>
++#include <test/util/setup_common.h>
++#include <txmempool.h>
++#include <univalue.h>
++#include <util/strencodings.h>
++#include <validation.h>
++
++#include <boost/asio/co_spawn.hpp>
++#include <boost/asio/detached.hpp>
++#include <boost/asio/thread_pool.hpp>
++#include <boost/test/unit_test.hpp>
++
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <future>
++#include <memory>
++#include <thread>
++#include <vector>
++
++BOOST_FIXTURE_TEST_SUITE(snapshot_rcu_tests, TestChain100Setup)
++
++BOOST_AUTO_TEST_CASE(snapshot_publication_concurrent_coherent_scalars) {
++    node::SnapshotPublisher publisher;
++    std::atomic<bool> stop{false};
++    std::atomic<uint64_t> reads_completed{0};
++
++    constexpr int kNumReaders = 4;
++    constexpr int kNumPublishes = 2500;
++
++    std::atomic<int> readers_started{0};
++    std::atomic<bool> reader_failed{false};
++    std::vector<std::thread> readers;
++    readers.reserve(kNumReaders);
++    for (int r = 0; r < kNumReaders; ++r) {
++        readers.emplace_back([&]() {
++            readers_started.fetch_add(1, std::memory_order_release);
++            int last_height = -1;
++            while (!stop.load(std::memory_order_relaxed)) {
++                auto snap = publisher.Load();
++                if (!snap) {
++                    reader_failed.store(true, std::memory_order_relaxed);
++                    break;
++                }
++                if (snap->chain_valid) {
++                    if (snap->height < last_height ||
++                        snap->mempool_size !=
++                            static_cast<size_t>(snap->height % 17)) {
++                        reader_failed.store(true, std::memory_order_relaxed);
++                        break;
++                    }
++                    last_height = snap->height;
++                }
++                reads_completed.fetch_add(1, std::memory_order_relaxed);
++            }
++        });
++    }
++
++    while (readers_started.load(std::memory_order_acquire) < kNumReaders) {
++        std::this_thread::yield();
++    }
++
++    for (int i = 1; i <= kNumPublishes; ++i) {
++        auto next = std::make_shared<node::ChainAndMempoolSnapshot>();
++        next->chain_valid = true;
++        next->height = i;
++        next->headers_height = i;
++        next->mempool_valid = true;
++        next->mempool_size = static_cast<size_t>(i % 17);
++        publisher.Publish(std::move(next));
++    }
++
++    while (reads_completed.load(std::memory_order_relaxed) == 0) {
++        std::this_thread::yield();
++    }
++    stop.store(true, std::memory_order_relaxed);
++    for (auto &t : readers) {
++        t.join();
++    }
++
++    BOOST_CHECK(!reader_failed.load());
++    auto final_snap = publisher.Load();
++    BOOST_REQUIRE(final_snap != nullptr);
++    BOOST_CHECK_EQUAL(final_snap->height, kNumPublishes);
++    BOOST_CHECK_GT(reads_completed.load(), 0U);
++}
++
++namespace {
++struct PruneModeTag {
++    using type = const bool node::BlockManager::*;
++    friend type GetPruneModePtr(PruneModeTag);
++};
++template <typename Tag, typename Tag::type M>
++struct RobPruneMode {
++    friend typename Tag::type GetPruneModePtr(Tag) { return M; }
++};
++template struct RobPruneMode<PruneModeTag, &node::BlockManager::m_prune_mode>;
++
++struct OptsTag {
++    using type = const kernel::BlockManagerOpts node::BlockManager::*;
++    friend type GetOptsPtr(OptsTag);
++};
++template <typename Tag, typename Tag::type M>
++struct RobOpts {
++    friend typename Tag::type GetOptsPtr(Tag) { return M; }
++};
++template struct RobOpts<OptsTag, &node::BlockManager::m_opts>;
++} // namespace
++
++BOOST_AUTO_TEST_CASE(snapshot_prune_height_and_difficulty_shift_branches) {
++    LOCK(::cs_main);
++    auto &blockman = m_node.chainman->m_blockman;
++    auto &chain = m_node.chainman->ActiveChain();
++    CBlockIndex *tip = chain.Tip();
++    BOOST_REQUIRE(tip != nullptr);
++
++    const uint32_t orig_bits = tip->nBits;
++    tip->nBits = 0x1c00ffffU; // nShift == 28 (< 29)
++
++    bool &prune_mode =
++        const_cast<bool &>(blockman.*GetPruneModePtr(PruneModeTag{}));
++    auto &opts =
++        const_cast<kernel::BlockManagerOpts &>(blockman.*GetOptsPtr(OptsTag{}));
++    const bool orig_prune_mode = prune_mode;
++    const uint64_t orig_prune_target = opts.prune_target;
++
++    prune_mode = true;
++    opts.prune_target = 600'000'000ULL;
++
++    // 1. All blocks have data and undo -> ComputePruneHeight returns std::nullopt (prune_height == 0)
++    node::PublishChainTipSnapshot(*m_node.chainman, nullptr);
++    auto snap1 = node::GetGlobalSnapshotPublisher().Load();
++    BOOST_REQUIRE(snap1 != nullptr);
++    BOOST_CHECK(snap1->pruned);
++    BOOST_CHECK(snap1->automatic_pruning);
++    BOOST_CHECK_EQUAL(snap1->prune_target_size, 600'000'000ULL);
++    BOOST_CHECK_EQUAL(snap1->prune_height, 0);
++
++    // 2. Blocks 1..50 pruned -> ComputePruneHeight returns 50 (snap->prune_height == 51)
++    for (int h = 1; h <= 50; ++h) {
++        chain[h]->nStatus = chain[h]->nStatus.withData(false);
++    }
++    node::PublishChainTipSnapshot(*m_node.chainman, nullptr);
++    auto snap2 = node::GetGlobalSnapshotPublisher().Load();
++    BOOST_REQUIRE(snap2 != nullptr);
++    BOOST_CHECK_EQUAL(snap2->prune_height, 51);
++
++    // 3. Tip itself missing data -> ComputePruneHeight returns tip->nHeight
++    const BlockStatus orig_tip_status = tip->nStatus;
++    tip->nStatus = tip->nStatus.withData(false);
++    node::PublishChainTipSnapshot(*m_node.chainman, nullptr);
++    auto snap3 = node::GetGlobalSnapshotPublisher().Load();
++    BOOST_REQUIRE(snap3 != nullptr);
++    BOOST_CHECK_EQUAL(snap3->prune_height, tip->nHeight + 1);
++
++    // Restore block statuses and options
++    tip->nStatus = orig_tip_status;
++    for (int h = 1; h <= 50; ++h) {
++        chain[h]->nStatus = chain[h]->nStatus.withData(true);
++    }
++    tip->nBits = orig_bits;
++    prune_mode = orig_prune_mode;
++    opts.prune_target = orig_prune_target;
++}
++
++BOOST_AUTO_TEST_CASE(
++    abc_mempool_batch_removal_and_prioritisation_snapshot_coalescing) {
++    CScript spk = GetScriptForDestination(PKHash(coinbaseKey.GetPubKey()));
++    std::vector<CTransactionRef> block_txs;
++    constexpr size_t kNumTxs = 4;
++    CTransactionRef prev_tx = m_coinbase_txns[0];
++    int prev_height = 1;
++    Amount cur_val = prev_tx->vout[0].nValue;
++    for (size_t i = 0; i < kNumTxs; ++i) {
++        cur_val -= 2000 * SATOSHI;
++        CMutableTransaction mtx = CreateValidMempoolTransaction(
++            prev_tx, 0, prev_height, coinbaseKey, spk, cur_val,
++            /*submit=*/true);
++        prev_tx = MakeTransactionRef(mtx);
++        prev_height = 101;
++        block_txs.push_back(prev_tx);
++    }
++    BOOST_CHECK_EQUAL(m_node.mempool->size(), kNumTxs);
++
++    node::SnapshotPublisher &publisher = node::GetGlobalSnapshotPublisher();
++
++    // Exercise lightweight PublishMempoolUnbroadcastSnapshot on AddUnbroadcastTx / RemoveUnbroadcastTx
++    m_node.mempool->AddUnbroadcastTx(block_txs[0]->GetId());
++    m_node.mempool->RemoveUnbroadcastTx(block_txs[0]->GetId(),
++                                        /*unchecked=*/false);
++    m_node.mempool->AddUnbroadcastTx(block_txs[0]->GetId());
++
++    // 1. ClearPrioritisation on an unprioritized transaction must NOT publish
++    // a redundant RCU snapshot.
++    {
++        LOCK(m_node.mempool->cs);
++        const auto snap_before = publisher.Load();
++        m_node.mempool->ClearPrioritisation(block_txs[0]->GetId());
++        BOOST_CHECK_EQUAL(publisher.Load().get(), snap_before.get());
++    }
++
++    // 2. Prioritising and then clearing prioritisation on a transaction MUST
++    // publish a snapshot when a delta actually existed.
++    m_node.mempool->PrioritiseTransaction(block_txs[0]->GetId(),
++                                          1000 * SATOSHI);
++    {
++        LOCK(m_node.mempool->cs);
++        const auto snap_before = publisher.Load();
++        m_node.mempool->ClearPrioritisation(block_txs[0]->GetId());
++        BOOST_CHECK_NE(publisher.Load().get(), snap_before.get());
++    }
++
++    // 3. DisconnectedBlockTransactions::removeForBlock must coalesce per-tx
++    // mempool removals under ScopedSnapshotDefer into a single snapshot
++    // publication, independent of any later mining-template implementation.
++    {
++        LOCK2(::cs_main, m_node.mempool->cs);
++        const auto publications_before = publisher.PublicationCount();
++        DisconnectedBlockTransactions disconnectpool;
++        disconnectpool.removeForBlock(block_txs, *m_node.mempool);
++        BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
++        const auto snap_after = publisher.Load();
++        BOOST_REQUIRE(snap_after != nullptr);
++        BOOST_CHECK_EQUAL(snap_after->mempool_size, 0U);
++        BOOST_CHECK_EQUAL(publisher.PublicationCount(),
++                          publications_before + 1);
++        disconnectpool.clear();
++    }
++}
++
++
++BOOST_AUTO_TEST_CASE(lazy_mempool_snapshots_pin_historical_values) {
++    auto &pool = *m_node.mempool;
++    auto &publisher = node::GetGlobalSnapshotPublisher();
++    CScript script = GetScriptForRawPubKey(coinbaseKey.GetPubKey());
++    std::vector<std::shared_ptr<const node::ChainAndMempoolSnapshot>> snapshots;
++    std::vector<CTransactionRef> txs;
++    CTransactionRef parent = m_coinbase_txns[0];
++    Amount value = parent->vout[0].nValue;
++    for (size_t i = 0; i < 4; ++i) {
++        value -= 2000 * SATOSHI;
++        auto tx = MakeTransactionRef(CreateValidMempoolTransaction(
++            parent, 0, i == 0 ? 1 : 101, coinbaseKey, script, value, true));
++        txs.push_back(tx);
++        parent = tx;
++        snapshots.push_back(publisher.Load());
++    }
++    auto before_fee = snapshots.back();
++    pool.PrioritiseTransaction(txs[1]->GetId(), 1000 * SATOSHI);
++    auto after_fee = publisher.Load();
++    pool.AddUnbroadcastTx(txs[1]->GetId());
++    auto after_unbroadcast = publisher.Load();
++    pool.clear();
++    auto after_clear = publisher.Load();
++    // Materialize only AFTER all mutations, including clear. No live mempool
++    // lookups may leak into any of these historical snapshots.
++    for (size_t i = 0; i < snapshots.size(); ++i) {
++        const auto &snap = snapshots[i];
++        snap->EnsureMempoolVectors();
++        BOOST_CHECK_EQUAL(snap->mempool_size, i + 1);
++        BOOST_CHECK_EQUAL(snap->mempool_entries.size(), i + 1);
++        for (size_t j = 0; j <= i; ++j) {
++            const auto *entry = snap->FindMempoolEntry(txs[j]->GetId());
++            BOOST_REQUIRE(entry);
++            BOOST_CHECK_EQUAL(entry->depends.size(), j == 0 ? 0U : 1U);
++            BOOST_CHECK_EQUAL(entry->spentby.size(), j == i ? 0U : 1U);
++        }
++    }
++    const auto *old_entry = before_fee->FindMempoolEntry(txs[1]->GetId());
++    const auto *new_entry = after_fee->FindMempoolEntry(txs[1]->GetId());
++    BOOST_REQUIRE(old_entry);
++    BOOST_REQUIRE(new_entry);
++    BOOST_CHECK_EQUAL(old_entry->modified_fee, old_entry->fee);
++    BOOST_CHECK_EQUAL(new_entry->modified_fee, new_entry->fee + 1000 * SATOSHI);
++    BOOST_CHECK(!new_entry->unbroadcast);
++    BOOST_REQUIRE(after_unbroadcast->FindMempoolEntry(txs[1]->GetId()));
++    BOOST_CHECK(after_unbroadcast->FindMempoolEntry(txs[1]->GetId())->unbroadcast);
++    after_clear->EnsureMempoolVectors();
++    BOOST_CHECK_EQUAL(after_clear->mempool_size, 0U);
++    BOOST_CHECK(after_clear->mempool_entries.empty());
++}
++
++BOOST_AUTO_TEST_CASE(lazy_snapshot_materialization_avoids_chain_and_mempool_locks) {
++    auto &pool = *m_node.mempool;
++    CScript script = GetScriptForRawPubKey(coinbaseKey.GetPubKey());
++    CreateValidMempoolTransaction(m_coinbase_txns[0], 0, 1, coinbaseKey,
++                                 script, 50 * COIN - 2000 * SATOSHI, true);
++    const auto snap = node::GetGlobalSnapshotPublisher().Load();
++    std::promise<void> begin;
++    auto start = begin.get_future();
++    auto reader = std::async(std::launch::async, [&] {
++        start.wait();
++        snap->EnsureMempoolVectors();
++        return snap->mempool_entries.size();
++    });
++    bool completed;
++    {
++        LOCK2(cs_main, pool.cs);
++        begin.set_value();
++        completed = reader.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
++    }
++    BOOST_CHECK(completed);
++    BOOST_CHECK_EQUAL(reader.get(), 1U);
++}
++
++BOOST_AUTO_TEST_CASE(chain_and_mempool_rebuild_publish_only_completed_state) {
++    auto &pool = *m_node.mempool;
++    auto &chainman = *m_node.chainman;
++    auto &publisher = node::GetGlobalSnapshotPublisher();
++    CScript script = GetScriptForRawPubKey(coinbaseKey.GetPubKey());
++    CreateValidMempoolTransaction(m_coinbase_txns[0], 0, 1, coinbaseKey,
++                                 script, 50 * COIN - 2000 * SATOSHI, true);
++    LOCK2(cs_main, pool.cs);
++    node::PublishChainTipSnapshot(chainman, &pool);
++    const auto before = publisher.Load();
++    BOOST_REQUIRE(before);
++    BOOST_CHECK_EQUAL(before->mempool_size, 1U);
++    const auto publications = publisher.PublicationCount();
++    {
++        node::ScopedChainSnapshotDefer outer(chainman, &pool);
++        pool.clear();
++        node::PublishChainTipSnapshot(chainman, &pool);
++        BOOST_CHECK_EQUAL(publisher.Load().get(), before.get());
++        {
++            node::ScopedChainSnapshotDefer inner(chainman, &pool);
++            pool.SetLoadTried(true);
++            node::PublishChainTipSnapshot(chainman, &pool);
++        }
++        BOOST_CHECK_EQUAL(publisher.Load().get(), before.get());
++        BOOST_CHECK_EQUAL(publisher.PublicationCount(), publications);
++    }
++    const auto after = publisher.Load();
++    BOOST_REQUIRE(after);
++    BOOST_CHECK_NE(after.get(), before.get());
++    BOOST_CHECK_EQUAL(publisher.PublicationCount(), publications + 1);
++    BOOST_CHECK_EQUAL(after->best_block_hash, chainman.ActiveTip()->GetBlockHash());
++    BOOST_CHECK_EQUAL(after->mempool_size, 0U);
++    BOOST_CHECK(after->mempool_loaded);
++    before->EnsureMempoolVectors();
++    BOOST_CHECK_EQUAL(before->mempool_entries.size(), 1U);
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index 8016d5ed2e..9004370e6e 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -14,6 +14,7 @@
+ #include <consensus/tx_verify.h>
+ #include <consensus/validation.h>
+ #include <logging.h>
++#include <node/snapshot.h>
+ #include <policy/fees.h>
+ #include <policy/policy.h>
+ #include <primitives/block.h>
+@@ -141,6 +142,8 @@ CTxMemPool::CTxMemPool(const Config &config, Options opts)
+       m_opts{std::move(opts)} {
+     // lock free clear
+     _clear();
++    LOCK(cs);
++    node::PublishMempoolSnapshot(*this);
+ }
+ 
+ CTxMemPool::~CTxMemPool() = default;
+@@ -209,6 +212,8 @@ void CTxMemPool::addUnchecked(CTxMemPoolEntryRef entry) {
+     nTransactionsUpdated++;
+     totalTxSize += entry->GetTxSize();
+     m_total_fee += entry->GetFee();
++    MarkSnapshotEntryChanged(tx->GetId());
++    node::PublishMempoolSnapshot(*this);
+ }
+ 
+ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason) {
+@@ -217,6 +222,7 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason) {
+     uint64_t mempool_sequence = GetAndIncrementSequence();
+ 
+     const TxId &txid = (*it)->GetTx().GetId();
++    MarkSnapshotEntryChanged(txid);
+     RemoveTransactionFromOverlay(m_merklix_overlay, (*it)->GetTx());
+ 
+     if (reason != MemPoolRemovalReason::BLOCK) {
+@@ -342,6 +348,7 @@ void CTxMemPool::updateFeeForBlock() {
+     AssertLockHeld(cs);
+     lastRollingFeeUpdate = GetTime();
+     blockSinceLastRollingFeeBump = true;
++    node::PublishMempoolSnapshot(*this);
+ }
+ 
+ void CTxMemPool::removeForFinalizedBlock(
+@@ -349,6 +356,7 @@ void CTxMemPool::removeForFinalizedBlock(
+         &confirmedTxIdsInNonFinalizedBlocks) {
+     AssertLockHeld(cs);
+ 
++    ScopedSnapshotDefer snapshot_defer(*this);
+     std::vector<CTxMemPoolEntryRef> finalizedTxsToKeep;
+     finalizedTxs.forEachLeaf(
+         [&](const CTxMemPoolEntryRef &entry) NO_THREAD_SAFETY_ANALYSIS {
+@@ -381,9 +389,12 @@ void CTxMemPool::removeForFinalizedBlock(
+     }
+ 
+     nTransactionsUpdated++;
++    node::PublishMempoolSnapshot(*this);
+ }
+ 
+ void CTxMemPool::_clear() {
++    m_snapshot_changed_entries.clear();
++    m_snapshot_needs_reset = true;
+     m_merklix_overlay.Clear();
+     mapTx.clear();
+     mapNextTx.clear();
+@@ -398,7 +409,9 @@ void CTxMemPool::_clear() {
+ 
+ const lotus::v2::MempoolOverlayLayer &CTxMemPool::FreezeEpochBatch() {
+     AssertLockHeld(cs);
+-    return m_merklix_overlay.FreezeEpochBatch();
++    const auto &frozen = m_merklix_overlay.FreezeEpochBatch();
++    node::PublishMempoolSnapshot(*this);
++    return frozen;
+ }
+ 
+ void CTxMemPool::SyncMerklixOverlayToTip(const BlockHash &tip_hash,
+@@ -430,6 +443,7 @@ void CTxMemPool::clear(bool include_finalized_txs) {
+         std::swap(finalizedTxs, empty);
+         m_finalizedTxsFitter.resetBlock();
+     }
++    node::PublishMempoolSnapshot(*this);
+ }
+ 
+ void CTxMemPool::check(const CCoinsViewCache &active_coins_tip,
+@@ -715,6 +729,7 @@ bool CTxMemPool::setAvalancheFinalized(const CTxMemPoolEntryRef &tx,
+     }
+ 
+     nTransactionsUpdated++;
++    node::PublishMempoolSnapshot(*this);
+ 
+     return true;
+ }
+@@ -785,7 +800,9 @@ void CTxMemPool::PrioritiseTransaction(const TxId &txid,
+                 e->UpdateModifiedFee(nFeeDelta);
+             });
+             ++nTransactionsUpdated;
++            MarkSnapshotEntryChanged(txid);
+         }
++        node::PublishMempoolSnapshot(*this);
+     }
+     LogPrintf("PrioritiseTransaction: %s fee += %s\n", txid.ToString(),
+               FormatMoney(nFeeDelta));
+@@ -803,7 +820,10 @@ void CTxMemPool::ApplyDelta(const TxId &txid, Amount &nFeeDelta) const {
+ 
+ void CTxMemPool::ClearPrioritisation(const TxId &txid) {
+     AssertLockHeld(cs);
+-    mapDeltas.erase(txid);
++    if (mapDeltas.erase(txid) > 0) {
++        MarkSnapshotEntryChanged(txid);
++        node::PublishMempoolSnapshot(*this);
++    }
+ }
+ 
+ CTransactionRef CTxMemPool::GetConflictTx(const COutPoint &prevout) const {
+@@ -892,10 +912,27 @@ size_t CTxMemPool::DynamicMemoryUsage() const {
+            memusage::DynamicUsage(mapDeltas) + cachedInnerUsage;
+ }
+ 
++void CTxMemPool::AddUnbroadcastTx(const TxId &txid) {
++    LOCK(cs);
++    if (exists(txid) && m_unbroadcast_txids.insert(txid).second) {
++        node::PublishMempoolUnbroadcastSnapshot(*this, txid, true);
++    }
++}
++
++CTxMemPool::ScopedSnapshotDefer::~ScopedSnapshotDefer() {
++    AssertLockHeld(m_pool.cs);
++    assert(m_pool.m_snapshot_defer_depth > 0);
++    if (--m_pool.m_snapshot_defer_depth == 0 && m_pool.m_snapshot_dirty) {
++        m_pool.m_snapshot_dirty = false;
++        node::PublishMempoolSnapshot(m_pool);
++    }
++}
++
+ void CTxMemPool::RemoveUnbroadcastTx(const TxId &txid, const bool unchecked) {
+     LOCK(cs);
+ 
+     if (m_unbroadcast_txids.erase(txid)) {
++        node::PublishMempoolUnbroadcastSnapshot(*this, txid, false);
+         LogDebug(
+             BCLog::MEMPOOL, "Removed %i from set of unbroadcast txns%s\n",
+             txid.GetHex(),
+@@ -906,6 +943,7 @@ void CTxMemPool::RemoveUnbroadcastTx(const TxId &txid, const bool unchecked) {
+ void CTxMemPool::RemoveStaged(const setEntries &stage,
+                               MemPoolRemovalReason reason) {
+     AssertLockHeld(cs);
++    ScopedSnapshotDefer snapshot_defer(*this);
+     UpdateForRemoveFromMempool(stage);
+ 
+     // Remove txs in reverse-topological order
+@@ -913,10 +951,12 @@ void CTxMemPool::RemoveStaged(const setEntries &stage,
+     for (txiter it : stageRevTopo) {
+         removeUnchecked(it, reason);
+     }
++    if (!stage.empty()) node::PublishMempoolSnapshot(*this);
+ }
+ 
+ int CTxMemPool::Expire(std::chrono::seconds time) {
+     AssertLockHeld(cs);
++    ScopedSnapshotDefer snapshot_defer(*this);
+     indexed_transaction_set::index<entry_time>::type::iterator it =
+         mapTx.get<entry_time>().begin();
+     setEntries toremove;
+@@ -949,6 +989,7 @@ int CTxMemPool::Expire(std::chrono::seconds time) {
+ void CTxMemPool::LimitSize(CCoinsViewCache &coins_cache) {
+     AssertLockHeld(::cs_main);
+     AssertLockHeld(cs);
++    ScopedSnapshotDefer snapshot_defer(*this);
+     int expired = Expire(GetTime<std::chrono::seconds>() - m_opts.expiry);
+     if (expired != 0) {
+         LogDebug(BCLog::MEMPOOL,
+@@ -964,6 +1005,7 @@ void CTxMemPool::LimitSize(CCoinsViewCache &coins_cache) {
+ 
+ void CTxMemPool::UpdateChild(txiter entry, txiter child, bool add) {
+     AssertLockHeld(cs);
++    MarkSnapshotEntryChanged((*entry)->GetTx().GetId());
+     CTxMemPoolEntry::Children s;
+     if (add && (*entry)->GetMemPoolChildren().insert(*child).second) {
+         cachedInnerUsage += memusage::IncrementalDynamicUsage(s);
+@@ -974,6 +1016,7 @@ void CTxMemPool::UpdateChild(txiter entry, txiter child, bool add) {
+ 
+ void CTxMemPool::UpdateParent(txiter entry, txiter parent, bool add) {
+     AssertLockHeld(cs);
++    MarkSnapshotEntryChanged((*entry)->GetTx().GetId());
+     CTxMemPoolEntry::Parents s;
+     if (add && (*entry)->GetMemPoolParents().insert(*parent).second) {
+         cachedInnerUsage += memusage::IncrementalDynamicUsage(s);
+@@ -1016,6 +1059,7 @@ void CTxMemPool::trackPackageRemoved(const CFeeRate &rate) {
+ void CTxMemPool::TrimToSize(size_t sizelimit,
+                             std::vector<COutPoint> *pvNoSpendsRemaining) {
+     AssertLockHeld(cs);
++    ScopedSnapshotDefer snapshot_defer(*this);
+ 
+     unsigned nTxnRemoved = 0;
+     size_t finalizedTxsSkipped = 0;
+@@ -1095,7 +1139,9 @@ bool CTxMemPool::GetLoadTried() const {
+ 
+ void CTxMemPool::SetLoadTried(bool load_tried) {
+     LOCK(cs);
++    if (m_load_tried == load_tried) return;
+     m_load_tried = load_tried;
++    node::PublishMempoolSnapshot(*this);
+ }
+ 
+ std::string RemovalReasonToString(const MemPoolRemovalReason &r) noexcept {
+diff --git a/src/txmempool.h b/src/txmempool.h
+index bf93826c2d..d0043318c6 100644
+--- a/src/txmempool.h
++++ b/src/txmempool.h
+@@ -559,14 +559,7 @@ public:
+     size_t DynamicMemoryUsage() const;
+ 
+     /** Adds a transaction to the unbroadcast set */
+-    void AddUnbroadcastTx(const TxId &txid) {
+-        LOCK(cs);
+-        // Sanity check the transaction is in the mempool & insert into
+-        // unbroadcast set.
+-        if (exists(txid)) {
+-            m_unbroadcast_txids.insert(txid);
+-        }
+-    }
++    void AddUnbroadcastTx(const TxId &txid);
+ 
+     /** Removes a transaction from the unbroadcast set */
+     void RemoveUnbroadcastTx(const TxId &txid, const bool unchecked = false);
+@@ -629,7 +622,45 @@ public:
+                            uint64_t next_height, uint64_t parent_mtp)
+         EXCLUSIVE_LOCKS_REQUIRED(cs);
+ 
++    double GetRollingMinimumFeeRate() const EXCLUSIVE_LOCKS_REQUIRED(cs) { return rollingMinimumFeeRate; }
++    int64_t GetLastRollingFeeUpdate() const EXCLUSIVE_LOCKS_REQUIRED(cs) { return lastRollingFeeUpdate; }
++    bool GetBlockSinceLastRollingFeeBump() const EXCLUSIVE_LOCKS_REQUIRED(cs) { return blockSinceLastRollingFeeBump; }
++
++    void MarkSnapshotEntryChanged(const TxId &id) const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        m_snapshot_changed_entries.insert(id);
++    }
++    const std::set<TxId> &SnapshotChangedEntries() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        return m_snapshot_changed_entries;
++    }
++    bool HasSnapshotState() const EXCLUSIVE_LOCKS_REQUIRED(cs) { return m_snapshot_initialized; }
++    bool SnapshotNeedsReset() const EXCLUSIVE_LOCKS_REQUIRED(cs) { return m_snapshot_needs_reset; }
++    void ClearSnapshotChanges() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        m_snapshot_changed_entries.clear();
++        m_snapshot_needs_reset = false;
++        m_snapshot_initialized = true;
++    }
++    bool DeferSnapshotIfActive() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
++        if (m_snapshot_defer_depth == 0) return false;
++        m_snapshot_dirty = true;
++        return true;
++    }
++    void ClearSnapshotDirty() const EXCLUSIVE_LOCKS_REQUIRED(cs) { m_snapshot_dirty = false; }
++    class ScopedSnapshotDefer {
++        const CTxMemPool &m_pool;
++    public:
++        explicit ScopedSnapshotDefer(const CTxMemPool &pool) EXCLUSIVE_LOCKS_REQUIRED(pool.cs)
++            : m_pool(pool) { ++m_pool.m_snapshot_defer_depth; }
++        ~ScopedSnapshotDefer();
++        ScopedSnapshotDefer(const ScopedSnapshotDefer &) = delete;
++        ScopedSnapshotDefer &operator=(const ScopedSnapshotDefer &) = delete;
++    };
++
+ private:
++    mutable std::set<TxId> m_snapshot_changed_entries GUARDED_BY(cs);
++    mutable bool m_snapshot_initialized GUARDED_BY(cs){false};
++    mutable bool m_snapshot_needs_reset GUARDED_BY(cs){true};
++    mutable unsigned int m_snapshot_defer_depth GUARDED_BY(cs){0};
++    mutable bool m_snapshot_dirty GUARDED_BY(cs){false};
+     mutable lotus::v2::MerklixOverlayManager m_merklix_overlay GUARDED_BY(cs);
+     /** Set ancestor state for an entry */
+     void UpdateEntryForAncestors(txiter it, const setEntries *setAncestors)
+diff --git a/src/validation.cpp b/src/validation.cpp
+index ead3d73e1e..30bdd7deb4 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -32,6 +32,7 @@
+ #include <logging/timer.h>
+ #include <minerfund.h>
+ #include <node/blockstorage.h>
++#include <node/snapshot.h>
+ #include <node/utxo_snapshot.h>
+ #include <policy/block/minerfund.h>
+ #include <policy/block/preconsensus.h>
+@@ -2736,6 +2737,7 @@ bool Chainstate::FlushStateToDisk(BlockValidationState &state,
+                                                   BCLog::BENCH);
+ 
+                     m_blockman.UnlinkPrunedFiles(setFilesToPrune);
++                    node::PublishChainTipSnapshot(m_chainman, m_mempool);
+                 }
+ 
+                 if (!CoinsTip().GetBestBlock().IsNull()) {
+@@ -2857,6 +2859,8 @@ void Chainstate::UpdateTip(const CBlockIndex *pindexNew) {
+         g_best_block_cv.notify_all();
+     }
+ 
++    node::PublishChainTipSnapshot(m_chainman, m_mempool);
++
+     UpdateTipLog(coins_tip, pindexNew, params, __func__, "");
+ }
+ 
+@@ -3406,6 +3410,8 @@ bool Chainstate::ActivateBestChainStep(
+         AssertLockHeld(m_mempool->cs);
+     }
+ 
++    node::ScopedChainSnapshotDefer snapshot_defer(m_chainman, m_mempool);
++
+     const CBlockIndex *pindexOldTip = m_chain.Tip();
+     const CBlockIndex *pindexFork = m_chain.FindFork(pindexMostWork);
+ 
+@@ -3923,6 +3929,8 @@ bool Chainstate::UnwindBlock(BlockValidationState &state, CBlockIndex *pindex,
+         // in between
+         LOCK(MempoolMutex());
+ 
++        node::ScopedChainSnapshotDefer snapshot_defer(m_chainman, m_mempool);
++
+         constexpr int maxDisconnectPoolBlocks = 10;
+         bool ret = false;
+         DisconnectedBlockTransactions disconnectpool;
+@@ -4286,6 +4294,8 @@ bool Chainstate::AvalancheFinalizeBlock(CBlockIndex *pindex,
+         m_avalancheFinalizedBlockIndex = pindex;
+     }
+ 
++    node::PublishChainTipSnapshot(m_chainman, m_mempool);
++
+     if (m_chainman.m_options.signals) {
+         m_chainman.m_options.signals->BlockFinalized(pindex);
+     }
+-- 
+2.50.1 (Apple Git-155)
+

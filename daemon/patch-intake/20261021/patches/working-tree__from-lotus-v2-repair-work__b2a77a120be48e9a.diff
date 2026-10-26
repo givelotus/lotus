@@ -1,0 +1,1130 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 4e8e072bdc..cbf66499ba 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -794,6 +794,7 @@ if(ENABLE_WEBTRANSPORT)
+ 		net_quic/node_webtransport.cpp
+ 		net_quic/quic_connection.cpp
+ 		net_quic/quic_engine.cpp
++		net_quic/quic_peer_sock.cpp
+ 		net_quic/udp_socket.cpp
+ 		net_quic/version_check.cpp
+ 		net_quic/webtransport_h3.cpp
+diff --git a/src/init.cpp b/src/init.cpp
+index ec8914ab9a..eabe3c14e9 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -315,6 +315,9 @@ void Shutdown(NodeContext &node) {
+             node.peerman.get());
+     }
+     if (node.connman) {
++#ifdef ENABLE_WEBTRANSPORT
++        InterruptNodeWebTransport();
++#endif
+         node.connman->Stop();
+     }
+     StopP2PWebSocketDialer();
+@@ -1181,12 +1184,6 @@ void SetupServerArgs(NodeContext &node) {
+                    "QUIC idle timeout for WebTransport (default: 30)",
+                    ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY,
+                    OptionsCategory::CONNECTION);
+-    argsman.AddArg("-p2pwebtransportecho",
+-                   "Echo WebTransport streams and datagrams instead of "
+-                   "running P2P sessions (browser interop tests only) "
+-                   "(default: 0)",
+-                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY,
+-                   OptionsCategory::DEBUG_TEST);
+     argsman.AddArg(
+         "-listenonion",
+         strprintf("Automatically create Tor onion service (default: %d)",
+@@ -3746,7 +3743,7 @@ bool AppInitMain(Config &config, RPCServer &rpcServer,
+     if (args.GetBoolArg("-p2pwebtransport", false)) {
+ #ifdef ENABLE_WEBTRANSPORT
+         bilingual_str error;
+-        if (!StartNodeWebTransport(args, error)) {
++        if (!StartNodeWebTransport(args, *node.connman, error)) {
+             return InitError(error);
+         }
+ #else
+diff --git a/src/net.cpp b/src/net.cpp
+index e4ed96db50..34f47c309b 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -258,7 +258,8 @@ std::optional<CService> GetLocalAddrForPeer(CNode &node) {
+     if (IsPeerAddrLocalGood(&node) &&
+         (!addrLocal.IsRoutable() ||
+          rng.randbits((GetnScore(addrLocal) > LOCAL_MANUAL) ? 3 : 1) == 0)) {
+-        if (node.IsInboundConn() && !node.m_websocket_info) {
++        if (node.IsInboundConn() && !node.m_websocket_info &&
++            !node.m_quic_info) {
+             // For inbound connections, assume both the address and the port
+             // as seen from the peer.
+             addrLocal = CService{node.GetAddrLocal()};
+@@ -436,6 +437,10 @@ CNode *CConnman::ConnectNode(CAddress addrConnect, const char *pszDest,
+     AssertLockNotHeld(m_unused_i2p_sessions_mutex);
+     assert(conn_type != ConnectionType::INBOUND);
+ 
++    // P2P over WebTransport: wt:// URLs.
++    if (pszDest != nullptr && IsWebTransportURL(pszDest)) {
++        return ConnectWebTransportNode(pszDest, fCountFailure, conn_type);
++    }
+     // P2P over WebSocket: ws:// and wss:// URLs, and NET_WSS addresses.
+     if (pszDest != nullptr && IsWebSocketURL(pszDest)) {
+         return ConnectWebSocketNode(pszDest, nullptr, fCountFailure,
+@@ -714,6 +719,7 @@ void CNode::copyStats(CNodeStats &stats) {
+ 
+     stats.m_conn_type = m_conn_type;
+     stats.m_websocket_info = m_websocket_info;
++    stats.m_quic_info = m_quic_info;
+ 
+     stats.m_availabilityScore = m_avalanche_enabled
+                                     ? std::make_optional(getAvailabilityScore())
+@@ -1417,10 +1423,134 @@ void CConnman::AcceptWebSocketPeer(
+                                  std::move(info));
+ }
+ 
++void CConnman::AcceptWebTransportPeer(
++    std::unique_ptr<Sock> &&sock, const CAddress &addr,
++    const CAddress &addr_bind, std::shared_ptr<QuicTransportInfo> info) {
++    NetPermissionFlags flags{NetPermissionFlags::None};
++    bool known{false};
++    if (info && !info->peer_spki.empty()) {
++        for (const auto &key : vWhitelistedKeys) {
++            if (key.m_key == info->peer_spki) {
++                NetPermissions::AddFlag(flags, key.m_flags);
++                known = true;
++            }
++        }
++        info->pinned = known;
++    }
++    if (m_websocket_require_known_key && !known) {
++        LogDebug(BCLog::NET,
++                 "WebTransport peer %s dropped: %s (-p2pwebsocketrequirecert)\n",
++                 addr.ToStringAddrPort(),
++                 info && !info->peer_spki.empty()
++                     ? "its key is not listed in -p2pwebsocketpeer"
++                     : "no client certificate");
++        return;
++    }
++    CreateNodeFromAcceptedSocket(std::move(sock), flags, addr_bind, addr,
++                                 nullptr, std::move(info));
++}
++
++CNode *CConnman::ConnectWebTransportNode(const std::string &url,
++                                         bool fCountFailure,
++                                         ConnectionType conn_type) {
++    const auto parsed{ParseWebTransportURL(url)};
++    if (!parsed) {
++        LogPrintf("Not connecting to %s: invalid WebTransport peer URL\n",
++                  RedactWebTransportURL(url));
++        return nullptr;
++    }
++    const WebTransportDialer dialer{GetWebTransportDialer()};
++    if (!dialer) {
++        LogPrintf("Cannot connect to %s: P2P over WebTransport is "
++                  "unavailable (-p2pwebtransport)\n",
++                  RedactWebTransportURL(url));
++        return nullptr;
++    }
++    // QUIC is UDP: it cannot go through a SOCKS5 proxy. Fail closed
++    // rather than reveal our address by dialing directly.
++    Proxy proxy;
++    if (parsed->host.ends_with(".onion") || GetNameProxy(proxy)) {
++        LogPrintf("Not connecting to %s: WebTransport cannot use a proxy\n",
++                  RedactWebTransportURL(url));
++        return nullptr;
++    }
++    std::optional<CService> target;
++    for (const CService &candidate :
++         Lookup(parsed->host, parsed->port, fNameLookup, 8)) {
++        if (!candidate.IsValid()) {
++            continue;
++        }
++        if (GetProxy(candidate.GetNetwork(), proxy)) {
++            LogPrintf("Not connecting to %s: WebTransport cannot use a "
++                      "proxy\n",
++                      RedactWebTransportURL(url));
++            return nullptr;
++        }
++        if (!IsReachable(candidate.GetNetwork())) {
++            continue;
++        }
++        target = candidate;
++        break;
++    }
++    if (!target) {
++        LogDebug(BCLog::NET, "Cannot resolve %s or its network is not "
++                             "reachable (-onlynet)\n",
++                 parsed->host);
++        return nullptr;
++    }
++    if (FindNode(*target)) {
++        LogPrintf("Failed to open new connection, already connected\n");
++        return nullptr;
++    }
++    LogPrintLevel(BCLog::NET, BCLog::Level::Debug,
++                  "trying WebTransport connection %s\n",
++                  RedactWebTransportURL(url));
++    WebTransportDialError error{WebTransportDialError::NONE};
++    std::optional<WebTransportDialResult> dialed{
++        dialer(*target, *parsed, WEBTRANSPORT_DIAL_TIMEOUT, interruptNet,
++               error)};
++    if (!dialed) {
++        LogDebug(BCLog::NET, "WebTransport connection to %s failed: %s\n",
++                 RedactWebTransportURL(url), WebTransportDialErrorName(error));
++        return nullptr;
++    }
++    const CAddress addrConnect{*target, NODE_NONE};
++    NetPermissionFlags permission_flags = NetPermissionFlags::None;
++    std::vector<NetWhitelistPermissions> whitelist_permissions =
++        conn_type == ConnectionType::MANUAL
++            ? vWhitelistedRangeOutgoing
++            : std::vector<NetWhitelistPermissions>{};
++    AddWhitelistPermissionFlags(permission_flags, addrConnect,
++                                whitelist_permissions);
++
++    NodeId id = GetNewNodeId();
++    uint64_t nonce = GetDeterministicRandomizer(RANDOMIZER_ID_LOCALHOSTNONCE)
++                         .Write(id)
++                         .Finalize();
++    uint64_t extra_entropy =
++        GetDeterministicRandomizer(RANDOMIZER_ID_EXTRAENTROPY)
++            .Write(id)
++            .Finalize();
++    CNode *pnode = new CNode(
++        id, std::move(dialed->sock), addrConnect,
++        CalculateKeyedNetGroup(addrConnect), nonce, extra_entropy,
++        CAddress{dialed->local, NODE_NONE}, url, conn_type,
++        /* inbound_onion */ false,
++        CNodeOptions{
++            .permission_flags = permission_flags,
++            .recv_flood_size = nReceiveFloodSize,
++            .quic_info = std::move(dialed->info),
++        });
++    pnode->AddRef();
++    RandAddEvent(uint32_t(id));
++    return pnode;
++}
++
+ void CConnman::CreateNodeFromAcceptedSocket(
+     std::unique_ptr<Sock> &&sock, NetPermissionFlags permission_flags,
+     const CAddress &addr_bind, const CAddress &addr,
+-    std::shared_ptr<WebSocketTransportInfo> websocket_info) {
++    std::shared_ptr<WebSocketTransportInfo> websocket_info,
++    std::shared_ptr<QuicTransportInfo> quic_info) {
+     int nInbound = 0;
+     int nMaxInbound = nMaxConnections - m_max_outbound;
+ 
+@@ -1451,9 +1581,10 @@ void CConnman::CreateNodeFromAcceptedSocket(
+ 
+     // According to the internet TCP_NODELAY is not carried into accepted
+     // sockets on all platforms.  Set it again here just to be sure.
+-    // (WebSocket peers use a local socketpair, which has no such option.)
++    // (WebSocket and WebTransport peers use a local socketpair, which has no
++    // such option.)
+     const int on{1};
+-    if (!websocket_info &&
++    if (!websocket_info && !quic_info &&
+         sock->SetSockOpt(IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)) ==
+             SOCKET_ERROR) {
+         LogDebug(BCLog::NET,
+@@ -1510,6 +1641,7 @@ void CConnman::CreateNodeFromAcceptedSocket(
+             .prefer_evict = discouraged,
+             .recv_flood_size = nReceiveFloodSize,
+             .websocket_info = std::move(websocket_info),
++            .quic_info = std::move(quic_info),
+         });
+     pnode->AddRef();
+     for (auto interface : m_msgproc) {
+@@ -1518,7 +1650,9 @@ void CConnman::CreateNodeFromAcceptedSocket(
+ 
+     LogDebug(BCLog::NET, "connection from %s accepted%s\n",
+              addr.ToStringAddrPort(),
+-             pnode->m_websocket_info ? " (WebSocket)" : "");
++             pnode->m_websocket_info ? " (WebSocket)"
++             : pnode->m_quic_info    ? " (WebTransport)"
++                                     : "");
+ 
+     {
+         LOCK(m_nodes_mutex);
+@@ -3625,7 +3759,8 @@ CNode::CNode(NodeId idIn, std::shared_ptr<Sock> sock, const CAddress &addrIn,
+       m_addr_name{addrNameIn.empty() ? addr.ToStringAddrPort() : addrNameIn},
+       m_inbound_onion{inbound_onion}, m_prefer_evict{node_opts.prefer_evict},
+       nKeyedNetGroup{nKeyedNetGroupIn}, m_conn_type{conn_type_in},
+-      m_websocket_info{std::move(node_opts.websocket_info)}, id{idIn},
++      m_websocket_info{std::move(node_opts.websocket_info)},
++      m_quic_info{std::move(node_opts.quic_info)}, id{idIn},
+       nLocalHostNonce{nLocalHostNonceIn},
+       nLocalExtraEntropy{nLocalExtraEntropyIn},
+       m_recv_flood_size{node_opts.recv_flood_size},
+diff --git a/src/net.h b/src/net.h
+index 51d02eae80..280008ac10 100644
+--- a/src/net.h
++++ b/src/net.h
+@@ -20,6 +20,7 @@
+ #include <logging.h>
+ #include <net_permissions.h>
+ #include <net_websocket.h>
++#include <net_webtransport.h>
+ #include <netaddress.h>
+ #include <netbase.h>
+ #include <node/connection_types.h>
+@@ -256,6 +257,8 @@ struct CNodeStats {
+     std::optional<double> m_availabilityScore;
+     //! Set for peers connected over WebSocket (/p2p/ws)
+     std::shared_ptr<const WebSocketTransportInfo> m_websocket_info;
++    //! Set for peers connected over WebTransport (HTTP/3 over QUIC)
++    std::shared_ptr<const QuicTransportInfo> m_quic_info;
+ };
+ 
+ /**
+@@ -395,6 +398,8 @@ struct CNodeOptions {
+     size_t recv_flood_size{DEFAULT_MAXRECEIVEBUFFER * 1000};
+     //! Set for peers connected over WebSocket (/p2p/ws)
+     std::shared_ptr<WebSocketTransportInfo> websocket_info = nullptr;
++    //! Set for peers connected over WebTransport (/p2p/wt)
++    std::shared_ptr<QuicTransportInfo> quic_info = nullptr;
+ };
+ 
+ /** Information about a peer */
+@@ -486,6 +491,12 @@ public:
+      * then one end of a local socketpair bridged to the WebSocket.
+      */
+     const std::shared_ptr<WebSocketTransportInfo> m_websocket_info;
++    /**
++     * Transport details if this peer is connected over WebTransport; m_sock
++     * is then a QuicPeerSock (one end of a socketpair the QUIC engine
++     * signals on).
++     */
++    const std::shared_ptr<QuicTransportInfo> m_quic_info;
+     //! Series of the peer gauges this node was counted in (metrics on at
+     //! construction), so that its destruction removes exactly that.
+     std::optional<std::pair<size_t, std::optional<size_t>>> m_metrics_series;
+@@ -1038,6 +1049,16 @@ public:
+     std::vector<AddedNodeInfo> GetAddedNodeInfo() const
+         EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex);
+ 
++    /**
++     * Accept an inbound peer whose WebTransport session (/p2p/wt) is
++     * established, like AcceptWebSocketPeer(). Called on the QUIC engine's
++     * thread.
++     */
++    void AcceptWebTransportPeer(std::unique_ptr<Sock> &&sock,
++                                const CAddress &addr,
++                                const CAddress &addr_bind,
++                                std::shared_ptr<QuicTransportInfo> info);
++
+     /**
+      * Accept an inbound peer that connected over WebSocket (/p2p/ws).
+      * Subject to the same limits, bans and eviction as TCP inbound peers.
+@@ -1175,7 +1196,8 @@ private:
+     void CreateNodeFromAcceptedSocket(
+         std::unique_ptr<Sock> &&sock, NetPermissionFlags permission_flags,
+         const CAddress &addr_bind, const CAddress &addr,
+-        std::shared_ptr<WebSocketTransportInfo> websocket_info = nullptr);
++        std::shared_ptr<WebSocketTransportInfo> websocket_info = nullptr,
++        std::shared_ptr<QuicTransportInfo> quic_info = nullptr);
+ 
+     void DisconnectNodes();
+     void NotifyNumConnectionsChanged();
+@@ -1240,6 +1262,13 @@ private:
+     CNode *ConnectWebSocketNode(const std::string &url,
+                                 const CAddress *wss_addr, bool fCountFailure,
+                                 ConnectionType conn_type);
++    /**
++     * Open an outbound P2P connection over WebTransport to `url` (wt://),
++     * via the dialer set with SetWebTransportDialer(). Never through a
++     * proxy: UDP cannot use one, so with -proxy/-onion it fails closed.
++     */
++    CNode *ConnectWebTransportNode(const std::string &url, bool fCountFailure,
++                                   ConnectionType conn_type);
+     ;
+     void AddWhitelistPermissionFlags(
+         NetPermissionFlags &flags, const CNetAddr &addr,
+diff --git a/src/net_quic/node_webtransport.cpp b/src/net_quic/node_webtransport.cpp
+index d7d93c4b2c..33738a12f7 100644
+--- a/src/net_quic/node_webtransport.cpp
++++ b/src/net_quic/node_webtransport.cpp
+@@ -13,8 +13,10 @@
+ #include <netbase.h>
+ #include <random.h>
+ #include <tls_util.h>
++#include <util/strencodings.h>
+ #include <util/string.h>
+ 
++#include <map>
+ #include <memory>
+ 
+ namespace {
+@@ -52,7 +54,8 @@ bool CertificateFiles(const ArgsManager &args, fs::path &cert, fs::path &key,
+ }
+ } // namespace
+ 
+-bool StartNodeWebTransport(const ArgsManager &args, bilingual_str &error) {
++bool StartNodeWebTransport(const ArgsManager &args, CConnman &connman,
++                           bilingual_str &error) {
+     QuicEngineOptions opts;
+     fs::path cert, key;
+     if (!CertificateFiles(args, cert, key, error)) {
+@@ -109,7 +112,20 @@ bool StartNodeWebTransport(const ArgsManager &args, bilingual_str &error) {
+     opts.bbr = cc == "bbr";
+     opts.idle_timeout = std::chrono::seconds{
+         std::max<int64_t>(5, args.GetIntArg("-p2pwebtransportidle", 30))};
+-    opts.wt_echo = args.GetBoolArg("-p2pwebtransportecho", false);
++    // Ask for client certificates when keys grant permissions.
++    opts.request_client_cert = args.IsArgSet("-p2pwebsocketpeer") ||
++                               args.GetBoolArg("-tlsmutual", false);
++    // -p2pwebsocketpin=<host>=<pin> applies to wt:// dials of that host.
++    std::map<std::string, std::vector<unsigned char>> host_pins;
++    for (const std::string &entry : args.GetArgs("-p2pwebsocketpin")) {
++        const size_t eq{entry.find('=')};
++        if (eq == std::string::npos || eq == 0) {
++            continue;
++        }
++        if (const auto pin{DecodeSpkiPin(entry.substr(eq + 1))}) {
++            host_pins[ToLower(entry.substr(0, eq))] = *pin;
++        }
++    }
+ 
+     std::string why;
+     g_engine = QuicEngine::Start(opts, why);
+@@ -120,14 +136,41 @@ bool StartNodeWebTransport(const ArgsManager &args, bilingual_str &error) {
+         return false;
+     }
+     for (const CService &addr : g_engine->BoundAddresses()) {
+-        LogPrintf("P2P over WebTransport listening on UDP %s%s\n",
+-                  addr.ToStringAddrPort(),
+-                  opts.wt_echo ? " (echo mode, for tests)" : "");
++        LogPrintf("P2P over WebTransport listening on UDP %s\n",
++                  addr.ToStringAddrPort());
+     }
++    SetP2PWebTransportAcceptor(
++        [&connman](std::unique_ptr<Sock> &&sock, const CAddress &addr,
++                   const CAddress &addr_bind,
++                   std::shared_ptr<QuicTransportInfo> info) {
++            connman.AcceptWebTransportPeer(std::move(sock), addr, addr_bind,
++                                           std::move(info));
++        });
++    SetWebTransportDialer(
++        [engine = g_engine.get(), host_pins](
++            const CService &target, const ParsedWebTransportURL &url,
++            std::chrono::milliseconds timeout, CThreadInterrupt &interrupt,
++            WebTransportDialError &error)
++            -> std::optional<WebTransportDialResult> {
++            ParsedWebTransportURL u{url};
++            if (!u.spki_pin && !u.cert_sha256) {
++                if (const auto it{host_pins.find(ToLower(u.host))};
++                    it != host_pins.end()) {
++                    u.spki_pin = it->second;
++                }
++            }
++            return engine->Dial(target, u, timeout, interrupt, error);
++        });
+     return true;
+ }
+ 
++void InterruptNodeWebTransport() {
++    SetP2PWebTransportAcceptor(nullptr);
++    SetWebTransportDialer(nullptr);
++}
++
+ void StopNodeWebTransport() {
++    InterruptNodeWebTransport();
+     if (g_engine) {
+         g_engine->Stop();
+         g_engine.reset();
+diff --git a/src/net_quic/node_webtransport.h b/src/net_quic/node_webtransport.h
+index 6c593699f1..5ba87fac26 100644
+--- a/src/net_quic/node_webtransport.h
++++ b/src/net_quic/node_webtransport.h
+@@ -12,11 +12,19 @@
+ #include <util/translation.h>
+ 
+ class ArgsManager;
++class CConnman;
+ class QuicEngine;
+ 
+-/** Start the QUIC engine per -p2pwebtransport*; false + error on failure */
+-bool StartNodeWebTransport(const ArgsManager &args, bilingual_str &error);
+-/** Stop it (idempotent); call after CConnman::Stop() */
++/**
++ * Start the QUIC engine per -p2pwebtransport* and register it with
++ * CConnman (inbound acceptor, outbound wt:// dialer); false + error on
++ * failure.
++ */
++bool StartNodeWebTransport(const ArgsManager &args, CConnman &connman,
++                           bilingual_str &error);
++/** Unregister from CConnman; call before CConnman::Stop() */
++void InterruptNodeWebTransport();
++/** Stop the engine (idempotent); call after CConnman::Stop() */
+ void StopNodeWebTransport();
+ /** The running engine, or nullptr */
+ QuicEngine *GetNodeQuicEngine();
+diff --git a/src/net_quic/quic_engine.cpp b/src/net_quic/quic_engine.cpp
+index f55fc034dd..6f9384161f 100644
+--- a/src/net_quic/quic_engine.cpp
++++ b/src/net_quic/quic_engine.cpp
+@@ -5,10 +5,16 @@
+ #include <net_quic/quic_engine.h>
+ 
+ #include <net_quic/quic_connection.h>
++#include <net_quic/quic_peer_sock.h>
+ #include <net_quic/udp_socket.h>
+ #include <net_quic/webtransport_h3.h>
++#include <net_quic/webtransport_wire.h>
++#include <net_websocket.h>
++#include <protocol.h>
+ 
+ #include <logging.h>
++#include <netbase.h>
++#include <util/strencodings.h>
+ #include <random.h>
+ #include <sync.h>
+ #include <tinyformat.h>
+@@ -25,6 +31,7 @@
+ #include <array>
+ #include <cerrno>
+ #include <deque>
++#include <fcntl.h>
+ #include <functional>
+ #include <future>
+ #include <list>
+@@ -217,6 +224,258 @@ private:
+     std::shared_ptr<Result> m_result;
+ };
+ 
++/** Wakes the engine thread; outlives it (channels keep a reference) */
++class EngineWaker {
++public:
++    explicit EngineWaker(int fd) : m_fd{fd} {}
++    void Wake() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) {
++        if (pending.exchange(true)) {
++            return;
++        }
++        LOCK(m_mutex);
++        if (m_fd >= 0) {
++            const uint8_t b{1};
++            [[maybe_unused]] auto r{::send(m_fd, &b, 1, MSG_DONTWAIT)};
++        }
++    }
++    void Close() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) {
++        LOCK(m_mutex);
++        if (m_fd >= 0) {
++            ::close(m_fd);
++            m_fd = -1;
++        }
++    }
++    std::atomic<bool> pending{false};
++
++private:
++    Mutex m_mutex;
++    int m_fd GUARDED_BY(m_mutex);
++};
++
++/** Result of an outbound dial, completed on the engine thread */
++struct DialState {
++    std::promise<std::optional<WebTransportDialResult>> promise;
++    WebTransportDialError error{WebTransportDialError::TIMEOUT};
++    bool done{false};
++    void Finish(std::optional<WebTransportDialResult> result,
++                WebTransportDialError why) {
++        if (!done) {
++            done = true;
++            error = result ? WebTransportDialError::NONE : why;
++            promise.set_value(std::move(result));
++        }
++    }
++};
++
++/**
++ * A P2P session: bridges the five class streams of one WebTransport
++ * session to a QuicPeerSock through a QuicPeerChannel (engine thread).
++ */
++class P2PSessionHandler final : public WtSessionHandler {
++public:
++    P2PSessionHandler(std::shared_ptr<EngineWaker> waker, bool compress,
++                      std::shared_ptr<DialState> dial = nullptr,
++                      std::optional<std::vector<unsigned char>> spki_pin = {},
++                      std::optional<std::vector<unsigned char>> cert_pin = {})
++        : m_waker{std::move(waker)}, m_compress{compress},
++          m_dial{std::move(dial)}, m_spki_pin{std::move(spki_pin)},
++          m_cert_pin{std::move(cert_pin)},
++          m_info{std::make_shared<QuicTransportInfo>()} {}
++
++    bool OnHandshake(H3Session &session, QuicConnection &conn) override {
++        m_info->alpn = tls::NegotiatedAlpn(conn.Ssl());
++        X509 *cert{tls::PeerCertificate(conn.Ssl())};
++        std::vector<unsigned char> spki;
++        if (cert) {
++            m_info->peer_cert_fingerprint_hex = tls::CertSha256Hex(cert);
++            spki = tls::SpkiSha256(cert);
++            if (!spki.empty()) {
++                m_info->peer_spki = EncodeSpkiPin(spki);
++            }
++        }
++        bool ok{true};
++        if (m_spki_pin) {
++            ok = spki.size() == m_spki_pin->size() &&
++                 CRYPTO_memcmp(spki.data(), m_spki_pin->data(),
++                               spki.size()) == 0;
++            if (!ok) {
++                LogPrintf("WebTransport peer %s: TLS key %s does not match "
++                          "the pinned key %s\n",
++                          conn.Remote().ToStringAddrPort(), m_info->peer_spki,
++                          EncodeSpkiPin(*m_spki_pin));
++            }
++            m_info->pinned = ok;
++        }
++        if (ok && m_cert_pin) {
++            const auto digest{ParseHex(m_info->peer_cert_fingerprint_hex)};
++            ok = digest.size() == m_cert_pin->size() &&
++                 CRYPTO_memcmp(digest.data(), m_cert_pin->data(),
++                               digest.size()) == 0;
++            if (!ok) {
++                LogPrintf("WebTransport peer %s: certificate %s does not "
++                          "match the pinned hash\n",
++                          conn.Remote().ToStringAddrPort(),
++                          m_info->peer_cert_fingerprint_hex);
++            }
++            m_info->pinned = ok;
++        }
++        if (cert) {
++            X509_free(cert);
++        }
++        if (!ok && m_dial) {
++            m_dial->Finish(std::nullopt, WebTransportDialError::HANDSHAKE);
++        }
++        return ok;
++    }
++
++    int OnConnect(H3Session &, const WtRequest &) override {
++        return GetP2PWebTransportAcceptor() ? 200 : 503;
++    }
++
++    void OnConnectResponse(H3Session &, int status) override {
++        if (status != 200 && m_dial) {
++            m_dial->Finish(std::nullopt, status == 0
++                                             ? WebTransportDialError::UNSUPPORTED
++                                             : WebTransportDialError::REFUSED);
++        }
++    }
++
++    void OnSessionReady(H3Session &session) override {
++        QuicConnection &conn{*session.Conn()};
++        int sv[2];
++        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
++            session.CloseSession(0, "no socketpair");
++            return;
++        }
++        for (int fd : sv) {
++            const int fl{::fcntl(fd, F_GETFL, 0)};
++            ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
++            ::fcntl(fd, F_SETFD, FD_CLOEXEC);
++        }
++        m_info->protocol = session.Protocol();
++        m_info->draft = session.PeerDraftSetting();
++        m_info->origin = session.Request().origin;
++        m_channel = std::make_shared<QuicPeerChannel>(
++            sv[1], m_info, [waker = m_waker] { waker->Wake(); });
++        auto sock{std::make_unique<QuicPeerSock>(static_cast<SOCKET>(sv[0]),
++                                                 m_channel, m_compress)};
++        if (m_dial) {
++            WebTransportDialResult result;
++            result.sock = std::move(sock);
++            result.info = m_info;
++            result.local = conn.Local();
++            m_dial->Finish(std::move(result), WebTransportDialError::NONE);
++            return;
++        }
++        const P2PWebTransportAcceptor acceptor{GetP2PWebTransportAcceptor()};
++        if (!acceptor) {
++            session.CloseSession(0, "not accepting peers");
++            return;
++        }
++        acceptor(std::move(sock), CAddress{conn.Remote(), NODE_NONE},
++                 CAddress{conn.Local(), NODE_NONE}, m_info);
++    }
++
++    void OnClassData(H3Session &session, StreamClass cls, const uint8_t *data,
++                     size_t len, bool) override {
++        if (!m_channel) {
++            session.ExtendCredit(cls, len);
++            return;
++        }
++        std::vector<FrameReassembler::Frame> frames;
++        if (!m_reassembler[StreamClassIndex(cls)].Feed({data, len}, frames)) {
++            LogDebug(BCLog::WEBTRANSPORT,
++                     "WebTransport peer %s sent a bad frame on %s\n",
++                     session.Conn()->Remote().ToStringAddrPort(),
++                     StreamClassName(cls));
++            session.CloseSession(wt::WT_P2P_BAD_STREAM, "bad frame");
++            return;
++        }
++        for (auto &f : frames) {
++            QuicPeerChannel::RxFrame rx;
++            rx.cls = cls;
++            rx.flags = f.flags;
++            rx.body = std::move(f.body);
++            rx.wire_size = f.wire_size;
++            m_channel->PushRx(std::move(rx));
++        }
++        // Credit for received bytes, unless the node is not keeping up
++        // (then the peer is back-pressured; given back as it consumes).
++        if (m_channel->RxHasRoom()) {
++            session.ExtendCredit(cls, len);
++        } else {
++            m_deferred_credit[StreamClassIndex(cls)] += len;
++        }
++    }
++
++    void BeforeWrite(H3Session &session) override {
++        if (!m_channel) {
++            return;
++        }
++        if (m_channel->SockGone()) {
++            session.CloseSession(0, "disconnected");
++            return;
++        }
++        for (const StreamClass cls : ALL_STREAM_CLASSES) {
++            for (auto &frame : m_channel->TakeTx(cls)) {
++                session.QueueClassData(cls, std::move(frame));
++            }
++            m_channel->SetEngineUnsent(cls, session.ClassUnsent(cls));
++        }
++        if (m_channel->send_blocked &&
++            m_channel->TxPending(static_cast<StreamClass>(
++                m_channel->blocked_class.load())) <=
++                QuicPeerChannel::MAX_PENDING_SEND / 2) {
++            m_channel->send_blocked = false;
++            m_channel->Notify();
++        }
++        if (m_channel->RxHasRoom()) {
++            m_channel->credit_wanted = false;
++            for (const StreamClass cls : ALL_STREAM_CLASSES) {
++                uint64_t &deferred{m_deferred_credit[StreamClassIndex(cls)]};
++                if (deferred > 0) {
++                    session.ExtendCredit(cls, deferred);
++                    deferred = 0;
++                }
++            }
++        }
++        ngtcp2_conn_info ci;
++        ngtcp2_conn_get_conn_info2(session.Conn()->Conn(), &ci);
++        m_info->rtt_us = ci.smoothed_rtt / NGTCP2_MICROSECONDS;
++        m_info->min_rtt_us = ci.min_rtt / NGTCP2_MICROSECONDS;
++        m_info->cwnd = ci.cwnd;
++        m_info->lost_pkts = ci.pkt_lost;
++        m_info->udp_bytes_sent = ci.bytes_sent;
++        m_info->udp_bytes_recv = ci.bytes_recv;
++    }
++
++    void OnSessionClosed(H3Session &session, uint32_t code,
++                         const std::string &reason) override {
++        if (m_channel) {
++            LogDebug(BCLog::WEBTRANSPORT,
++                     "WebTransport session with %s ended: code %u (%s)\n",
++                     session.Conn() ? session.Conn()->Remote().ToStringAddrPort()
++                                    : "?",
++                     code, reason);
++            m_channel->MarkClosed();
++        }
++        if (m_dial) {
++            m_dial->Finish(std::nullopt, WebTransportDialError::REFUSED);
++        }
++    }
++
++private:
++    const std::shared_ptr<EngineWaker> m_waker;
++    const bool m_compress;
++    const std::shared_ptr<DialState> m_dial;
++    const std::optional<std::vector<unsigned char>> m_spki_pin;
++    const std::optional<std::vector<unsigned char>> m_cert_pin;
++    const std::shared_ptr<QuicTransportInfo> m_info;
++    std::shared_ptr<QuicPeerChannel> m_channel;
++    std::array<FrameReassembler, NUM_STREAM_CLASSES> m_reassembler;
++    std::array<uint64_t, NUM_STREAM_CLASSES> m_deferred_credit{};
++};
++
+ std::string CidKey(const uint8_t *data, size_t len) {
+     return std::string(reinterpret_cast<const char *>(data), len);
+ }
+@@ -256,7 +515,7 @@ public:
+             return false;
+         }
+         m_wake_read = sv[0];
+-        m_wake_write = sv[1];
++        m_waker = std::make_shared<EngineWaker>(sv[1]);
+         for (int fd : sv) {
+             const int fl{::fcntl(fd, F_GETFL, 0)};
+             ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+@@ -305,12 +564,11 @@ public:
+         m_stop = true;
+         Wake();
+         m_thread.join();
+-        for (int fd : {m_wake_read, m_wake_write}) {
+-            if (fd >= 0) {
+-                ::close(fd);
+-            }
++        if (m_wake_read >= 0) {
++            ::close(m_wake_read);
++            m_wake_read = -1;
+         }
+-        m_wake_read = m_wake_write = -1;
++        m_waker->Close();
+     }
+ 
+     /** Run `fn` on the engine thread */
+@@ -322,12 +580,7 @@ public:
+         Wake();
+     }
+ 
+-    void Wake() {
+-        if (!m_wake_pending.exchange(true)) {
+-            const uint8_t b{1};
+-            [[maybe_unused]] auto r{::send(m_wake_write, &b, 1, MSG_DONTWAIT)};
+-        }
+-    }
++    void Wake() { m_waker->Wake(); }
+ 
+     std::vector<CService> BoundAddresses() const {
+         std::vector<CService> out;
+@@ -388,6 +641,50 @@ public:
+         return future.get();
+     }
+ 
++    std::optional<WebTransportDialResult>
++    Dial(const CService &target, const ParsedWebTransportURL &url,
++         std::chrono::milliseconds timeout, CThreadInterrupt &interrupt,
++         WebTransportDialError &error) EXCLUSIVE_LOCKS_REQUIRED(!m_tasks_mutex) {
++        auto state{std::make_shared<DialState>()};
++        auto future{state->promise.get_future()};
++        auto cancel{std::make_shared<std::atomic<bool>>(false)};
++        const std::string sni{LookupHost(url.host, false).has_value() ||
++                                      url.host.find(':') != std::string::npos
++                                  ? ""
++                                  : url.host};
++        Post([this, target, url, sni, state, cancel] {
++            QuicConnection *conn{CreateClient(target, sni)};
++            if (!conn) {
++                state->Finish(std::nullopt, WebTransportDialError::HANDSHAKE);
++                return;
++            }
++            conn->CancelFlag() = cancel;
++            H3Options h3;
++            h3.server = false;
++            h3.path = url.path;
++            h3.token = url.token;
++            h3.authority = url.authority;
++            conn->SetApp(std::make_unique<H3Session>(
++                h3, std::make_unique<P2PSessionHandler>(
++                        m_waker, m_opts.compress, state, url.spki_pin,
++                        url.cert_sha256)));
++        });
++        const auto deadline{std::chrono::steady_clock::now() + timeout};
++        while (future.wait_for(std::chrono::milliseconds{50}) !=
++               std::future_status::ready) {
++            if (interrupt || std::chrono::steady_clock::now() >= deadline) {
++                *cancel = true;
++                Wake();
++                error = interrupt ? WebTransportDialError::INTERRUPTED
++                                  : WebTransportDialError::TIMEOUT;
++                return std::nullopt;
++            }
++        }
++        auto result{future.get()};
++        error = state->error;
++        return result;
++    }
++
+     std::optional<WtProbeResult>
+     WebTransportProbeForTest(const CService &target,
+                              const WtProbeOptions &options,
+@@ -500,6 +797,12 @@ private:
+         SSL_CTX_set_options(ctx.get(), SSL_OP_CIPHER_SERVER_PREFERENCE |
+                                            SSL_OP_NO_ANTI_REPLAY);
+         SSL_CTX_set_alpn_select_cb(ctx.get(), SelectH3Alpn, nullptr);
++        if (m_opts.request_client_cert) {
++            // Any certificate (node certificates are self-signed); its key
++            // is matched against -p2pwebsocketpeer by CConnman.
++            SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_PEER,
++                               [](int, X509_STORE_CTX *) { return 1; });
++        }
+         if (!tls::UseCertificateFiles(ctx.get(), *m_opts.cert_file,
+                                       *m_opts.key_file)) {
+             error = "unable to load " + fs::PathToString(*m_opts.cert_file) +
+@@ -539,7 +842,7 @@ private:
+         }
+     }
+ 
+-    static tls::SslCtxPtr NewClientContext() {
++    tls::SslCtxPtr NewClientContext() const {
+         tls::SslCtxPtr ctx{SSL_CTX_new(TLS_client_method())};
+         if (!ctx) {
+             return {};
+@@ -551,6 +854,14 @@ private:
+         SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_PEER,
+                            [](int, X509_STORE_CTX *) { return 1; });
+         SSL_CTX_set_default_verify_paths(ctx.get());
++        // Present our certificate to servers that ask (-p2pwebsocketpeer).
++        if (m_opts.cert_file && m_opts.key_file &&
++            !tls::UseCertificateFiles(ctx.get(), *m_opts.cert_file,
++                                      *m_opts.key_file)) {
++            LogPrintf("WebTransport: unable to load the client certificate "
++                      "%s\n",
++                      fs::PathToString(*m_opts.cert_file));
++        }
+         return ctx;
+     }
+ 
+@@ -803,7 +1114,12 @@ private:
+                 h3.origins = m_opts.wt_origins;
+                 h3.token = m_opts.wt_token;
+                 h3.echo = m_opts.wt_echo;
+-                conn->SetApp(std::make_unique<H3Session>(h3, nullptr));
++                std::unique_ptr<WtSessionHandler> handler;
++                if (!m_opts.wt_echo) {
++                    handler = std::make_unique<P2PSessionHandler>(
++                        m_waker, m_opts.compress);
++                }
++                conn->SetApp(std::make_unique<H3Session>(h3, std::move(handler)));
+                 break;
+             }
+         }
+@@ -934,7 +1250,7 @@ private:
+                        0) {
+                 }
+             }
+-            m_wake_pending = false;
++            m_waker->pending = false;
+             if (m_stop) {
+                 break;
+             }
+@@ -981,8 +1297,7 @@ private:
+     std::thread m_thread;
+     std::atomic<bool> m_stop{false};
+     int m_wake_read{-1};
+-    int m_wake_write{-1};
+-    std::atomic<bool> m_wake_pending{false};
++    std::shared_ptr<EngineWaker> m_waker;
+ 
+     Mutex m_tasks_mutex;
+     std::deque<std::function<void()>> m_tasks GUARDED_BY(m_tasks_mutex);
+@@ -1041,6 +1356,13 @@ QuicEngineStats QuicEngine::Stats() const {
+     return m_impl->Stats();
+ }
+ 
++std::optional<WebTransportDialResult>
++QuicEngine::Dial(const CService &target, const ParsedWebTransportURL &url,
++                 std::chrono::milliseconds timeout, CThreadInterrupt &interrupt,
++                 WebTransportDialError &error) {
++    return m_impl->Dial(target, url, timeout, interrupt, error);
++}
++
+ std::optional<WtProbeResult>
+ QuicEngine::WebTransportProbeForTest(const CService &target,
+                                      const WtProbeOptions &options,
+diff --git a/src/net_quic/quic_engine.h b/src/net_quic/quic_engine.h
+index 90defdf712..ce082a744b 100644
+--- a/src/net_quic/quic_engine.h
++++ b/src/net_quic/quic_engine.h
+@@ -5,6 +5,7 @@
+ #ifndef BITCOIN_NET_QUIC_QUIC_ENGINE_H
+ #define BITCOIN_NET_QUIC_QUIC_ENGINE_H
+ 
++#include <net_webtransport.h>
+ #include <netaddress.h>
+ #include <util/fs.h>
+ 
+@@ -74,6 +75,11 @@ struct QuicEngineOptions {
+     //! Tests and browser interop: echo WebTransport streams and datagrams
+     //! instead of running P2P sessions
+     bool wt_echo{false};
++    //! Ask inbound peers for a TLS client certificate (accepting any), so
++    //! -p2pwebsocketpeer keys can grant permissions
++    bool request_client_cert{false};
++    //! Compress P2P messages on the class streams (zstd + dictionary)
++    bool compress{true};
+ };
+ 
+ /** Tests: an extended CONNECT made by WebTransportProbeForTest() */
+@@ -148,6 +154,16 @@ public:
+                 std::chrono::milliseconds timeout,
+                 const std::optional<std::vector<uint8_t>> &cert_sha256 = {});
+ 
++    /**
++     * Open an outbound P2P session (see WebTransportDialer): blocks until
++     * the class streams are open, the dial fails, `timeout` passes or
++     * `interrupt` fires.
++     */
++    std::optional<WebTransportDialResult>
++    Dial(const CService &target, const ParsedWebTransportURL &url,
++         std::chrono::milliseconds timeout, CThreadInterrupt &interrupt,
++         WebTransportDialError &error);
++
+     /**
+      * Tests: QUIC + HTTP/3 + extended CONNECT to `target`; on a 200 open
+      * the five class streams and send a few bytes on each.
+diff --git a/src/net_quic/webtransport_h3.cpp b/src/net_quic/webtransport_h3.cpp
+index 4d75623da7..fdcc40b5da 100644
+--- a/src/net_quic/webtransport_h3.cpp
++++ b/src/net_quic/webtransport_h3.cpp
+@@ -224,6 +224,12 @@ bool H3Session::InitH3(QuicConnection &conn) {
+ }
+ 
+ int H3Session::OnHandshakeCompleted(QuicConnection &conn) {
++    m_conn = &conn;
++    if (m_handler && !m_handler->OnHandshake(*this, conn)) {
++        SessionEnded(0, "peer refused at handshake");
++        conn.CloseApp(H3_NO_ERROR, "refused");
++        return 0;
++    }
+     return InitH3(conn) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
+ }
+ 
+diff --git a/src/net_quic/webtransport_h3.h b/src/net_quic/webtransport_h3.h
+index 59e99a0d18..b10e3cad63 100644
+--- a/src/net_quic/webtransport_h3.h
++++ b/src/net_quic/webtransport_h3.h
+@@ -45,6 +45,10 @@ struct WtRequest {
+ class WtSessionHandler {
+ public:
+     virtual ~WtSessionHandler() = default;
++    //! The TLS handshake completed: check the peer (pins); false closes
++    virtual bool OnHandshake(H3Session &session, QuicConnection &conn) {
++        return true;
++    }
+     //! Server: the request passed the path/token/origin checks; return the
+     //! status to answer (200 accepts, 503 when nobody takes sessions)
+     virtual int OnConnect(H3Session &session, const WtRequest &request) {
+diff --git a/src/net_webtransport.h b/src/net_webtransport.h
+index 43eef43612..649fdab655 100644
+--- a/src/net_webtransport.h
++++ b/src/net_webtransport.h
+@@ -39,6 +39,8 @@ static const char *const P2P_WT_PROTOCOL_V1 = "p2p-v1";
+ static const char *const P2P_WT_PROTOCOL_V2 = "p2p-v2";
+ //! Port of a wt:// URL without one
+ static constexpr uint16_t DEFAULT_WEBTRANSPORT_URL_PORT = 443;
++//! How long an outbound WebTransport dial may take (QUIC, HTTP/3, CONNECT)
++static constexpr std::chrono::milliseconds WEBTRANSPORT_DIAL_TIMEOUT{10000};
+ 
+ /**
+  * The bidirectional WebTransport stream a P2P message travels on. The
+diff --git a/src/rpc/net.cpp b/src/rpc/net.cpp
+index e45e101e8f..0e11ce3216 100644
+--- a/src/rpc/net.cpp
++++ b/src/rpc/net.cpp
+@@ -172,8 +172,65 @@ static RPCHelpMan getpeerinfo() {
+                      "Type of connection: \n" +
+                          Join(CONNECTION_TYPE_DOC, ",\n") + "."},
+                     {RPCResult::Type::STR, "transport",
+-                     "How the P2P stream is carried: tcp, ws (WebSocket) "
+-                     "or wss (WebSocket over TLS)"},
++                     "How the P2P stream is carried: tcp, ws (WebSocket), "
++                     "wss (WebSocket over TLS) or webtransport (HTTP/3 over "
++                     "QUIC)"},
++                    {RPCResult::Type::OBJ,
++                     "webtransport",
++                     /*optional=*/true,
++                     "WebTransport details, for webtransport peers",
++                     {
++                         {RPCResult::Type::STR, "protocol",
++                          "Negotiated wt-protocol (P2P framing), e.g. p2p-v1"},
++                         {RPCResult::Type::STR_HEX, "draft",
++                          "Newest WebTransport SETTINGS codepoint the peer "
++                          "announced (2c7cf000: draft-15/16, 2b603742: "
++                          "draft-02 browsers)"},
++                         {RPCResult::Type::STR, "origin", /*optional=*/true,
++                          "Origin of a browser peer"},
++                         {RPCResult::Type::NUM, "rtt",
++                          "Smoothed QUIC round-trip time (seconds)"},
++                         {RPCResult::Type::NUM, "min_rtt",
++                          "Minimum QUIC round-trip time (seconds)"},
++                         {RPCResult::Type::NUM, "cwnd",
++                          "Congestion window (bytes)"},
++                         {RPCResult::Type::NUM, "lost_pkts",
++                          "QUIC packets declared lost"},
++                         {RPCResult::Type::NUM, "udp_bytes_sent",
++                          "QUIC bytes sent, UDP payloads"},
++                         {RPCResult::Type::NUM, "udp_bytes_recv",
++                          "QUIC bytes received, UDP payloads"},
++                         {RPCResult::Type::NUM, "splits",
++                          "Messages split into one message per stream class"},
++                         {RPCResult::Type::OBJ_DYN, "classes",
++                          "Per stream class (control, avalanche, "
++                          "tx_announce, tx_body, block)",
++                          {{RPCResult::Type::OBJ,
++                            "class",
++                            "",
++                            {
++                                {RPCResult::Type::NUM, "msg_bytes_sent",
++                                 "P2P message bytes sent"},
++                                {RPCResult::Type::NUM, "msg_bytes_recv",
++                                 "P2P message bytes received"},
++                                {RPCResult::Type::NUM, "stream_bytes_sent",
++                                 "Stream bytes sent (framed, compressed)"},
++                                {RPCResult::Type::NUM, "stream_bytes_recv",
++                                 "Stream bytes received (framed, "
++                                 "compressed)"},
++                            }}}},
++                         {RPCResult::Type::STR_HEX, "peer_cert_fingerprint",
++                          /*optional=*/true,
++                          "SHA-256 of the peer's TLS certificate, if any"},
++                         {RPCResult::Type::STR, "peer_spki", /*optional=*/true,
++                          "base64url SHA-256 of the peer's TLS public key, "
++                          "usable as a pin (wt://...#spki=)"},
++                         {RPCResult::Type::STR, "alpn", /*optional=*/true,
++                          "TLS ALPN protocol agreed with the peer"},
++                         {RPCResult::Type::BOOL, "pinned",
++                          "Whether the peer's key matched a pin (outbound) "
++                          "or -p2pwebsocketpeer entry (inbound)"},
++                     }},
+                     {RPCResult::Type::OBJ,
+                      "websocket",
+                      /*optional=*/true,
+@@ -395,6 +452,46 @@ static RPCHelpMan getpeerinfo() {
+                     }
+                     wsobj.pushKV("pinned", ws->pinned);
+                     obj.pushKV("websocket", std::move(wsobj));
++                } else if (const auto &wt = stats.m_quic_info) {
++                    obj.pushKV("transport", "webtransport");
++                    UniValue wtobj(UniValue::VOBJ);
++                    wtobj.pushKV("protocol", wt->protocol);
++                    wtobj.pushKV("draft", strprintf("%x", wt->draft));
++                    if (!wt->origin.empty()) {
++                        wtobj.pushKV("origin", wt->origin);
++                    }
++                    wtobj.pushKV("rtt", wt->rtt_us.load() / 1e6);
++                    wtobj.pushKV("min_rtt", wt->min_rtt_us.load() / 1e6);
++                    wtobj.pushKV("cwnd", wt->cwnd.load());
++                    wtobj.pushKV("lost_pkts", wt->lost_pkts.load());
++                    wtobj.pushKV("udp_bytes_sent", wt->udp_bytes_sent.load());
++                    wtobj.pushKV("udp_bytes_recv", wt->udp_bytes_recv.load());
++                    wtobj.pushKV("splits", wt->splits.load());
++                    UniValue classes(UniValue::VOBJ);
++                    for (const StreamClass c : ALL_STREAM_CLASSES) {
++                        const size_t i{StreamClassIndex(c)};
++                        UniValue cls(UniValue::VOBJ);
++                        cls.pushKV("msg_bytes_sent", wt->msg_bytes_sent[i].load());
++                        cls.pushKV("msg_bytes_recv", wt->msg_bytes_recv[i].load());
++                        cls.pushKV("stream_bytes_sent",
++                                   wt->stream_bytes_sent[i].load());
++                        cls.pushKV("stream_bytes_recv",
++                                   wt->stream_bytes_recv[i].load());
++                        classes.pushKV(StreamClassName(c), std::move(cls));
++                    }
++                    wtobj.pushKV("classes", std::move(classes));
++                    if (!wt->peer_cert_fingerprint_hex.empty()) {
++                        wtobj.pushKV("peer_cert_fingerprint",
++                                     wt->peer_cert_fingerprint_hex);
++                    }
++                    if (!wt->peer_spki.empty()) {
++                        wtobj.pushKV("peer_spki", wt->peer_spki);
++                    }
++                    if (!wt->alpn.empty()) {
++                        wtobj.pushKV("alpn", wt->alpn);
++                    }
++                    wtobj.pushKV("pinned", wt->pinned);
++                    obj.pushKV("webtransport", std::move(wtobj));
+                 } else {
+                     obj.pushKV("transport", "tcp");
+                 }

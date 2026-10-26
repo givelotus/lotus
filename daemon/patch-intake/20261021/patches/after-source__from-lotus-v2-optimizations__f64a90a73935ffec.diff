@@ -1,0 +1,502 @@
+diff --git a/src/net/v2_protocol_handler.cpp b/src/net/v2_protocol_handler.cpp
+index 85b72e61a5..ac7d3acf5a 100644
+--- a/src/net/v2_protocol_handler.cpp
++++ b/src/net/v2_protocol_handler.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <net/v2_protocol_handler.h>
+ 
++#include <avalanche/processor.h>
+ #include <common/args.h>
+ #include <consensus/merkle.h>
+ #include <consensus/validation.h>
+@@ -1807,6 +1808,70 @@ bool V2PeerProtocolHandler::SendRawPayloadToPeerLocked(
+     return sent;
+ }
+ 
++bool V2PeerProtocolHandler::IsFastSyncBlockRequested(const BlockHash &hash) const {
++    LOCK(m_mutex);
++    return m_swarm.state == FastSyncSwarmState::PIVOT_ACTIVE_PEELING &&
++           hash == m_swarm.undo_in_flight_hash;
++}
++
++void V2PeerProtocolHandler::BlockDataReceived(const BlockHash &hash) {
++    NodeId undo_peer = -1;
++    std::vector<uint8_t> payload;
++    {
++        LOCK(m_mutex);
++        if (m_swarm.state != FastSyncSwarmState::PIVOT_ACTIVE_PEELING ||
++            hash != m_swarm.undo_in_flight_hash ||
++            !m_swarm.pending_undo_for_block) {
++            return;
++        }
++        std::string err;
++        if (!lotus::v2::EncodeBlockUndoMessage(*m_swarm.pending_undo_for_block,
++                                               payload, err)) {
++            return;
++        }
++        undo_peer = m_swarm.pending_undo_peer;
++    }
++    // Retain attribution to the undo supplier even if a different peer sent
++    // the body. Reuse the same authenticated reverse-validation path.
++    auto resume = [&](CNode *node) {
++        DataStream stream{payload};
++        HandleBlockUndo(*node, stream, GetTime<std::chrono::microseconds>());
++        return true;
++    };
++    if (!m_connman.ForNode(undo_peer, resume)) {
++        CNode *node = nullptr;
++        {
++            LOCK(m_mutex);
++            auto it = m_peer_nodes.find(undo_peer);
++            if (it != m_peer_nodes.end()) node = it->second;
++        }
++        if (node) resume(node);
++    }
++}
++
++void V2PeerProtocolHandler::CheckFastSyncTimeouts(
++    NodeId peer_id, std::chrono::microseconds now) {
++    LOCK(m_mutex);
++    bool pending =
++        (m_swarm.state == FastSyncSwarmState::FETCHING_ROOTS &&
++         m_swarm.roots_in_flight_peer == peer_id) ||
++        (m_swarm.state == FastSyncSwarmState::PIVOT_ACTIVE_PEELING &&
++         m_swarm.undo_in_flight_peer == peer_id);
++    if (m_swarm.state == FastSyncSwarmState::FETCHING_SHARDS) {
++        for (const auto &[key, supplier] : m_swarm.in_flight_shards) {
++            if (supplier == peer_id) pending = true;
++        }
++    }
++    auto deadline = m_swarm.request_deadlines.find(peer_id);
++    if (!pending) {
++        m_swarm.request_deadlines.erase(peer_id);
++    } else if (deadline != m_swarm.request_deadlines.end() &&
++               now >= deadline->second) {
++        m_swarm.request_deadlines.erase(deadline);
++        HandleSwarmPeerFailureLocked(peer_id, std::nullopt);
++    }
++}
++
+ bool V2PeerProtocolHandler::RequestSwarmRootsLocked() {
+     AssertLockHeld(m_mutex);
+     const lotus::v2::GetUtxoRootsRequest req{m_swarm.pivot_v2_id};
+@@ -1818,6 +1883,8 @@ bool V2PeerProtocolHandler::RequestSwarmRootsLocked() {
+         ++m_swarm.rr_cursor;
+         if (SendRawPayloadToPeerLocked(peer_id, NetMsgType::GETUTXOROOTS,
+                                        Span{payload})) {
++            m_swarm.request_deadlines[peer_id] =
++                GetTime<std::chrono::microseconds>() + 30s;
+             m_swarm.roots_in_flight_peer = peer_id;
+             return true;
+         }
+@@ -1852,6 +1919,8 @@ void V2PeerProtocolHandler::DispatchPendingSwarmShardsLocked() {
+             ++m_swarm.rr_cursor;
+             if (SendRawPayloadToPeerLocked(peer_id, NetMsgType::GETUTXOSHARD,
+                                            Span{payload})) {
++                m_swarm.request_deadlines[peer_id] =
++                    GetTime<std::chrono::microseconds>() + 30s;
+                 m_swarm.in_flight_shards[key] = peer_id;
+                 dispatched = true;
+                 break;
+@@ -1909,6 +1978,9 @@ bool V2PeerProtocolHandler::RequestNextReversePeelBlockLocked(
+                     }
+                 }
+             }
++            m_swarm.pending_undo_for_block.reset();
++            m_swarm.request_deadlines[peer_id] =
++                GetTime<std::chrono::microseconds>() + 30s;
+             m_swarm.undo_in_flight_hash = target_hash;
+             m_swarm.undo_in_flight_peer = peer_id;
+             return true;
+@@ -1998,7 +2070,8 @@ void V2PeerProtocolHandler::HandleSwarmPeerFailureLocked(
+         if (m_swarm.undo_in_flight_peer == peer_id &&
+             !m_swarm.undo_in_flight_hash.IsNull()) {
+             const BlockHash retry_hash = m_swarm.undo_in_flight_hash;
+-            RequestNextReversePeelBlockLocked(/*target_height=*/1, retry_hash);
++            RequestNextReversePeelBlockLocked(/*target_height=*/1, retry_hash,
++                                              /*need_block_data=*/true);
+         }
+     }
+ }
+@@ -2854,6 +2927,7 @@ void V2PeerProtocolHandler::HandleBlockUndo(
+         {
+             LOCK(m_mutex);
+             m_swarm.pending_undo_for_block = std::move(undo_msg);
++            m_swarm.pending_undo_peer = pfrom.GetId();
+         }
+         m_connman.PushMessage(
+             &pfrom, NetMsg::Make(NetMsgType::GETDATA,
+diff --git a/src/net/v2_protocol_handler.h b/src/net/v2_protocol_handler.h
+index ae8f3ba1a4..020b9c37e2 100644
+--- a/src/net/v2_protocol_handler.h
++++ b/src/net/v2_protocol_handler.h
+@@ -515,6 +515,15 @@ public:
+                                     std::string &err)
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
++    /** Requested historical bodies must be accepted by ABC before undo replay. */
++    bool IsFastSyncBlockRequested(const BlockHash &hash) const
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    void BlockDataReceived(const BlockHash &hash)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++    /** Called by the normal peer send loop, including while no reply arrives. */
++    void CheckFastSyncTimeouts(NodeId peer_id, std::chrono::microseconds now)
++        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
++
+     FastSyncSwarmStatus GetFastSyncSwarmStatus() const
+         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+ 
+@@ -696,6 +705,7 @@ private:
+         std::vector<NodeId> healthy_peers;
+         std::unordered_set<NodeId> banned_peers;
+         size_t rr_cursor{0};
++        std::map<NodeId, std::chrono::microseconds> request_deadlines;
+         NodeId roots_in_flight_peer{-1};
+         bool has_verified_roots{false};
+         lotus::v2::UtxoRootsMessage verified_roots{};
+@@ -708,6 +718,7 @@ private:
+         BlockHash undo_in_flight_hash{};
+         NodeId undo_in_flight_peer{-1};
+         std::optional<lotus::v2::BlockUndoMessage> pending_undo_for_block{};
++        NodeId pending_undo_peer{-1};
+     };
+ 
+     bool PeerSupportsUtxoShardsLocked(NodeId peer_id) const
+diff --git a/src/net_processing.cpp b/src/net_processing.cpp
+index 68138acbb4..51e2f2e7ba 100644
+--- a/src/net_processing.cpp
++++ b/src/net_processing.cpp
+@@ -4922,8 +4922,16 @@ void PeerManagerImpl::ProcessBlock(const Config &config, CNode &node,
+                                    bool force_processing,
+                                    bool min_pow_checked) {
+     bool new_block{false};
+-    m_chainman.ProcessNewBlock(block, force_processing, min_pow_checked,
+-                               &new_block, m_avalanche);
++    const BlockHash hash = block->GetHash();
++    force_processing |= m_v2_protocol_handler.IsFastSyncBlockRequested(hash);
++    const bool accepted = m_chainman.ProcessNewBlock(
++        block, force_processing, min_pow_checked, &new_block, m_avalanche);
++    // AcceptBlock stores only bodies passing the normal ABC block checks.
++    // PeelFastSyncBlock still performs the actual ConnectBlock/script checks;
++    // receiving a body alone never certifies historical UTXO/script validity.
++    if (accepted) {
++        m_v2_protocol_handler.BlockDataReceived(hash);
++    }
+     if (new_block) {
+         node.m_last_block_time = GetTime<std::chrono::seconds>();
+         // In case this block came from a different peer than we requested
+@@ -8843,6 +8851,7 @@ bool PeerManagerImpl::SendMessages(const Config &config, CNode *pto) {
+     }
+ 
+     const auto current_time{GetTime<std::chrono::microseconds>()};
++    m_v2_protocol_handler.CheckFastSyncTimeouts(pto->GetId(), current_time);
+ 
+     if (pto->IsAddrFetchConn() &&
+         current_time - pto->m_connected > 10 * AVG_ADDRESS_BROADCAST_INTERVAL) {
+diff --git a/src/rpc/blockchain.cpp b/src/rpc/blockchain.cpp
+index c4473ecb83..cf0698e825 100644
+--- a/src/rpc/blockchain.cpp
++++ b/src/rpc/blockchain.cpp
+@@ -23,6 +23,7 @@
+ #include <logging/timer.h>
+ #include <net.h>
+ #include <net_processing.h>
++#include <net/v2_protocol_handler.h>
+ #include <node/blockstorage.h>
+ #include <node/coinstats.h>
+ #include <node/context.h>
+@@ -3356,6 +3357,179 @@ static RPCHelpMan getchainstates() {
+         }};
+ }
+ 
++static RPCHelpMan syncutxoshardswarm() {
++    return RPCHelpMan{
++        "syncutxoshardswarm",
++        "\nStart an autonomous multi-peer Fast UTXO Shard Sync swarm session for a pivot block.\n",
++        {
++            {"pivot_blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
++             "The authenticated pivot block hash"},
++            {"peer_ids",
++             RPCArg::Type::ARR,
++             RPCArg::Optional::OMITTED,
++             "Optional list of peer IDs to include in the swarm (defaults to all connected peers)",
++             {
++                 {"peer_id", RPCArg::Type::NUM, RPCArg::Optional::OMITTED,
++                  "A connected peer ID"},
++             }},
++            {"auto_peel", RPCArg::Type::BOOL, RPCArg::Default{false},
++             "Whether to peel historical blocks after activation, bounded by -reversesynchorizon"},
++        },
++        RPCResult{RPCResult::Type::OBJ,
++                  "",
++                  "",
++                  {
++                      {RPCResult::Type::STR, "swarm_state",
++                       "current swarm state"},
++                      {RPCResult::Type::STR_HEX, "pivot_blockhash",
++                       "the target pivot block hash"},
++                      {RPCResult::Type::NUM, "pivot_height",
++                       "the target pivot height"},
++                      {RPCResult::Type::NUM, "active_peers",
++                       "number of healthy peers in the swarm"},
++                  }},
++        RPCExamples{""},
++        [&](const RPCHelpMan &self, const Config &config,
++            const JSONRPCRequest &request) -> UniValue {
++            NodeContext &node = EnsureAnyNodeContext(request.context);
++            if (!node.peerman) {
++                throw JSONRPCError(RPC_CLIENT_P2P_DISABLED,
++                                   "Error: Peer-to-peer functionality missing or disabled");
++            }
++            auto *v2_handler = node.peerman->GetV2ProtocolHandler();
++            if (!v2_handler) {
++                throw JSONRPCError(RPC_INTERNAL_ERROR,
++                                   "State-sync protocol handler unavailable");
++            }
++
++            const BlockHash pivot_hash(
++                ParseHashV(request.params[0], "pivot_blockhash"));
++            std::vector<NodeId> peer_ids;
++            if (!request.params[1].isNull()) {
++                for (const UniValue &v :
++                     request.params[1].get_array().getValues()) {
++                    peer_ids.push_back(v.getInt<int64_t>());
++                }
++            }
++            const bool auto_peel =
++                request.params[2].isNull() ? false : request.params[2].get_bool();
++
++            std::string err;
++            if (!v2_handler->StartFastSyncSwarm(pivot_hash, peer_ids, auto_peel,
++                                                err)) {
++                throw JSONRPCError(RPC_MISC_ERROR, err);
++            }
++
++            const auto status = v2_handler->GetFastSyncSwarmStatus();
++            UniValue res(UniValue::VOBJ);
++            res.pushKV("swarm_state",
++                       lotus::v2::net::FastSyncSwarmStateToString(status.state));
++            res.pushKV("pivot_blockhash", status.pivot_block_hash.GetHex());
++            res.pushKV("pivot_height", status.pivot_height);
++            res.pushKV("active_peers",
++                       static_cast<uint64_t>(status.active_peers));
++            return res;
++        },
++    };
++}
++
++static RPCHelpMan getfastsyncinfo() {
++    return RPCHelpMan{
++        "getfastsyncinfo",
++        "\nReturn Fast UTXO Shard Sync and Reverse Peeling Swarm status.\n",
++        {},
++        RPCResult{RPCResult::Type::OBJ,
++                  "",
++                  "",
++                  {
++                      {RPCResult::Type::BOOL, "fast_sync_active",
++                       "whether fast-sync reverse peeling is active on the chainstate"},
++                      {RPCResult::Type::NUM, "earliest_verified_height",
++                       "reverse-validation cursor height; input creation provenance remains provisional until genesis"},
++                      {RPCResult::Type::STR, "swarm_state",
++                       "current P2P swarm state"},
++                      {RPCResult::Type::STR_HEX, "pivot_blockhash",
++                       "swarm target pivot block hash"},
++                      {RPCResult::Type::NUM, "pivot_height",
++                       "swarm target pivot height"},
++                      {RPCResult::Type::NUM, "total_non_empty_shards",
++                       "number of non-empty shards to fetch"},
++                      {RPCResult::Type::NUM, "verified_shards",
++                       "number of cryptographically verified shards"},
++                      {RPCResult::Type::NUM, "pending_shards",
++                       "number of shards queued for dispatch"},
++                      {RPCResult::Type::NUM, "in_flight_shards",
++                       "number of shards currently in flight"},
++                      {RPCResult::Type::NUM, "active_peers",
++                       "number of healthy swarm peers"},
++                      {RPCResult::Type::NUM, "banned_swarm_peers",
++                       "number of peers banned from the swarm due to invalid payloads"},
++                      {RPCResult::Type::NUM, "coins_imported",
++                       "number of coins imported at pivot activation"},
++                      {RPCResult::Type::NUM, "corrupted_roots_rejected",
++                       "number of corrupted UTXOROOTS messages rejected"},
++                      {RPCResult::Type::NUM, "corrupted_shards_rejected",
++                       "number of corrupted UTXOSHARD messages rejected"},
++                      {RPCResult::Type::NUM, "corrupted_undo_rejected",
++                       "number of corrupted BLOCKUNDO messages rejected"},
++                      {RPCResult::Type::NUM, "blocks_peeled",
++                       "number of historical blocks peeled via the swarm"},
++                  }},
++        RPCExamples{""},
++        [&](const RPCHelpMan &self, const Config &config,
++            const JSONRPCRequest &request) -> UniValue {
++            NodeContext &node = EnsureAnyNodeContext(request.context);
++            ChainstateManager &chainman = EnsureChainman(node);
++
++            bool fast_sync_active = false;
++            int earliest_verified_height = 0;
++            {
++                LOCK(cs_main);
++                Chainstate &active_chainstate = chainman.ActiveChainstate();
++                fast_sync_active = active_chainstate.IsFastSyncActive();
++                earliest_verified_height =
++                    active_chainstate.GetEarliestVerifiedHeight();
++            }
++
++            lotus::v2::net::FastSyncSwarmStatus status{};
++            if (node.peerman && node.peerman->GetV2ProtocolHandler()) {
++                status =
++                    node.peerman->GetV2ProtocolHandler()->GetFastSyncSwarmStatus();
++            }
++
++            UniValue res(UniValue::VOBJ);
++            res.pushKV("fast_sync_active", fast_sync_active);
++            res.pushKV("earliest_verified_height", earliest_verified_height);
++            res.pushKV("swarm_state",
++                       lotus::v2::net::FastSyncSwarmStateToString(status.state));
++            res.pushKV("pivot_blockhash", status.pivot_block_hash.GetHex());
++            res.pushKV("pivot_height", status.pivot_height);
++            res.pushKV("total_non_empty_shards",
++                       static_cast<uint64_t>(status.total_non_empty_shards));
++            res.pushKV("verified_shards",
++                       static_cast<uint64_t>(status.verified_shards));
++            res.pushKV("pending_shards",
++                       static_cast<uint64_t>(status.pending_shards));
++            res.pushKV("in_flight_shards",
++                       static_cast<uint64_t>(status.in_flight_shards));
++            res.pushKV("active_peers",
++                       static_cast<uint64_t>(status.active_peers));
++            res.pushKV("banned_swarm_peers",
++                       static_cast<uint64_t>(status.banned_swarm_peers));
++            res.pushKV("coins_imported", status.coins_imported);
++            res.pushKV("corrupted_roots_rejected",
++                       status.corrupted_roots_rejected);
++            res.pushKV("corrupted_shards_rejected",
++                       status.corrupted_shards_rejected);
++            res.pushKV("corrupted_undo_rejected",
++                       status.corrupted_undo_rejected);
++            res.pushKV("blocks_peeled", status.blocks_peeled);
++            return res;
++        },
++    };
++}
++
++
+ void RegisterBlockchainRPCCommands(CRPCTable &t) {
+     // clang-format off
+     static const CRPCCommand commands[] = {
+@@ -3384,6 +3558,8 @@ void RegisterBlockchainRPCCommands(CRPCTable &t) {
+         { "blockchain",         getchainstates,                    },
+ 
+         /* Not shown in help */
++        { "hidden",             getfastsyncinfo,                   },
++        { "hidden",             syncutxoshardswarm,                },
+         { "hidden",             invalidateblock,                   },
+         { "hidden",             parkblock,                         },
+         { "hidden",             reconsiderblock,                   },
+diff --git a/src/rpc/client.cpp b/src/rpc/client.cpp
+index 5d24176df8..c791043f2b 100644
+--- a/src/rpc/client.cpp
++++ b/src/rpc/client.cpp
+@@ -27,6 +27,8 @@ public:
+  * @note Parameter indexes start from 0.
+  */
+ static const CRPCConvertParam vRPCConvertParams[] = {
++    {"syncutxoshardswarm", 1, "peer_ids"},
++    {"syncutxoshardswarm", 2, "auto_peel"},
+     {"setmocktime", 0, "timestamp"},
+     {"mockscheduler", 0, "delta_time"},
+     {"utxoupdatepsbt", 1, "descriptors"},
+diff --git a/src/test/v2_protocol_handler_tests.cpp b/src/test/v2_protocol_handler_tests.cpp
+index bb87921985..40b8455e4d 100644
+--- a/src/test/v2_protocol_handler_tests.cpp
++++ b/src/test/v2_protocol_handler_tests.cpp
+@@ -1,14 +1,15 @@
+-#include <avalanche/processor.h>
+-#include <avalanche/stateanchor.h>
+-#include <lotus_v2/fast_sync.h>
+-#include <lotus_v2/legacy_coin.h>
+-#include <node/snapshot.h>
+ // Copyright (c) 2026 The Lotus developers
+ // Distributed under the MIT software license, see the accompanying
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
+ #include <net/v2_protocol_handler.h>
+ 
++#include <avalanche/processor.h>
++#include <avalanche/stateanchor.h>
++#include <lotus_v2/fast_sync.h>
++#include <lotus_v2/legacy_coin.h>
++#include <node/snapshot.h>
++
+ #include <blockencodings.h>
+ #include <chain.h>
+ #include <chainparams.h>
+@@ -1878,6 +1879,21 @@ BOOST_AUTO_TEST_CASE(tachyon_avalanche_snapsync_reverse_peel_and_opt_out) {
+         pivot_hash, {peer_bad.GetId(), peer_honest.GetId()},
+         /*auto_peel=*/false, swarm_err));
+ 
++    // A silent supplier must fail over through the normal SendMessages tick,
++    // even when no incoming message calls the swarm handler.
++    const auto timeout_start = GetTime<std::chrono::seconds>();
++    SetMockTime(timeout_start + 31s);
++    BOOST_CHECK(peerman->SendMessages(config, &peer_bad));
++    BOOST_CHECK_EQUAL(v2_handler->GetFastSyncSwarmStatus().banned_swarm_peers, 1U);
++    BOOST_CHECK_EQUAL(v2_handler->GetFastSyncSwarmStatus().active_peers, 1U);
++    BOOST_CHECK(peerman->SendMessages(config, &peer_honest));
++    BOOST_CHECK_EQUAL(v2_handler->GetFastSyncSwarmStatus().banned_swarm_peers, 1U);
++    SetMockTime(0s);
++    // Restart the session to retain the independent forged-root regression.
++    BOOST_REQUIRE(v2_handler->StartFastSyncSwarm(
++        pivot_hash, {peer_bad.GetId(), peer_honest.GetId()},
++        /*auto_peel=*/false, swarm_err));
++
+     // Deliver forged UTXOROOTS from peer_bad -> must disconnect peer_bad and
+     // fail over to peer_honest!
+     {
+@@ -2038,6 +2054,18 @@ BOOST_AUTO_TEST_CASE(tachyon_avalanche_snapsync_reverse_peel_and_opt_out) {
+             BOOST_CHECK(peer_bad2.fDisconnect);
+         }
+ 
++        // Exercise undo-before-body ordering once. Hide an already stored
++        // historical body (as after pruning), then deliver it through the real
++        // BLOCK message path. The undo must wait for ABC to accept the body.
++        const bool missing_body = (step == 1);
++        CBlock pending_body;
++        if (missing_body) {
++            LOCK(cs_main);
++            BOOST_REQUIRE(m_node.chainman->m_blockman.ReadBlock(pending_body, *cur_pindex));
++            m_node.chainman->m_blockman.m_have_pruned = true;
++            cur_pindex->nStatus = cur_pindex->nStatus.withData(false).withUndo(false);
++        }
++
+         // Now deliver the authentic BlockUndoMessage from peer_honest
+         {
+             std::vector<uint8_t> encoded_ok_undo;
+@@ -2049,6 +2077,25 @@ BOOST_AUTO_TEST_CASE(tachyon_avalanche_snapsync_reverse_peel_and_opt_out) {
+             peerman->ProcessMessage(config, peer_honest, NetMsgType::BLOCKUNDO,
+                                     ok_ss, cur_time, interrupt);
+         }
++        if (missing_body) {
++            BOOST_CHECK_EQUAL(v2_handler->GetFastSyncSwarmStatus().blocks_peeled, 1U);
++            BOOST_CHECK(v2_handler->IsFastSyncBlockRequested(cur_pindex->GetBlockHash()));
++            // Same header, invalid body: no storage and no reverse progress.
++            CBlock corrupt_body = pending_body;
++            corrupt_body.vtx.clear();
++            DataStream corrupt_stream{};
++            corrupt_stream << corrupt_body;
++            peerman->ProcessMessage(config, peer_honest, NetMsgType::BLOCK,
++                                    corrupt_stream, cur_time, interrupt);
++            BOOST_CHECK_EQUAL(v2_handler->GetFastSyncSwarmStatus().blocks_peeled, 1U);
++            { LOCK(cs_main); BOOST_CHECK(!cur_pindex->nStatus.hasData()); }
++            DataStream body_stream{};
++            body_stream << pending_body;
++            peerman->ProcessMessage(config, peer_honest, NetMsgType::BLOCK,
++                                    body_stream, cur_time, interrupt);
++            { LOCK(cs_main); BOOST_CHECK(cur_pindex->nStatus.hasData()); }
++            BOOST_CHECK_EQUAL(v2_handler->GetFastSyncSwarmStatus().blocks_peeled, 2U);
++        }
+     }
+ 
+     BOOST_CHECK(injected_forged_undo);

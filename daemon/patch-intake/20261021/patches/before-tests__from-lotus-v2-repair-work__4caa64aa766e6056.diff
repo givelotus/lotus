@@ -1,0 +1,158 @@
+diff --git a/src/test/policy_fee_tests.cpp b/src/test/policy_fee_tests.cpp
+index 08c82d3389..fb2e7f8660 100644
+--- a/src/test/policy_fee_tests.cpp
++++ b/src/test/policy_fee_tests.cpp
+@@ -3,6 +3,10 @@
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
+ #include <config.h>
++#include <core_io.h>
++#include <protocol.h>
++#include <streams.h>
++#include <script/standard.h>
+ #include <common/args.h>
+ #include <consensus/consensus.h>
+ #include <validation.h>
+@@ -213,6 +217,67 @@ BOOST_FIXTURE_TEST_CASE(UnifiedFeeEstimationRpcsUnderCongestion,
+ }
+ 
+ 
++BOOST_FIXTURE_TEST_CASE(single_rpc_admission_attempt_under_congestion, TestChain100Setup) {
++    auto &controller = lotus::v2::GetGlobalFeeHysteresisController();
++    const auto now = TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
++    controller.Reset(now);
++    controller.SetRpcAdmissionRatePerKCu(9000, now);
++    CMutableTransaction tx;
++    const COutPoint funding(TxId(uint256S("123456")), 0);
++    const CScript redeem = CScript() << OP_TRUE;
++    const CScript standard = GetScriptForDestination(ScriptHash(redeem));
++    tx.vin.emplace_back(funding, CScript() << std::vector<uint8_t>{OP_TRUE});
++    tx.vout.emplace_back(10 * COIN - 2000 * SATOSHI, standard);
++    tx.vout.emplace_back(Amount::zero(), CScript() << OP_RETURN << std::vector<uint8_t>(32));
++    {
++        LOCK(cs_main);
++        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
++            funding, Coin(CTxOut(10 * COIN, standard), 0, false), false);
++    }
++    JSONRPCRequest req;
++    req.context = &m_node;
++    req.strMethod = "sendrawtransaction";
++    req.params = UniValue(UniValue::VARR);
++    req.params.push_back(EncodeHexTx(CTransaction(tx)));
++    const auto before = GetMempoolAdmissionAttempts();
++    UniValue result;
++    try {
++        result = tableRPC.execute(m_node.chainman->GetConfig(), req);
++    } catch (const UniValue &error) {
++        controller.Reset(now);
++        BOOST_FAIL(error.write());
++    }
++    BOOST_CHECK_EQUAL(result.get_str(), tx.GetId().ToString());
++    BOOST_CHECK_EQUAL(GetMempoolAdmissionAttempts() - before, 1);
++    BOOST_CHECK(m_node.mempool->exists(tx.GetId()));
++    controller.Reset(now);
++}
++
++BOOST_AUTO_TEST_CASE(adaptive_ancestry_size_survives_pruned_index_roundtrip) {
++    LOCK(cs_main);
++    CBlockIndex index;
++    index.nHeight = 123;
++    index.nSize = 17'000'000;
++    index.nStatus = index.nStatus.withData(false);
++    CDiskBlockIndex stored(&index), loaded;
++    DataStream stream;
++    stream << stored;
++    stream >> loaded;
++    BOOST_CHECK_EQUAL(loaded.nSize, index.nSize);
++}
++
++BOOST_AUTO_TEST_CASE(adaptive_block_message_bound_tracks_current_capacity) {
++    GlobalConfig config;
++    auto &controller = lotus::v2::GetGlobalFeeHysteresisController();
++    controller.Reset(0);
++    const auto size = controller.GetAdaptiveMaxBlockSize() + 256 * 1024 + 1;
++    CMessageHeader header(config.GetChainParams().NetMagic(), NetMsgType::BLOCK, size);
++    BOOST_CHECK(header.IsOversized(config));
++    for (int i = 0; i < 32; ++i) controller.RecordConnectedBlock(64'000'000, i);
++    BOOST_CHECK(!header.IsOversized(config));
++    controller.Reset(0);
++}
++
+ BOOST_AUTO_TEST_CASE(adaptive_policy_preserves_ecash_block_validity_limit) {
+     GlobalConfig config;
+     auto &controller = lotus::v2::GetGlobalFeeHysteresisController();
+diff --git a/src/validation.cpp b/src/validation.cpp
+index 0a866bcac6..9dd7d96510 100644
+--- a/src/validation.cpp
++++ b/src/validation.cpp
+@@ -2015,12 +2015,20 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package &package,
+ }
+ } // namespace
+ 
++namespace {
++std::atomic<uint64_t> g_mempool_admission_attempts{0};
++}
++uint64_t GetMempoolAdmissionAttempts() noexcept {
++    return g_mempool_admission_attempts.load(std::memory_order_relaxed);
++}
++
+ MempoolAcceptResult AcceptToMemoryPool(Chainstate &active_chainstate,
+                                        const CTransactionRef &tx,
+                                        int64_t accept_time, bool bypass_limits,
+                                        bool test_accept,
+                                        unsigned int heightOverride) {
+     AssertLockHeld(::cs_main);
++    g_mempool_admission_attempts.fetch_add(1, std::memory_order_relaxed);
+     assert(active_chainstate.GetMempool() != nullptr);
+     CTxMemPool &pool{*active_chainstate.GetMempool()};
+ 
+diff --git a/src/validation.h b/src/validation.h
+index c837302e67..2df0ad3ce9 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -345,6 +345,9 @@ struct PackageMempoolAcceptResult {
+  * @returns a MempoolAcceptResult indicating whether the transaction was
+  *     accepted/rejected with reason.
+  */
++/** Diagnostic count of single-transaction admission attempts, including dry runs. */
++uint64_t GetMempoolAdmissionAttempts() noexcept;
++
+ MempoolAcceptResult
+ AcceptToMemoryPool(Chainstate &active_chainstate, const CTransactionRef &tx,
+                    int64_t accept_time, bool bypass_limits,
+diff --git a/src/wallet/test/wallet_tests.cpp b/src/wallet/test/wallet_tests.cpp
+index 9cb4f303bf..dc1d483bf7 100644
+--- a/src/wallet/test/wallet_tests.cpp
++++ b/src/wallet/test/wallet_tests.cpp
+@@ -6,6 +6,9 @@
+ #include <chainparams.h>
+ #include <config.h>
+ #include <interfaces/chain.h>
++#include <lotus_v2/fee_hysteresis.h>
++#include <wallet/fees.h>
++#include <util/time.h>
+ #include <node/blockstorage.h>
+ #include <node/context.h>
+ #include <policy/policy.h>
+@@ -38,6 +41,21 @@ using node::MAX_BLOCKFILE_SIZE;
+ 
+ BOOST_FIXTURE_TEST_SUITE(wallet_tests, WalletTestingSetup)
+ 
++BOOST_AUTO_TEST_CASE(adaptive_fees_via_chain_interface) {
++    auto &controller = lotus::v2::GetGlobalFeeHysteresisController();
++    const auto now = TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now());
++    controller.Reset(now);
++    controller.SetRpcAdmissionRatePerKCu(9000, now);
++    const auto info = controller.GetFeeRateInfo(now);
++    const CFeeRate admission(static_cast<int64_t>(info.rpc_admission_feerate_per_kcu) * SATOSHI);
++    const CFeeRate recommended(static_cast<int64_t>(info.recommended_sdk_feerate_per_kcu) * SATOSHI);
++    // The wallet's chain abstraction must publish congestion estimates itself.
++    BOOST_CHECK(m_wallet.chain().estimateFee() >= recommended);
++    BOOST_CHECK(GetRequiredFeeRate(m_wallet) >= admission);
++    BOOST_CHECK(GetMinimumFeeRate(m_wallet, CCoinControl{}) >= recommended);
++    controller.Reset(now);
++}
++
+ static std::shared_ptr<CWallet> TestLoadWallet(WalletContext &context) {
+     DatabaseOptions options;
+     DatabaseStatus status;

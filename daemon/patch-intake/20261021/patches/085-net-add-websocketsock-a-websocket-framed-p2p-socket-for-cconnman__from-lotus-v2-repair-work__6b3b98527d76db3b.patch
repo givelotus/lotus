@@ -1,0 +1,1318 @@
+From acf9f6212141d762b6d446b113361db7e571dc85 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 20:00:07 -0700
+Subject: [PATCH] net: add WebSocketSock, a WebSocket-framed P2P socket for
+ CConnman
+
+Groundwork for carrying /p2p/ws peers on the real TCP socket instead of
+the socketpair bridge (an extra thread hop per side and direction, about
+77 us per round trip on loopback). Not used yet.
+
+- WebSocketCodec: RFC 6455 framing without I/O. Each P2P chunk becomes one
+  binary message, zstd-compressed per the negotiated mode (p2p-zstd-v1,
+  p2p-zstd, none) using P2PZstdSession. Decoding handles fragmentation,
+  answers pings and closes, and rejects text frames, reserved bits and
+  opcodes, wrong masking for the role, fragmented or long control frames,
+  frames or messages over 64 MiB (checked from the header, before
+  buffering), corrupt zstd and decompression beyond the same limit.
+- WebSocketSock: a Sock CConnman polls directly. Send() frames and
+  compresses on the calling thread, coalescing MSG_MORE chunks into one
+  message, accepts what it is given unless more than 4 MiB is already
+  waiting (then EAGAIN), and leaves the unwritten tail to the Sock
+  PendingEvents()/FlushPending() hooks. Recv() deframes and decompresses;
+  decoded bytes not yet returned, EOF and errors are reported through
+  HasBufferedRecv(). The socket is made non-blocking (MSG_DONTWAIT may be
+  defined as 0) and SIGPIPE-safe. A pluggable byte layer (plain here)
+  lets TLS reuse the framing.
+
+Unit tests cover every frame-length class in all compression modes in
+both directions (incl. 3 MB payloads), MSG_MORE coalescing, buffered-data
+signalling, fragmented messages with an interleaved ping, close handling,
+each protocol violation, EOF mid-frame, corrupt zstd and back-pressure.
+A websocket_codec fuzz target checks arbitrary input and encode/decode
+round trips across arbitrary splits.
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 88eac6b020..5682c7fd9e 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -657,6 +657,8 @@ add_library(server
+ 	net.cpp
+ 	net_processing.cpp
+ 	net_websocket.cpp
++	net_websocket_codec.cpp
++	net_websocket_sock.cpp
+ 	node/abort.cpp
+ 	node/blockfitter.cpp
+ 	node/blockmanager_args.cpp
+diff --git a/src/net_websocket_codec.cpp b/src/net_websocket_codec.cpp
+new file mode 100644
+index 0000000000..b20a25a688
+--- /dev/null
++++ b/src/net_websocket_codec.cpp
+@@ -0,0 +1,274 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <net_websocket_codec.h>
++
++#include <tinyformat.h>
++
++#include <algorithm>
++#include <cstring>
++
++namespace {
++constexpr uint8_t OP_CONTINUATION = 0x0;
++constexpr uint8_t OP_TEXT = 0x1;
++constexpr uint8_t OP_BINARY = 0x2;
++constexpr uint8_t OP_CLOSE = 0x8;
++constexpr uint8_t OP_PING = 0x9;
++constexpr uint8_t OP_PONG = 0xA;
++
++/** Parsed frame header */
++struct FrameHeader {
++    bool fin;
++    uint8_t rsv;
++    uint8_t opcode;
++    bool masked;
++    uint64_t length;
++    uint8_t mask[4];
++    size_t header_size;
++};
++
++/**
++ * Parse a frame header at the start of `in`. Returns nullopt if more bytes
++ * are needed.
++ */
++std::optional<FrameHeader> ParseHeader(Span<const uint8_t> in) {
++    if (in.size() < 2) {
++        return std::nullopt;
++    }
++    FrameHeader h{};
++    h.fin = in[0] & 0x80;
++    h.rsv = in[0] & 0x70;
++    h.opcode = in[0] & 0x0F;
++    h.masked = in[1] & 0x80;
++    uint64_t len = in[1] & 0x7F;
++    size_t pos = 2;
++    if (len == 126) {
++        if (in.size() < pos + 2) {
++            return std::nullopt;
++        }
++        len = (uint64_t{in[2]} << 8) | in[3];
++        pos += 2;
++    } else if (len == 127) {
++        if (in.size() < pos + 8) {
++            return std::nullopt;
++        }
++        len = 0;
++        for (int i = 0; i < 8; ++i) {
++            len = (len << 8) | in[pos + i];
++        }
++        pos += 8;
++    }
++    if (h.masked) {
++        if (in.size() < pos + 4) {
++            return std::nullopt;
++        }
++        std::memcpy(h.mask, in.data() + pos, 4);
++        pos += 4;
++    }
++    h.length = len;
++    h.header_size = pos;
++    return h;
++}
++} // namespace
++
++WebSocketCodec::WebSocketCodec(Role role, P2PWebSocketCompression compression)
++    : m_role{role}, m_compression{compression} {
++    if (compression == P2PWebSocketCompression::ZSTD ||
++        compression == P2PWebSocketCompression::ZSTD_DICT) {
++        m_zstd = std::make_unique<P2PZstdSession>(
++            compression == P2PWebSocketCompression::ZSTD_DICT);
++    }
++}
++
++uint64_t WebSocketCodec::MaxWireMessageSize() const {
++    const uint64_t plain_limit{GetP2PWebSocketMessageSizeLimit()};
++    return m_zstd ? P2PZstdMaxWireSize(plain_limit) : plain_limit;
++}
++
++void WebSocketCodec::AppendFrame(uint8_t opcode, Span<const uint8_t> payload,
++                                 std::vector<uint8_t> &out) {
++    const size_t start{out.size()};
++    const bool mask{m_role == Role::CLIENT};
++    out.push_back(0x80 | opcode);
++    const uint8_t mask_bit = mask ? 0x80 : 0;
++    const uint64_t len{payload.size()};
++    if (len <= 125) {
++        out.push_back(mask_bit | uint8_t(len));
++    } else if (len <= 0xFFFF) {
++        out.push_back(mask_bit | 126);
++        out.push_back(len >> 8);
++        out.push_back(len & 0xFF);
++    } else {
++        out.push_back(mask_bit | 127);
++        for (int i = 7; i >= 0; --i) {
++            out.push_back((len >> (8 * i)) & 0xFF);
++        }
++    }
++    uint8_t key[4] = {0, 0, 0, 0};
++    if (mask) {
++        const uint32_t r{m_rng.rand32()};
++        std::memcpy(key, &r, 4);
++        out.insert(out.end(), key, key + 4);
++    }
++    const size_t body{out.size()};
++    out.insert(out.end(), payload.begin(), payload.end());
++    if (mask) {
++        for (size_t i = 0; i < payload.size(); ++i) {
++            out[body + i] ^= key[i & 3];
++        }
++    }
++    m_wire_sent += out.size() - start;
++}
++
++void WebSocketCodec::EncodeMessage(Span<const uint8_t> payload,
++                                   std::vector<uint8_t> &out) {
++    if (m_zstd) {
++        m_scratch.clear();
++        m_zstd->CompressFrame(payload, m_scratch);
++        AppendFrame(OP_BINARY, m_scratch, out);
++    } else {
++        AppendFrame(OP_BINARY, payload, out);
++    }
++}
++
++void WebSocketCodec::EncodeClose(uint16_t code, std::vector<uint8_t> &out) {
++    if (m_close_sent) {
++        return;
++    }
++    m_close_sent = true;
++    const uint8_t payload[2] = {uint8_t(code >> 8), uint8_t(code & 0xFF)};
++    AppendFrame(OP_CLOSE, payload, out);
++}
++
++bool WebSocketCodec::HasCompleteFrame(Span<const uint8_t> in) {
++    const auto h{ParseHeader(in)};
++    return h && in.size() - h->header_size >= h->length;
++}
++
++std::optional<std::string>
++WebSocketCodec::FinishMessage(std::vector<uint8_t> &plain) {
++    const uint64_t plain_limit{GetP2PWebSocketMessageSizeLimit()};
++    if (!m_zstd) {
++        if (m_message.size() > plain_limit) {
++            return std::string{"message too large"};
++        }
++        if (plain.empty()) {
++            plain.swap(m_message);
++        } else {
++            plain.insert(plain.end(), m_message.begin(), m_message.end());
++        }
++        return std::nullopt;
++    }
++    size_t produced{0};
++    try {
++        m_zstd->DecompressFrame(m_message, [&](Span<const uint8_t> chunk) {
++            if (chunk.size() > plain_limit - produced) {
++                throw std::runtime_error("decompressed message too large");
++            }
++            produced += chunk.size();
++            plain.insert(plain.end(), chunk.begin(), chunk.end());
++        });
++    } catch (const std::exception &e) {
++        return strprintf("zstd: %s", e.what());
++    }
++    return std::nullopt;
++}
++
++WebSocketCodec::DecodeResult
++WebSocketCodec::Decode(Span<const uint8_t> in, std::vector<uint8_t> &plain,
++                       std::vector<uint8_t> &reply) {
++    DecodeResult result;
++    while (!m_peer_closed) {
++        const Span<const uint8_t> rest{in.subspan(result.consumed)};
++        const auto h{ParseHeader(rest)};
++        if (!h) {
++            break;
++        }
++        // Validate as soon as the header is known, before buffering.
++        if (h->rsv != 0) {
++            result.error = "reserved bits set (extensions not supported)";
++            return result;
++        }
++        if (h->masked != (m_role == Role::SERVER)) {
++            result.error = m_role == Role::SERVER ? "unmasked client frame"
++                                                  : "masked server frame";
++            return result;
++        }
++        const bool control{(h->opcode & 0x8) != 0};
++        if (control && (!h->fin || h->length > 125)) {
++            result.error = "invalid control frame";
++            return result;
++        }
++        const uint64_t wire_limit{MaxWireMessageSize()};
++        if (h->length > wire_limit ||
++            (!control && (m_message.size() > wire_limit ||
++                          h->length > wire_limit - m_message.size()))) {
++            result.error = "message too large";
++            return result;
++        }
++        if (rest.size() - h->header_size < h->length) {
++            break;
++        }
++
++        const auto body{rest.subspan(h->header_size, h->length)};
++        result.consumed += h->header_size + h->length;
++        m_wire_recv += h->header_size + h->length;
++
++        // Unmask straight into its destination (no copy for data frames).
++        const auto unmask_into = [&](std::vector<uint8_t> &dst) {
++            const size_t start{dst.size()};
++            dst.insert(dst.end(), body.begin(), body.end());
++            if (h->masked) {
++                for (size_t i = 0; i < body.size(); ++i) {
++                    dst[start + i] ^= h->mask[i & 3];
++                }
++            }
++        };
++        std::vector<uint8_t> payload;
++        if (control) {
++            unmask_into(payload);
++        }
++
++        switch (h->opcode) {
++            case OP_BINARY:
++            case OP_CONTINUATION: {
++                if ((h->opcode == OP_BINARY) == m_in_message) {
++                    result.error = "unexpected continuation state";
++                    return result;
++                }
++                m_in_message = !h->fin;
++                unmask_into(m_message);
++                if (h->fin) {
++                    if (auto err{FinishMessage(plain)}) {
++                        result.error = err;
++                        return result;
++                    }
++                    m_message.clear();
++                }
++                break;
++            }
++            case OP_TEXT:
++                result.error = "text frames are not P2P data";
++                return result;
++            case OP_PING:
++                AppendFrame(OP_PONG, payload, reply);
++                break;
++            case OP_PONG:
++                break;
++            case OP_CLOSE: {
++                m_peer_closed = true;
++                uint16_t code{1000};
++                if (payload.size() >= 2) {
++                    code = (uint16_t{payload[0]} << 8) | payload[1];
++                }
++                EncodeClose(code, reply);
++                break;
++            }
++            default:
++                result.error = strprintf("unknown opcode %u", h->opcode);
++                return result;
++        }
++    }
++    return result;
++}
+diff --git a/src/net_websocket_codec.h b/src/net_websocket_codec.h
+new file mode 100644
+index 0000000000..a6086b3220
+--- /dev/null
++++ b/src/net_websocket_codec.h
+@@ -0,0 +1,87 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_NET_WEBSOCKET_CODEC_H
++#define BITCOIN_NET_WEBSOCKET_CODEC_H
++
++#include <net_websocket.h>
++#include <net_zstd_dict.h>
++#include <random.h>
++#include <span.h>
++
++#include <cstdint>
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++/**
++ * RFC 6455 framing for P2P over WebSocket, without any I/O.
++ *
++ * One P2P chunk handed to EncodeMessage() becomes one binary message (one
++ * frame), optionally zstd-compressed as negotiated (see P2PZstdSession).
++ * Decode() turns received wire bytes back into P2P bytes, answering pings
++ * and closes. Extensions (RSV bits, permessage-deflate) are not supported:
++ * connections that negotiated them use the HTTP server's bridge instead.
++ */
++class WebSocketCodec {
++public:
++    enum class Role { CLIENT, SERVER };
++
++    //! Bound wire bytes without reserving them; follows current P2P config.
++    uint64_t MaxWireMessageSize() const;
++
++    WebSocketCodec(Role role, P2PWebSocketCompression compression);
++
++    /** Append `payload` (P2P bytes) to `out` as one binary message */
++    void EncodeMessage(Span<const uint8_t> payload, std::vector<uint8_t> &out);
++
++    /** Append a Close frame (once) */
++    void EncodeClose(uint16_t code, std::vector<uint8_t> &out);
++
++    struct DecodeResult {
++        //! Wire bytes consumed from the input
++        size_t consumed{0};
++        //! Set if the stream is invalid; the connection must be dropped
++        std::optional<std::string> error;
++    };
++
++    /**
++     * Decode complete frames from `in`. P2P bytes are appended to `plain`,
++     * frames to send back (pong, close reply) to `reply`.
++     */
++    DecodeResult Decode(Span<const uint8_t> in, std::vector<uint8_t> &plain,
++                        std::vector<uint8_t> &reply);
++
++    /** Whether `in` starts with at least one complete frame */
++    static bool HasCompleteFrame(Span<const uint8_t> in);
++
++    bool PeerClosed() const { return m_peer_closed; }
++    bool CloseSent() const { return m_close_sent; }
++
++    //! Bytes of wire frames produced / consumed (headers included)
++    uint64_t WireBytesSent() const { return m_wire_sent; }
++    uint64_t WireBytesRecv() const { return m_wire_recv; }
++
++private:
++    void AppendFrame(uint8_t opcode, Span<const uint8_t> payload,
++                     std::vector<uint8_t> &out);
++    std::optional<std::string> FinishMessage(std::vector<uint8_t> &plain);
++
++    const Role m_role;
++    const P2PWebSocketCompression m_compression;
++    std::unique_ptr<P2PZstdSession> m_zstd;
++    FastRandomContext m_rng;
++
++    //! Fragments of the message being received
++    std::vector<uint8_t> m_message;
++    bool m_in_message{false};
++    bool m_peer_closed{false};
++    bool m_close_sent{false};
++    uint64_t m_wire_sent{0};
++    uint64_t m_wire_recv{0};
++    std::vector<uint8_t> m_scratch;
++};
++
++#endif // BITCOIN_NET_WEBSOCKET_CODEC_H
+diff --git a/src/net_websocket_sock.cpp b/src/net_websocket_sock.cpp
+new file mode 100644
+index 0000000000..44a107f0d1
+--- /dev/null
++++ b/src/net_websocket_sock.cpp
+@@ -0,0 +1,254 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <net_websocket_sock.h>
++
++#include <compat/compat.h>
++#include <logging.h>
++
++#include <algorithm>
++#include <cerrno>
++#include <cstring>
++
++#ifndef MSG_NOSIGNAL
++#define MSG_NOSIGNAL 0
++#endif
++
++ssize_t PlainByteLayer::Read(SOCKET fd, uint8_t *buf, size_t len) {
++    return ::recv(fd, reinterpret_cast<char *>(buf), len, MSG_DONTWAIT);
++}
++
++ssize_t PlainByteLayer::Write(SOCKET fd, const uint8_t *buf, size_t len) {
++    return ::send(fd, reinterpret_cast<const char *>(buf), len,
++                  MSG_NOSIGNAL | MSG_DONTWAIT);
++}
++
++namespace {
++bool WouldBlock(int err) {
++    return err == EAGAIN || err == EWOULDBLOCK || err == EINTR;
++}
++
++void AddCounters(WebSocketTransportInfo &info, uint64_t payload_sent,
++                 uint64_t payload_recv, uint64_t wire_sent,
++                 uint64_t wire_recv) {
++    auto &totals{GetWebSocketTransportTotals()};
++    info.payload_bytes_sent += payload_sent;
++    info.payload_bytes_recv += payload_recv;
++    info.wire_bytes_sent += wire_sent;
++    info.wire_bytes_recv += wire_recv;
++    totals.payload_bytes_sent += payload_sent;
++    totals.payload_bytes_recv += payload_recv;
++    totals.wire_bytes_sent += wire_sent;
++    totals.wire_bytes_recv += wire_recv;
++}
++} // namespace
++
++WebSocketSock::WebSocketSock(SOCKET fd, WebSocketCodec::Role role,
++                             std::shared_ptr<WebSocketTransportInfo> info,
++                             std::unique_ptr<WebSocketByteLayer> layer,
++                             std::vector<uint8_t> initial_wire_bytes)
++    : Sock{fd}, m_info{std::move(info)}, m_layer{std::move(layer)},
++      m_codec{role, m_info->compression},
++      m_rx_wire{std::move(initial_wire_bytes)} {
++    // Never block a CConnman thread: MSG_DONTWAIT may be unavailable (it is
++    // then defined as 0 by compat.h), so make the socket itself
++    // non-blocking. Likewise avoid SIGPIPE where MSG_NOSIGNAL is missing.
++    if (!SetNonBlocking()) {
++        LogPrintf("WebSocket: unable to make socket non-blocking\n");
++    }
++#ifdef SO_NOSIGPIPE
++    const int on{1};
++    (void)SetSockOpt(SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
++#endif
++    LOCK(m_mutex);
++    UpdateFlagsLocked();
++}
++
++WebSocketSock::~WebSocketSock() {
++    LOCK(m_mutex);
++    if (!m_failed && m_socket != INVALID_SOCKET) {
++        // Best effort: say goodbye without blocking.
++        m_codec.EncodeClose(1000, m_tx);
++        (void)FlushLocked();
++        m_layer->Shutdown(m_socket);
++    }
++}
++
++void WebSocketSock::UpdateFlagsLocked() const {
++    m_has_buffered = m_rx_offset < m_rx_plain.size() || m_layer->HasBuffered() ||
++                     WebSocketCodec::HasCompleteFrame(m_rx_wire) ||
++                     m_eof || m_failed;
++    const bool pending{!m_coalesce.empty() || m_tx_offset < m_tx.size()};
++    m_pending_events = pending ? m_layer->WriteWaitsFor() : Event{0};
++}
++
++bool WebSocketSock::FlushLocked() const {
++    if (!m_coalesce.empty()) {
++        m_codec.EncodeMessage(m_coalesce, m_tx);
++        AddCounters(*m_info, m_coalesce.size(), 0, 0, 0);
++        m_coalesce.clear();
++    }
++    while (m_tx_offset < m_tx.size()) {
++        const ssize_t n{m_layer->Write(m_socket, m_tx.data() + m_tx_offset,
++                                       m_tx.size() - m_tx_offset)};
++        if (n <= 0) {
++            if (n < 0 && WouldBlock(errno)) {
++                break;
++            }
++            // After the peer's Close, failing to deliver our reply (it may
++            // already have gone) still ends the connection in an orderly way.
++            if (!m_codec.PeerClosed()) {
++                m_failed = true;
++            }
++            m_tx.clear();
++            m_tx_offset = 0;
++            return false;
++        }
++        m_tx_offset += n;
++    }
++    if (m_tx_offset == m_tx.size()) {
++        m_tx.clear();
++        m_tx_offset = 0;
++    } else if (m_tx_offset > (1 << 20)) {
++        m_tx.erase(m_tx.begin(), m_tx.begin() + m_tx_offset);
++        m_tx_offset = 0;
++    }
++    const uint64_t wire{m_codec.WireBytesSent()};
++    AddCounters(*m_info, 0, 0, wire - m_wire_sent_reported, 0);
++    m_wire_sent_reported = wire;
++    return true;
++}
++
++ssize_t WebSocketSock::Send(const void *data, size_t len, int flags) const {
++    LOCK(m_mutex);
++    if (m_failed || m_codec.CloseSent()) {
++        errno = EPIPE;
++        return -1;
++    }
++    if (m_tx.size() - m_tx_offset + m_coalesce.size() > MAX_PENDING_SEND) {
++        // Back-pressure: try to drain first.
++        if (!FlushLocked()) {
++            errno = ECONNRESET;
++            UpdateFlagsLocked();
++            return -1;
++        }
++        if (m_tx.size() - m_tx_offset > MAX_PENDING_SEND) {
++            UpdateFlagsLocked();
++            errno = EAGAIN;
++            return -1;
++        }
++    }
++    const auto *bytes{static_cast<const uint8_t *>(data)};
++    m_coalesce.insert(m_coalesce.end(), bytes, bytes + len);
++    bool more{false};
++#ifdef MSG_MORE
++    more = flags & MSG_MORE;
++#endif
++    if (!more || m_coalesce.size() >= MAX_COALESCE) {
++        if (!FlushLocked()) {
++            errno = ECONNRESET;
++            UpdateFlagsLocked();
++            return -1;
++        }
++    }
++    UpdateFlagsLocked();
++    return len;
++}
++
++bool WebSocketSock::FillLocked() const {
++    // Read what the OS socket (or TLS layer) has, then decode.
++    uint8_t buf[64 * 1024];
++    while (!m_eof) {
++        const ssize_t n{m_layer->Read(m_socket, buf, sizeof(buf))};
++        if (n > 0) {
++            m_rx_wire.insert(m_rx_wire.end(), buf, buf + n);
++            if (m_rx_wire.size() > m_codec.MaxWireMessageSize() + 16) {
++                break; // Decode before reading more.
++            }
++            continue;
++        }
++        if (n == 0) {
++            m_eof = true;
++            break;
++        }
++        if (WouldBlock(errno)) {
++            break;
++        }
++        m_failed = true;
++        return false;
++    }
++
++    std::vector<uint8_t> reply;
++    const size_t plain_before{m_rx_plain.size()};
++    const auto result{m_codec.Decode(m_rx_wire, m_rx_plain, reply)};
++    m_rx_wire.erase(m_rx_wire.begin(), m_rx_wire.begin() + result.consumed);
++    AddCounters(*m_info, 0, m_rx_plain.size() - plain_before, 0,
++                m_codec.WireBytesRecv() - m_wire_recv_reported);
++    m_wire_recv_reported = m_codec.WireBytesRecv();
++    if (result.error) {
++        LogDebug(BCLog::NET, "WebSocket peer error: %s\n", *result.error);
++        m_failed = true;
++        return false;
++    }
++    if (m_codec.PeerClosed()) {
++        m_eof = true;
++    }
++    if (!reply.empty()) {
++        m_tx.insert(m_tx.end(), reply.begin(), reply.end());
++        if (!FlushLocked() && !m_codec.PeerClosed()) {
++            return false;
++        }
++    }
++    return true;
++}
++
++ssize_t WebSocketSock::Recv(void *buf, size_t len, int flags) const {
++    LOCK(m_mutex);
++    if (m_rx_offset == m_rx_plain.size()) {
++        m_rx_plain.clear();
++        m_rx_offset = 0;
++        if (!m_failed && !FillLocked()) {
++            UpdateFlagsLocked();
++            errno = ECONNRESET;
++            return -1;
++        }
++    }
++    if (m_rx_offset < m_rx_plain.size()) {
++        const size_t n{std::min(len, m_rx_plain.size() - m_rx_offset)};
++        std::memcpy(buf, m_rx_plain.data() + m_rx_offset, n);
++        m_rx_offset += n;
++        UpdateFlagsLocked();
++        return n;
++    }
++    UpdateFlagsLocked();
++    if (m_failed) {
++        errno = ECONNRESET;
++        return -1;
++    }
++    if (m_eof) {
++        // An EOF in the middle of a frame is not an orderly close.
++        if (!m_rx_wire.empty() && !m_codec.PeerClosed()) {
++            errno = ECONNRESET;
++            return -1;
++        }
++        return 0;
++    }
++    errno = EAGAIN;
++    return -1;
++}
++
++bool WebSocketSock::HasBufferedRecv() const {
++    return m_has_buffered.load();
++}
++
++Sock::Event WebSocketSock::PendingEvents() const {
++    return m_pending_events.load();
++}
++
++bool WebSocketSock::FlushPending() const {
++    LOCK(m_mutex);
++    const bool ok{!m_failed && FlushLocked()};
++    UpdateFlagsLocked();
++    return ok;
++}
+diff --git a/src/net_websocket_sock.h b/src/net_websocket_sock.h
+new file mode 100644
+index 0000000000..6dcb2cea5f
+--- /dev/null
++++ b/src/net_websocket_sock.h
+@@ -0,0 +1,114 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef BITCOIN_NET_WEBSOCKET_SOCK_H
++#define BITCOIN_NET_WEBSOCKET_SOCK_H
++
++#include <net_websocket.h>
++#include <net_websocket_codec.h>
++#include <sync.h>
++#include <util/sock.h>
++
++#include <atomic>
++#include <memory>
++#include <vector>
++
++/**
++ * Raw byte I/O beneath WebSocket framing: the plain socket, or TLS (see
++ * net_websocket_tls.h). Called with WebSocketSock's lock held.
++ * Read/Write follow recv(2)/send(2) on a non-blocking socket: >0 bytes, 0 on
++ * orderly EOF (Read only), -1 with errno set (EAGAIN when it would block).
++ */
++class WebSocketByteLayer {
++public:
++    virtual ~WebSocketByteLayer() = default;
++    virtual ssize_t Read(SOCKET fd, uint8_t *buf, size_t len) = 0;
++    virtual ssize_t Write(SOCKET fd, const uint8_t *buf, size_t len) = 0;
++    //! Bytes already read from the OS socket but not yet returned
++    virtual bool HasBuffered() const { return false; }
++    //! OS socket events a blocked Write() is waiting for
++    virtual Sock::Event WriteWaitsFor() const { return Sock::SEND; }
++    //! Best-effort non-blocking shutdown before the socket is closed
++    virtual void Shutdown(SOCKET fd) {}
++    //! Whether the layer is TLS
++    virtual bool IsTLS() const { return false; }
++};
++
++class PlainByteLayer final : public WebSocketByteLayer {
++public:
++    ssize_t Read(SOCKET fd, uint8_t *buf, size_t len) override;
++    ssize_t Write(SOCKET fd, const uint8_t *buf, size_t len) override;
++};
++
++/**
++ * A P2P socket carrying the P2P byte stream in WebSocket messages, used by
++ * CConnman like any other Sock (polled on the real TCP socket). Send()
++ * frames and (if negotiated) compresses on the calling thread; Recv()
++ * deframes and decompresses. No extra thread or socketpair is involved.
++ *
++ * Send() coalesces chunks passed with MSG_MORE into one message. It accepts
++ * everything it is given (returning `len`) unless more than
++ * MAX_PENDING_SEND bytes are already waiting to be written, in which case
++ * it fails with EAGAIN; the unwritten tail is flushed via the Sock
++ * PendingEvents()/FlushPending() hooks.
++ */
++class WebSocketSock final : public Sock {
++public:
++    //! Back-pressure threshold for data accepted but not yet written
++    static constexpr size_t MAX_PENDING_SEND = 4 * 1024 * 1024;
++    //! Coalesced chunks are framed once they reach this size
++    static constexpr size_t MAX_COALESCE = 1024 * 1024;
++
++    WebSocketSock(SOCKET fd, WebSocketCodec::Role role,
++                  std::shared_ptr<WebSocketTransportInfo> info,
++                  std::unique_ptr<WebSocketByteLayer> layer,
++                  std::vector<uint8_t> initial_wire_bytes = {});
++    ~WebSocketSock() override;
++
++    ssize_t Send(const void *data, size_t len, int flags) const override;
++    ssize_t Recv(void *buf, size_t len, int flags) const override;
++    bool HasBufferedRecv() const override;
++    Event PendingEvents() const override;
++    bool FlushPending() const override;
++
++    const std::shared_ptr<WebSocketTransportInfo> &Info() const {
++        return m_info;
++    }
++
++private:
++    //! Frame coalesced data; write as much as possible. False on error.
++    bool FlushLocked() const EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
++    //! Read and decode what is available. False on fatal error.
++    bool FillLocked() const EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
++    void UpdateFlagsLocked() const EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
++
++    const std::shared_ptr<WebSocketTransportInfo> m_info;
++
++    mutable Mutex m_mutex;
++    const std::unique_ptr<WebSocketByteLayer> m_layer GUARDED_BY(m_mutex);
++    mutable WebSocketCodec m_codec GUARDED_BY(m_mutex);
++    //! P2P bytes passed with MSG_MORE, not yet framed
++    mutable std::vector<uint8_t> m_coalesce GUARDED_BY(m_mutex);
++    //! Encoded frames not yet written
++    mutable std::vector<uint8_t> m_tx GUARDED_BY(m_mutex);
++    mutable size_t m_tx_offset GUARDED_BY(m_mutex){0};
++    //! Wire bytes not yet decoded
++    mutable std::vector<uint8_t> m_rx_wire GUARDED_BY(m_mutex);
++    //! Decoded P2P bytes not yet returned by Recv()
++    mutable std::vector<uint8_t> m_rx_plain GUARDED_BY(m_mutex);
++    mutable size_t m_rx_offset GUARDED_BY(m_mutex){0};
++    mutable bool m_eof GUARDED_BY(m_mutex){false};
++    mutable bool m_failed GUARDED_BY(m_mutex){false};
++    mutable uint64_t m_payload_recv_reported GUARDED_BY(m_mutex){0};
++    mutable uint64_t m_wire_recv_reported GUARDED_BY(m_mutex){0};
++    mutable uint64_t m_wire_sent_reported GUARDED_BY(m_mutex){0};
++
++    //! Lock-free views for the Sock hooks (see util/sock.h). A failed or
++    //! closed socket reports buffered data so CConnman calls Recv() and
++    //! sees the error/EOF without waiting for the OS socket.
++    mutable std::atomic<bool> m_has_buffered{false};
++    mutable std::atomic<Event> m_pending_events{0};
++};
++
++#endif // BITCOIN_NET_WEBSOCKET_SOCK_H
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index e4ca5b5410..ad8e564454 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -205,6 +205,7 @@ add_boost_unit_tests_to_suite(bitcoin test_bitcoin
+ 		multisig_tests.cpp
+ 		net_peer_eviction_tests.cpp
+ 		net_tests.cpp
++		net_websocket_tests.cpp
+ 		netbase_tests.cpp
+ 		op_reversebytes_tests.cpp
+ 		orphanage_tests.cpp
+diff --git a/src/test/fuzz/CMakeLists.txt b/src/test/fuzz/CMakeLists.txt
+index dcb7c53436..e4d952ede7 100644
+--- a/src/test/fuzz/CMakeLists.txt
++++ b/src/test/fuzz/CMakeLists.txt
+@@ -103,6 +103,7 @@ add_executable(fuzz EXCLUDE_FROM_ALL
+ 	txrequest.cpp
+ 	util.cpp
+ 	validation_load_mempool.cpp
++	websocket_codec.cpp
+ )
+ 
+ # Get the link options for this target and reuse them for checking if a
+diff --git a/src/test/fuzz/websocket_codec.cpp b/src/test/fuzz/websocket_codec.cpp
+new file mode 100644
+index 0000000000..893bed87b1
+--- /dev/null
++++ b/src/test/fuzz/websocket_codec.cpp
+@@ -0,0 +1,73 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <net_websocket_codec.h>
++
++#include <test/fuzz/FuzzedDataProvider.h>
++#include <test/fuzz/fuzz.h>
++#include <test/fuzz/util.h>
++
++#include <cassert>
++#include <vector>
++
++FUZZ_TARGET(websocket_codec) {
++    FuzzedDataProvider provider{buffer.data(), buffer.size()};
++    const auto role{provider.ConsumeBool() ? WebSocketCodec::Role::CLIENT
++                                           : WebSocketCodec::Role::SERVER};
++    const auto compression{provider.PickValueInArray(
++        {P2PWebSocketCompression::NONE, P2PWebSocketCompression::ZSTD,
++         P2PWebSocketCompression::ZSTD_DICT})};
++
++    // Arbitrary wire input must never crash, and must be consumed in
++    // order without exceeding the input.
++    {
++        WebSocketCodec codec{role, compression};
++        std::vector<uint8_t> wire;
++        std::vector<uint8_t> plain, reply;
++        while (provider.remaining_bytes() > 0 && !codec.PeerClosed()) {
++            const auto chunk{ConsumeRandomLengthByteVector(provider, 4096)};
++            wire.insert(wire.end(), chunk.begin(), chunk.end());
++            const auto result{codec.Decode(wire, plain, reply)};
++            assert(result.consumed <= wire.size());
++            if (result.error) {
++                break;
++            }
++            wire.erase(wire.begin(), wire.begin() + result.consumed);
++            if (plain.size() > (1 << 20)) {
++                plain.clear();
++            }
++        }
++    }
++
++    // Round trip: what one side encodes, the other side decodes exactly,
++    // however the wire bytes are split.
++    {
++        FuzzedDataProvider rt{buffer.data(), buffer.size()};
++        const auto peer_role{role == WebSocketCodec::Role::CLIENT
++                                 ? WebSocketCodec::Role::SERVER
++                                 : WebSocketCodec::Role::CLIENT};
++        WebSocketCodec sender{role, compression}, receiver{peer_role,
++                                                           compression};
++        std::vector<uint8_t> sent, wire, plain, reply;
++        for (int i = 0; i < 8 && rt.remaining_bytes() > 0; ++i) {
++            const auto msg{ConsumeRandomLengthByteVector(rt, 2048)};
++            sent.insert(sent.end(), msg.begin(), msg.end());
++            sender.EncodeMessage(msg, wire);
++        }
++        size_t fed{0};
++        std::vector<uint8_t> pending;
++        while (fed < wire.size()) {
++            const size_t n{std::min<size_t>(
++                wire.size() - fed, 1 + rt.ConsumeIntegralInRange<size_t>(0, 64))};
++            pending.insert(pending.end(), wire.begin() + fed,
++                           wire.begin() + fed + n);
++            fed += n;
++            const auto result{receiver.Decode(pending, plain, reply)};
++            assert(!result.error);
++            pending.erase(pending.begin(), pending.begin() + result.consumed);
++        }
++        assert(pending.empty());
++        assert(plain == sent);
++    }
++}
+diff --git a/src/test/net_websocket_tests.cpp b/src/test/net_websocket_tests.cpp
+new file mode 100644
+index 0000000000..9d00f8c0b0
+--- /dev/null
++++ b/src/test/net_websocket_tests.cpp
+@@ -0,0 +1,409 @@
++// Copyright (c) 2026 The Bitcoin developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <config.h>
++#include <protocol.h>
++#include <net_websocket_codec.h>
++#include <net_websocket_sock.h>
++
++#include <random.h>
++#include <util/sock.h>
++
++#include <test/util/setup_common.h>
++
++#include <boost/test/unit_test.hpp>
++
++#include <cerrno>
++#include <chrono>
++#include <cstring>
++#include <memory>
++#include <vector>
++
++#include <poll.h>
++#include <sys/socket.h>
++
++namespace {
++using Role = WebSocketCodec::Role;
++using C = P2PWebSocketCompression;
++
++std::shared_ptr<WebSocketTransportInfo> Info(C compression) {
++    auto info{std::make_shared<WebSocketTransportInfo>()};
++    info->compression = compression;
++    return info;
++}
++
++/** Larger socket buffers than macOS's 8 KiB socketpair default */
++void BigBuffers(const int (&sv)[2]) {
++    const int size{1 << 20};
++    for (int fd : sv) {
++        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
++        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
++    }
++}
++
++/** A connected client/server WebSocketSock pair over a socketpair */
++struct Pair {
++    std::unique_ptr<WebSocketSock> client, server;
++    explicit Pair(C compression) {
++        int sv[2];
++        BOOST_REQUIRE_EQUAL(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
++        BigBuffers(sv);
++        client = std::make_unique<WebSocketSock>(
++            SOCKET(sv[0]), Role::CLIENT, Info(compression),
++            std::make_unique<PlainByteLayer>());
++        server = std::make_unique<WebSocketSock>(
++            SOCKET(sv[1]), Role::SERVER, Info(compression),
++            std::make_unique<PlainByteLayer>());
++    }
++};
++
++/** Receive exactly `want` bytes, pumping the sender's pending writes */
++std::vector<uint8_t> ReceiveAll(const Sock &from, const Sock &to,
++                                size_t want) {
++    std::vector<uint8_t> got;
++    uint8_t buf[0x10000];
++    const auto deadline{std::chrono::steady_clock::now() +
++                        std::chrono::seconds{20}};
++    while (got.size() < want) {
++        BOOST_REQUIRE(std::chrono::steady_clock::now() < deadline);
++        if (from.PendingEvents()) {
++            BOOST_REQUIRE(from.FlushPending());
++        }
++        const ssize_t n{to.Recv(buf, sizeof(buf), 0)};
++        if (n > 0) {
++            got.insert(got.end(), buf, buf + n);
++        } else {
++            BOOST_REQUIRE(n < 0 && errno == EAGAIN);
++            Sock::Event occurred;
++            (void)to.Wait(std::chrono::milliseconds{5}, Sock::RECV, &occurred);
++        }
++    }
++    return got;
++}
++
++/** Write raw bytes to an fd (blocking) */
++void WriteRaw(int fd, const std::vector<uint8_t> &data) {
++    size_t off{0};
++    while (off < data.size()) {
++        const ssize_t n{::send(fd, data.data() + off, data.size() - off, 0)};
++        BOOST_REQUIRE(n > 0);
++        off += n;
++    }
++}
++
++/** Unmasked (server-to-client style) or masked frame, built by hand */
++std::vector<uint8_t> Frame(uint8_t first_byte, const std::vector<uint8_t> &payload,
++                           bool masked) {
++    std::vector<uint8_t> f{first_byte};
++    const uint8_t m = masked ? 0x80 : 0;
++    if (payload.size() <= 125) {
++        f.push_back(m | uint8_t(payload.size()));
++    } else {
++        f.push_back(m | 126);
++        f.push_back(payload.size() >> 8);
++        f.push_back(payload.size() & 0xFF);
++    }
++    const uint8_t key[4] = {0x11, 0x22, 0x33, 0x44};
++    if (masked) {
++        f.insert(f.end(), key, key + 4);
++    }
++    for (size_t i = 0; i < payload.size(); ++i) {
++        f.push_back(masked ? payload[i] ^ key[i & 3] : payload[i]);
++    }
++    return f;
++}
++
++/** A server WebSocketSock on sv[0]; the test speaks raw frames on sv[1] */
++struct RawPeer {
++    int raw;
++    std::unique_ptr<WebSocketSock> server;
++    explicit RawPeer(C compression = C::NONE) {
++        int sv[2];
++        BOOST_REQUIRE_EQUAL(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
++        raw = sv[1];
++        server = std::make_unique<WebSocketSock>(
++            SOCKET(sv[0]), Role::SERVER, Info(compression),
++            std::make_unique<PlainByteLayer>());
++    }
++    ~RawPeer() { close(raw); }
++    /** Recv() until data, EOF or error; returns the result of the last call */
++    ssize_t RecvUntilResult(std::vector<uint8_t> &out) {
++        uint8_t buf[4096];
++        for (int i = 0; i < 400; ++i) {
++            const ssize_t n{server->Recv(buf, sizeof(buf), 0)};
++            if (n > 0) {
++                out.insert(out.end(), buf, buf + n);
++                return n;
++            }
++            if (n == 0 || errno != EAGAIN) {
++                return n;
++            }
++            Sock::Event occurred;
++            (void)server->Wait(std::chrono::milliseconds{5}, Sock::RECV,
++                               &occurred);
++        }
++        return -1;
++    }
++    std::vector<uint8_t> ReadRaw(size_t n) {
++        std::vector<uint8_t> got(n);
++        size_t off{0};
++        while (off < n) {
++            const ssize_t r{::recv(raw, got.data() + off, n - off, 0)};
++            BOOST_REQUIRE(r > 0);
++            off += r;
++        }
++        return got;
++    }
++};
++} // namespace
++
++BOOST_FIXTURE_TEST_SUITE(net_websocket_tests, BasicTestingSetup)
++
++BOOST_AUTO_TEST_CASE(roundtrip_all_modes_and_sizes) {
++    FastRandomContext rng{/*fDeterministic=*/true};
++    for (const C mode : {C::NONE, C::ZSTD, C::ZSTD_DICT}) {
++        Pair p{mode};
++        // Every frame length encoding, both directions, plus a payload far
++        // larger than the socket buffer (exercises pending writes).
++        for (const size_t size : {1, 125, 126, 65535, 65536, 3000000}) {
++            std::vector<uint8_t> payload{rng.randbytes<uint8_t>(size)};
++            std::fill(payload.begin(), payload.begin() + size / 2, 7);
++            BOOST_CHECK_EQUAL(p.client->Send(payload.data(), size, 0),
++                              ssize_t(size));
++            BOOST_CHECK(ReceiveAll(*p.client, *p.server, size) == payload);
++            BOOST_CHECK_EQUAL(p.server->Send(payload.data(), size, 0),
++                              ssize_t(size));
++            BOOST_CHECK(ReceiveAll(*p.server, *p.client, size) == payload);
++        }
++        const auto &ci{*p.client->Info()};
++        BOOST_CHECK_EQUAL(ci.payload_bytes_sent.load(),
++                          p.server->Info()->payload_bytes_recv.load());
++        if (mode != C::NONE) {
++            // Half of each payload is compressible.
++            BOOST_CHECK_LT(ci.wire_bytes_sent.load(),
++                           ci.payload_bytes_sent.load());
++        }
++    }
++}
++
++#ifdef MSG_MORE
++BOOST_AUTO_TEST_CASE(msg_more_coalesces_into_one_frame) {
++    Pair p{C::NONE};
++    const std::vector<uint8_t> a(100, 1), b(200, 2);
++    BOOST_CHECK_EQUAL(p.client->Send(a.data(), a.size(), MSG_MORE), 100);
++    BOOST_CHECK(p.client->PendingEvents() & Sock::SEND);
++    BOOST_CHECK_EQUAL(p.client->Send(b.data(), b.size(), 0), 200);
++    ReceiveAll(*p.client, *p.server, 300);
++    // One masked frame with a 16-bit length: 2 + 2 + 4 header bytes.
++    BOOST_CHECK_EQUAL(p.client->Info()->wire_bytes_sent.load(), 300U + 8);
++}
++#endif
++
++BOOST_AUTO_TEST_CASE(buffered_data_is_signalled) {
++    Pair p{C::NONE};
++    const std::vector<uint8_t> data(1000, 9);
++    BOOST_CHECK_EQUAL(p.client->Send(data.data(), data.size(), 0), 1000);
++    uint8_t buf[10];
++    ssize_t n;
++    while ((n = p.server->Recv(buf, sizeof(buf), 0)) < 0) {
++        Sock::Event occurred;
++        (void)p.server->Wait(std::chrono::milliseconds{5}, Sock::RECV,
++                             &occurred);
++    }
++    BOOST_CHECK_EQUAL(n, 10);
++    // The rest was decoded already: readable without the OS socket.
++    BOOST_CHECK(p.server->HasBufferedRecv());
++    std::vector<uint8_t> rest{ReceiveAll(*p.client, *p.server, 990)};
++    BOOST_CHECK_EQUAL(rest.size(), 990U);
++    BOOST_CHECK(!p.server->HasBufferedRecv());
++}
++
++BOOST_AUTO_TEST_CASE(fragments_ping_and_close_from_raw_peer) {
++    RawPeer peer;
++    const std::vector<uint8_t> part1{'a', 'b'}, part2{'c'}, ping{'p', 'i'};
++    // Binary (no FIN), ping in between, continuation with FIN.
++    WriteRaw(peer.raw, Frame(0x02, part1, true));
++    WriteRaw(peer.raw, Frame(0x89, ping, true));
++    WriteRaw(peer.raw, Frame(0x80, part2, true));
++    std::vector<uint8_t> got;
++    BOOST_CHECK_EQUAL(peer.RecvUntilResult(got), 3);
++    BOOST_CHECK(got == std::vector<uint8_t>({'a', 'b', 'c'}));
++    // The server answered the ping with an unmasked pong.
++    BOOST_CHECK(peer.ReadRaw(4) == Frame(0x8A, ping, false));
++
++    // Close: the server replies with Close and reports EOF.
++    WriteRaw(peer.raw, Frame(0x88, {0x03, 0xE8}, true));
++    got.clear();
++    BOOST_CHECK_EQUAL(peer.RecvUntilResult(got), 0);
++    BOOST_CHECK(peer.ReadRaw(4) == Frame(0x88, {0x03, 0xE8}, false));
++    // Nothing more may be sent after Close.
++    const uint8_t x{0};
++    BOOST_CHECK_EQUAL(peer.server->Send(&x, 1, 0), -1);
++}
++
++BOOST_AUTO_TEST_CASE(close_from_departed_peer_is_orderly) {
++    // The peer sends Close and disappears: our Close reply cannot be
++    // delivered, which must still read as an orderly EOF.
++    RawPeer peer;
++    WriteRaw(peer.raw, Frame(0x88, {0x03, 0xE8}, true));
++    close(peer.raw);
++    peer.raw = -1;
++    std::vector<uint8_t> got;
++    BOOST_CHECK_EQUAL(peer.RecvUntilResult(got), 0);
++}
++
++BOOST_AUTO_TEST_CASE(protocol_violations_drop_the_connection) {
++    const std::vector<std::vector<uint8_t>> bad{
++        Frame(0x81, {'t'}, true),          // text frame
++        Frame(0x82, {'x'}, false),         // unmasked client frame
++        Frame(0xC2, {'x'}, true),          // RSV1 (extension) set
++        Frame(0x80, {'x'}, true),          // continuation without start
++        Frame(0x09, {'x'}, true),          // fragmented control frame
++        Frame(0x83, {'x'}, true),          // reserved opcode
++        // 64-bit length beyond the limit, rejected before buffering
++        {0x82, 0xFF, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
++         0x11, 0x22, 0x33, 0x44},
++    };
++    for (const auto &frame : bad) {
++        RawPeer peer;
++        WriteRaw(peer.raw, frame);
++        std::vector<uint8_t> got;
++        BOOST_CHECK_EQUAL(peer.RecvUntilResult(got), -1);
++        BOOST_CHECK_EQUAL(errno, ECONNRESET);
++        BOOST_CHECK(peer.server->HasBufferedRecv());
++    }
++}
++
++BOOST_AUTO_TEST_CASE(eof_mid_frame_is_an_error) {
++    RawPeer peer;
++    auto frame{Frame(0x82, std::vector<uint8_t>(50, 1), true)};
++    frame.resize(20);
++    WriteRaw(peer.raw, frame);
++    shutdown(peer.raw, SHUT_WR);
++    std::vector<uint8_t> got;
++    BOOST_CHECK_EQUAL(peer.RecvUntilResult(got), -1);
++}
++
++BOOST_AUTO_TEST_CASE(corrupt_zstd_is_an_error) {
++    RawPeer peer{C::ZSTD_DICT};
++    WriteRaw(peer.raw, Frame(0x82, {0xde, 0xad, 0xbe, 0xef, 0x00}, true));
++    std::vector<uint8_t> got;
++    BOOST_CHECK_EQUAL(peer.RecvUntilResult(got), -1);
++}
++
++BOOST_AUTO_TEST_CASE(back_pressure) {
++    Pair p{C::NONE};
++    // Nobody reads: the socketpair buffer fills, data stays pending, and
++    // Send() eventually refuses more with EAGAIN.
++    const std::vector<uint8_t> chunk(256 * 1024, 5);
++    size_t accepted{0};
++    ssize_t n;
++    while ((n = p.client->Send(chunk.data(), chunk.size(), 0)) > 0) {
++        accepted += n;
++        BOOST_REQUIRE(accepted < 64 * 1024 * 1024);
++    }
++    BOOST_CHECK_EQUAL(errno, EAGAIN);
++    BOOST_CHECK(p.client->PendingEvents() & Sock::SEND);
++    BOOST_CHECK_GT(accepted, WebSocketSock::MAX_PENDING_SEND);
++    // Draining delivers everything that was accepted.
++    BOOST_CHECK_EQUAL(ReceiveAll(*p.client, *p.server, accepted).size(),
++                      accepted);
++    BOOST_CHECK_EQUAL(p.client->PendingEvents(), 0);
++}
++
++BOOST_AUTO_TEST_CASE(codec_complete_frame_detection) {
++    WebSocketCodec client{Role::CLIENT, C::NONE};
++    std::vector<uint8_t> wire;
++    const std::vector<uint8_t> payload(300, 1);
++    client.EncodeMessage(payload, wire);
++    BOOST_CHECK(WebSocketCodec::HasCompleteFrame(wire));
++    for (size_t len : {size_t{0}, size_t{1}, size_t{3}, wire.size() - 1}) {
++        BOOST_CHECK(!WebSocketCodec::HasCompleteFrame(
++            Span<const uint8_t>{wire.data(), len}));
++    }
++}
++
++namespace {
++struct RestoreBlockLimit {
++    Config &config{const_cast<Config &>(GetConfig())};
++    const uint64_t original{config.GetMaxBlockSize()};
++    ~RestoreBlockLimit() { config.SetMaxBlockSize(original); }
++};
++
++std::vector<uint8_t> ClientFrameHeader(uint64_t bytes) {
++    std::vector<uint8_t> wire{0x82, 0xff};
++    for (int i = 7; i >= 0; --i) wire.push_back(uint8_t(bytes >> (8 * i)));
++    wire.resize(14); // Masking key; no body is needed to reject the length.
++    return wire;
++}
++} // namespace
++
++BOOST_AUTO_TEST_CASE(configured_large_message_roundtrip) {
++    RestoreBlockLimit restore;
++    BOOST_REQUIRE(restore.config.SetMaxBlockSize(100000000));
++    // Exceeds the old64MiB cap without approaching the configured cap.
++    const std::vector<uint8_t> payload(65 * 1024 * 1024, 0x5a);
++    for (C compression : {C::NONE, C::ZSTD, C::ZSTD_DICT}) {
++        WebSocketCodec client{Role::CLIENT, compression};
++        WebSocketCodec server{Role::SERVER, compression};
++        std::vector<uint8_t> wire, plain, reply;
++        client.EncodeMessage(payload, wire);
++        BOOST_REQUIRE(!server.Decode(wire, plain, reply).error);
++        BOOST_CHECK(plain == payload);
++    }
++}
++
++BOOST_AUTO_TEST_CASE(message_limit_tracks_configuration_without_body_allocation) {
++    RestoreBlockLimit restore;
++    BOOST_REQUIRE(restore.config.SetMaxBlockSize(100000000));
++    WebSocketCodec server{Role::SERVER, C::NONE};
++    const uint64_t large{GetP2PWebSocketMessageSizeLimit()};
++    BOOST_REQUIRE(restore.config.SetMaxBlockSize(32 * 1000000));
++    const uint64_t small{GetP2PWebSocketMessageSizeLimit()};
++    BOOST_CHECK_LT(small, large);
++    std::vector<uint8_t> plain, reply;
++    auto result{server.Decode(ClientFrameHeader(small + 1), plain, reply)};
++    BOOST_REQUIRE(result.error);
++    BOOST_CHECK_EQUAL(*result.error, "message too large");
++    BOOST_CHECK(plain.empty());
++    // Restore a larger configured cap on the same already-established codec.
++    BOOST_REQUIRE(restore.config.SetMaxBlockSize(100000000));
++    result = server.Decode(ClientFrameHeader(small + 1), plain, reply);
++    BOOST_CHECK(!result.error);
++    BOOST_CHECK_EQUAL(result.consumed, 0U); // Header accepted; no body supplied.
++    BOOST_CHECK(plain.empty());
++}
++
++BOOST_AUTO_TEST_CASE(compressed_output_is_bounded_by_plain_limit) {
++    RestoreBlockLimit restore;
++    BOOST_REQUIRE(restore.config.SetMaxBlockSize(32 * 1000000));
++    const uint64_t limit{GetP2PWebSocketMessageSizeLimit()};
++    WebSocketCodec client{Role::CLIENT, C::ZSTD_DICT};
++    WebSocketCodec server{Role::SERVER, C::ZSTD_DICT};
++    std::vector<uint8_t> wire, plain, reply;
++    client.EncodeMessage(std::vector<uint8_t>(limit + 1, 0x00), wire);
++    BOOST_CHECK_LT(wire.size(), 100000U);
++    const auto result{server.Decode(wire, plain, reply)};
++    BOOST_REQUIRE(result.error);
++    BOOST_CHECK(result.error->find("decompressed message too large") != std::string::npos);
++    BOOST_CHECK_LE(plain.size(), limit);
++}
++
++BOOST_AUTO_TEST_CASE(incompressible_stream_wire_overhead_is_allowed) {
++    RestoreBlockLimit restore;
++    BOOST_REQUIRE(restore.config.SetMaxBlockSize(32 * 1000000));
++    const uint64_t limit{GetP2PWebSocketMessageSizeLimit()};
++    FastRandomContext rng{true};
++    const auto payload{rng.randbytes(limit)};
++    WebSocketCodec client{Role::CLIENT, C::ZSTD};
++    WebSocketCodec server{Role::SERVER, C::ZSTD};
++    std::vector<uint8_t> wire, plain, reply;
++    client.EncodeMessage(payload, wire);
++    BOOST_CHECK_GT(wire.size(), payload.size());
++    BOOST_CHECK_LE(wire.size(), server.MaxWireMessageSize() + 14);
++    BOOST_REQUIRE(!server.Decode(wire, plain, reply).error);
++    BOOST_CHECK(plain == payload);
++}
++
++BOOST_AUTO_TEST_SUITE_END()

@@ -1,0 +1,636 @@
+From 1c28cfe2a3fbf0ddf3daedf76804281c950099ee Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Sun, 18 Oct 2026 21:37:05 -0700
+Subject: [PATCH] http: configurable P2P WebSocket path and upgrade token
+
+-p2pwebsocketpath serves P2P WebSocket upgrades at a path other than
+/p2p/ws, and -p2pwebsockettoken (repeatable) requires a token, as
+"Authorization: Bearer <t>" or a "t=<t>" cookie, compared as SHA-256
+digests in constant time. With a token set, a request without one (or
+with a wrong one, or not an upgrade) is handled exactly as a request for
+an unknown path: the endpoint is not public, and probing it gets the same
+answer as any other missing page.
+
+Dialers take the token from wss://host/path?token=<t>, remove it from the
+request target and send it as a header; logs show the URL with
+token=***. Such a node is a private bridge: -externaldomain cannot be
+combined with either option, since peers learning a NET_WSS address dial
+/p2p/ws without a token.
+
+Coordinator integration provenance (reference405):
+Preserve earlier purposeful source repairs through downstream consumer/context adaptations; exact conflict ledger retained.
+All60 authored input payloads retained, with prerequisite-aware same-purpose splits; distinct legacy-index and inherited CXX compatibility remain independent. Pre-format source equals exact403+all60 control tree95718fceff83364b74294a751bd752b2f1a4e384. Only pinnedRuff import/format cleanup follows. Original author commands/hashes are historical reference evidence, not combined405 approval. Reference OFF/native/Rust full gates are preserved separately; combined compile/runtime NOT_RUN.
+---
+ src/httpserver.cpp                            |  90 ++++++++++-
+ src/init.cpp                                  |  42 +++++-
+ src/net.cpp                                   |  68 ++++++++-
+ src/net_websocket.cpp                         |   3 +
+ src/net_websocket.h                           |  14 +-
+ src/test/net_tests.cpp                        |  15 ++
+ .../functional/p2p_websocket_addr_versions.py |  23 +++
+ test/functional/p2p_websocket_token.py        | 142 ++++++++++++++++++
+ 8 files changed, 382 insertions(+), 15 deletions(-)
+ create mode 100755 test/functional/p2p_websocket_token.py
+
+diff --git a/src/httpserver.cpp b/src/httpserver.cpp
+index eb3c448893bb564c7b037e5df0b6bc6aa29023f0..6f06d967b057588ce14d156182543f614b8eec35 100644
+--- a/src/httpserver.cpp
++++ b/src/httpserver.cpp
+@@ -9,20 +9,22 @@
+ #include <common/args.h>
+ #include <compat/compat.h>
+ #include <config.h>
++#include <crypto/sha256.h>
++#include <http_tls_stream.h>
+ #include <logging.h>
+ #include <net_websocket.h>
+ #include <net_websocket_bridge.h>
+ #include <net_websocket_sock.h>
+ #include <net_websocket_tls.h>
+ #include <netbase.h>
+-#include <protocol.h>
+ #include <node/ui_interface.h>
++#include <protocol.h>
+ #include <random.h>
+ #include <rpc/protocol.h> // For HTTP status codes
+ #include <shutdown.h>
+ #include <sync.h>
+-#include <http_tls_stream.h>
+ #include <tls_util.h>
++#include <uint256.h>
+ #include <util/check.h>
+ #include <util/fs.h>
+ #include <util/sock.h>
+@@ -35,6 +37,8 @@
+ // and its logging is configured from here.
+ #include <event2/event.h>
+ 
++#include <openssl/crypto.h>
++
+ #include <boost/asio/as_tuple.hpp>
+ #include <boost/asio/co_spawn.hpp>
+ #include <boost/asio/detached.hpp>
+@@ -358,6 +362,10 @@ static bool g_chronik_enabled{false};
+ 
+ //! Whether /p2p/ws is served
+ static bool g_p2p_websocket_enabled{false};
++//! Path P2P WebSocket upgrades are served at (-p2pwebsocketpath)
++static std::string g_p2p_websocket_path{P2P_WEBSOCKET_PATH};
++//! SHA-256 of the accepted upgrade tokens; none: no token needed
++static std::vector<uint256> g_p2p_websocket_token_hashes;
+ //! Use X-Forwarded-For of /p2p/ws upgrades coming from loopback
+ static bool g_p2p_websocket_trust_forwarded_for{false};
+ //! Debug: bridge every /p2p/ws peer through a socketpair (-p2pwebsocketbridge)
+@@ -1265,6 +1273,55 @@ static asio::awaitable<void> AcceptP2PWebSocket(Stream &stream,
+ #endif
+ }
+ 
++static uint256 HashToken(std::string_view token) {
++    uint256 out;
++    CSHA256()
++        .Write(reinterpret_cast<const uint8_t *>(token.data()), token.size())
++        .Finalize(out.begin());
++    return out;
++}
++
++/**
++ * Whether a request carries an accepted upgrade token, as
++ * "Authorization: Bearer <t>" or a "t=<t>" cookie. Compared as SHA-256
++ * digests in constant time, so neither content nor length leaks by timing.
++ */
++static bool HasP2PWebSocketToken(const BeastRequest &req) {
++    std::vector<std::string> candidates;
++    const std::string_view auth{req[http::field::authorization]};
++    if (auth.substr(0, 7) == "Bearer ") {
++        candidates.emplace_back(auth.substr(7));
++    }
++    for (const std::string &cookie :
++         util::SplitString(req[http::field::cookie], ';')) {
++        const std::string_view trimmed{util::TrimStringView(cookie)};
++        if (trimmed.substr(0, 2) == "t=") {
++            candidates.emplace_back(trimmed.substr(2));
++        }
++    }
++    bool found{false};
++    for (const std::string &candidate : candidates) {
++        const uint256 hash{HashToken(candidate)};
++        for (const uint256 &accepted : g_p2p_websocket_token_hashes) {
++            found |= CRYPTO_memcmp(hash.begin(), accepted.begin(),
++                                   uint256::size()) == 0;
++        }
++    }
++    return found;
++}
++
++/**
++ * Whether a request is a P2P WebSocket upgrade for us. With tokens
++ * configured, one without a valid token is not: it is handled as a request
++ * for any other path would be, so the endpoint cannot be probed for.
++ */
++static bool IsP2PWebSocketRequest(const BeastRequest &req) {
++    return g_p2p_websocket_enabled &&
++           URIHasPathPrefix(req.target(), g_p2p_websocket_path) &&
++           (g_p2p_websocket_token_hashes.empty() ||
++            (websocket::is_upgrade(req) && HasP2PWebSocketToken(req)));
++}
++
+ /**
+  * Handle a WebSocket upgrade request if a WebSocket endpoint matches its
+  * target. Returns true if the connection was taken over.
+@@ -1275,7 +1332,7 @@ TryHandleWebSocketUpgrade(Stream &stream, beast::flat_buffer &buffer,
+                           const BeastRequest &req,
+                           const HTTPConnectionInfo &conn) {
+     const std::string_view target{req.target()};
+-    if (g_p2p_websocket_enabled && URIHasPathPrefix(target, P2P_WEBSOCKET_PATH)) {
++    if (IsP2PWebSocketRequest(req)) {
+         co_await AcceptP2PWebSocket(stream, buffer, req, conn);
+         co_return true;
+     }
+@@ -1372,7 +1429,8 @@ static asio::awaitable<void> ServeHTTP(Stream &stream,
+         // on RPC listeners only for -rpcallowip clients. Other requests go
+         // to DispatchRequest, which applies the same rules.
+         const bool endpoint_allowed{conn.public_only
+-                                        ? IsPublicPath(req.target())
++                                        ? IsPublicPath(req.target()) ||
++                                              IsP2PWebSocketRequest(req)
+                                         : ClientAllowed(conn.peer)};
+ 
+         // Handlers may take arbitrarily long (e.g. long polling), as may
+@@ -1904,8 +1962,28 @@ bool InitHTTPServer(Config &config) {
+         gArgs.GetBoolArg("-p2pwebsockettrustforwardedfor", false);
+     g_p2p_websocket_force_bridge =
+         gArgs.GetBoolArg("-p2pwebsocketbridge", false);
+-    if (g_p2p_websocket_enabled) {
+-        RegisterPublicHTTPPrefix(P2P_WEBSOCKET_PATH);
++    g_p2p_websocket_path =
++        gArgs.GetArg("-p2pwebsocketpath", P2P_WEBSOCKET_PATH);
++    if (g_p2p_websocket_path.size() < 2 || g_p2p_websocket_path[0] != '/' ||
++        g_p2p_websocket_path.find_first_of("?#% \t\r\n") != std::string::npos ||
++        g_p2p_websocket_path.back() == '/') {
++        LogPrintf("Error: invalid -p2pwebsocketpath '%s' (an absolute path "
++                  "such as /p2p/ws, not / and without query or trailing /)\n",
++                  g_p2p_websocket_path);
++        return false;
++    }
++    g_p2p_websocket_token_hashes.clear();
++    for (const std::string &token : gArgs.GetArgs("-p2pwebsockettoken")) {
++        if (!IsValidWebSocketToken(token)) {
++            LogPrintf("Error: invalid -p2pwebsockettoken (use 1-256 of "
++                      "A-Z a-z 0-9 . _ ~ -)\n");
++            return false;
++        }
++        g_p2p_websocket_token_hashes.push_back(HashToken(token));
++    }
++    if (g_p2p_websocket_enabled && g_p2p_websocket_token_hashes.empty()) {
++        // With a token, the path is only public for requests carrying it.
++        RegisterPublicHTTPPrefix(g_p2p_websocket_path);
+     }
+ 
+     g_config = &config;
+diff --git a/src/init.cpp b/src/init.cpp
+index 1907bb21451ca4f24ac5686f1c0cc151fd9e2897..cdcba9648492933896e5ec80fc7abe85e3797b55 100644
+--- a/src/init.cpp
++++ b/src/init.cpp
+@@ -1053,10 +1053,29 @@ void SetupServerArgs(NodeContext &node) {
+                   "-server (default: %d)",
+                   P2P_WEBSOCKET_PATH, DEFAULT_P2P_WEBSOCKET),
+         ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
++    argsman.AddArg(
++        "-p2pwebsocketpath=<path>",
++        strprintf("Serve P2P WebSocket upgrades at this path instead of %s. "
++                  "It is advertised with -externaldomain; otherwise peers "
++                  "need the full URL (-addnode=wss://host/path)",
++                  P2P_WEBSOCKET_PATH),
++        ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
++    argsman.AddArg(
++        "-p2pwebsockettoken=<token>",
++        "Only accept P2P WebSocket upgrades carrying this token (1-256 of "
++        "A-Z a-z 0-9 . _ ~ -) as \"Authorization: Bearer <token>\" or a "
++        "\"t=<token>\" cookie. Dial such a peer with "
++        "wss://host/path?token=<token> (the token is sent as a header). "
++        "Without it, the endpoint answers like any unknown path. Can be "
++        "specified multiple times; incompatible with -externaldomain, since "
++        "the token is never advertised.",
++        ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE,
++        OptionsCategory::CONNECTION);
+     argsman.AddArg(
+         "-externaldomain=<domain>[:port]",
+         "Advertise that this node accepts P2P over WebSocket+TLS at "
+-        "wss://<domain>:<port>/p2p/ws (default port: 443), e.g. behind a "
++        "wss://<domain>:<port>/p2p/ws (default port: 443; the path is "
++        "-p2pwebsocketpath if set), e.g. behind a "
+         "TLS-terminating proxy. Only announced to peers supporting ADDRv2 "
+         "(BIP155); others never see it. Can be specified multiple times.",
+         ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY,
+@@ -3533,14 +3552,33 @@ bool AppInitMain(Config &config, RPCServer &rpcServer,
+         return false;
+     }
+ 
++    if (args.IsArgSet("-externaldomain") &&
++        args.IsArgSet("-p2pwebsockettoken")) {
++        // Peers learning a NET_WSS address dial it without a token:
++        // advertising it would only reveal a node they cannot use.
++        return InitError(_("-externaldomain cannot be combined with "
++                           "-p2pwebsockettoken: peers learning the address "
++                           "could not connect"));
++    }
++    // A -p2pwebsocketpath is advertised with the domain.
++    const std::string ws_path{
++        args.GetArg("-p2pwebsocketpath", P2P_WEBSOCKET_PATH)};
+     for (const std::string &strDomain : args.GetArgs("-externaldomain")) {
+         uint16_t port{443};
+         std::string host;
+         CNetAddr domain;
+-        if (!SplitHostPort(strDomain, port, host) || !domain.SetWSSDomain(host)) {
++        if (!SplitHostPort(strDomain, port, host) ||
++            !domain.SetWSSDomain(host)) {
+             return InitError(strprintf(_("Invalid -externaldomain: '%s'"),
+                                        strDomain));
+         }
++        if (!domain.SetWSSDomain(host, ws_path)) {
++            return InitError(strprintf(
++                _("-p2pwebsocketpath '%s' cannot be advertised with "
++                  "-externaldomain (use / followed by A-Z a-z 0-9 - . _ ~ /, "
++                  "at most 255 characters)"),
++                ws_path));
++        }
+         AddLocal(CService{domain, port}, LOCAL_MANUAL);
+     }
+ 
+diff --git a/src/net.cpp b/src/net.cpp
+index 96f35b6984290dafefa7682b971b98f606de9786..7e2197a727115e0563f401e832838002aa54184e 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -1156,6 +1156,57 @@ std::optional<std::vector<unsigned char>> DecodeSpkiPin(std::string_view pin) {
+     return std::vector<unsigned char>(decoded->begin(), decoded->end());
+ }
+ 
++bool IsValidWebSocketToken(std::string_view token) {
++    return !token.empty() && token.size() <= 256 &&
++           std::all_of(token.begin(), token.end(), [](char c) {
++               return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++                      (c >= '0' && c <= '9') || c == '-' || c == '_' ||
++                      c == '.' || c == '~';
++           });
++}
++
++/**
++ * Remove "token=<t>" from the query of a request target. Returns <t> ("" if
++ * absent), or std::nullopt if it is not a valid token.
++ */
++static std::optional<std::string> TakeWebSocketToken(std::string &target) {
++    const size_t q{target.find('?')};
++    if (q == std::string::npos) {
++        return std::string{};
++    }
++    std::string token;
++    std::vector<std::string> kept;
++    for (const auto &param : util::SplitString(target.substr(q + 1), '&')) {
++        if (param.starts_with("token=")) {
++            token = param.substr(6);
++            if (!IsValidWebSocketToken(token)) {
++                return std::nullopt;
++            }
++        } else if (!param.empty()) {
++            kept.push_back(param);
++        }
++    }
++    target = target.substr(0, q) +
++             (kept.empty() ? std::string{} : "?" + util::Join(kept, "&"));
++    return token;
++}
++
++std::string RedactWebSocketURL(std::string_view url) {
++    std::string out{url};
++    for (size_t pos{out.find("token=")}; pos != std::string::npos;
++         pos = out.find("token=", pos + 1)) {
++        if (pos == 0 || (out[pos - 1] != '?' && out[pos - 1] != '&')) {
++            continue;
++        }
++        const size_t start{pos + 6};
++        const size_t end{out.find_first_of("&#", start)};
++        out.replace(start,
++                    (end == std::string::npos ? out.size() : end) - start,
++                    "***");
++    }
++    return out;
++}
++
+ std::optional<ParsedWebSocketURL> ParseWebSocketURL(std::string_view url) {
+     ParsedWebSocketURL out;
+     if (const size_t hash{url.find('#')}; hash != std::string_view::npos) {
+@@ -1182,6 +1233,11 @@ std::optional<ParsedWebSocketURL> ParseWebSocketURL(std::string_view url) {
+     out.target = slash == std::string_view::npos
+                      ? std::string{P2P_WEBSOCKET_PATH}
+                      : std::string{url.substr(slash)};
++    const auto token{TakeWebSocketToken(out.target)};
++    if (!token) {
++        return std::nullopt;
++    }
++    out.token = *token;
+     uint16_t port{static_cast<uint16_t>(out.tls ? 443 : 80)};
+     std::string host;
+     if (authority.empty() || !SplitHostPort(authority, port, host) ||
+@@ -1201,24 +1257,25 @@ CNode *CConnman::ConnectWebSocketNode(const std::string &url,
+                                       ConnectionType conn_type) {
+     const auto parsed{ParseWebSocketURL(url)};
+     if (!parsed) {
+-        LogPrintf("Not connecting to %s: invalid WebSocket peer URL\n", url);
++        LogPrintf("Not connecting to %s: invalid WebSocket peer URL\n",
++                  RedactWebSocketURL(url));
+         return nullptr;
+     }
+     const bool onion{parsed->host.ends_with(".onion")};
+     if (!IsReachable(onion ? NET_ONION : NET_WSS)) {
+         LogPrintf("Not connecting to %s: network %s is not reachable "
+                   "(-onlynet)\n",
+-                  url, onion ? "onion" : "wss");
++                  RedactWebSocketURL(url), onion ? "onion" : "wss");
+         return nullptr;
+     }
+     const WebSocketDialer dialer{GetWebSocketDialer()};
+     if (!dialer) {
+         LogPrintf("Cannot connect to %s: P2P over WebSocket is unavailable\n",
+-                  url);
++                  RedactWebSocketURL(url));
+         return nullptr;
+     }
+     LogPrintLevel(BCLog::NET, BCLog::Level::Debug,
+-                  "trying WebSocket connection %s\n", url);
++                  "trying WebSocket connection %s\n", RedactWebSocketURL(url));
+ 
+     // Open the TCP connection exactly as for TCP peers: through the proxy
+     // (which resolves the name: no local DNS lookup) when one applies,
+@@ -1229,7 +1286,8 @@ CNode *CConnman::ConnectWebSocketNode(const std::string &url,
+     Proxy proxy;
+     if (onion) {
+         if (!GetProxy(NET_ONION, proxy)) {
+-            LogPrintf("Not connecting to %s: no -onion proxy\n", url);
++            LogPrintf("Not connecting to %s: no -onion proxy\n",
++                      RedactWebSocketURL(url));
+             return nullptr;
+         }
+         sock = ConnectThroughProxy(proxy, parsed->host, parsed->port,
+diff --git a/src/net_websocket.cpp b/src/net_websocket.cpp
+index 8f514c9b3e15b6a36a4cc3379ae3a4d2faa90eaa..9c6fef6b8406b26c7944c98665d92d957c003dbd 100644
+--- a/src/net_websocket.cpp
++++ b/src/net_websocket.cpp
+@@ -264,6 +264,9 @@ Handshake(const DialerState &state, std::unique_ptr<Sock> &&tcp,
+     if (!state.protocols.empty()) {
+         request += strprintf("Sec-WebSocket-Protocol: %s\r\n", state.protocols);
+     }
++    if (!url.token.empty()) {
++        request += strprintf("Authorization: Bearer %s\r\n", url.token);
++    }
+     request += "\r\n";
+     if (!WriteAll(*layer, *sock, request, deadline, interrupt)) {
+         LogDebug(BCLog::NET, "WebSocket upgrade to %s: write failed\n",
+diff --git a/src/net_websocket.h b/src/net_websocket.h
+index a5da79a908843ebf2280ad51c0a68a8528b1701b..ed4b788bfcf928654da5de627ffa5255b1686603 100644
+--- a/src/net_websocket.h
++++ b/src/net_websocket.h
+@@ -100,14 +100,24 @@ struct ParsedWebSocketURL {
+     std::string target;
+     //! Required SHA-256 of the server's public key (from "#spki=")
+     std::optional<std::vector<unsigned char>> spki_pin;
++    //! Upgrade token (from "?token="), sent as Authorization: Bearer
++    std::string token;
+ };
+ 
+ /**
+- * Parse ws://host[:port][/path][#spki=<pin>] (default port 80) or wss://
+- * (443). A pin (see DecodeSpkiPin) is only meaningful for wss://.
++ * Parse ws://host[:port][/path][?token=<t>][#spki=<pin>] (default port 80)
++ * or wss:// (443). A pin (see DecodeSpkiPin) is only meaningful for wss://.
++ * The token is removed from the request target and sent as a header, so it
++ * does not appear in request logs.
+  */
+ std::optional<ParsedWebSocketURL> ParseWebSocketURL(std::string_view url);
+ 
++/** Whether a string is usable as an upgrade token ([A-Za-z0-9._~-]) */
++bool IsValidWebSocketToken(std::string_view token);
++
++/** The URL with any upgrade token replaced by "***", for logging */
++std::string RedactWebSocketURL(std::string_view url);
++
+ /** Encode a public key hash as an unpadded base64url pin */
+ std::string EncodeSpkiPin(Span<const unsigned char> sha256);
+ 
+diff --git a/src/test/net_tests.cpp b/src/test/net_tests.cpp
+index 1fc10681927d47e8735343435f33cd7dfce5371d..9edf791521059c74ea0b0821a7178cd8fdaee086 100644
+--- a/src/test/net_tests.cpp
++++ b/src/test/net_tests.cpp
+@@ -1886,6 +1886,21 @@ BOOST_AUTO_TEST_CASE(p2p_websocket_url_parsing) {
+         BOOST_CHECK_MESSAGE(!ParseWebSocketURL(bad), bad);
+     }
+ 
++    // An upgrade token leaves the request target and is never logged
++    url = ParseWebSocketURL("wss://host/a/b?x=1&token=Ab-9_.~&y=2#spki=" + pin);
++    BOOST_REQUIRE(url);
++    BOOST_CHECK_EQUAL(url->token, "Ab-9_.~");
++    BOOST_CHECK_EQUAL(url->target, "/a/b?x=1&y=2");
++    url = ParseWebSocketURL("ws://host/p?token=t");
++    BOOST_REQUIRE(url);
++    BOOST_CHECK_EQUAL(url->target, "/p");
++    BOOST_CHECK(!ParseWebSocketURL("wss://host/p?token="));
++    BOOST_CHECK(!ParseWebSocketURL("wss://host/p?token=a%20b"));
++    BOOST_CHECK_EQUAL(RedactWebSocketURL("wss://h/p?a=1&token=secret#spki=x"),
++                      "wss://h/p?a=1&token=***#spki=x");
++    BOOST_CHECK_EQUAL(RedactWebSocketURL("wss://h/p?xtoken=keep"),
++                      "wss://h/p?xtoken=keep");
++
+     BOOST_CHECK(IsWebSocketURL("wss://a"));
+     BOOST_CHECK(IsWebSocketURL("ws://a"));
+     BOOST_CHECK(!IsWebSocketURL("1.2.3.4:8333"));
+diff --git a/test/functional/p2p_websocket_addr_versions.py b/test/functional/p2p_websocket_addr_versions.py
+index e24a9635dd74cb8e9bb966dc2f8d16c4d094facb..8e44e1c9b2f082dfeb5c089a19a1d380d9d6eab1 100755
+--- a/test/functional/p2p_websocket_addr_versions.py
++++ b/test/functional/p2p_websocket_addr_versions.py
+@@ -17,6 +17,7 @@ import time
+ from test_framework.messages import NODE_NETWORK, CAddress, msg_addrv2
+ from test_framework.p2p import P2PInterface, p2p_lock
+ from test_framework.test_framework import BitcoinTestFramework
++from test_framework.test_node import ErrorMatch
+ from test_framework.util import assert_equal
+ 
+ 
+@@ -98,6 +99,28 @@ class P2PWebSocketAddrVersionsTest(BitcoinTestFramework):
+         ):
+             pass
+ 
++        self.log.info("-externaldomain advertises -p2pwebsocketpath")
++        self.restart_node(0, self.extra_args[0] + [
++            "-externaldomain=Self.Example.org:8443",
++            "-p2pwebsocketpath=/lotus/ws",
++        ])
++        # Nodes advertise themselves only once out of initial block download.
++        self.generate(self.nodes[0], 1, sync_fun=self.no_op)
++        peer = self.nodes[0].add_p2p_connection(AddrReceiver())
++        self.nodes[0].setmocktime(int(time.time()) + 24 * 60 * 60)
++        peer.wait_until(lambda: any(a.net == CAddress.NET_WSS for a in peer.received))
++        self.nodes[0].setmocktime(0)
++        with p2p_lock:
++            own = [(a.wss_version, a.ip, a.port) for a in peer.received
++                   if a.net == CAddress.NET_WSS]
++        assert_equal(own, [(1, "self.example.org/lotus/ws", 8443)])
++        self.stop_node(0)
++        self.nodes[0].assert_start_raises_init_error(
++            ["-externaldomain=self.example.org", "-p2pwebsocketpath=/a!b"],
++            "cannot be advertised with -externaldomain",
++            match=ErrorMatch.PARTIAL_REGEX,
++        )
++
+ 
+ if __name__ == "__main__":
+     P2PWebSocketAddrVersionsTest().main()
+diff --git a/test/functional/p2p_websocket_token.py b/test/functional/p2p_websocket_token.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..32ee9c5ae00bdcc52dc6d74f12c7a233ee036569
+--- /dev/null
++++ b/test/functional/p2p_websocket_token.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026 The Bitcoin developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++"""Test -p2pwebsocketpath and -p2pwebsockettoken.
++
++A node serving P2P WebSocket at a custom path behind a token answers every
++request lacking the token exactly as it answers a request for an unknown
++path, so the endpoint cannot be found by probing.
++"""
++
++import base64
++import os
++import re
++import socket
++
++from test_framework.test_framework import BitcoinTestFramework
++from test_framework.test_node import ErrorMatch
++from test_framework.util import assert_equal, p2p_port
++
++PUBLIC_PORT_INDEX = 40
++PATH = "/assets/live"
++TOKENS = ["s3cret-Token_1", "other.2~"]
++
++
++class P2PWebSocketTokenTest(BitcoinTestFramework):
++    def set_test_params(self):
++        self.num_nodes = 2
++        self.setup_clean_chain = True
++
++    def setup_network(self):
++        self.public_port = p2p_port(PUBLIC_PORT_INDEX)
++        self.extra_args = [
++            [
++                f"-publicbind=127.0.0.1:{self.public_port}",
++                f"-p2pwebsocketpath={PATH}",
++                *[f"-p2pwebsockettoken={t}" for t in TOKENS],
++            ],
++            [],
++        ]
++        self.add_nodes(self.num_nodes, self.extra_args)
++        self.start_nodes()
++
++    def request(self, target, headers=(), upgrade=True):
++        """Send one request; return (status line, headers without Date, body)."""
++        lines = [f"GET {target} HTTP/1.1", f"Host: 127.0.0.1:{self.public_port}"]
++        if upgrade:
++            key = base64.b64encode(os.urandom(16)).decode()
++            lines += [
++                "Upgrade: websocket",
++                "Connection: Upgrade",
++                f"Sec-WebSocket-Key: {key}",
++                "Sec-WebSocket-Version: 13",
++                "Sec-WebSocket-Protocol: p2p-zstd-v1",
++            ]
++        lines += list(headers)
++        with socket.create_connection(("127.0.0.1", self.public_port)) as s:
++            s.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
++            data = b""
++            while b"\r\n\r\n" not in data:
++                chunk = s.recv(4096)
++                if not chunk:
++                    break
++                data += chunk
++            head, _, body = data.partition(b"\r\n\r\n")
++            head_lines = head.decode().split("\r\n")
++            status, fields = head_lines[0], head_lines[1:]
++            if status.split()[1] == "101":
++                return status, [], b""
++            length = 0
++            for f in fields:
++                if f.lower().startswith("content-length:"):
++                    length = int(f.split(":", 1)[1])
++            while len(body) < length:
++                chunk = s.recv(4096)
++                if not chunk:
++                    break
++                body += chunk
++        fields = [f for f in fields if not f.lower().startswith("date:")]
++        return status, fields, body
++
++    def ws_peers(self, n):
++        return [p for p in self.nodes[n].getpeerinfo() if p["transport"] != "tcp"]
++
++    def run_test(self):
++        self.log.info("Without a valid token the endpoint looks like any unknown path")
++        unknown = self.request("/no-such-page", upgrade=False)
++        assert unknown[0].split()[1] in ("403", "404"), unknown[0]
++        for target, headers, upgrade in (
++            (PATH, (), False),
++            (PATH, (), True),
++            (PATH, ("Authorization: Bearer wrong",), True),
++            (PATH, ("Cookie: t=wrong",), True),
++            (PATH, (f"Authorization: Bearer {TOKENS[0]}",), False),
++            ("/p2p/ws", (f"Authorization: Bearer {TOKENS[0]}",), True),
++            ("/no-such-page", (), True),
++        ):
++            assert_equal(self.request(target, headers, upgrade), unknown)
++
++        self.log.info("With a token (header or cookie) the upgrade succeeds")
++        for headers in (
++            (f"Authorization: Bearer {TOKENS[0]}",),
++            (f"Cookie: a=b; t={TOKENS[1]}",),
++        ):
++            status = self.request(PATH, headers)[0]
++            assert status.split()[1] == "101", (status, headers)
++        self.wait_until(lambda: len(self.ws_peers(0)) == 0)
++
++        self.log.info("A node dials ?token= URLs, sending the token as a header")
++        url = f"wss://localhost:{self.public_port}{PATH}?token={TOKENS[0]}"
++        with self.nodes[1].assert_debug_log(["?token=***"]):
++            self.nodes[1].addnode(node=url, command="onetry")
++            self.wait_until(lambda: len(self.ws_peers(0)) == 1)
++        self.sync_blocks()
++        with open(self.nodes[1].debug_log_path, encoding="utf8") as f:
++            assert TOKENS[0] not in f.read()
++        self.nodes[1].disconnectnode(nodeid=self.ws_peers(1)[0]["id"])
++        self.wait_until(lambda: len(self.ws_peers(0)) == 0)
++
++        self.log.info("...and gets nowhere with a wrong token")
++        bad = f"wss://localhost:{self.public_port}{PATH}?token=wrong"
++        with self.nodes[1].assert_debug_log(["WebSocket upgrade"]):
++            self.nodes[1].addnode(node=bad, command="onetry")
++        assert_equal(self.ws_peers(1), [])
++
++        self.log.info("Invalid settings are startup errors")
++        node0 = self.nodes[0]
++        self.stop_node(0)
++        for args, error in (
++            (["-p2pwebsockettoken=x", "-externaldomain=example.org"],
++             "-externaldomain cannot be combined"),
++            (["-p2pwebsocketpath=/"], "Unable to start HTTP server"),
++            (["-p2pwebsocketpath=relative"], "Unable to start HTTP server"),
++            (["-p2pwebsockettoken=bad token"], "Unable to start HTTP server"),
++        ):
++            node0.assert_start_raises_init_error(
++                args, re.escape(error), match=ErrorMatch.PARTIAL_REGEX
++            )
++
++
++if __name__ == "__main__":
++    P2PWebSocketTokenTest().main()
+-- 
+2.50.1 (Apple Git-155)
+

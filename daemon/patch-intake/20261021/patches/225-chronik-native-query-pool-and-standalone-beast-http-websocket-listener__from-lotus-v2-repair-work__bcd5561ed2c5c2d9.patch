@@ -1,0 +1,1642 @@
+From 67cf712fbd1c63c7c72e5a0121ae5d4e97c9bbbd Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Mon, 19 Oct 2026 05:08:01 -0700
+Subject: [PATCH] chronik: native query pool and standalone Beast
+ HTTP/WebSocket listener
+
+Add chronik_native_transport, which serves the Router and WebSocket
+handlers on -chronikbind without Rust's axum/tokio:
+
+- QueryPool: a fixed thread pool on which every request handler runs.
+  AsyncHandle(pool, router, request, token) completes on the caller's Asio
+  executor (callback or use_awaitable), so io threads never block; the
+  in-process /chronik bridge reuses it.
+- BeastListener: Boost.Beast HTTP/1.1 with keep-alive on each bind address,
+  its own io_context with 2 threads, the 2 MB request body limit (413 by
+  Content-Length or chunked body), no TLS, and the bind error text of the
+  Rust server.
+- WebSocket on /ws: a strand per session, non-blocking SendBinary, a
+  20,000-byte message limit, Pong replies, a Ping with payload
+  "Bitcoin ABC Chronik Indexer" after the idle interval (45 s, 5 s on
+  regtest), text frames passed to the handler. Handler callbacks run one at
+  a time per session on the query pool.
+
+The tests run a real listener on 127.0.0.1:0 and exercise GET, HEAD,
+POST, OPTIONS, 404/405/413, CORS, keep-alive, two binds, address-in-use,
+and WebSocket echo, close, ping/pong and oversized messages.
+
+Tier: eCash
+---
+ chronik/native/CMakeLists.txt                 |   3 +
+ .../chronik/native/transport/beast_listener.h |  86 +++
+ .../chronik/native/transport/query_pool.h     |  93 +++
+ chronik/native/include/chronik/native/ws.h    |  77 +++
+ chronik/native/test/transport_tests.cpp       | 575 ++++++++++++++++
+ chronik/native/transport/beast_listener.cpp   | 646 ++++++++++++++++++
+ chronik/native/transport/query_pool.cpp       |  34 +
+ chronik/native/transport/transport.cmake      |  26 +
+ 8 files changed, 1540 insertions(+)
+ create mode 100644 chronik/native/include/chronik/native/transport/beast_listener.h
+ create mode 100644 chronik/native/include/chronik/native/transport/query_pool.h
+ create mode 100644 chronik/native/include/chronik/native/ws.h
+ create mode 100644 chronik/native/test/transport_tests.cpp
+ create mode 100644 chronik/native/transport/beast_listener.cpp
+ create mode 100644 chronik/native/transport/query_pool.cpp
+ create mode 100644 chronik/native/transport/transport.cmake
+
+diff --git a/chronik/native/CMakeLists.txt b/chronik/native/CMakeLists.txt
+index 202a229e3ed4153514df2724322be2f7f83cda1e..ac69e1d00c0a5135b856d3d3d833020659b7824e 100644
+--- a/chronik/native/CMakeLists.txt
++++ b/chronik/native/CMakeLists.txt
+@@ -103,6 +103,9 @@ endif()
+ # ---- Protobuf messages (chronik.proto) ----
+ include("${CHRONIK_NATIVE_ROOT}/proto/proto.cmake")
+ 
++# ---- HTTP/WS transports (query pool, standalone Beast listener) ----
++include("${CHRONIK_NATIVE_ROOT}/transport/transport.cmake")
++
+ # ---- Host adapter (node build only) ----
+ if(NOT CHRONIK_NATIVE_STANDALONE)
+     add_library(chronik_native_host_abc STATIC
+diff --git a/chronik/native/include/chronik/native/transport/beast_listener.h b/chronik/native/include/chronik/native/transport/beast_listener.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..245d1b4805c0ac4c0cd5aada74021c261a2bb84f
+--- /dev/null
++++ b/chronik/native/include/chronik/native/transport/beast_listener.h
+@@ -0,0 +1,86 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef CHRONIK_NATIVE_TRANSPORT_BEAST_LISTENER_H
++#define CHRONIK_NATIVE_TRANSPORT_BEAST_LISTENER_H
++
++#include <chronik/native/http.h>
++#include <chronik/native/ws.h>
++
++#include <chrono>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace chronik::native {
++
++class QueryPool;
++
++struct ListenerBind {
++    /** IPv4 or IPv6 literal, e.g. "127.0.0.1" or "::1" */
++    std::string ip;
++    uint16_t port = 0;
++};
++
++struct ListenerOptions {
++    std::vector<ListenerBind> binds;
++    /** Own io_context threads (design: 2) */
++    size_t io_threads = 2;
++    /** Idle interval before Chronik pings a WebSocket (45 s; 5 s regtest) */
++    std::chrono::milliseconds ws_ping_interval{std::chrono::seconds{45}};
++    /** Max WebSocket message (and frame) size */
++    size_t ws_max_message_size = 20'000;
++    /** Request bodies above this are flagged body_too_large (not read). */
++    size_t max_body_size = MAX_REQUEST_BODY_SIZE;
++    /** Max request header bytes */
++    size_t max_header_size = 64 * 1024;
++    /** Close idle keep-alive HTTP connections after this long. */
++    std::chrono::seconds http_idle_timeout{std::chrono::seconds{120}};
++};
++
++/**
++ * Standalone Boost.Beast HTTP/1.1 listener for -chronikbind (replaces axum):
++ * keep-alive, multiple binds, own io_context, request handling posted to the
++ * QueryPool, WebSocket upgrade on WebSocket routes of the Router handed to
++ * `ws_accept`. No TLS, no compression.
++ */
++class BeastListener {
++public:
++    BeastListener(const Router &router, QueryPool &pool, WsAccept ws_accept,
++                  ListenerOptions opts);
++    ~BeastListener();
++    BeastListener(const BeastListener &) = delete;
++    BeastListener &operator=(const BeastListener &) = delete;
++
++    /**
++     * Bind all addresses and start serving. Throws ChronikError
++     * "Chronik failed binding to <addr>: <os error>" (server.rs
++     * FailedBindingAddress) if a bind fails.
++     */
++    void Start();
++    /** Actual bound ports, in bind order (useful with port 0). */
++    std::vector<uint16_t> BoundPorts() const;
++    /** Stop accepting, close all HTTP and WebSocket sessions, join. */
++    void Stop();
++
++    /** Number of currently open WebSocket sessions. */
++    size_t NumWsSessions() const;
++
++    struct Impl;
++    struct IoHolder;
++
++private:
++    // Destroyed after m_impl: destroying the io_context destroys pending
++    // coroutine frames, which release their references to the Impl.
++    std::unique_ptr<IoHolder> m_io;
++    std::shared_ptr<Impl> m_impl;
++};
++
++/** Rust SocketAddr Display: "1.2.3.4:80" or "[::1]:80" */
++std::string FormatSocketAddr(const std::string &ip, uint16_t port);
++
++} // namespace chronik::native
++
++#endif // CHRONIK_NATIVE_TRANSPORT_BEAST_LISTENER_H
+diff --git a/chronik/native/include/chronik/native/transport/query_pool.h b/chronik/native/include/chronik/native/transport/query_pool.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e7137fc09d8511d9b6b4e4c41c285564c1eba5b3
+--- /dev/null
++++ b/chronik/native/include/chronik/native/transport/query_pool.h
+@@ -0,0 +1,93 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef CHRONIK_NATIVE_TRANSPORT_QUERY_POOL_H
++#define CHRONIK_NATIVE_TRANSPORT_QUERY_POOL_H
++
++#include <chronik/native/http.h>
++
++#include <boost/asio/associated_executor.hpp>
++#include <boost/asio/async_result.hpp>
++#include <boost/asio/dispatch.hpp>
++#include <boost/asio/executor_work_guard.hpp>
++#include <boost/asio/post.hpp>
++#include <boost/asio/strand.hpp>
++#include <boost/asio/thread_pool.hpp>
++
++#include <functional>
++#include <memory>
++
++namespace chronik::native {
++
++/**
++ * Fixed pool of threads running blocking Chronik work (HTTP handlers, WS
++ * subscription handling), so transport io threads never block (design §3.4).
++ */
++class QueryPool {
++public:
++    using executor_type = boost::asio::thread_pool::executor_type;
++
++    explicit QueryPool(size_t num_threads = DefaultThreads());
++    ~QueryPool();
++    QueryPool(const QueryPool &) = delete;
++    QueryPool &operator=(const QueryPool &) = delete;
++
++    /** min(8, max(1, hardware_concurrency / 2)) */
++    static size_t DefaultThreads();
++
++    executor_type GetExecutor() { return m_pool.get_executor(); }
++    /** A strand on the pool: posted work runs serialized, in order. */
++    boost::asio::strand<executor_type> MakeStrand() {
++        return boost::asio::make_strand(m_pool.get_executor());
++    }
++    void Post(std::function<void()> fn) {
++        boost::asio::post(m_pool, std::move(fn));
++    }
++    /** Stop accepting work and join (pending work is abandoned). */
++    void Stop();
++    /** Wait for queued work to finish, then join. */
++    void Join();
++    size_t NumThreads() const { return m_num_threads; }
++
++private:
++    size_t m_num_threads;
++    boost::asio::thread_pool m_pool;
++};
++
++/**
++ * Run router.Handle(req) on the pool and deliver the response to the
++ * completion handler on its associated executor (e.g. an io strand or a
++ * coroutine's executor). Usable with callbacks or boost::asio::use_awaitable:
++ *
++ *   HttpResponse resp = co_await AsyncHandle(pool, router, std::move(req),
++ *                                            boost::asio::use_awaitable);
++ */
++template <typename CompletionToken>
++auto AsyncHandle(QueryPool &pool, const Router &router, HttpRequest req,
++                 CompletionToken &&token) {
++    return boost::asio::async_initiate<CompletionToken, void(HttpResponse)>(
++        [&pool, &router](auto handler, HttpRequest request) {
++            auto work = boost::asio::make_work_guard(
++                boost::asio::get_associated_executor(handler));
++            // asio::post, not Post(std::function): handlers are move-only
++            boost::asio::post(pool.GetExecutor(), [&router,
++                                                   request = std::move(request),
++                       handler = std::move(handler),
++                       work = std::move(work)]() mutable {
++                HttpResponse resp = router.Handle(request);
++                auto ex = work.get_executor();
++                boost::asio::dispatch(
++                    ex, [handler = std::move(handler),
++                         resp = std::move(resp)]() mutable {
++                        std::move(handler)(std::move(resp));
++                    });
++                work.reset();
++            });
++        },
++        token, std::move(req));
++}
++
++} // namespace chronik::native
++
++#endif // CHRONIK_NATIVE_TRANSPORT_QUERY_POOL_H
+diff --git a/chronik/native/include/chronik/native/ws.h b/chronik/native/include/chronik/native/ws.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..4676bbaba80bf18d8181468fe13232a82c23185d
+--- /dev/null
++++ b/chronik/native/include/chronik/native/ws.h
+@@ -0,0 +1,77 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#ifndef CHRONIK_NATIVE_WS_H
++#define CHRONIK_NATIVE_WS_H
++
++#include <chronik/native/types.h>
++
++#include <functional>
++#include <memory>
++#include <span>
++#include <string>
++
++/**
++ * Transport-neutral WebSocket session interfaces (design §6.1).
++ *
++ * The transport (standalone Beast listener, or the node's in-process
++ * /chronik/ws) implements WsSession; the core implements one WsHandler per
++ * session (port of chronik-http ws.rs handle_subscribe_socket).
++ *
++ * Threading: a transport calls the WsHandler methods of one session one at a
++ * time, in order, never on an io thread (they run serialized on the query
++ * pool, so a handler may take the indexer's shared lock). OnClosed is called
++ * exactly once, last; afterwards the transport drops the handler.
++ *
++ * The transport itself implements the protocol-level parts of ws.rs:
++ *  - binary frames are passed to OnBinary, text frames call OnText;
++ *  - Ping is answered with Pong; Pong is ignored;
++ *  - Close or an error ends the session (OnClosed);
++ *  - messages/frames above MAX_WS_MESSAGE_SIZE (20,000 B) end the session;
++ *  - after `ping_interval` without session activity, a Ping with payload
++ *    "Bitcoin ABC Chronik Indexer" is sent. Rust re-arms that sleep on every
++ *    loop iteration, i.e. after any client message and any subscription
++ *    event; the transport resets it on every received frame and every
++ *    SendBinary, and the handler calls NotifyActivity() for events it handled
++ *    without sending (e.g. deduplicated messages).
++ */
++namespace chronik::native {
++
++/** Payload of Chronik's keep-alive pings (ws.rs schedule_ping). */
++constexpr const char *WS_PING_PAYLOAD = "Bitcoin ABC Chronik Indexer";
++
++class WsSession {
++public:
++    virtual ~WsSession() = default;
++    /** Non-blocking enqueue of a binary message; callable from any thread. */
++    virtual void SendBinary(Bytes msg) = 0;
++    /** Close the connection (normal closure); callable from any thread. */
++    virtual void Close() = 0;
++    /** Real client IP address, without port. */
++    virtual const std::string &PeerIp() const = 0;
++    /** Restart the idle-ping timer (see above). */
++    virtual void NotifyActivity() = 0;
++};
++
++class WsHandler {
++public:
++    virtual ~WsHandler() = default;
++    /** A binary message (a proto::WsSub) */
++    virtual void OnBinary(std::span<const uint8_t> msg) = 0;
++    /** A text message (Rust replies with an "Unexpected message type" error) */
++    virtual void OnText() = 0;
++    /** The session ended; release subscriptions. Called exactly once. */
++    virtual void OnClosed() = 0;
++};
++
++/**
++ * Creates the handler for a newly upgraded session. The handler may keep the
++ * shared_ptr to its session to send messages; it must drop it in OnClosed().
++ */
++using WsAccept =
++    std::function<std::unique_ptr<WsHandler>(std::shared_ptr<WsSession>)>;
++
++} // namespace chronik::native
++
++#endif // CHRONIK_NATIVE_WS_H
+diff --git a/chronik/native/test/transport_tests.cpp b/chronik/native/test/transport_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..0f319cc62b4719b73298c483d0d8a701bfe26a3a
+--- /dev/null
++++ b/chronik/native/test/transport_tests.cpp
+@@ -0,0 +1,575 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++// Integration tests of the standalone Beast listener on 127.0.0.1:0, with a
++// Beast client: HTTP routing/keep-alive/limits/CORS and the WebSocket
++// transport (echo handler, pings, pongs, max message size).
++
++#include <chronik/native/error.h>
++#include <chronik/native/http.h>
++#include <chronik/native/proto.h>
++#include <chronik/native/transport/beast_listener.h>
++#include <chronik/native/transport/query_pool.h>
++#include <chronik/native/ws.h>
++
++#include <boost/asio/co_spawn.hpp>
++#include <boost/asio/detached.hpp>
++#include <boost/asio/io_context.hpp>
++#include <boost/asio/ip/tcp.hpp>
++#include <boost/asio/use_awaitable.hpp>
++#include <boost/beast/core.hpp>
++#include <boost/beast/http.hpp>
++#include <boost/beast/websocket.hpp>
++#include <boost/test/unit_test.hpp>
++
++#include <atomic>
++#include <cerrno>
++#include <condition_variable>
++#include <cstring>
++#include <mutex>
++#include <thread>
++
++using namespace chronik::native;
++namespace asio = boost::asio;
++namespace beast = boost::beast;
++namespace http = beast::http;
++namespace websocket = beast::websocket;
++using tcp = asio::ip::tcp;
++
++namespace {
++
++using Response = http::response<http::string_body>;
++
++struct Client {
++    asio::io_context ioc;
++    tcp::socket socket{ioc};
++    beast::flat_buffer buffer;
++
++    explicit Client(uint16_t port) {
++        socket.connect(
++            tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
++    }
++
++    Response Request(http::verb method, const std::string &target,
++                     std::string body = {},
++                     std::vector<std::pair<std::string, std::string>>
++                         headers = {}) {
++        http::request<http::string_body> req{method, target, 11};
++        req.set(http::field::host, "127.0.0.1");
++        for (auto &[k, v] : headers) {
++            req.set(k, v);
++        }
++        req.body() = std::move(body);
++        req.prepare_payload();
++        http::write(socket, req);
++        return Read(method == http::verb::head);
++    }
++
++    Response Read(bool head = false) {
++        http::response_parser<http::string_body> parser;
++        parser.skip(head);
++        http::read(socket, buffer, parser);
++        return parser.release();
++    }
++
++    /** True if the server closed the connection. */
++    bool ServerClosed() {
++        beast::error_code ec;
++        char c;
++        socket.read_some(asio::buffer(&c, 1), ec);
++        return ec == asio::error::eof || ec == asio::error::connection_reset;
++    }
++};
++
++std::string ErrMsg(const Response &res) {
++    proto::Error err;
++    BOOST_REQUIRE(err.ParseFromString(res.body()));
++    return err.msg();
++}
++
++/** Echo handler; counters shared with the test. */
++struct WsCounters {
++    std::atomic<int> accepted{0};
++    std::atomic<int> closed{0};
++    std::atomic<int> texts{0};
++    std::atomic<bool> on_io_thread{false};
++    std::mutex mutex;
++    std::condition_variable cv;
++    std::string last_peer_ip;
++
++    void WaitClosed(int n) {
++        std::unique_lock lock(mutex);
++        cv.wait_for(lock, std::chrono::seconds(5),
++                    [&] { return closed.load() >= n; });
++    }
++};
++
++class EchoHandler : public WsHandler {
++public:
++    EchoHandler(std::shared_ptr<WsSession> session,
++                std::shared_ptr<WsCounters> counters)
++        : m_session(std::move(session)), m_counters(std::move(counters)) {}
++
++    void OnBinary(std::span<const uint8_t> msg) override {
++        const std::string text(msg.begin(), msg.end());
++        if (text == "delay") {
++            // Reply later, without activity in between (pings are due)
++            std::thread([session = m_session] {
++                std::this_thread::sleep_for(std::chrono::milliseconds(700));
++                const std::string done = "done";
++                session->SendBinary(Bytes(done.begin(), done.end()));
++            }).detach();
++            return;
++        }
++        if (text == "close") {
++            m_session->Close();
++            return;
++        }
++        m_session->SendBinary(Bytes(msg.begin(), msg.end()));
++    }
++    void OnText() override {
++        ++m_counters->texts;
++        const std::string reply = "Unexpected message type Text";
++        m_session->SendBinary(Bytes(reply.begin(), reply.end()));
++    }
++    void OnClosed() override {
++        m_session.reset();
++        {
++            std::lock_guard lock(m_counters->mutex);
++            ++m_counters->closed;
++        }
++        m_counters->cv.notify_all();
++    }
++
++private:
++    std::shared_ptr<WsSession> m_session;
++    std::shared_ptr<WsCounters> m_counters;
++};
++
++Router MakeRouter() {
++    Router router(RouterOptions{true, {}});
++    router.Get("/info", [](const HttpRequest &req, const PathParams &) {
++        return HttpResponse::Text(200, "info from " + req.peer_ip);
++    });
++    router.Get("/blocks/:start/:end",
++               [](const HttpRequest &, const PathParams &p) {
++                   return HttpResponse::Text(
++                       200, std::to_string(PathI32(p, 0) + PathI32(p, 1)));
++               });
++    router.PostWithOptions(
++        "/broadcast-tx", [](const HttpRequest &req, const PathParams &) {
++            auto raw = ParseProtobufRequest<proto::BroadcastTxRequest>(req);
++            proto::RawTx out;
++            out.set_raw_tx(raw.raw_tx());
++            return HttpResponse::Protobuf(out);
++        });
++    router.AddWebSocket("/ws");
++    return router;
++}
++
++struct Fixture {
++    Router router = MakeRouter();
++    QueryPool pool{2};
++    std::shared_ptr<WsCounters> counters = std::make_shared<WsCounters>();
++    std::unique_ptr<BeastListener> listener;
++    uint16_t port = 0;
++
++    explicit Fixture(ListenerOptions opts = DefaultOpts()) {
++        auto counters_ = counters;
++        listener = std::make_unique<BeastListener>(
++            router, pool,
++            [counters_](std::shared_ptr<WsSession> session)
++                -> std::unique_ptr<WsHandler> {
++                ++counters_->accepted;
++                {
++                    std::lock_guard lock(counters_->mutex);
++                    counters_->last_peer_ip = session->PeerIp();
++                }
++                return std::make_unique<EchoHandler>(std::move(session),
++                                                     counters_);
++            },
++            std::move(opts));
++        listener->Start();
++        port = listener->BoundPorts().at(0);
++    }
++
++    static ListenerOptions DefaultOpts() {
++        ListenerOptions opts;
++        opts.binds = {{"127.0.0.1", 0}};
++        opts.ws_ping_interval = std::chrono::milliseconds(300);
++        return opts;
++    }
++};
++
++using WsClient = websocket::stream<tcp::socket>;
++
++std::unique_ptr<WsClient> ConnectWs(asio::io_context &ioc, uint16_t port,
++                                    websocket::response_type *res = nullptr) {
++    auto ws = std::make_unique<WsClient>(ioc);
++    ws->next_layer().connect(
++        tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
++    ws->read_message_max(1 << 20);
++    websocket::response_type ignored;
++    ws->handshake(res ? *res : ignored, "127.0.0.1", "/ws");
++    ws->binary(true);
++    return ws;
++}
++
++std::string ReadMsg(WsClient &ws) {
++    beast::flat_buffer buf;
++    ws.read(buf);
++    return beast::buffers_to_string(buf.data());
++}
++
++void WriteMsg(WsClient &ws, const std::string &msg) {
++    ws.write(asio::buffer(msg));
++}
++
++} // namespace
++
++BOOST_AUTO_TEST_SUITE(transport_tests)
++
++BOOST_AUTO_TEST_CASE(http_routes_and_keep_alive) {
++    Fixture fx;
++    Client client(fx.port);
++
++    // Several requests on one keep-alive connection
++    Response res = client.Request(http::verb::get, "/info");
++    BOOST_CHECK_EQUAL(res.result_int(), 200);
++    BOOST_CHECK_EQUAL(res.body(), "info from 127.0.0.1");
++    BOOST_CHECK_EQUAL(res[http::field::content_type],
++                      "text/plain; charset=utf-8");
++    BOOST_CHECK_EQUAL(res["access-control-allow-origin"], "*");
++    BOOST_CHECK(res.keep_alive());
++
++    res = client.Request(http::verb::get, "/blocks/2/40");
++    BOOST_CHECK_EQUAL(res.body(), "42");
++
++    res = client.Request(http::verb::head, "/info");
++    BOOST_CHECK_EQUAL(res.result_int(), 200);
++    BOOST_CHECK_EQUAL(res[http::field::content_length], "19");
++    BOOST_CHECK(res.body().empty());
++
++    res = client.Request(http::verb::get, "/nope?a=1");
++    BOOST_CHECK_EQUAL(res.result_int(), 404);
++    BOOST_CHECK_EQUAL(res[http::field::content_type], "application/x-protobuf");
++    BOOST_CHECK_EQUAL(ErrMsg(res), "404: Not found: /nope?a=1");
++
++    res = client.Request(http::verb::delete_, "/info");
++    BOOST_CHECK_EQUAL(res.result_int(), 405);
++    BOOST_CHECK_EQUAL(res[http::field::allow], "GET,HEAD");
++    BOOST_CHECK(res.body().empty());
++
++    res = client.Request(http::verb::get, "/blocks/x/1");
++    BOOST_CHECK_EQUAL(res.result_int(), 400);
++    BOOST_CHECK_EQUAL(res.body(), "Invalid URL: Cannot parse value at index 0 "
++                                  "with value `\"x\"` to a `i32`");
++
++    // CORS preflight
++    res = client.Request(http::verb::options, "/broadcast-tx", {},
++                         {{"Origin", "https://example.com"},
++                          {"Access-Control-Request-Method", "POST"}});
++    BOOST_CHECK_EQUAL(res.result_int(), 200);
++    BOOST_CHECK_EQUAL(res["access-control-allow-origin"], "*");
++    BOOST_CHECK_EQUAL(res["access-control-allow-methods"], "*");
++    BOOST_CHECK_EQUAL(res[http::field::vary],
++                      "origin, access-control-request-method, "
++                      "access-control-request-headers");
++
++    // POST protobuf
++    proto::BroadcastTxRequest req;
++    req.set_raw_tx("\x01\x02\x03");
++    res = client.Request(http::verb::post, "/broadcast-tx",
++                         req.SerializeAsString(),
++                         {{"Content-Type", "application/x-protobuf"}});
++    BOOST_CHECK_EQUAL(res.result_int(), 200);
++    proto::RawTx raw;
++    BOOST_REQUIRE(raw.ParseFromString(res.body()));
++    BOOST_CHECK_EQUAL(raw.raw_tx(), "\x01\x02\x03");
++
++    res = client.Request(http::verb::post, "/broadcast-tx", "\xff",
++                         {{"Content-Type", "application/x-protobuf"}});
++    BOOST_CHECK_EQUAL(res.result_int(), 400);
++    BOOST_CHECK_EQUAL(ErrMsg(res), "400: Bad protobuf: failed to decode "
++                                   "Protobuf message: invalid varint");
++
++    res = client.Request(http::verb::post, "/broadcast-tx", "",
++                         {{"Content-Type", "text/plain"}});
++    BOOST_CHECK_EQUAL(ErrMsg(res), "400: Content-Type must be "
++                                   "application/x-protobuf, got text/plain");
++
++    // GET on /ws without upgrade headers: axum's WebSocketUpgrade rejection
++    res = client.Request(http::verb::get, "/ws");
++    BOOST_CHECK_EQUAL(res.result_int(), 400);
++    BOOST_CHECK_EQUAL(res.body(),
++                      "Connection header did not include 'upgrade'");
++
++    // Connection: close is honoured
++    res = client.Request(http::verb::get, "/info", {},
++                         {{"Connection", "close"}});
++    BOOST_CHECK_EQUAL(res.result_int(), 200);
++    BOOST_CHECK(!res.keep_alive());
++    BOOST_CHECK(client.ServerClosed());
++}
++
++BOOST_AUTO_TEST_CASE(http_body_limit) {
++    ListenerOptions opts = Fixture::DefaultOpts();
++    opts.max_body_size = 100;
++    Fixture fx(opts);
++    const std::string expected =
++        "413: Request body exceeds maximum size of 2000000 bytes";
++    {
++        // Content-Length above the limit: not read, 413, connection closed.
++        // Like axum/hyper the response doesn't announce the close.
++        Client client(fx.port);
++        Response res =
++            client.Request(http::verb::post, "/broadcast-tx",
++                           std::string(101, 'x'),
++                           {{"Content-Type", "application/x-protobuf"}});
++        BOOST_CHECK_EQUAL(res.result_int(), 413);
++        BOOST_CHECK_EQUAL(ErrMsg(res), expected);
++        BOOST_CHECK(res.find(http::field::connection) == res.end());
++        BOOST_CHECK(client.ServerClosed());
++    }
++    {
++        // Chunked body growing above the limit
++        Client client(fx.port);
++        http::request<http::string_body> req{http::verb::post,
++                                             "/broadcast-tx", 11};
++        req.set(http::field::host, "127.0.0.1");
++        req.set(http::field::content_type, "application/x-protobuf");
++        req.chunked(true);
++        req.body() = std::string(150, 'y');
++        http::write(client.socket, req);
++        Response res = client.Read();
++        BOOST_CHECK_EQUAL(res.result_int(), 413);
++        BOOST_CHECK_EQUAL(ErrMsg(res), expected);
++    }
++    {
++        // The content type is checked before the size (axum order)
++        Client client(fx.port);
++        Response res = client.Request(http::verb::post, "/broadcast-tx",
++                                      std::string(101, 'x'),
++                                      {{"Content-Type", "text/plain"}});
++        BOOST_CHECK_EQUAL(res.result_int(), 400);
++    }
++    {
++        // At the limit is fine, and Expect: 100-continue is answered
++        Client client(fx.port);
++        proto::BroadcastTxRequest req;
++        req.set_raw_tx(std::string(90, 'z'));
++        const std::string body = req.SerializeAsString();
++        BOOST_REQUIRE_LE(body.size(), 100u);
++        http::request<http::string_body> hreq{http::verb::post,
++                                              "/broadcast-tx", 11};
++        hreq.set(http::field::host, "127.0.0.1");
++        hreq.set(http::field::content_type, "application/x-protobuf");
++        hreq.set(http::field::expect, "100-continue");
++        hreq.body() = body;
++        hreq.prepare_payload();
++        http::request_serializer<http::string_body> sr{hreq};
++        http::write_header(client.socket, sr);
++        Response cont = client.Read();
++        BOOST_CHECK_EQUAL(cont.result_int(), 100);
++        http::write(client.socket, sr);
++        Response res = client.Read();
++        BOOST_CHECK_EQUAL(res.result_int(), 200);
++    }
++}
++
++BOOST_AUTO_TEST_CASE(multiple_binds_and_bind_failure) {
++    ListenerOptions opts = Fixture::DefaultOpts();
++    opts.binds = {{"127.0.0.1", 0}, {"127.0.0.1", 0}};
++    Fixture fx(opts);
++    const auto ports = fx.listener->BoundPorts();
++    BOOST_REQUIRE_EQUAL(ports.size(), 2u);
++    BOOST_CHECK_NE(ports[0], ports[1]);
++    for (uint16_t port : ports) {
++        Client client(port);
++        BOOST_CHECK_EQUAL(client.Request(http::verb::get, "/info").result_int(),
++                          200);
++    }
++
++    // Port already in use
++    ListenerOptions taken = Fixture::DefaultOpts();
++    taken.binds = {{"127.0.0.1", ports[1]}};
++    BeastListener second(fx.router, fx.pool, {}, taken);
++    const std::string expected = "Chronik failed binding to 127.0.0.1:" +
++                                 std::to_string(ports[1]) + ": " +
++                                 std::strerror(EADDRINUSE) + " (os error " +
++                                 std::to_string(EADDRINUSE) + ")";
++    BOOST_CHECK_EXCEPTION(second.Start(), ChronikError,
++                          [&](const ChronikError &err) {
++                              BOOST_CHECK_EQUAL(err.what(), expected);
++                              return true;
++                          });
++    BOOST_CHECK_EQUAL(FormatSocketAddr("::1", 8331), "[::1]:8331");
++}
++
++BOOST_AUTO_TEST_CASE(async_handle_completion) {
++    Router router = MakeRouter();
++    QueryPool pool(1);
++    asio::io_context ioc;
++    std::optional<HttpResponse> got;
++    std::thread::id handler_thread;
++    HttpRequest req;
++    req.method = "GET";
++    req.path = "/blocks/1/2";
++    AsyncHandle(pool, router, req, [&](HttpResponse resp) {
++        handler_thread = std::this_thread::get_id();
++        got = std::move(resp);
++    });
++    // Coroutine form
++    std::optional<HttpResponse> got_co;
++    asio::co_spawn(
++        ioc,
++        [&]() -> asio::awaitable<void> {
++            got_co = co_await AsyncHandle(pool, router, req,
++                                          asio::use_awaitable);
++        },
++        asio::detached);
++    ioc.run();
++    BOOST_REQUIRE(got_co);
++    BOOST_CHECK_EQUAL(std::string(got_co->body.begin(), got_co->body.end()),
++                      "3");
++    pool.Join();
++    // A plain callback has the system executor: it runs on the pool thread
++    BOOST_REQUIRE(got);
++    BOOST_CHECK_EQUAL(got->status, 200);
++    BOOST_CHECK(handler_thread != std::this_thread::get_id());
++}
++
++BOOST_AUTO_TEST_CASE(websocket_echo_text_and_close) {
++    Fixture fx;
++    asio::io_context ioc;
++    {
++        websocket::response_type res;
++        auto ws = ConnectWs(ioc, fx.port, &res);
++        BOOST_CHECK_EQUAL(res.result_int(), 101);
++        BOOST_CHECK_EQUAL(res["access-control-allow-origin"], "*");
++
++        WriteMsg(*ws, "hello");
++        BOOST_CHECK_EQUAL(ReadMsg(*ws), "hello");
++        BOOST_CHECK(ws->got_binary());
++        WriteMsg(*ws, std::string(20'000, 'a'));
++        BOOST_CHECK_EQUAL(ReadMsg(*ws).size(), 20'000u);
++
++        ws->text(true);
++        WriteMsg(*ws, "hi");
++        ws->binary(true);
++        BOOST_CHECK_EQUAL(ReadMsg(*ws), "Unexpected message type Text");
++        BOOST_CHECK_EQUAL(fx.counters->texts.load(), 1);
++        BOOST_CHECK_EQUAL(fx.listener->NumWsSessions(), 1u);
++
++        ws->close(websocket::close_code::normal);
++    }
++    fx.counters->WaitClosed(1);
++    BOOST_CHECK_EQUAL(fx.counters->accepted.load(), 1);
++    BOOST_CHECK_EQUAL(fx.counters->closed.load(), 1);
++    {
++        std::lock_guard lock(fx.counters->mutex);
++        BOOST_CHECK_EQUAL(fx.counters->last_peer_ip, "127.0.0.1");
++    }
++
++    // Server-initiated close
++    auto ws = ConnectWs(ioc, fx.port);
++    WriteMsg(*ws, "close");
++    beast::flat_buffer buf;
++    beast::error_code ec;
++    ws->read(buf, ec);
++    BOOST_CHECK(ec == websocket::error::closed);
++    BOOST_CHECK(ws->reason().code == websocket::close_code::normal);
++    fx.counters->WaitClosed(2);
++    BOOST_CHECK_EQUAL(fx.counters->closed.load(), 2);
++}
++
++BOOST_AUTO_TEST_CASE(websocket_ping_pong) {
++    Fixture fx;
++    asio::io_context ioc;
++    auto ws = ConnectWs(ioc, fx.port);
++    std::vector<std::pair<websocket::frame_type, std::string>> control;
++    ws->control_callback(
++        [&](websocket::frame_type kind, beast::string_view payload) {
++            control.emplace_back(kind, std::string(payload));
++        });
++
++    // Server answers our ping with a pong
++    ws->ping("abc");
++    WriteMsg(*ws, "echo");
++    BOOST_CHECK_EQUAL(ReadMsg(*ws), "echo");
++    BOOST_REQUIRE(!control.empty());
++    BOOST_CHECK(control[0].first == websocket::frame_type::pong);
++    BOOST_CHECK_EQUAL(control[0].second, "abc");
++    control.clear();
++
++    // While idle (700 ms, interval 300 ms) the server pings us
++    WriteMsg(*ws, "delay");
++    BOOST_CHECK_EQUAL(ReadMsg(*ws), "done");
++    BOOST_CHECK_GE(control.size(), 2u);
++    for (const auto &[kind, payload] : control) {
++        BOOST_CHECK(kind == websocket::frame_type::ping);
++        BOOST_CHECK_EQUAL(payload, WS_PING_PAYLOAD);
++    }
++    control.clear();
++
++    // Activity re-arms the timer: no ping while messages flow
++    for (int i = 0; i < 6; ++i) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(100));
++        WriteMsg(*ws, "x");
++        BOOST_CHECK_EQUAL(ReadMsg(*ws), "x");
++    }
++    BOOST_CHECK(control.empty());
++    ws->close(websocket::close_code::normal);
++}
++
++BOOST_AUTO_TEST_CASE(websocket_max_message_size) {
++    Fixture fx;
++    asio::io_context ioc;
++    auto ws = ConnectWs(ioc, fx.port);
++    // Frame and message above 20000 bytes end the session
++    WriteMsg(*ws, std::string(20'001, 'b'));
++    beast::flat_buffer buf;
++    beast::error_code ec;
++    ws->read(buf, ec);
++    BOOST_CHECK(ec);
++    fx.counters->WaitClosed(1);
++    BOOST_CHECK_EQUAL(fx.counters->closed.load(), 1);
++
++    // A fragmented message above the limit also ends it
++    auto ws2 = ConnectWs(ioc, fx.port);
++    ws2->auto_fragment(false);
++    const std::string part(15'000, 'c');
++    ws2->write_some(false, asio::buffer(part));
++    ws2->write_some(true, asio::buffer(part));
++    buf.clear();
++    ws2->read(buf, ec);
++    BOOST_CHECK(ec);
++    fx.counters->WaitClosed(2);
++    BOOST_CHECK_EQUAL(fx.counters->closed.load(), 2);
++}
++
++BOOST_AUTO_TEST_CASE(stop_closes_sessions) {
++    auto fx = std::make_unique<Fixture>();
++    asio::io_context ioc;
++    auto ws = ConnectWs(ioc, fx->port);
++    WriteMsg(*ws, "x");
++    BOOST_CHECK_EQUAL(ReadMsg(*ws), "x");
++    Client idle(fx->port);
++    BOOST_CHECK_EQUAL(idle.Request(http::verb::get, "/info").result_int(), 200);
++
++    fx->listener->Stop();
++    fx->counters->WaitClosed(1);
++    BOOST_CHECK_EQUAL(fx->counters->closed.load(), 1);
++    beast::flat_buffer buf;
++    beast::error_code ec;
++    ws->read(buf, ec);
++    BOOST_CHECK(ec);
++    BOOST_CHECK(idle.ServerClosed());
++    fx->listener.reset();
++    // Handler calls run on the pool; it must outlive the listener's sessions
++    fx->pool.Join();
++    BOOST_CHECK_EQUAL(fx->counters->closed.load(), 1);
++}
++
++BOOST_AUTO_TEST_SUITE_END()
+diff --git a/chronik/native/transport/beast_listener.cpp b/chronik/native/transport/beast_listener.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..21e69567aaac3144b1adb3ffc0493976a59647bb
+--- /dev/null
++++ b/chronik/native/transport/beast_listener.cpp
+@@ -0,0 +1,646 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++// Standalone Boost.Beast HTTP/1.1 + WebSocket listener for -chronikbind.
++//
++// Each connection runs as a coroutine on its own strand of the listener's
++// io_context. Request handling (Router::Handle) and WebSocket handler calls
++// run on the QueryPool, never on io threads.
++
++#include <chronik/native/error.h>
++#include <chronik/native/transport/beast_listener.h>
++#include <chronik/native/transport/query_pool.h>
++
++#include <boost/asio/as_tuple.hpp>
++#include <boost/asio/co_spawn.hpp>
++#include <boost/asio/detached.hpp>
++#include <boost/asio/io_context.hpp>
++#include <boost/asio/ip/tcp.hpp>
++#include <boost/asio/ip/v6_only.hpp>
++#include <boost/asio/steady_timer.hpp>
++#include <boost/asio/use_awaitable.hpp>
++#include <boost/beast/core.hpp>
++#include <boost/beast/http.hpp>
++#include <boost/beast/websocket.hpp>
++
++#include <array>
++#include <atomic>
++#include <cstring>
++#include <deque>
++#include <list>
++#include <mutex>
++#include <thread>
++
++namespace chronik::native {
++
++namespace asio = boost::asio;
++namespace beast = boost::beast;
++namespace http = beast::http;
++namespace websocket = beast::websocket;
++using tcp = asio::ip::tcp;
++
++namespace {
++
++constexpr auto use_nothrow = asio::as_tuple(asio::use_awaitable);
++
++std::string OsErrorString(const boost::system::error_code &ec) {
++    // Rust io::Error Display: "<strerror> (os error N)"
++    if (ec.category() == boost::system::system_category() ||
++        ec.category() == boost::system::generic_category()) {
++        return std::string(std::strerror(ec.value())) + " (os error " +
++               std::to_string(ec.value()) + ")";
++    }
++    return ec.message();
++}
++
++} // namespace
++
++std::string FormatSocketAddr(const std::string &ip, uint16_t port) {
++    if (ip.find(':') != std::string::npos) {
++        return "[" + ip + "]:" + std::to_string(port);
++    }
++    return ip + ":" + std::to_string(port);
++}
++
++class BeastWsSession;
++
++struct BeastListener::Impl : std::enable_shared_from_this<Impl> {
++    const Router &router;
++    QueryPool &pool;
++    WsAccept ws_accept;
++    ListenerOptions opts;
++
++    asio::io_context &ioc;
++    std::vector<std::unique_ptr<tcp::acceptor>> acceptors;
++    std::vector<uint16_t> ports;
++    std::vector<std::thread> threads;
++    std::atomic<bool> stopping{false};
++
++    mutable std::mutex sessions_mutex;
++    std::list<std::weak_ptr<BeastWsSession>> ws_sessions;
++    std::list<std::weak_ptr<beast::tcp_stream>> http_streams;
++
++    Impl(asio::io_context &io, const Router &r, QueryPool &p, WsAccept a,
++         ListenerOptions o)
++        : router(r), pool(p), ws_accept(std::move(a)), opts(std::move(o)),
++          ioc(io) {}
++
++    asio::awaitable<void> AcceptLoop(tcp::acceptor &acceptor);
++    asio::awaitable<void> RunHttp(std::shared_ptr<beast::tcp_stream> stream);
++};
++
++/** One upgraded WebSocket connection. */
++class BeastWsSession : public WsSession,
++                       public std::enable_shared_from_this<BeastWsSession> {
++public:
++    using Strand = beast::tcp_stream::executor_type;
++    using WsStream = websocket::stream<beast::tcp_stream>;
++
++    BeastWsSession(std::shared_ptr<BeastListener::Impl> listener,
++                   beast::tcp_stream stream, std::string peer_ip)
++        : m_listener(std::move(listener)),
++          m_strand(stream.get_executor()),
++          m_ws(std::move(stream)), m_timer(m_strand),
++          m_handler_strand(m_listener->pool.MakeStrand()),
++          m_peer_ip(std::move(peer_ip)) {}
++
++    // ---- WsSession ----
++    void SendBinary(Bytes msg) override {
++        asio::post(m_strand, [self = shared_from_this(),
++                              msg = std::move(msg)]() mutable {
++            self->Enqueue(OutMsg{OutMsg::Kind::Binary, std::move(msg)});
++        });
++    }
++    void Close() override {
++        asio::post(m_strand, [self = shared_from_this()] {
++            self->Enqueue(OutMsg{OutMsg::Kind::Close, {}});
++        });
++    }
++    const std::string &PeerIp() const override { return m_peer_ip; }
++    void NotifyActivity() override {
++        asio::post(m_strand,
++                   [self = shared_from_this()] { self->ResetIdleTimer(); });
++    }
++
++    /** Runs on the connection's strand, with the upgrade request. */
++    asio::awaitable<void>
++    Run(http::request<http::vector_body<uint8_t>> req,
++        std::vector<HttpHeader> extra_headers) {
++        auto self = shared_from_this();
++        beast::get_lowest_layer(m_ws).expires_never();
++        websocket::stream_base::timeout timeout{};
++        timeout.handshake_timeout = std::chrono::seconds(30);
++        timeout.idle_timeout = websocket::stream_base::none();
++        timeout.keep_alive_pings = false;
++        m_ws.set_option(timeout);
++        m_ws.set_option(websocket::stream_base::decorator(
++            [extra_headers](websocket::response_type &res) {
++                for (const auto &[name, value] : extra_headers) {
++                    res.insert(name, value);
++                }
++            }));
++        m_ws.read_message_max(m_listener->opts.ws_max_message_size);
++        m_ws.binary(true);
++        m_ws.auto_fragment(false);
++        m_ws.control_callback(
++            [this](websocket::frame_type, beast::string_view) {
++                // Ping (auto-answered by Beast with a Pong) or Pong: both end
++                // a Rust loop iteration and so re-arm the ping timer.
++                ResetIdleTimer();
++            });
++        auto [ec] = co_await m_ws.async_accept(req, use_nothrow);
++        if (ec) {
++            co_return;
++        }
++        {
++            std::lock_guard lock(m_listener->sessions_mutex);
++            m_listener->ws_sessions.push_back(self);
++        }
++        // Create the handler on the pool strand, before any message.
++        asio::post(m_handler_strand, [self] {
++            if (!self->m_closed_notified.load()) {
++                self->m_handler = self->m_listener->ws_accept(self);
++            }
++        });
++        asio::co_spawn(m_strand, PingLoop(), asio::detached);
++        co_await ReadLoop();
++    }
++
++    /** Thread-safe: notify the handler and close the socket (Stop()). */
++    void ForceClose() {
++        NotifyClosed();
++        asio::post(m_strand, [self = shared_from_this()] {
++            beast::error_code ec;
++            beast::get_lowest_layer(self->m_ws).socket().close(ec);
++            self->m_timer.cancel();
++        });
++    }
++
++private:
++    struct OutMsg {
++        enum class Kind { Binary, Ping, Close } kind;
++        Bytes data;
++    };
++
++    asio::awaitable<void> ReadLoop() {
++        auto self = shared_from_this();
++        while (true) {
++            beast::flat_buffer buffer;
++            auto [ec, n] = co_await m_ws.async_read(buffer, use_nothrow);
++            if (ec) {
++                break;
++            }
++            ResetIdleTimer();
++            if (m_ws.got_text()) {
++                asio::post(m_handler_strand, [self] {
++                    if (self->m_handler) {
++                        self->m_handler->OnText();
++                    }
++                });
++            } else {
++                const auto data = buffer.data();
++                Bytes msg(static_cast<const uint8_t *>(data.data()),
++                          static_cast<const uint8_t *>(data.data()) +
++                              data.size());
++                asio::post(m_handler_strand,
++                           [self, msg = std::move(msg)] {
++                               if (self->m_handler) {
++                                   self->m_handler->OnBinary(msg);
++                               }
++                           });
++            }
++        }
++        m_closed = true;
++        m_out.clear();
++        m_timer.cancel();
++        NotifyClosed();
++    }
++
++    asio::awaitable<void> PingLoop() {
++        auto self = shared_from_this();
++        while (!m_closed) {
++            m_timer.expires_after(m_listener->opts.ws_ping_interval);
++            auto [ec] = co_await m_timer.async_wait(use_nothrow);
++            if (m_closed) {
++                break;
++            }
++            if (ec) {
++                // Cancelled by activity: re-arm
++                continue;
++            }
++            Enqueue(OutMsg{OutMsg::Kind::Ping,
++                           Bytes(WS_PING_PAYLOAD,
++                                 WS_PING_PAYLOAD +
++                                     std::strlen(WS_PING_PAYLOAD))});
++        }
++    }
++
++    void ResetIdleTimer() { m_timer.cancel(); }
++
++    void Enqueue(OutMsg msg) {
++        if (m_closed) {
++            return;
++        }
++        if (msg.kind != OutMsg::Kind::Ping) {
++            ResetIdleTimer();
++        }
++        m_out.push_back(std::move(msg));
++        if (!m_writing) {
++            m_writing = true;
++            asio::co_spawn(m_strand, WriteLoop(), asio::detached);
++        }
++    }
++
++    asio::awaitable<void> WriteLoop() {
++        auto self = shared_from_this();
++        while (!m_out.empty() && !m_closed) {
++            OutMsg msg = std::move(m_out.front());
++            m_out.pop_front();
++            beast::error_code ec;
++            switch (msg.kind) {
++                case OutMsg::Kind::Binary: {
++                    auto [wec, n] = co_await m_ws.async_write(
++                        asio::buffer(msg.data), use_nothrow);
++                    ec = wec;
++                    break;
++                }
++                case OutMsg::Kind::Ping: {
++                    websocket::ping_data payload(
++                        reinterpret_cast<const char *>(msg.data.data()),
++                        msg.data.size());
++                    auto [pec] = co_await m_ws.async_ping(payload, use_nothrow);
++                    ec = pec;
++                    break;
++                }
++                case OutMsg::Kind::Close: {
++                    auto [cec] = co_await m_ws.async_close(
++                        websocket::close_code::normal, use_nothrow);
++                    ec = cec;
++                    m_closed = true;
++                    break;
++                }
++            }
++            if (ec) {
++                // Rust: a failed send ends the session.
++                m_closed = true;
++                beast::error_code ignored;
++                beast::get_lowest_layer(m_ws).socket().close(ignored);
++                break;
++            }
++        }
++        m_writing = false;
++        if (m_closed) {
++            m_out.clear();
++            m_timer.cancel();
++        }
++    }
++
++    void NotifyClosed() {
++        if (m_closed_notified.exchange(true)) {
++            return;
++        }
++        asio::post(m_handler_strand, [self = shared_from_this()] {
++            if (self->m_handler) {
++                self->m_handler->OnClosed();
++                self->m_handler.reset();
++            }
++        });
++    }
++
++    std::shared_ptr<BeastListener::Impl> m_listener;
++    Strand m_strand;
++    WsStream m_ws;
++    asio::steady_timer m_timer;
++    asio::strand<QueryPool::executor_type> m_handler_strand;
++    std::string m_peer_ip;
++    std::unique_ptr<WsHandler> m_handler; // only touched on m_handler_strand
++    std::deque<OutMsg> m_out;
++    bool m_writing = false;
++    bool m_closed = false;
++    std::atomic<bool> m_closed_notified{false};
++};
++
++namespace {
++
++HttpRequest ToHttpRequest(const http::request<http::vector_body<uint8_t>> &req,
++                          std::string peer_ip) {
++    HttpRequest out;
++    out.method = std::string(req.method_string());
++    std::string target(req.target());
++    size_t q = target.find('?');
++    if (q == std::string::npos) {
++        out.path = target;
++    } else {
++        out.path = target.substr(0, q);
++        out.query_string = target.substr(q + 1);
++        out.has_query = true;
++    }
++    for (const auto &field : req) {
++        out.headers.emplace_back(std::string(field.name_string()),
++                                 std::string(field.value()));
++    }
++    out.peer_ip = std::move(peer_ip);
++    return out;
++}
++
++http::response<http::vector_body<uint8_t>>
++ToBeastResponse(HttpResponse resp, unsigned version, bool is_head) {
++    http::response<http::vector_body<uint8_t>> res{
++        static_cast<http::status>(resp.status), version};
++    std::optional<std::string> explicit_length;
++    for (auto &[name, value] : resp.headers) {
++        if (beast::iequals(name, "content-length")) {
++            explicit_length = value;
++            continue;
++        }
++        res.insert(name, value);
++    }
++    res.body() = std::move(resp.body);
++    if (is_head && explicit_length) {
++        res.set(http::field::content_length, *explicit_length);
++    } else {
++        res.prepare_payload();
++    }
++    return res;
++}
++
++} // namespace
++
++asio::awaitable<void>
++BeastListener::Impl::AcceptLoop(tcp::acceptor &acceptor) {
++    auto self = shared_from_this();
++    while (!stopping) {
++        auto [ec, socket] = co_await acceptor.async_accept(
++            asio::make_strand(ioc), use_nothrow);
++        if (ec) {
++            if (ec == asio::error::operation_aborted || stopping) {
++                co_return;
++            }
++            continue;
++        }
++        auto stream = std::make_shared<beast::tcp_stream>(std::move(socket));
++        {
++            std::lock_guard lock(sessions_mutex);
++            http_streams.remove_if([](const auto &w) { return w.expired(); });
++            ws_sessions.remove_if([](const auto &w) { return w.expired(); });
++            http_streams.push_back(stream);
++        }
++        auto ex = stream->get_executor();
++        asio::co_spawn(ex, RunHttp(std::move(stream)), asio::detached);
++    }
++}
++
++asio::awaitable<void>
++BeastListener::Impl::RunHttp(std::shared_ptr<beast::tcp_stream> stream) {
++    auto self = shared_from_this();
++    std::string peer_ip;
++    {
++        beast::error_code ec;
++        auto ep = stream->socket().remote_endpoint(ec);
++        if (!ec) {
++            peer_ip = ep.address().to_string();
++        }
++    }
++    beast::flat_buffer buffer;
++    while (!stopping) {
++        http::request_parser<http::vector_body<uint8_t>> parser;
++        parser.header_limit(uint32_t(opts.max_header_size));
++        // Content-Length is checked below; the parser would fail the header.
++        parser.body_limit(boost::none);
++        stream->expires_after(opts.http_idle_timeout);
++        auto [hec, hn] =
++            co_await http::async_read_header(*stream, buffer, parser, use_nothrow);
++        if (hec) {
++            break;
++        }
++        bool too_large = false;
++        bool must_close = false;
++        const auto content_length = parser.content_length();
++        if (content_length && *content_length > opts.max_body_size) {
++            // Don't read it: like axum's DefaultBodyLimit the protobuf
++            // extractor answers 413; then the connection is closed.
++            too_large = true;
++            must_close = true;
++        } else if (!parser.is_done()) {
++            parser.body_limit(opts.max_body_size);
++            const auto &hdr = parser.get();
++            auto expect = hdr.find(http::field::expect);
++            if (expect != hdr.end() &&
++                beast::iequals(expect->value(), "100-continue")) {
++                http::response<http::empty_body> cont{http::status::continue_,
++                                                      hdr.version()};
++                auto [cec, cn] =
++                    co_await http::async_write(*stream, cont, use_nothrow);
++                if (cec) {
++                    break;
++                }
++            }
++            auto [bec, bn] =
++                co_await http::async_read(*stream, buffer, parser, use_nothrow);
++            if (bec == http::error::body_limit) {
++                too_large = true;
++                must_close = true;
++            } else if (bec) {
++                break;
++            }
++        }
++        auto beast_req = parser.release();
++        HttpRequest req = ToHttpRequest(beast_req, peer_ip);
++        if (too_large) {
++            req.body.clear();
++            req.body_too_large = true;
++        } else {
++            req.body = std::move(beast_req.body());
++        }
++
++        if (websocket::is_upgrade(beast_req) &&
++            router.IsWebSocketUpgrade(req)) {
++            stream->expires_never();
++            auto session = std::make_shared<BeastWsSession>(
++                self, std::move(*stream), peer_ip);
++            co_await session->Run(std::move(beast_req),
++                                  router.UpgradeResponseHeaders(req));
++            co_return;
++        }
++
++        const bool is_head = beast_req.method() == http::verb::head;
++        const unsigned version = beast_req.version();
++        const bool keep_alive = beast_req.keep_alive() && !must_close;
++        stream->expires_never();
++        HttpResponse resp =
++            co_await AsyncHandle(pool, router, std::move(req),
++                                 asio::use_awaitable);
++        auto res = ToBeastResponse(std::move(resp), version, is_head);
++        // A 413 closes the connection afterwards (below), but like axum/hyper
++        // its headers don't announce it: only the client's own keep-alive
++        // choice is reflected.
++        res.keep_alive(beast_req.keep_alive());
++        stream->expires_after(opts.http_idle_timeout);
++        http::response_serializer<http::vector_body<uint8_t>> sr{res};
++        if (is_head) {
++            sr.split(true);
++            auto [wec, wn] =
++                co_await http::async_write_header(*stream, sr, use_nothrow);
++            if (wec) {
++                break;
++            }
++        } else {
++            auto [wec, wn] = co_await http::async_write(*stream, sr, use_nothrow);
++            if (wec) {
++                break;
++            }
++        }
++        if (must_close) {
++            // Lingering close: discard the unread body for a while so the
++            // client can read the 413 instead of getting a reset.
++            beast::error_code ec;
++            stream->socket().shutdown(tcp::socket::shutdown_send, ec);
++            stream->expires_after(std::chrono::seconds(2));
++            std::array<char, 16384> sink;
++            size_t discarded = 0;
++            while (discarded < 2 * opts.max_body_size + (1 << 20)) {
++                auto [rec, rn] = co_await stream->async_read_some(
++                    asio::buffer(sink), use_nothrow);
++                if (rec) {
++                    break;
++                }
++                discarded += rn;
++            }
++            break;
++        }
++        if (!keep_alive) {
++            break;
++        }
++    }
++    beast::error_code ec;
++    stream->socket().shutdown(tcp::socket::shutdown_send, ec);
++    stream->socket().close(ec);
++}
++
++struct BeastListener::IoHolder {
++    asio::io_context ioc;
++};
++
++BeastListener::BeastListener(const Router &router, QueryPool &pool,
++                             WsAccept ws_accept, ListenerOptions opts)
++    : m_io(std::make_unique<IoHolder>()),
++      m_impl(std::make_shared<Impl>(m_io->ioc, router, pool,
++                                    std::move(ws_accept), std::move(opts))) {}
++
++BeastListener::~BeastListener() {
++    Stop();
++    m_impl->acceptors.clear();
++    m_impl.reset();
++    m_io.reset();
++}
++
++void BeastListener::Start() {
++    Impl &impl = *m_impl;
++    for (const ListenerBind &bind : impl.opts.binds) {
++        const std::string display = FormatSocketAddr(bind.ip, bind.port);
++        boost::system::error_code ec;
++        const auto address = asio::ip::make_address(bind.ip, ec);
++        if (ec) {
++            throw ChronikError("Chronik failed binding to " + display + ": " +
++                               ec.message());
++        }
++        const tcp::endpoint endpoint(address, bind.port);
++        auto acceptor = std::make_unique<tcp::acceptor>(impl.ioc);
++        acceptor->open(endpoint.protocol(), ec);
++        if (!ec) {
++            // Rust's std TcpListener::bind sets SO_REUSEADDR on Unix
++            acceptor->set_option(asio::socket_base::reuse_address(true), ec);
++            if (endpoint.address().is_v6()) {
++                acceptor->set_option(asio::ip::v6_only(true), ec);
++            }
++            ec.clear();
++            acceptor->bind(endpoint, ec);
++        }
++        if (!ec) {
++            acceptor->listen(128, ec);
++        }
++        if (ec) {
++            throw ChronikError("Chronik failed binding to " + display + ": " +
++                               OsErrorString(ec));
++        }
++        impl.ports.push_back(acceptor->local_endpoint().port());
++        impl.acceptors.push_back(std::move(acceptor));
++    }
++    for (auto &acceptor : impl.acceptors) {
++        asio::co_spawn(impl.ioc, impl.AcceptLoop(*acceptor), asio::detached);
++    }
++    const size_t n = std::max<size_t>(1, impl.opts.io_threads);
++    for (size_t i = 0; i < n; ++i) {
++        impl.threads.emplace_back([impl = m_impl] { impl->ioc.run(); });
++    }
++}
++
++std::vector<uint16_t> BeastListener::BoundPorts() const {
++    return m_impl->ports;
++}
++
++size_t BeastListener::NumWsSessions() const {
++    std::lock_guard lock(m_impl->sessions_mutex);
++    size_t n = 0;
++    for (const auto &weak : m_impl->ws_sessions) {
++        if (!weak.expired()) {
++            ++n;
++        }
++    }
++    return n;
++}
++
++void BeastListener::Stop() {
++    Impl &impl = *m_impl;
++    if (impl.stopping.exchange(true)) {
++        return;
++    }
++    asio::post(impl.ioc, [&impl] {
++        for (auto &acceptor : impl.acceptors) {
++            beast::error_code ec;
++            acceptor->close(ec);
++        }
++    });
++    std::vector<std::shared_ptr<BeastWsSession>> sessions;
++    std::vector<std::shared_ptr<beast::tcp_stream>> streams;
++    {
++        std::lock_guard lock(impl.sessions_mutex);
++        for (auto &weak : impl.ws_sessions) {
++            if (auto s = weak.lock()) {
++                sessions.push_back(std::move(s));
++            }
++        }
++        for (auto &weak : impl.http_streams) {
++            if (auto s = weak.lock()) {
++                streams.push_back(std::move(s));
++            }
++        }
++    }
++    for (auto &session : sessions) {
++        session->ForceClose();
++    }
++    for (auto &stream : streams) {
++        asio::post(stream->get_executor(), [stream] {
++            beast::error_code ec;
++            stream->socket().close(ec);
++        });
++    }
++    sessions.clear();
++    streams.clear();
++    if (impl.threads.empty()) {
++        return;
++    }
++    // Let the close handlers run briefly, then stop the loop.
++    auto stop_timer = std::make_shared<asio::steady_timer>(impl.ioc);
++    stop_timer->expires_after(std::chrono::milliseconds(50));
++    stop_timer->async_wait([&impl, stop_timer](const auto &) { impl.ioc.stop(); });
++    for (auto &thread : impl.threads) {
++        if (thread.joinable()) {
++            thread.join();
++        }
++    }
++    impl.threads.clear();
++}
++
++} // namespace chronik::native
+diff --git a/chronik/native/transport/query_pool.cpp b/chronik/native/transport/query_pool.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..54417f85219222e6b41f7f2389d97a918cb77be1
+--- /dev/null
++++ b/chronik/native/transport/query_pool.cpp
+@@ -0,0 +1,34 @@
++// Copyright (c) 2026 The Lotus developers
++// Distributed under the MIT software license, see the accompanying
++// file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++#include <chronik/native/transport/query_pool.h>
++
++#include <algorithm>
++#include <thread>
++
++namespace chronik::native {
++
++size_t QueryPool::DefaultThreads() {
++    const size_t hw = std::thread::hardware_concurrency();
++    return std::min<size_t>(8, std::max<size_t>(1, hw / 2));
++}
++
++QueryPool::QueryPool(size_t num_threads)
++    : m_num_threads(std::max<size_t>(1, num_threads)),
++      m_pool(m_num_threads) {}
++
++QueryPool::~QueryPool() {
++    Stop();
++}
++
++void QueryPool::Stop() {
++    m_pool.stop();
++    m_pool.join();
++}
++
++void QueryPool::Join() {
++    m_pool.join();
++}
++
++} // namespace chronik::native
+diff --git a/chronik/native/transport/transport.cmake b/chronik/native/transport/transport.cmake
+new file mode 100644
+index 0000000000000000000000000000000000000000..357c885d007788769ae1fa75073fe965ff72f318
+--- /dev/null
++++ b/chronik/native/transport/transport.cmake
+@@ -0,0 +1,26 @@
++# Copyright (c) 2026 The Lotus developers
++# Distributed under the MIT software license, see the accompanying
++# file COPYING or http://www.opensource.org/licenses/mit-license.php.
++
++# HTTP/WebSocket transports: the query pool and the standalone Beast listener
++# (-chronikbind). Header-only Boost.Asio/Beast.
++add_library(chronik_native_transport STATIC
++    transport/query_pool.cpp
++    transport/beast_listener.cpp
++)
++target_include_directories(chronik_native_transport
++    PUBLIC "${CHRONIK_NATIVE_ROOT}/include"
++)
++target_link_libraries(chronik_native_transport
++    PUBLIC chronik_native_core Boost::headers
++)
++find_package(Threads REQUIRED)
++target_link_libraries(chronik_native_transport PUBLIC Threads::Threads)
++set_target_properties(chronik_native_transport PROPERTIES
++    POSITION_INDEPENDENT_CODE ON
++)
++
++target_sources(test_chronik_native PRIVATE
++    test/transport_tests.cpp
++)
++target_link_libraries(test_chronik_native chronik_native_transport)
+-- 
+2.50.1 (Apple Git-155)
+

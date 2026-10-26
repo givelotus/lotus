@@ -1,0 +1,150 @@
+From c98d96d0586ed2fce746764a110f6aea6dc99ed2 Mon Sep 17 00:00:00 2001
+From: Shammah Chancellor <shammah.chancellor@notvalid.com>
+Date: Wed, 14 Oct 2026 15:58:13 -0700
+Subject: [PATCH] mempool: avoid redundant ancestor checks in topological
+ diagnostic
+
+CTxMemPool::check already traverses the entry_id index, checks every direct
+parent link against transaction inputs, and asserts parent id < child id.
+Those strict inequalities imply the ordering of every ancestor by induction.
+Reconstructing the full ancestor set for each entry therefore proves the same
+property at quadratic cost on a chain: n(n-1)/2 ancestor visits per full check.
+
+Keep direct graph links, coin existence, scratch UTXO replay, input pointers,
+fee/size totals and memory accounting intact. Add a 512-entry chain with two
+inputs sharing each parent, a diamond, recursive removals and topological
+reinsertion to exercise the diagnostic's invariants.
+
+This changes only explicitly enabled/sampled consistency checking, not
+admission policy, transaction selection, chain limits or consensus. Checks
+are disabled under normal mainnet defaults. Repeated whole-pool checking
+after every insertion still has aggregate quadratic work. Unlike BCHN, this
+source already checks in topological order; there is no retry-queue rewrite.
+---
+ src/test/mempool_tests.cpp | 77 ++++++++++++++++++++++++++++++++++++++
+ src/txmempool.cpp          | 14 ++-----
+ 2 files changed, 80 insertions(+), 11 deletions(-)
+
+diff --git a/src/test/mempool_tests.cpp b/src/test/mempool_tests.cpp
+index 2fb20bd2d4..058a12e01f 100644
+--- a/src/test/mempool_tests.cpp
++++ b/src/test/mempool_tests.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include <txmempool.h>
+ 
++#include <coins.h>
++
+ #include <common/system.h>
+ #include <consensus/tx_verify.h>
+ #include <kernel/disconnected_transactions.h>
+@@ -24,6 +26,81 @@ BOOST_FIXTURE_TEST_SUITE(mempool_tests, TestingSetup)
+ 
+ static constexpr auto REMOVAL_REASON_DUMMY = MemPoolRemovalReason::CONFLICT;
+ 
++BOOST_AUTO_TEST_CASE(MempoolCheckTopologicalGraph) {
++    // TestingSetup enables every consistency check, independently of mainnet
++    // defaults.
++    CTxMemPool &pool = *Assert(m_node.mempool);
++    LOCK2(cs_main, pool.cs);
++    CCoinsView coins_base;
++    CCoinsViewCache coins(&coins_base);
++    const COutPoint funding(TxId(uint256S("01")), 0);
++    coins.AddCoin(
++        funding, Coin(CTxOut(100000 * SATOSHI, CScript() << OP_TRUE), 0, false),
++        false);
++    TestMemPoolEntryHelper entry;
++    std::vector<CTransactionRef> chain;
++    CMutableTransaction tx;
++    tx.vin.resize(1);
++    tx.vin[0].prevout = funding;
++    Amount value = 100000 * SATOSHI;
++    for (size_t i = 0; i < 512; ++i) {
++        value -= SATOSHI;
++        tx.vout = {CTxOut(value - SATOSHI, CScript() << OP_TRUE),
++                   CTxOut(SATOSHI, CScript() << OP_TRUE)};
++        chain.push_back(MakeTransactionRef(tx));
++        pool.addUnchecked(entry.Fee(SATOSHI).FromTx(chain.back()));
++        // Two inputs sharing one parent must produce one direct graph edge.
++        tx.vin.resize(2);
++        tx.vin[0].prevout = COutPoint(chain.back()->GetId(), 0);
++        tx.vin[1].prevout = COutPoint(chain.back()->GetId(), 1);
++    }
++    BOOST_CHECK_EQUAL(pool.size(), chain.size());
++    pool.check(coins, 1);
++    pool.removeRecursive(*chain[256], REMOVAL_REASON_DUMMY);
++    BOOST_CHECK_EQUAL(pool.size(), 256);
++    pool.check(coins, 1);
++    pool.removeRecursive(*chain.front(), REMOVAL_REASON_DUMMY);
++    BOOST_CHECK_EQUAL(pool.size(), 0);
++    pool.check(coins, 1);
++
++    // A diamond has a shared transitive ancestor but two distinct direct
++    // parents.
++    tx.vin.resize(1);
++    tx.vin[0].prevout = funding;
++    tx.vout = {CTxOut(40000 * SATOSHI, CScript() << OP_TRUE),
++               CTxOut(40000 * SATOSHI, CScript() << OP_TRUE)};
++    const auto root = MakeTransactionRef(tx);
++    pool.addUnchecked(entry.Fee(20000 * SATOSHI).FromTx(root));
++    std::vector<CTransactionRef> branches;
++    for (uint32_t i = 0; i < 2; ++i) {
++        tx.vin[0].prevout = COutPoint(root->GetId(), i);
++        tx.vout = {CTxOut(39999 * SATOSHI, CScript() << OP_TRUE)};
++        branches.push_back(MakeTransactionRef(tx));
++        pool.addUnchecked(entry.Fee(SATOSHI).FromTx(branches.back()));
++    }
++    tx.vin.resize(2);
++    for (uint32_t i = 0; i < 2; ++i) {
++        tx.vin[i].prevout = COutPoint(branches[i]->GetId(), 0);
++    }
++    tx.vout = {CTxOut(79997 * SATOSHI, CScript() << OP_TRUE)};
++    pool.addUnchecked(entry.Fee(SATOSHI).FromTx(tx));
++    pool.check(coins, 1);
++    pool.removeRecursive(*branches.front(), REMOVAL_REASON_DUMMY);
++    BOOST_CHECK_EQUAL(pool.size(), 2);
++    pool.check(coins, 1);
++    pool.removeRecursive(*root, REMOVAL_REASON_DUMMY);
++    BOOST_CHECK_EQUAL(pool.size(), 0);
++    pool.check(coins, 1);
++    // Reaccept a retained topological sequence, as the reorg path must do.
++    // This is unit coverage of reinsertion, not a full chain-reorg test.
++    for (const auto &transaction : chain) {
++        pool.addUnchecked(entry.Fee(SATOSHI).FromTx(transaction));
++    }
++    pool.check(coins, 1);
++    pool.clear();
++    pool.check(coins, 1);
++}
++
+ BOOST_AUTO_TEST_CASE(MempoolRemoveTest) {
+     // Test CTxMemPool::remove functionality
+ 
+diff --git a/src/txmempool.cpp b/src/txmempool.cpp
+index 70a0b1b64d..17e04d3557 100644
+--- a/src/txmempool.cpp
++++ b/src/txmempool.cpp
+@@ -449,17 +449,9 @@ void CTxMemPool::check(const CCoinsViewCache &active_coins_tip,
+         assert(std::equal(setParentCheck.begin(), setParentCheck.end(),
+                           entry->GetMemPoolParentsConst().begin(), comp));
+ 
+-        // Verify ancestor state is correct.
+-        setEntries setAncestors;
+-        std::string dummy;
+-
+-        const bool ok = CalculateMemPoolAncestors(entry, setAncestors);
+-        assert(ok);
+-
+-        // all ancestors should have entryId < this tx's entryId
+-        for (const auto &ancestor : setAncestors) {
+-            assert((*ancestor)->GetEntryId() < entry->GetEntryId());
+-        }
++        // Every direct parent was checked above and has a smaller entry id.
++        // Transitivity proves the same ordering for all ancestors, without
++        // rebuilding each entry's complete ancestor set (quadratic on chains).
+ 
+         // Check children against mapNextTx
+         CTxMemPoolEntry::Children setChildrenCheck;
+-- 
+2.50.1 (Apple Git-155)
+

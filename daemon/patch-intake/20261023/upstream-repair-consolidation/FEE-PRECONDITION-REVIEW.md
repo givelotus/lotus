@@ -1,0 +1,13 @@
+# Reviewed ownership repair discovered by the full shared gate
+
+The relay candidate passed focused shared suites, but full shared testing failed2 assertions in policy_fee_tests/single_rpc_admission_attempt_under_congestion. The same isolated case failed. All fee/controller/admission production files and this test were byte-identical to the prior shared input; the failure is not attributed to relay rank caching.
+
+The successful first RPC can update the pressure controller. The shared test then attempted a fee rejection using its old9,000-rate assumption. Inspection of the native adapter4371511f showed that it already re-established9,000 immediately before each rejection. That generic fixture repair was misplaced in V2.
+
+Reviewed correction: set and require the congestion-rate precondition for each rejection in original shared RPC/test owner2e735ad1. Preserve exactly-one-admission, insufficient-fee diagnostics, maximum-fee rejection and no-insertion assertions. Keep native v7 transaction/coin/witness construction and its richer failure diagnostics in the native adapter; remove its now-redundant later reset and replace native-specific comment wording with the common shared explanation. No production policy/controller code changes.
+
+Validation before folding:1022/1022 shared cases and31,167,602 assertions pass ated40eed543. Preservation: input full-history chain plus verified fee-precondition input/fixup bundles, exact refs, standalone reviewed diff and temporary-index native projection. The shared autosquash candidate must equal the testeded40 tracked tree exactly. The native replay must equal the independently projected native treef9e8646814df06e47380bc79db3e398f17f2ae3d exactly, with the only endpoint difference from303d41ca in src/test/policy_fee_tests.cpp.
+
+The autosquash uses GIT_SEQUENCE_EDITOR=true and disables updateRefs, so all original source refs and main/master/tags remain intact. Existing commit bodies mention fixup strings; verify subject prefixes rather than treating a body match as an unsquashed commit. The resulting378shared+153native histories have no fixup subjects. Complete composed hunk ownership is recorded in RELAY-COMPOSED-OWNERSHIP.json.
+
+Shared candidate5e3375602b54839a65d0e5fbfab0d1c0965be83b retains the passed shared tree. Native candidate24e17f599791c9a9cb3465d45fa17c84a06dd314 has the expected projected test tree; its final native build and all1,203 cases/31,480,438 assertions pass. This is a separate test-correctness repair, not a throughput improvement or a pure whole-tree-preserving move. Active source pins remain unchanged.

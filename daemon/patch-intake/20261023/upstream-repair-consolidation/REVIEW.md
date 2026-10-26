@@ -1,0 +1,20 @@
+# Plan review and required corrections
+
+Review performed by the task owner against actual Git diffs, source contracts and the repository preservation rules. This is a self-review, not a claimed independent agent review. No history was changed for this review.
+
+## Findings
+
+1. **The 19 candidates are not 19 removable commits.** Some contain new mechanisms or changes to several owners. Commit 44 includes snapshot coalescing; 116 combines TLS-test setup with an inherited SOCKS fixture repair; 162 formats 23 test files. Require per-hunk ownership and preserve independent upstream fixes.
+2. **The Beast timer repair cannot be blindly moved as one patch.** Commit 99's diff includes Chronik and WebSocket handler contexts introduced at 95/96. Move the generic write/watchdog behavior to 86 only with explicit later-consumer adapters and a checkpoint after all participating original changes. Start with the simpler complete body-move repair 98 instead.
+3. **Earlier guessed owners need correction.** The zstd helper and `AcceptWebSocketPeer` declaration were introduced by 96, so fixes 111/126 belong there. The native router change 229 adds a raw-path API; at the shared tip only its implementation and unit test reference `PathExtraction::Raw`. Do not call it a verified production parity repair. Consolidating the API with the router foundation is a separate review decision.
+4. **Coroutine placement has real dependencies.** The current implementation depends on the admission outcome/limits, dispatcher, validation queues and staged-preparation APIs. Do not manufacture a temporary implementation or hoist unused APIs merely to make it fifth. Audit the minimum complete dependency group before moving it early.
+5. **Freeze feature changes separately from history cleanup.** Baseline shared/native endpoints are d38c3820/a3679647. Native coroutine candidate 4d77f464 has a different endpoint. It is accepted review work to retain, but its shared-tier counterpart and native adapters need their own integration gates before becoming a new frozen endpoint. Atomic-reader and queue-capability candidates also remain explicitly inventoried, not silently included or lost.
+6. **Endpoint equality is necessary but insufficient.** A late fix may be required for an earlier feature to build or behave correctly. Validate each moved logical owner and its prerequisites, then the shared boundary and full native endpoint. Compare checkpoint trees after the old repair positions have been passed. Do not rely on clean cherry-picks or matching subjects.
+7. **Reordering cannot explain a performance gain.** A pure move preserves endpoint behavior. Use source/binary/config hashes, old/new number mappings and unchanged-tree evidence when reusing old endpoint results. New semantic fixes must have separately identified diffs and A/B evidence.
+8. **Do not optimize a generator-limited test or the wrong chain.** Shared legacy RPC profiles do not describe native UTXO snapshot preparation. Native baseline batch admission is about 36.8K TPS; transport-only echo capacity is about 1.63M transaction-sized items/s. Profile actual native validation/commit and scaling before selecting the next optimization.
+9. **Preserve reviewability, not an arbitrary commit target.** A large Chronik rewrite must not become one giant commit solely to lower the count. Conversely, keep tests/build/docs with the change they establish instead of late cleanup commits. Do not promise a 30-commit result before the owner audit.
+10. **Keep the performance work moving.** Complete a bounded consolidation cohort and its gates, then investigate a bounded native hotspot. Do not spend an indefinite period rearranging history before working toward 100K TPS. Never overlap compiler/archival jobs with timed runs.
+
+## Disposition
+
+Plan revised in PLAN.md to address all findings. First executable cohort: fold shared repair 98 into Beast owner 86, with exact original-98, shared and native tree checkpoints and relevant owner gates. The rest of the inventory remains preserved until its individual mapping is reviewed. No human approval is required for this authorized work.
