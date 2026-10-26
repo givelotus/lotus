@@ -1,0 +1,116 @@
+// One validated, immutable description of the connected node. Mining accepts
+// only compiled-in algorithm identifiers; descriptors never provide code/URLs.
+const ALGOS = Object.freeze({
+  sha256d: Object.freeze({ headerbytes: 80, nonceoffset: 76, noncebytes: 4 }),
+  'lotus-v2-blockid': Object.freeze({ headerbytes: 134, nonceoffset: 42, noncebytes: 8 }),
+});
+
+/** @typedef {'sha256d'|'lotus-v2-blockid'} MiningAlgorithm */
+/** @typedef {{algorithm: MiningAlgorithm, headerbytes: number, nonceoffset: number, noncebytes: number, chainid?: string}} MiningDescriptor */
+export function validateMiningDescriptor(value) {
+  if (!value || value.version !== 1) throw new Error('This node does not advertise a supported mining descriptor.');
+  const expected = Object.hasOwn(ALGOS, value.algorithm) ? ALGOS[value.algorithm] : null;
+  if (!expected) throw new Error('This node advertises an unsupported proof-of-work algorithm.');
+  for (const key of ['headerbytes', 'nonceoffset', 'noncebytes']) {
+    if (value[key] !== expected[key]) throw new Error(`Unsupported mining header layout (${key}).`);
+  }
+  if (value.noncebyteorder !== 'little' || value.hashbyteorder !== 'little' || value.targetbyteorder !== 'big') throw new Error('Unsupported mining byte order.');
+  if (value.template_rpc !== 'getrawunsolvedblock' || value.submit_rpc !== 'submitblock') throw new Error('Unsupported mining RPC contract.');
+  if (value.algorithm === 'lotus-v2-blockid' && !/^[0-9a-f]{64}$/i.test(value.chainid ?? '')) throw new Error('Missing or invalid mining chain identifier.');
+  return Object.freeze({ version: 1, algorithm: value.algorithm, ...expected,
+    noncebyteorder: 'little', hashbyteorder: 'little', targetbyteorder: 'big',
+    ...(value.algorithm === 'lotus-v2-blockid' ? { chainid: value.chainid.toLowerCase() } : {}),
+    template_rpc: 'getrawunsolvedblock', submit_rpc: 'submitblock' });
+}
+
+
+function object(value, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Invalid ${label}.`);
+  return value;
+}
+function text(value, label, pattern) {
+  if (typeof value !== 'string' || !value || value.length > 256 || (pattern && !pattern.test(value))) throw new Error(`Invalid ${label}.`);
+  return value;
+}
+function integer(value, label, max) {
+  if (!Number.isSafeInteger(value) || value < 0 || value > max) throw new Error(`Invalid ${label}.`);
+  return value;
+}
+function bool(value, label) {
+  if (typeof value !== 'boolean') throw new Error(`Invalid ${label}.`);
+  return value;
+}
+function freeze(value) {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) freeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+/** Immutable facts and UI policy for one authenticated node connection.
+ * Behavioral operations belong to ChainAdaptor, not this configuration.
+ */
+export class ChainConfig {
+  constructor(raw) {
+    object(raw, 'chain discovery');
+    if (raw.version !== 1) throw new Error('Unsupported getchainconfig schema version.');
+    const chain = object(raw.chain, 'chain identity');
+    if (chain.family !== 'bitcoin' || !['ecash', 'lotus-v2'].includes(chain.kind) || !['main', 'test', 'regtest'].includes(chain.network)) throw new Error('Unsupported chain family, kind or network.');
+    const genesis = text(chain.genesis, 'genesis hash', /^[0-9a-f]{64}$/);
+    const identifier = text(chain.identifier, 'chain identifier');
+    if (identifier !== `${chain.kind}-${chain.network}:${genesis}`) throw new Error('Chain identifier disagrees with genesis/network identity.');
+    const native = chain.kind === 'lotus-v2';
+    const chainid = native ? text(chain.chainid, 'native chain identifier', /^[0-9a-f]{64}$/) : null;
+    const money = object(raw.currency, 'currency');
+    const rpcDecimals = integer(money.rpcdecimals, 'RPC precision', 18);
+    const displayDecimals = integer(money.displaydecimals, 'display precision', rpcDecimals);
+    const atoms = text(money.atomsperunit, 'atomic units', /^[1-9][0-9]*$/);
+    if (BigInt(atoms) !== 10n ** BigInt(rpcDecimals)) throw new Error('Currency atomic unit and RPC precision disagree.');
+    const ticker = text(money.ticker, 'currency ticker', /^[A-Za-z0-9]{1,16}$/);
+    const address = object(raw.address, 'address capabilities');
+    if (!['cashaddr', 'base58check'].includes(address.format) || !Array.isArray(address.acceptedformats) || !address.acceptedformats.includes(address.format) || address.acceptedformats.some((f) => !['cashaddr', 'base58check', ...(native ? ['xpiaddr'] : [])].includes(f))) throw new Error('Unsupported address codec.');
+    if (!Array.isArray(address.types) || address.types.length !== 2 || !address.types.includes(0) || !address.types.includes(1)) throw new Error('Unsupported address destination types.');
+    const hrp = text(address.hrp, 'address prefix', /^[a-z0-9]+$/);
+    const hasNativeCodec = address.acceptedformats.includes('xpiaddr');
+    const nativeHrp = address.nativehrp === undefined ? null : text(address.nativehrp, 'native address prefix', /^(xpi|txpi|rxpi)$/);
+    if ((nativeHrp !== null && !native) || hasNativeCodec !== (nativeHrp !== null)) throw new Error('Native address codec and prefix disagree.');
+    if (nativeHrp !== null && nativeHrp !== ({ main: 'xpi', test: 'txpi', regtest: 'rxpi' })[chain.network]) throw new Error('Native address prefix disagrees with network.');
+    const prefixes = object(address.base58prefixes, 'Base58 prefixes');
+    const pubkeyhash = text(prefixes.pubkeyhash, 'Base58 pubkey prefix', /^(?:[0-9a-f]{2})+$/);
+    const scripthash = text(prefixes.scripthash, 'Base58 script prefix', /^(?:[0-9a-f]{2})+$/);
+    const mining = object(raw.mining, 'mining capabilities');
+    const pow = validateMiningDescriptor(mining.pow);
+    if (pow.algorithm !== (native ? 'lotus-v2-blockid' : 'sha256d') || (native && pow.chainid !== chainid)) throw new Error('Proof-of-work descriptor disagrees with chain identity.');
+    const testGeneration = bool(mining.testgeneration, 'test block generation');
+    if (testGeneration && chain.network !== 'regtest') throw new Error('Test block generation advertised outside regtest.');
+    const features = object(raw.features, 'protocol features');
+    if (features.message_signing !== 'legacy-p2pkh') throw new Error('Unsupported message-signature scheme.');
+    const legacy = bool(features.legacytransactions, 'legacy transaction capability');
+    const nativeTransactions = bool(features.nativetransactions, 'native transaction capability');
+    if (nativeTransactions !== native) throw new Error('Transaction capabilities disagree with chain kind.');
+    const node = object(raw.node, 'node identity');
+    const client = text(node.client, 'node client');
+    const version = integer(node.version, 'node version', 0x7fffffff);
+    let nativeReceiving = false;
+    const receive = raw.wallet?.native_receiving;
+    if (receive !== undefined) {
+      object(receive, 'native wallet receiving capability');
+      nativeReceiving = bool(receive.available, 'native wallet receiving availability');
+      if (nativeReceiving && (!native || !hasNativeCodec || nativeHrp === null || receive.address_type !== 'native' || receive.format !== 'xpiaddr' || receive.template !== 'keyhash')) throw new Error('Unsupported native wallet receiving contract.');
+    }
+    Object.assign(this, {
+      configVersion: 1, chainIdentifier: identifier,
+      network: { family: chain.family, kind: chain.kind, chain: chain.network, chainIdentifier: identifier, genesis, chainid, client, version },
+      currency: { ticker, atomicUnitsPerCoin: atoms, rpcDecimals, displayDecimals },
+      address: { format: address.format, hrp, nativeHrp, types: [...address.types], acceptedFormats: [...address.acceptedformats], base58Prefixes: { pubkeyhash, scripthash } },
+      mining: { supported: true, descriptor: pow },
+      wallet: { nativeReceiving },
+      rpc: { testBlockGeneration: testGeneration, template: pow.template_rpc, submission: pow.submit_rpc },
+      features: { legacyTransactions: legacy, nativeTransactions, messageSigning: features.message_signing, nativeMessageSigning: false },
+      // Existing view vocabulary references these same validated facts.
+      chain: chain.network, profile: chain.kind, client, version, ticker, decimals: rpcDecimals, addressFormat: address.format, hrp,
+    });
+    freeze(this);
+  }
+}
