@@ -43,11 +43,11 @@ def main():
         parser.error('Peer completion timeout must be10..600seconds')
     data = args.data.resolve()
     data.mkdir(parents=True, exist_ok=False)
-    lock = (ROOT / 'daemon/.local-artifact-archive/benchmark-host.lock').open('a')
+    lock = (Path.home() / 'repos/archive/builds/lotus-bench/benchmark-host.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     source_lock = (audit.SOURCE / '.git/progression.lock').open('a')
     fcntl.flock(source_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    receipt_path = args.build_receipt or ROOT / 'daemon/.local-artifact-archive/commit-regressions/async-admission-and-info/point-377/BUILD.json'
+    receipt_path = args.build_receipt or Path.home() / 'repos/archive/builds/lotus-bench/commit-regressions/async-admission-and-info/point-377/BUILD.json'
     receipt = json.loads(receipt_path.read_text())
     assert audit.sha(receipt['binary']) == receipt['binary_sha256']
     audit.checkout(receipt['commit'])
@@ -83,7 +83,7 @@ def main():
                 command += ['--fixture-hash-site', args.fixture_hash_site.resolve()]
             print('RUN', round_number, label, flush=True)
             env = dict(os.environ, CAPACITY_CONFIG=str(path),
-                       TMPDIR=str(ROOT / 'daemon/.local-artifact-archive/commit-regressions/runtime'))
+                       TMPDIR=str(Path.home() / 'repos/archive/builds/lotus-bench/commit-regressions/runtime'))
             resources = audit.guarded(command, directory / 'stdout.log', env,
                                       owned_rss_limit_gib=args.owned_rss_limit_gib)
             audit.write(directory / 'RESOURCES.json', resources)

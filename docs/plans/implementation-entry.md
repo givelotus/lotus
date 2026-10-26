@@ -8,7 +8,7 @@ The first two units can start independently. The third is an evidence investigat
 
 **Outcome:** a developer can prepare separate reference-v1, candidate-v1, candidate-v2 and upstream workspaces with explicit source pins, without overwriting existing work or suppressing patch failures.
 
-**Historical evidence:** the original October 9 investigation reported ambiguous pins/shared workspaces and suppressed failures. Recheck each condition against current tooling before treating it as an open bug. The dedicated V2 pin and six-patch manifest now exist; the [current implementation plan](../../daemon/docs/lotus-v2-implementation-plan.md) owns source routing and acceptance.
+**Historical evidence:** the original October 9 investigation reported ambiguous pins/shared workspaces and suppressed failures. Recheck each condition against current tooling before treating it as an open bug. The dedicated V2 pin and six-patch manifest now exist; the [current implementation plan](../lotus-v2/research/implementation-notes/lotus-v2-implementation-plan.md) owns source routing and acceptance.
 
 **Boundary:** `daemon/scripts`, Makefile, pin-role metadata, patch-series validation and their disposable-repository tests. Preserve existing workspaces and all data directories. Do not apply the full history, change network consensus or launch a node.
 

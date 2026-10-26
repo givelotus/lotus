@@ -70,5 +70,5 @@ validation and Chronik. `decode` measures real framing plus complete transaction
 commitment, excluding VM/UTXO/PoW checks. `prototype` is explicitly the standalone
 whole-snapshot PersistentUtxoStore that the daemon does not link.
 
-See [the assessment](../../docs/plans/lotus-v2-performance-baseline.md) for
+See [the assessment](../../docs/lotus-v2/research/plans/lotus-v2-performance-baseline.md) for
 source traces, findings, limitations and the purpose-built database decision.

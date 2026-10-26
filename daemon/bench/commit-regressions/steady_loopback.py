@@ -6,7 +6,7 @@ diagnostic_net = '--audit-debug-net' in sys.argv
 if diagnostic_net:
     sys.argv.remove('--audit-debug-net')
 ROOT=Path(__file__).resolve().parents[3]
-SCRIPTS=ROOT/'daemon/patch-audit/consolidation/20261022/benchmark-tools/scripts'
+SCRIPTS=ROOT/'daemon/bench/workloads/scripts'
 sys.path.insert(0,str(SCRIPTS))
 frozen=SCRIPTS/'matched_loopback.py'
 lines=frozen.read_text().splitlines()

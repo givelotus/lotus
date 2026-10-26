@@ -14,7 +14,7 @@ import time
 import types
 
 ROOT = Path(__file__).resolve().parents[3]
-FROZEN = ROOT / 'daemon/patch-audit/consolidation/20261022/benchmark-tools/scripts'
+FROZEN = ROOT / 'daemon/bench/workloads/scripts'
 sys.path.insert(0, str(FROZEN))
 import steady_ingestion as core
 

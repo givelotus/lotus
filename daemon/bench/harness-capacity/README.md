@@ -11,7 +11,7 @@ Run from the canonical repository root. These tools reuse the registered `daemon
 The native fixture-only acceleration is the existing frozen adapter. Install the pinned package into an isolated canonical directory, then pass that directory with `--fixture-hash-site`. Its compatibility checks run before preparation. Node validation is unchanged.
 
 ```sh
-python3 -m pip install --only-binary=:all: --no-deps --target daemon/.local-artifact-archive/fixture-hash-site blake3==1.0.8
+python3 -m pip install --only-binary=:all: --no-deps --target ~/repos/archive/builds/lotus-bench/fixture-hash-site blake3==1.0.8
 ```
 
 Use a clean source checkout and frozen build receipt matching the desired source; build/gate it before timing. Exact commands, flags, source trees, binary hashes, fixture hashes and historical tool versions for completed measurements are in `daemon/patch-intake/20261023/harness-capacity/evidence.tar.gz`. Reproducing an old measurement requires its recorded tool versions rather than silently substituting the newest wrapper.

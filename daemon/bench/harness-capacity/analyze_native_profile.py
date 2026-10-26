@@ -35,10 +35,12 @@ def main():
             frame['ancestors'] = [p['symbol'] for p in stack]
             stack.append(frame)
         counts = collections.Counter()
+        exclusive_symbols = collections.Counter()
         for frame in frames:
             count = frame['count'] - frame['children']
             assert count >= 0, frame
             symbol = frame['symbol']
+            exclusive_symbols[symbol] += count
             parents = '\n'.join(frame['ancestors'])
             if '__psynch_cvwait' in symbol:
                 category = 'condition wait'
@@ -61,7 +63,11 @@ def main():
                            percent={k: round(100*v/total, 2) for k, v in counts.items()},
                            rpc_worker='thread_pool::thread_function' in block,
                            message_handler='ThreadMessageHandler' in block,
-                           signing_worker='SigningWorkerPool' in block))
+                           signing_worker='SigningWorkerPool' in block,
+                           admission_worker='ThreadTxAdmission' in block,
+                           script_worker='ParallelScriptWorkerPool' in block,
+                           top_exclusive_frames=[dict(symbol=symbol, samples=count)
+                               for symbol, count in exclusive_symbols.most_common(20) if count]))
     assert result
     args.output.write_text(json.dumps(dict(
         scope='Exclusive wall-stack samples, including blocked/idle time; not CPU percentages or throughput attribution',

@@ -1,6 +1,6 @@
 # New Lotus Chain — Design Reference
 
-This document preserves earlier design notes. Current authority is the [Lotus development plan](plans/lotus-v2-artifacts-plan.md) and its linked consensus/daemon documents. Historical chain-state claims, build commands and source pins below are unverified leads; they do not identify the present target network or diagnose the reported sync obstruction.
+This document preserves earlier design notes. Current authority is the [Lotus development plan](lotus-v2/research/plans/lotus-v2-artifacts-plan.md) and its linked consensus/daemon documents. Historical chain-state claims, build commands and source pins below are unverified leads; they do not identify the present target network or diagnose the reported sync obstruction.
 
 ---
 

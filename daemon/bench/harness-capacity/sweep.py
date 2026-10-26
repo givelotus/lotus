@@ -27,14 +27,14 @@ def main():
     args = parser.parse_args()
     data = args.data.resolve()
     data.mkdir(parents=True, exist_ok=False)
-    lock = (ROOT / 'daemon/.local-artifact-archive/benchmark-host.lock').open('a')
+    lock = (Path.home() / 'repos/archive/builds/lotus-bench/benchmark-host.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     source_lock = (audit.SOURCE / '.git/progression.lock').open('a')
     fcntl.flock(source_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     sources = {}
     for side, variant in [('blocking', 'queue-only-fixture-corrected'),
                           ('co_await', 'async-admission-only')]:
-        receipt = ROOT / 'daemon/.local-artifact-archive/commit-regressions' / variant / 'point-377/BUILD.json'
+        receipt = Path.home() / 'repos/archive/builds/lotus-bench/commit-regressions' / variant / 'point-377/BUILD.json'
         sources[side] = json.loads(receipt.read_text())
         assert audit.sha(sources[side]['binary']) == sources[side]['binary_sha256']
     audit.write(data / 'INPUTS.json', {'sources': sources, 'argv': sys.argv,
@@ -94,7 +94,7 @@ def main():
                     command += ['--sample-node0-output', directory / 'node0.sample.txt']
                 print('RUN', number, label, side, flush=True)
                 env = dict(os.environ, CAPACITY_CONFIG=str(path),
-                           TMPDIR=str(ROOT / 'daemon/.local-artifact-archive/commit-regressions/runtime'))
+                           TMPDIR=str(Path.home() / 'repos/archive/builds/lotus-bench/commit-regressions/runtime'))
                 resources = audit.guarded(command, directory / 'stdout.log', env)
                 audit.write(directory / 'RESOURCES.json', resources)
                 payload = json.loads(output.read_text())

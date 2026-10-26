@@ -26,8 +26,8 @@ def main():
     args = parser.parse_args()
     data = args.data.resolve()
     data.mkdir(parents=True, exist_ok=False)
-    archive = audit.ROOT/'daemon/.local-artifact-archive/commit-regressions/template-test-order'
-    probe = audit.ROOT/'daemon/patch-intake/20261021/triage/beast-json-array/size_probe.py'
+    archive = Path.home()/'repos/archive/builds/lotus-bench/commit-regressions/template-test-order'
+    probe = audit.ROOT/'daemon/bench/workloads/scripts/size_probe.py'
     lock = (archive.parent/'benchmark-host.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     points = tuple(int(n) if n.isdigit() else n for n in args.points.split(','))

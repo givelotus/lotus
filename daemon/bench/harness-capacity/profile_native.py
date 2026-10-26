@@ -27,7 +27,7 @@ def main():
     import json
     receipt = json.loads(args.build_receipt.read_text())
     assert audit.sha(receipt['binary']) == receipt['binary_sha256']
-    with (ROOT / 'daemon/.local-artifact-archive/benchmark-host.lock').open('a') as host_lock, \
+    with (Path.home() / 'repos/archive/builds/lotus-bench/benchmark-host.lock').open('a') as host_lock, \
             (audit.SOURCE / '.git/progression.lock').open('a') as source_lock:
         for lock in (host_lock, source_lock):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -40,11 +40,11 @@ def main():
                    '--output', data / 'result.json', '--steady', '--case', 'signed_batch200_steady',
                    '--max-fixture-transactions', '1200000', '--exact-fixture-transactions',
                    str(args.fixture_transactions), '--fixture-hash-site',
-                   ROOT / 'daemon/.local-artifact-archive/fixture-hash-site',
+                   Path.home() / 'repos/archive/builds/lotus-bench/fixture-hash-site',
                    '--fixture-fee-sats', '10000', '--hierarchical-funding',
                    '--maxmempool-mb', '4096', '--port-base', '39110',
                    '--sample-node0-output', data / 'node0.sample.txt']
-        tools = list((ROOT / 'daemon/patch-audit/consolidation/20261022/benchmark-tools').rglob('*.py'))
+        tools = list((ROOT / 'daemon/bench/workloads').rglob('*.py'))
         tools += [Path(__file__), ROOT / 'daemon/bench/commit-regressions/steady_loopback.py']
         audit.write(data / 'INPUTS.json', dict(source=receipt,
             tools={str(p.relative_to(ROOT)): audit.sha(p) for p in tools},
@@ -52,7 +52,7 @@ def main():
             scope='Instrumented native V2 signed-batch200 acceptance; NOT publishable TPS, peer convergence or finality'))
         try:
             resources = audit.guarded(command, data / 'stdout.log', dict(os.environ,
-                TMPDIR=str(ROOT / 'daemon/.local-artifact-archive/commit-regressions/runtime')))
+                TMPDIR=str(Path.home() / 'repos/archive/builds/lotus-bench/commit-regressions/runtime')))
             audit.write(data / 'RESOURCES.json', resources)
         finally:
             if previous.startswith('refs/heads/'):

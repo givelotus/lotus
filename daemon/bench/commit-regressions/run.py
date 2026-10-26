@@ -4,9 +4,9 @@ import argparse, datetime, fcntl, hashlib, json, os, platform, re, shutil
 import signal, statistics, subprocess, sys, time
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
-SOURCE = ROOT/'daemon/worktrees/grok-progression-source'
-BUILD = ROOT/'daemon/.local-artifact-archive/grok-progression-build'
-TOOLS = ROOT/'daemon/patch-audit/consolidation/20261022/benchmark-tools'
+SOURCE = None
+BUILD = None
+TOOLS = ROOT/'daemon/bench/workloads'
 FLAGS = ['-DCMAKE_BUILD_TYPE=Release','-DBUILD_WALLET=OFF','-DBUILD_QT=OFF',
          '-DBUILD_ZMQ=OFF','-DBUILD_CLI=ON','-DBUILD_TX=OFF','-DBUILD_CHRONIK=OFF',
          '-DBUILD_SEEDER=OFF','-DENABLE_UPNP=OFF','-DENABLE_NATPMP=OFF',
@@ -70,10 +70,13 @@ def guarded(argv,log,env,*,owned_rss_limit_gib=12):
                 except subprocess.TimeoutExpired:os.killpg(p.pid,signal.SIGKILL);p.wait()
     return {'limits':limits,'before':before,'after':host(),'samples':samples,'owned_group':p.pid,'seconds_including_untimed_setup':time.monotonic()-start}
 def main():
+    global SOURCE, BUILD
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--points',default='376,377');ap.add_argument('--rounds',type=int,default=3)
     ap.add_argument('--cases',default='single_tx_steady,json_rpc_batch50_steady')
-    ap.add_argument('--data',type=Path,default=ROOT/'benchmark-results/20261023/commit-regressions')
+    ap.add_argument('--source', type=Path, required=True, help='Independent temporary source clone; registered submodules are refused')
+    ap.add_argument('--build', type=Path, required=True)
+    ap.add_argument('--data', type=Path, required=True, help='Results directory outside the source checkout')
     ap.add_argument('--jobs',type=int,default=10);ap.add_argument('--build-only',action='store_true');ap.add_argument('--skip-build',action='store_true')
     ap.add_argument('--fixture-smoke',action='store_true')
     ap.add_argument('--plan',type=Path,default=ROOT/'daemon/stack-review.json')
@@ -81,6 +84,13 @@ def main():
     ap.add_argument('--override-ref',action='append',default=[],metavar='POINT=REF')
     ap.add_argument('--diagnostic-net',action='store_true',help='Enable network logs; results are diagnostics, not progression timing samples')
     ap.add_argument('--fixed-transactions',type=int,help='Fixed-count latency diagnostic, not a sustained TPS claim');args=ap.parse_args()
+    SOURCE, BUILD = args.source.resolve(), args.build.resolve()
+    registered = json.loads((ROOT/'daemon/sources.json').read_text())['sources']
+    if SOURCE in [(ROOT/s['path']).resolve() for s in registered.values()] or not (SOURCE/'.git').is_dir():
+        raise RuntimeError('Use an independent temporary Git clone, not a registered source submodule or linked worktree')
+    if args.data.resolve() == ROOT or ROOT in args.data.resolve().parents:
+        raise RuntimeError('Benchmark results belong outside the Lotus working tree')
+    BUILD.mkdir(parents=True, exist_ok=True)
     assert 1<=args.jobs<=10 and args.rounds>=1
     if not re.fullmatch(r'[a-zA-Z0-9_-]+',args.variant):raise RuntimeError('Invalid variant label')
     if args.plan.resolve()!=(ROOT/'daemon/stack-review.json').resolve() and args.variant=='reference':raise RuntimeError('Candidate history requires a separate --variant cache')
@@ -97,11 +107,11 @@ def main():
     if any(n<0 or n>=len(ordered) for n in points):raise RuntimeError('Invalid ordered Git prefix')
     data=args.data.resolve();data.mkdir(parents=True,exist_ok=True)
     if not args.build_only and any(data.glob('round-*')):raise RuntimeError('Existing attempts are preserved; select a fresh --data directory')
-    archive=ROOT/'daemon/.local-artifact-archive/commit-regressions'
+    archive=Path.home()/'repos/archive/builds/lotus-bench/commit-regressions'
     if args.variant!='reference':archive=archive/args.variant
     archive.mkdir(parents=True,exist_ok=True)
     lock=(SOURCE/'.git/progression.lock').open('a');fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-    shared_lock=(ROOT/'daemon/.local-artifact-archive/benchmark-host.lock').open('a');fcntl.flock(shared_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    shared_lock=(Path.home()/'repos/archive/builds/lotus-bench/benchmark-host.lock').open('a');fcntl.flock(shared_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     fingerprint={'parent_commit':subprocess.check_output(['git','-C',str(ROOT),'rev-parse','HEAD'],text=True).strip(),'flags':FLAGS,'compiler':subprocess.check_output(['c++','--version'],text=True),'platform':platform.platform(),'runner_sha256':sha(__file__),'startup_adapter_sha256':sha(Path(__file__).with_name('steady_loopback.py')),
                  'history_plan':str(args.plan.resolve()),'history_plan_sha256':sha(args.plan),'variant':args.variant,
                  'fixed_transactions':args.fixed_transactions,'diagnostic_net':args.diagnostic_net,

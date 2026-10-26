@@ -33,7 +33,7 @@ def main():
     assert receipts['before']['flags'] == receipts['after']['flags'], 'Build flags differ'
     for receipt in receipts.values():
         assert audit.sha(receipt['binary']) == receipt['binary_sha256']
-    with (ROOT / 'daemon/.local-artifact-archive/benchmark-host.lock').open('a') as host_lock, \
+    with (Path.home() / 'repos/archive/builds/lotus-bench/benchmark-host.lock').open('a') as host_lock, \
             (audit.SOURCE / '.git/progression.lock').open('a') as source_lock:
         for lock in (host_lock, source_lock):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -59,13 +59,13 @@ def main():
                         '--daemon', receipt['binary'], '--source', audit.SOURCE,
                         '--output', directory / 'result.json', '--steady', '--case', 'signed_batch200_steady',
                         '--max-fixture-transactions', '1200000', '--exact-fixture-transactions', str(args.fixture_transactions),
-                        '--fixture-hash-site', ROOT / 'daemon/.local-artifact-archive/fixture-hash-site',
+                        '--fixture-hash-site', Path.home() / 'repos/archive/builds/lotus-bench/fixture-hash-site',
                         '--fixture-fee-sats', '10000', '--hierarchical-funding',
                         '--maxmempool-mb', '4096', '--port-base', '39110']
                     print('RUN', round_number, side, flush=True)
                     resources = audit.guarded(command, directory / 'stdout.log', dict(os.environ,
                         CAPACITY_CONFIG=str(config),
-                        TMPDIR=str(ROOT / 'daemon/.local-artifact-archive/commit-regressions/runtime')),
+                        TMPDIR=str(Path.home() / 'repos/archive/builds/lotus-bench/commit-regressions/runtime')),
                         owned_rss_limit_gib=args.owned_rss_limit_gib)
                     audit.write(directory / 'RESOURCES.json', resources)
                     payload = json.loads((directory / 'result.json').read_text())
