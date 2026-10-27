@@ -456,3 +456,60 @@ F5: drop the “≥99% of seeds freeze within 25 rounds” acceptance condition;
 ==================================================================
 
 F1: the gate uses c only when the item’s previous success side is IN; otherwise its gate value is 0. The same applies when computing the mean over W. This replaces “remove the false implication only”. With it, a gate entrant after a freeze is FINAL-in. Append this to the inputs bundle, apply it, and continue the IMPCD iterations.
+
+
+==================================================================
+## F5 — EVIDENCE-WEIGHTED ROUNDS
+==================================================================
+
+AMENDMENT: F5 — EVIDENCE-WEIGHTED ROUNDS (from Shammah). Replaces the β_c streak, c, and the reset rule in §8. Closes F1 and F5.
+
+1. Votes. Per item x per round, n_x = the number of sampled peers that cast a valid vote on x. Silent, late, invalid and undecoded peers abstain. A partial peel votes only on the items it decoded (decoded present = yes, decoded absent or excluded = no, rest abstain). A MATCH votes as before.
+2. Success. A round is a success for side s if at least ⌈0.8·n_x⌉ of the n_x votes are for s.
+3. Weight. A success adds e = −ln H, where H = P(X ≥ y) for X hypergeometric: n_x draws without replacement from D peers, ⌈D/2⌉ of them on side s, and y = the actual number of votes for s. Add +e for an IN success and −e for an OUT success. A round with no success adds 0. Nothing resets.
+4. FINAL. x is FINAL-in when the sum reaches +ln(1/ε) and x has at least 3 IN successes. It is FINAL-out when the sum reaches −ln(1/ε) and x has at least 3 OUT successes. FINAL is immutable. FINAL is the side reached, not the prior preference (this fixes F1).
+5. Preference, the gate and the freeze predicate stay as they are, with the gate comparing an item's IN-side sum to the mean sum over W. Add: a node does not freeze while it holds a FINAL-in Pending item; it keeps fetching from other yes-voting donors.
+6. We never vote yes for a Pending item. Confirm that the spec says so.
+7. K: at small D, poll all D peers. The point where K drops below D is left for the (f, K) grid. Flag it as open; do not pick a number.
+8. F5: remove the ≥99%-within-25-rounds target. Report the freeze-round distribution; zero false or split freezes is required.
+9. Tests: e and the implied rounds for D ∈ {16, 32, 64, 128, 500} with all K answering, and with half answering; no FINAL with fewer than 3 successes even when one round's e exceeds ln(1/ε); silence adds 0 and does not reset; an OUT success subtracts; a FINAL-in Pending item blocks the freeze.
+
+Run IMPCD on this change until it converges (cap 8 iterations). Append this amendment to SNOWSTORM-SPEC-INPUTS.md, report the new SHA, regenerate, list anything still open, STOP.
+
+
+==================================================================
+## EVIDENCE-WEIGHTED ROUNDS — RULES 10–12
+==================================================================
+
+10. Round deadline. The deadline uses measured request-to-reply times (including transfer), not propagation RTT. A round with zero answers doubles the deadline for the next round; a round with answers resets it to the measured value.
+11. Probe fallback. A fallback reply to a probe is sized from the probe's difference estimate, not from 2 × (largest probe index + 1).
+12. FINAL-out items leave the sketched set and are never listed as exclusions again. They need no further votes.
+
+
+==================================================================
+## RULE 10 — EXACT DEADLINE INPUTS AND RESET
+==================================================================
+
+Rule 10, exact: the deadline is unchanged in form, 4 × the upper median, over the K sampled peers, of each peer's RTT estimate captured at round start. The only change is the input: a peer's RTT estimate is its most recent measured request-to-reply time (send of POLL to receipt of the complete reply, transfer included), not propagation RTT. No averaging and no new constant. A sampled peer with no measurement yet uses the upper median of the measured peers; if none are measured, the existing fallback applies. Zero-answer doubling stays as written: after a round with zero answers the next deadline is twice the previous one; a round with answers returns to the formula above. Not open.
+
+
+==================================================================
+## EVIDENCE-WEIGHTED ROUNDS — ANSWER FLOOR AND DEADLINE BACKOFF
+==================================================================
+
+Answer to the one-fast-voter blocker. Add to the amendment:
+
+13. Answer floor. A round counts for item x only if n_x ≥ ⌊K/2⌋ + 1 (a majority of the sampled peers cast a valid vote on x). A round below the floor adds 0 to x's sum and is not a success.
+14. Deadline. A round in which fewer than ⌊K/2⌋ + 1 sampled peers answered at all doubles the deadline for the next round (this generalizes the zero-answer rule). A round meeting the floor returns to the measured formula in rule 10.
+15. Test: D = 16, all 16 sampled, one peer replies YES in 1 ms, fifteen reply NO in 250 ms. x must not reach FINAL-in; the deadline must grow until the NO replies are counted; x ends FINAL-out.
+
+Report whether any other attack still reaches FINAL with fewer than a majority of the sample answering.
+
+
+==================================================================
+## CPP STYLE — LOTUS DEVELOPER NOTES
+==================================================================
+
+also:
+
+Style: C++ samples in the spec must follow the Lotus naming conventions in ~/repos/lotus/doc/developer-notes.md, not snake_case. Read that file and apply it to every C++ sample and identifier in SPEC-PROPOSED.md and TESTS-PROPOSED.md. If the file is silent on something, match the surrounding Lotus code. Report the convention you applied in one line.

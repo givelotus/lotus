@@ -1,27 +1,43 @@
-# Snowstorm proposal conformance — IMPCD iteration 5
+# Snowstorm proposal conformance — evidence-weighted amendment, iteration 6
 
-The spec and test proposal remain at their existing `.scratch/oneshot/` paths. Operator amendments were committed separately as `355ea9be55`; this terminal review adds independent records and updates only review/status metadata. No normative protocol rule or test-requirement row changed during iteration5.
+Updated the existing SPEC-PROPOSED.md and TESTS-PROPOSED.md in place. All operator messages were appended verbatim, in order, including the main weighted-round amendment, rules10–12, exact Rule10, rules13–15 and C++style instruction. Earlier review histories remain unchanged. No source or canonical-parent change.
 
-## Maintained input and author decisions
+## Input authority
 
-Both F5 and F1 messages were appended verbatim in arrival order. Current bundle SHA256 is **`fb84e15abe521460cd55f65f693835b8047be070075191729fe07df0128e9d96`**,49,197bytes/458lines, pinned in both proposals. Intermediate SHA256 after F5 is `9153f677b2680aaa309704b91828b53c3cbd0f1b20d8f0c2001b4e0b978df823`; the preceding48,180-byte prefix remains unchanged. Exact messages and sparse ledger changes are preserved in iteration-4/author-resolutions.json.
+Current bundle SHA256 **`fb140f92e8287616f0979c4c1744863d88b0b9e2e9fa85afb3b3860c2515ce5c`**,54,599bytes. The previous49,197byte prefix and its digest remain unchanged. Intermediate hashes/messages are in iteration-6/author-amendment.json. Latest input is pinned in both proposals.
 
-F1 CLOSED: gate_value=c only when the item's previous success side is IN, otherwise0, for both the single prechange W mean and outsider entry. The old capped-OUT-streak witness is blocked; twelve subsequent IN successes make it FINAL-in and eligible. An entrant into a still-nonempty frozen W must be FINAL-in. Empty-W mean0 and other selected rules remain unchanged.
+## Applied amendment and naming
 
-F5 CLOSED: the >=99%-within25-rounds acceptance condition is withdrawn. Retain1000fixed seeds, run fixtures to a horizon long enough to finish, and report freeze-round distributions and nonfinishing trials. Zero false freezes and zero split freezes remain hard assertions. No replacement performance percentage, threshold or seed tuning was introduced.
+Weighted successes use80%of valid item votes, subject to n>=floor(K/2)+1. Add signed natural-log hypergeometric-tail evidence without resets; require at least3same-side successes for reached-side immutable FINAL. The old streakc/beta/reset policy is removed. The gate compares evidence under an explicitly unconfirmed signed-sum reading; missing mathematical choices are not invented. FINAL-in Pending vetoes freeze and retains ordinary fetch/donor/admission lifecycle. A node never advertisesYES for its own Pending, but may receive remoteYES for that lifetime.
 
-## Independent IMPCD review
+At smallD poll allD; the crossover toK<D remains OPEN for the(f,K)grid. Exact deadline uses4*captured sampled upper median of latest complete POLL-to-reply measurements, transfer included, with specified imputation/bootstrap; below-majority answered rounds double next duration, majority-answer rounds restore formula. Probe fallback uses the existing difference estimator and RequiredSymbols, not twice the largest probe index. FINAL-out leaves derived advertisedA and W, never enters exclusions or receives further votes; physicalR retains bounded body/state ownership. Gate entries are restricted toA, including under a negative mean.
 
-Installed IMPCD v3.0.0 with the operator's eleven technical perspectives and counterexample-first rules. Independent gpt-6-astra and gpt-6.1-sol contexts reviewed the same amended ledger/spec/tests; neither saw the other's revision before submission. Both submitted empty substantive operations and no new concrete finding or unresolved high-severity issue. Their reports include adversarial fixed-population withholding/delay, equivocation, fake Pending and valid-assertion analysis; Sybil resistance stays deferred.
+Requested root developer-notes path does not exist. Read the complete canonical `/Users/shammah/repos/lotus/daemon/lotusd/doc/developer-notes.md`; source hash/mapping recorded in iteration-6/naming-map.json. Convention: **UpperCamelCase functions/methods, lowerCamelCase variables, m_members, UPPER_SNAKE_CASE constants, lower_snake_case namespaces**. Both proposed C++ interface and active test identifiers updated; real paths/std spellings/exact historical source references retained as provenance. No frozen C++file renamed or edited.
 
-Root reproduced the F1 trace and checked4,930 distinct item states through24updates with13,338 transitions. Both revisers independently checked the local gate implication; their additional bounded checks are documented in their reports. These are item-state checks, not network agreement proofs or SnowstormNode execution.
+## Independent review and actual status
 
-Substantive disagreement0, no disputes, no new locks. All document-review criteria are answered. **STOP: fixed point / no-new-major condition at iteration5.** The explicit continuation request superseded the earlier capped stop; the resumed5–8cap is not reached. Spec metadata growth0.242361% is below20%; no oscillation or cutback. Historical reports and initial/final ledgers remain preserved.
+Separate gpt-6-astra and gpt-6.1-sol formal revisions reviewed the same ledger/brief/input without seeing each other's output before submission. All11technical perspectives plusanchor documented, including fixed-population attacks. Both also independently validated a shared post-review terminal-reentry witness. Model consensus is not human-expert or execution evidence.
+
+Accepted7shared claim repairs: physicalR operands→advertisedA, terminal gate filter and negative-mean regression, documented D1zero-weight nontermination, and explicit majority-answer selection counterexample/regression. Shared repair direction agrees; raw location disagreement3/9=0.333333 within tolerance0.50. Current renderings match ledger-accepted.json; metadata and substantive operations separated in decision.json. No locks added.
+
+**Not converged;1of8permitted run iterations completed.** EW1–EW4 remain severity>=8 and require the author definitions already requested. The next scope is arithmetic EW1 once its definition arrives. Repeating unchanged missing choices cannot supply a corrective iteration or justify a fixed point; cap is not claimed exhausted. No growth/oscillation stop or cutback occurred.
+
+## Still open
+
+- **EW1:** full-population successes have H0,e∞; opposing successes before the3guard give undefined infinity-minus-infinity.
+- **EW2:** finite floor-valid histories can reach FINAL-in with retained pOUT, or FINAL-out with pIN; terminal preference/gate integration is unspecified.
+- **EW3:** gate quantity “IN-side sum” needs confirmation. With signedS, an immutable FINAL-in outsider at21.014529 can remain below frozen mean21.796289 forever.
+- **EW4:** nine answers biased8:1 meet the floor; three rounds can produce opposite immutable FINAL at honest pollers with mirrored delays. Hard zero false/split assertions remain unchanged; no hidden response-independence assumption.
+- **K crossover:** intentionally deferred to the named experiment, no number selected.
+
+D1,H1,e0 implies nonempty nontermination; documented limitation rather than an invented minimumD or special weight.
+
+**Requested fewer-than-majority attack report:** none reaches a new FINAL under literal rule13: valid per-item votes<=answered peers, and below-floor rounds update neither sum nor successes. The one1msYES/fifteen250msNO scenario now doubles deadlines until NOs count, then reachesOUT in the independent rule trace. EW4 has9answers and remains a distinct safety failure.
 
 ## Verification and limits
 
-PASS:22 ledger/document/integrity checks, unchanged104historical inventory rows and all active test rows during the terminal step, verbatim ordered input appends/prefix, gate and F5 requirement checks, regenerated normative patch applicability and whitespace. Final renderings match ledger-final.json. Frozen acceptance-manifest SHA256 remains `4aa896175e94e472f645c2d7ca25552a3efb079a789dd8aaca203b0e318906db`; canonical parent and source files remain unchanged.
+PASS: exact rational-tail/80digit log vectors and implied same-side rounds for D16,32,64,128,500 with allK/halfK; full-population and quarter-population K are declared arithmetic fixtures, not a chosen crossover. HalfK is below floor: contribution0/no success/no final. Verified finite preference/gate witnesses, majority-floor inequality and rule15timing trace;27ledger/input/inventory/naming/patch-integrity checks. All104historical source inventory rows and mandatory workload counts retained. Review patch regenerated/applies; Markdown/Python whitespace passes.
 
-No implementation acceptance, sanitizer, simulator, sizing-table generation, frozen-artifact migration, human expert review, source freeze, production/node-data change, publication or deployment. Provisional K/f selection, executable header/harness/oracle correction, implementation conformance, empirical hard-safety outcomes and real-network validation remain future evidence obligations. Document-review convergence does not validate those outcomes.
+No current-protocol node acceptance, sanitizer, simulator, generated sizing table, frozen-artifact migration, source freeze, publication, deployment or human panel. Existing frozen sources implement an older contract. Acceptance-manifest SHA256 remains `4aa896175e94e472f645c2d7ca25552a3efb079a789dd8aaca203b0e318906db`; canonical parent remains unchanged. Exact arithmetic/local event traces are not a full-network implementation result.
 
-SPEC SHA256 **`b22450e5b399510a203592c97d83a0e973e62658f8d2984b6d592900d32a1956`**,78,172bytes. TESTS SHA256 **`55e7000ee6b2ce0487fbf97329c9e6b9ce36900a4e9415d33e219f0f01440f18`**,54,221bytes. No unresolved contract finding remains from this review. See iteration-5/findings.md,minority-report.md,accepted-changes.md and both independent revisions.
+SPEC SHA256 **`8ed2ff8fd3617fcef1668bd25745e492d07c9fc894c532cc9d605ccb98e784f0`**,81,190bytes. TESTS SHA256 **`f620ba544bb9290ec1644bd67a21539aa8dbb97b8281c6e1f4ed12ba9dc2efa2`**,55,535bytes. Findings, minority report, accepted changes, both revisions and ledger history are under `.scratch/impcd/iteration-6/`.
