@@ -1,0 +1,17 @@
+# IMPCD continuation — iteration 5
+
+Authority: operator's verbatim F5 and F1 resolutions, then “continue the IMPCD iterations”, supersede the prior STOP/cap. Both amendments are appended in order; controlling input SHA256 fb84e15abe521460cd55f65f693835b8047be070075191729fe07df0128e9d96. Amendment commit355ea9be55 is the baseline. Historical iteration4 remains intact.
+
+Method: installed IMPCD v3.0.0 runtime and migration guide, preserving the operator's technical adaptation. Same author-owned intent: coherent finished technical spec/test contract; deterministic bounded semantics; preserve latest operator choices and prescribed workloads; include fixed-population adversarial Snowball analysis; keep separate revertible commits. No implementation, deployment, Sybil solution, human-expert approval or empirical security result is inferred.
+
+Roles: anchor plus the11technical perspectives: coding theorist, IBLT researcher, consensus researcher, Core/lotusd P2P developer, red team, liveness/formal, C++ implementer, test engineer, measurement engineer, minimalist, skeptical paper reviewer. Severity1–10 and confidence1–10; weight=product. Counterexamples override opinion; preferences cannot override intent. No social/moral catalog or COI weighting.
+
+Revisers: gpt-6-astra and gpt-6.1-sol, independent separate contexts, same current ledger and critique brief. Neither may read the other's outputs before submission. Prior joint accepted rendering is their common input, not new independent evidence. Models may independently discover additional defects, but cannot make unmotivated revisions.
+
+Initial scope: all open claims in spec/test proposal, prioritizing the conditional gate, gate mean, freeze implication, distribution-only performance reporting and zero-false/split hard assertions. Other settled architecture only reopens for a concrete internal counterexample. Stable claim IDs continue from iteration4 through sparse author-resolution operations; sentence/line formatting fragments do not count as substantive claims.
+
+Distance/error: stable substantive claim operations changed/added/deleted; disagreement=unshared substantive operations/union, empty union0. Tolerance0.50 (execution setting). Apply only meaningfully shared repairs regardless error. Disputed changes remain explicit; preserve unresolved severity>=8. Accept nonempty consensus within tolerance; narrow to one finding if empty or above tolerance, unless empty consensus qualifies for convergence. Widen by one finding after acceptance. Claims unchanged through two accepted review iterations can lock; an empty rejected/terminal review does not fabricate a second accepted step. Owner-changed claims reset their stability.
+
+Continuation cap: at most4more iterations,5–8, preserving a bounded run after explicit resumption. Stop sooner at an empty consensus with all contract criteria answered and no unresolved severity>=8, consistent with the author's no-new-major rule. Stop for oscillation (ledger recurs twice), or >20% spec growth from this resumed baseline; also observe runtime two-iteration growth guard and cutback. Commit each review round and consensual edits. This is not permission to weaken hard safety assertions or rewrite rejected operator decisions.
+
+Baseline byte counts are in ledger-initial.json renderings; SPEC77,983bytes, TESTS54,057bytes. Implementation/testing/simulator execution remains future validation, not completion of this document review. Q1–Q13 and F1/F5 author decisions stay closed except a new concrete internal failure.

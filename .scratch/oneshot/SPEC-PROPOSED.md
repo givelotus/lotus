@@ -1,6 +1,6 @@
 # Complete normative proposal
 
-REVIEW ROUND 4: author resolutions of F1 and F5 applied; independent IMPCD review continues. No freeze or implementation.
+REVIEW ROUND 5: technical IMPCD document review reached an empty consensus after the author resolutions of F1 and F5. No freeze or implementation.
 
 Controlling input: [.scratch/inputs/SNOWSTORM-SPEC-INPUTS.md](../inputs/SNOWSTORM-SPEC-INPUTS.md), SHA256 `fb84e15abe521460cd55f65f693835b8047be070075191729fe07df0128e9d96`. Read in full; later bundled sections override earlier conflicting sections. Downloads is no longer an input. The existing .scratch/oneshot proposal supplies the earlier base;the bundle's literal parent-folder SPEC-PROPOSED.md path does not exist here. No alternate base was manufactured.
 
@@ -312,9 +312,9 @@ Candidate-ID keyed XOR proofs do not prove body possession, complete collision-b
 
 ## Remaining contract questions
 
-Q1–Q13 are CLOSED by the maintained input bundle. The latest instruction closes Q13 with alpha=floor(((1+beta_adv)/2)*K)+1 and replaces the earlier partial-voting definitions with explicit decoded-present/decoded-absent/exclusion observations. The preceding reply-vote instruction excludes rescue-only discoveries from this round’s item votes. F1 and F5 are CLOSED by the final operator resolutions in the maintained input bundle. The gate and its mean use c only for previous success IN, otherwise zero. The obsolete >=99%-within25-rounds acceptance condition is removed; fixtures run to a horizon long enough to finish and report freeze-round distributions, retaining zero false freezes and zero split freezes as hard assertions. No unresolved author decision remains from iteration4; independent review continues.
+Q1–Q13 are CLOSED by the maintained input bundle. The latest instruction closes Q13 with alpha=floor(((1+beta_adv)/2)*K)+1 and replaces the earlier partial-voting definitions with explicit decoded-present/decoded-absent/exclusion observations. The preceding reply-vote instruction excludes rescue-only discoveries from this round’s item votes. F1 and F5 are CLOSED by the final operator resolutions in the maintained input bundle. The gate and its mean use c only for previous success IN, otherwise zero. Fixtures report freeze-round distributions at a horizon long enough to finish; zero false freezes and zero split freezes remain hard assertions. Iteration5 found no new concrete internal defect in either independent revision, and no unresolved contract finding remains from this document review. Implementation, acceptance execution and empirical security/performance validation remain future work.
 
-Provisional K remains the named pre-release (f,K) experiment outcome. Simulator measurements, implementation conformance, frozen-artifact migration and network validation are future evidence obligations, not completed results. This regeneration edits the proposal/test plan in place and does not modify production or frozen source files. Review records are in `.scratch/impcd/iteration-4/`.
+Provisional K remains the named pre-release (f,K) experiment outcome. Simulator measurements, implementation conformance, frozen-artifact migration and network validation are future evidence obligations, not completed results. This regeneration edits the proposal/test plan in place and does not modify production or frozen source files. Review records are in `.scratch/impcd/iteration-5/`; author amendments remain recorded under iteration-4/author-resolutions.json.
 
 ### Candidate-proof arithmetic vectors (proposal)
 
