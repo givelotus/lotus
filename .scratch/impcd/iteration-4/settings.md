@@ -1,0 +1,17 @@
+# IMPCD technical run — iteration 4 (first v3 review)
+
+Authority: Shammah's supplied protocol amendments and request to review/refine spec and tests in place, with a commit after each round. Input bundle SHA256 e6ab26b85fe03c3c0a327b21bb5d2da7fc9c38f9a2aee178a0d584f42b1abd1d. Prior iterations 1–3 are amendment regenerations, not evidence of independent v3 revision.
+
+Method: installed IMPCD skill and v3.0.0 runtime plus migration guide; keep the author's technical adaptation: severity × confidence, counterexamples stand regardless support, 11 technical perspectives, Sybil limitations explicitly deferred. Anchor safeguards the ordered amendments. The 11 roles are coding theorist, IBLT researcher, distributed-consensus researcher, P2P developer, red-team attacker, liveness/formal reviewer, C++ implementer, test engineer, measurement engineer, minimalist, skeptical paper reviewer. Perspectives are model analyses, not recruited human experts.
+
+Author-owned intent/completion criteria: finished technical specification and executable-contract proposal; deterministic bounded implementation contract; preserve the latest selected vote, gate, FINAL and freeze rules; preserve required test workloads; identify concrete internal failures and adversarial attacks including fixed-population attacks; keep individual Git-revertible steps. No implementation, deployment, freeze, simulator result, or Sybil solution is inferred from this request.
+
+Initial scope: all open claims in spec and tests. Ledger text fragments retain exact sentence/line bytes, including formatting fragments; claim IDs stable; layout fragments do not count as substantive changes. Existing architecture remains author-settled: no redesign absent a counterexample. Historical ledger claims are initially open; two accepted iterations of unchanged substance are required before locking.
+
+Independent revisers: gpt-6-astra and gpt-6.1-sol, separate contexts; same ledger, initial findings and authority; neither sees the other's output before submission. Each also critiques all 11 perspectives and can report additional counterexamples. Model agreement is damping, not proof.
+
+Distance: number of stable substantive claim IDs changed/added/deleted. Disagreement: count of proposed substantive operations not shared in meaning divided by union of proposed substantive operations; empty union zero. Tolerance 0.50, selected as an execution setting, not a runtime default. A disputed operation is never applied, even below tolerance. If error exceeds tolerance or consensus empty, narrow to one finding at a time; widen one finding per accepted step. Counterexamples remain findings even when revisions disagree on the repair.
+
+Run cap: four numbered iterations total, retaining the author's original cap; this is iteration 4 and the final permitted round. Stop at this cap after recording/applying the consensus step; do not claim convergence when high-severity findings remain. Before the cap, stop earlier on author's no-new-major condition only if no unresolved severity>=8 and all completion criteria answered. Also stop at >20% spec-byte growth from this run's initial size, or runtime growth guard/oscillation. Each iteration commits records and consensual smallest fixes. Unresolved author-intent choices remain explicit; do not fabricate an author decision. Preserve earlier report histories.
+
+Baseline: SPEC 76,725 bytes; TESTS 52,252 bytes; Git 6fa54f317c. Source acceptance manifest and canonical parent spec remain unchanged.
