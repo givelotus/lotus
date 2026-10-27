@@ -1,14 +1,14 @@
-# Snowstorm executable-contract test proposal — review round 2
+# Snowstorm executable-contract test proposal — review round 3
 
-Regenerated in place from the maintained input bundle, SHA256 `b3163bd3a4e3fbfcfacf0817127844b836f5b12a48b83ea0bf3fe947c7e9753c`. The final ANSWERS TO Q1–Q12 and both subsequent partial-peel overrides control. The current shared-witness definition retains the precise current-Pending restriction from the preceding override. No frozen test/header/harness/oracle/manifest or production implementation is changed. Argon owns simulations with fetchable uniques and printed 1 ms validation.
+Regenerated in place from the maintained input bundle, SHA256 `e6ab26b85fe03c3c0a327b21bb5d2da7fc9c38f9a2aee178a0d584f42b1abd1d`. The final per-item reply-vote and partial-peel instructions control over all earlier vote wording. No frozen test/header/harness/oracle/manifest or production implementation is changed. Argon owns simulations with fetchable uniques and printed 1 ms validation.
 
 ## Current replacement contract
 
-- Sample K=min(D,ceil(D/4)); capture alpha=ceil(((1+beta_adv)/2)*K). Only yes>=alpha or no>=alpha succeeds. Abstention never shrinks the quorum.
+- Sample K=min(D,ceil(D/4)); capture alpha=floor(((1+beta_adv)/2)*K)+1. Only yes>=alpha or no>=alpha succeeds. Abstention never shrinks the quorum.
 - beta_c=Btx=ceil(ceil(log2(25/epsilon))/3), independent of D, equals 12 at epsilon=1e-9. No likelihood, hypothesis, adaptive match-rate estimator or root accumulator remains.
 - Preference changes only on strict cumulative-success-count overtaking. Same-side successive successes advance c; a changed side starts at one. Every no-success round resets nonfinal c to zero, including zero usable replies. FINAL accepts no further updates.
 - Capture raw admitted IDs with incarnation/candidate bit plus Pending lifetimes present at round start, at most M+P records. No post-capture item votes. Matching Pending admission preserves all state, including preference and FINAL-out.
-- DIFF reconstructs from captured raw R. MATCH is equivalent compact captured item evidence. At round end a partial reply votes no for decoded-absent or excluded items; yes for the scheduled zero-cell witness only if no current Pending ID is scheduled there; otherwise abstain. No wins over yes. This partial-vote policy and its measured yes-lean are accepted.
+- DIFF reconstructs from captured raw R. MATCH supplies captured preference observations. At arrival, decoded-present/nonexcluded=>YES, decoded-absent or excluded=>NO. With residual, other captured items abstain; without residual, other eligible captured reference items are shared and vote yes unless excluded. Rescue-only discoveries abstain that round. No inferred-sharing partial votes or per-reply evidence buffers remain.
 - Evaluate the gate once at round end after item updates, using one pre-entry/pre-exit W snapshot and mean c (empty mean zero); apply all entries/exits simultaneously.
 - Freeze iff (W nonempty and all W is FINAL-in) or (R union Pending empty). Later gate entry invalidates the root freeze; no empty-W vacuity shortcut.
 - Body traffic in both directions uses ordinary FetchBody. wanted is only a description for votes; it is not a body request and triggers no host body-send action.
@@ -35,17 +35,19 @@ These are test requirements for a future executable-contract correction, not cla
 | T13_pending_admission_preserves_whole_state | §§6.4,7,8 | Transfer both side counters, c, previous success, preference and FINAL intact. In particular Pending FINAL-out is still OUT after admission; fresh ordinary admission is IN with zero counters |
 | T13_match_equals_full_candidate_observations | §§6.1,8 | Verified MATCH and equivalent full reconstruction produce identical captured item yes/no observations, including raw excluded and Pending IDs; no raw-set equality/body-possession claim |
 | T13_diff_local_excluded_peer_included_yes | §§6.1,8 | Captured raw R contains locally excluded x; peer includes x; empty-list DIFF supplies an eligible yes for x |
-| T13_partial_yes_no_abstain_guarded | §§6.2,8 | Captured x: decoded absent/excluded=>no; qualifying zero scheduled index>=1 with no current Pending scheduled there=>yes; otherwise abstain. No wins; index zero never proves sharing |
-| T13_partial_pending_guard_current_state | §§6.2,8 | One adversary’s Pending ID scheduled at the zero witness blocks yes in an honest partial reply. Check CURRENT Pending, including Pending-to-R transitions preserving Ref; retain accepted yes-lean measurements |
-| T13_partial_masks_capacity_and_lifetime | §§6.2,6.5 | One zero-index bit per received cell plus one decoded-absent bit per captured item, overwritten by every real attempt; exact capacity/padding charged; no second cell array or extra evidence-only peel |
-| T13_partial_full_rescue_single_observation | §§6.2,8 | Final full reconstruction replaces partial classification; one observation per sampled peer/item, no duplicate counts |
+| T13_complete_arrival_unclaimed_shared | §§6.1,6.2,8 | Complete arrival infers other eligible captured reference items shared and yes unless excluded; captured Pending absent from a complete DIFF raw assertion is no, not shared |
+| T13_arrival_exclusion_overrides_presence | §§6.1,8 | Peer holds x but excludes it: no for complete DIFF, full arrival peel or partial explicit-present outcome; MATCH no outside captured W |
+| T13_partial_explicit_preference_observations | §§6.2,8 | Incomplete arrival: explicitly decoded present and nonexcluded=>yes; decoded absent or excluded=>no; all other captured items abstain. Holding but excluding is no |
+| T13_partial_unclaimed_items_abstain | §§6.2,8 | Unclaimed captured items abstain while residual remains, even if a received cell is zero or no Pending item is scheduled there. No cell/schedule-only inference |
+| T13_arrival_evidence_lifetime_and_storage | §§6.2,6.5 | Arrival observations use existing bounded round-evidence records; no per-reply cell-index buffers, second cell array or evidence-only peel. Captured lifetime filters and round/tip cleanup remain |
+| T13_rescue_only_discoveries_abstain | §§6.2,8 | Items first decoded or inferred shared by rescue abstain that round, including full and same-call cascade rescue. Keep valid initial arrival observations unchanged; no duplicate/upgrade |
 | T13_no_one_round_nonempty_freeze | §8 | Starting nonempty W with all sampled peers matching yields c=1, not FINAL; no freeze after one round |
 | T13_empty_W_nonempty_support_does_not_freeze | §8 | W empty while R or Pending nonempty never freezes, including first-round exit of the sole nonfinal candidate and admitted FINAL-out items |
 | T13_truly_empty_state_freezes | §§6,8 | R union Pending empty can freeze with empty txids, including D=0; no fake timer/sample requirement or duplicate Frozen action |
 | T13_later_final_in_gate_entry_invalidates_freeze | §8 | Frozen nonempty W has mean beta_c; a later entrant must reach that mean and be FINAL-in, then changes root and invalidates the old freeze |
 | T13_no_obsolete_confidence_state | §§1,8,10 | Corrected future API/state/Stats/transcript has no root accumulator, scalar item likelihood, match-rate estimator, hypothesis parameters or root-change scoring veto; Broot only derives Btx |
 | T13_unique_final_side_agreement | §§8,9 | Fetchable unique items reach the same FINAL side at all honest nodes in the required quiescent fixtures; report adversarial disagreement/nontermination without retuning seeds |
-| T13_zero_adversary_dual_quorum_boundary | §8/Q13 | D=5,K=2,beta_adv=0,alpha=1,yes=no=1 satisfies both side predicates; retain this boundary case pending an explicit single-success rule, without inventing priority |
+| T13_strict_quorum_zero_adversary_boundary | §8 | D=5,K=2,beta_adv=0 gives alpha=2: yes=no=1 causes no success. Check 2*alpha>K over supported populations and valid adversary fractions; IN/OUT cannot both succeed |
 | T7_diff_only_round_shrinks_request | §6.3 | Independent quantile fixture and small exact DIFF samples choose a smaller cost argmin than the old prefix; verify shrink and unchanged conditional doubling |
 | T11_reply_removed_fields_and_header_bounds | §§6.1,6.5 | New independent byte golden has no REPLY mode/basis; conservative REPLY=100/POLL=116/DIFF=109 headers and both byte/domain cap boundaries; reject old layout under the canonical grammar |
 | T11_diff_missing_capture_and_exclusion_consistency | §6.1 | Reject missing overlapping captured raw R or exclusions outside reconstructed peer raw set, before any body/evidence effect |
@@ -56,7 +58,7 @@ These are test requirements for a future executable-contract correction, not cla
 | 32 | 8 | 5 | 12 |
 | 64 | 16 | 10 | 12 |
 | 128 | 32 | 20 | 12 |
-| 500 | 125 | 75 | 12 |
+| 500 | 125 | 76 | 12 |
 
 ## Primitive and workload preservation
 
@@ -194,7 +196,7 @@ The following nonvoting cases retain their workloads. Current replacement rules 
 | T7_reply_is_current_and_internally_consistent | poll_tests.cpp | §§5,6.1: interleave admissions/removals before delivery; cells/root/size/full exclusions all match a single reply-construction state; repeated polls may see changed state |
 | T7_match_with_excluded_raw_extra | poll_tests.cpp | §§6,8: identical candidate root with unequal raw sets returns MATCH; assert candidate equality only |
 | T7_match_assertion_does_not_authenticate_body | poll_tests.cpp | §§1,6,8: malicious echo never inserts body or authenticates raw membership |
-| T7_decode_time_reference_and_partial_results | poll_tests.cpp | §6.2: own/Pending changes between send and receipt; frozen per-call Ref, independent residual checks, failed peel retains valid partial fetch opportunities and gives guarded partial yes/no/abstain observations only at round end |
+| T7_decode_time_reference_and_partial_results | poll_tests.cpp | §6.2: own/Pending changes between send and receipt; frozen per-call Ref, independent residual checks, failed peel retains valid partial fetch opportunities and records arrival decoded-present/decoded-absent/exclusion observations; residual unclaimed items and rescue discoveries abstain |
 | T8_constructor_and_body_result_validation | lifecycle_tests.cpp | §1: preserve invalid Config domains, live enum/hash/binding validation and stale-token precedence from three old T8 cases |
 | T8_ten_rounds_all_removal_reasons | lifecycle_tests.cpp | §§5–7: 0–5 adds/removes each side before/during/between 10 rounds; every RemovalReason; no double residual update on fetched admission; exact next sufficiently-sized poll after quiescence |
 | T8_pending_only_fetch_or_awaiting | lifecycle_tests.cpp | §7: six counterexamples: decode without fetch reservation, fetch-only without prior decode, result-to-admission gap, own removal without support, removal with live awaiting support, and ended support followed by repeated decode; no history/session support |
@@ -237,9 +239,9 @@ The following nonvoting cases retain their workloads. Current replacement rules 
 | T7_approximate_estimator_calibration | sizing_tests.cpp | §6.3:Delta10/50/150/500,1000 trials each,prefixS;include censored lower bounds;mean[.9,1.1],nearest-rankp90[.7,1.4],report censor counts,no retuning |
 | T7_now_vs_round_start_estimate | sizing_tests.cpp | §6.3:undo only currently-present round additions,remove departed IDs,unchangedR/Pending transition not logged;P-list overflow disables start estimate for round and uses now without penalty/abandonment |
 | T12_id_churn_releases_item_state | adversarial_tests.cpp | §§5,8: more than M distinct IDs across repeated remove/admit while live R<=M; no historical item-state growth; readmission starts a fresh admitted lifetime |
-| T7_failed_reply_rescued_by_other_peer | poll_tests.cpp | Peer A fails alone; peer B's decoded items enter Ref via legitimate live fetch support; peer A then succeeds, with the same reconstructed candidate set and item evidence as fresh decoding C against its rescue-time Ref; no insertion into R |
-| T7_retained_residual_every_ref_transition | poll_tests.cpp | §6.2:harness retains independent wire bytes;core retains one invariant residual,never raw copy;private peel copy discarded;each netRef delta once;negative claims never directly mutate invariant; partial observations follow the guarded witness and captured-lifetime rule |
-| T7_cascade_poll_order_and_single_observation | poll_tests.cpp | §6.2:smallest dirty poll repeatedly,earlier rescue from later poll;success releases,failure retained clean;guarded partial observations at round end or one full-rescue observation; no duplicate observations/sizing/fetch;<=K*(1+RefChanges) attempts and no dirty reply at return |
+| T7_failed_reply_rescued_by_other_peer | poll_tests.cpp | Peer A fails alone; peer B's decoded items enter Ref via legitimate live support; A succeeds with the same raw/candidate reconstruction as fresh rescue-time decoding. New rescue discoveries abstain; no R insertion bypass |
+| T7_retained_residual_every_ref_transition | poll_tests.cpp | §6.2:harness retains independent wire bytes;core retains one invariant residual,never raw copy;private peel copy discarded;each netRef delta once;negative claims never directly mutate invariant; item observations use explicit arrival outcomes and captured lifetimes; rescue adds no votes |
+| T7_cascade_poll_order_and_single_observation | poll_tests.cpp | Smallest dirty poll repeatedly; success releases/failure clean; <=K*(1+RefChanges) attempts and no dirty reply. Same-call or later rescue never adds/upgrades arrival observations or duplicates sizing/fetch |
 | T12_retained_reply_workspace_and_release | adversarial_tests.cpp | §6.5:<=K residual arrays,indices,exclusions<=K*M,one transient work buffer;no second raw copy;growable observation audit excluded from protocol reservations;allocation failure fails test;release all at boundary |
 | T15_same_seed_rescue_transcript | determinism_tests.cpp | Same seed produces identical Ref deltas,rescue order,actions and evidence within one process and across processes |
 | T16_round_end_or_tip_cancels_rescues | timing_tests.cpp | No cross-round retention; late replies discarded; root-changing admission preserves eligible item observations; only round end/tip releases retained replies; no root-confidence reset or veto |
@@ -318,7 +320,7 @@ STEP 2 retains old files unregistered but hashed; records both manifest states f
 
 Full normal acceptance, ASan+UBSan, ENABLE_SNOWSTORM=OFF configure/build and no-added-Snowstorm-input audit follow implementation, not this proposal. Keep T14 no-oracle access and T15 same-/cross-process byte-identical transcript checks. Keep all original field workload counts,7000 T7 trials,5/20/100-node T9,100000 malformed messages per NEW type,50-height20-node soak, and host-equivalence cases. Changed sizing/statistical fixtures report their actual seeds/configuration and outcomes.
 
-Mutations: T1 wrong field reduction; T2 bypass reference-sign check; T3 wrong schedule boundary; T5 omit scheduled subtraction; T7 use send-time Ref instead of decode-time Ref; T10 preserve unsupported Pending after failure; T13 reduce alpha to a quorum of answerers instead of full K, and separately omit the current-Pending guard from a partial yes witness; T16 omit fallback or substitute first-answer timer for strict-majority rule. Each mutation compiles, fails its named frozen test, restores exact source bytes, passes, and ends with both repos clean. Never edit tests to accommodate the mutant.
+Mutations: T1 wrong field reduction; T2 bypass reference-sign check; T3 wrong schedule boundary; T5 omit scheduled subtraction; T7 use send-time Ref instead of decode-time Ref; T10 preserve unsupported Pending after failure; T13 reduce alpha to a quorum of answerers instead of full K, and separately permit a rescue-only discovery to vote that round; T16 omit fallback or substitute first-answer timer for strict-majority rule. Each mutation compiles, fails its named frozen test, restores exact source bytes, passes, and ends with both repos clean. Never edit tests to accommodate the mutant.
 
 ## Stages and stop boundary
 
@@ -330,8 +332,6 @@ No freeze, production implementation, host-relay change, table generation or sim
 
 ## Remaining contract questions
 
-Q1–Q12 are CLOSED by the final ANSWERS TO Q1–Q12 section of the maintained input bundle. The two subsequent overrides restore partial-peel voting with the guarded zero-cell definition of proven shared. Their order and exact input text are preserved in that bundle.
+Q1–Q13 are CLOSED by the maintained input bundle. The latest instruction closes Q13 with alpha=floor(((1+beta_adv)/2)*K)+1 and replaces the earlier partial-voting definitions with explicit decoded-present/decoded-absent/exclusion observations. The preceding reply-vote instruction excludes rescue-only discoveries from this round’s item votes. No unresolved contract question was identified in this regeneration.
 
-Q13 — Simultaneous quorums at the supported beta_adv=0 boundary. Config permits beta_adv=0. With D=5, K=2 and alpha=ceil(K/2)=1, one yes and one no satisfy both IN and OUT success predicates. Which single side is successful is not defined by the amendment. The same issue occurs for any even K at beta_adv=0. No silent priority, strict-majority replacement, or new Config restriction is selected. This is a concrete boundary ambiguity, not a reopening of the accepted partial-vote policy.
-
-Provisional K remains an explicitly named pre-release experiment outcome, not a missing scoring rule. No production implementation, frozen-contract rebaseline, simulator run or publication is performed by this regeneration. The review and evidence are recorded in `.scratch/impcd/iteration-2/`.
+Provisional K remains the named pre-release (f,K) experiment outcome. Simulator measurements, implementation conformance, frozen-artifact migration and network validation are future evidence obligations, not completed results. This regeneration edits the proposal/test plan in place and does not modify production or frozen source files. Review records are in `.scratch/impcd/iteration-3/`.

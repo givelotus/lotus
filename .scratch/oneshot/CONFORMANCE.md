@@ -1,46 +1,38 @@
-# Snowstorm proposal conformance — IMPCD iteration 2
+# Snowstorm proposal conformance — IMPCD iteration 3
 
-Edited `.scratch/oneshot/SPEC-PROPOSED.md` and `TESTS-PROPOSED.md` **in place**. No relocation or duplicate proposal. The operator confirmed this is the intended location.
+Updated `.scratch/oneshot/SPEC-PROPOSED.md` and `TESTS-PROPOSED.md` in place. No relocation or duplicate proposal.
 
-## Maintained authoritative input
+## Maintained input
 
-Current `.scratch/inputs/SNOWSTORM-SPEC-INPUTS.md` SHA256: **`b3163bd3a4e3fbfcfacf0817127844b836f5b12a48b83ea0bf3fe947c7e9753c`**. It contains 46,566 bytes and 422 lines. The incoming bundle already included accepted-review and final quorum-amendment sections; before this pass's answers append it comprised 42,859 bytes, SHA256 `ac75af45390b84a80493d38e52ab16a3d70a9ebfba28f850a00913e6ca256506`. The earlier iteration-1 bundle digest is historical provenance, not the digest of this updated incoming prefix.
+Current bundle SHA256: **`e6ab26b85fe03c3c0a327b21bb5d2da7fc9c38f9a2aee178a0d584f42b1abd1d`**; 48,180 bytes / 444 lines. The prior committed 46,566-byte prefix remains byte-identical with SHA256 `b3163bd3a4e3fbfcfacf0817127844b836f5b12a48b83ea0bf3fe947c7e9753c`.
 
-Appended the entire answers message verbatim under `ANSWERS TO Q1–Q12`; its intermediate whole-file digest was `46326c7029bf0886cee068ecfdf9a7abac20a13371adb2359e89fd0fb22bef30`. Then appended both partial-voting overrides verbatim in arrival order under separately titled final sections. Existing incoming text was preserved by append-only writes. Every future operator instruction changing the spec is appended verbatim to this bundle before application, with the new whole-file SHA256 recorded. This round versions the maintained input in Git.
+Appended both new messages verbatim in order, under `PER-ITEM REPLY VOTES — ARRIVAL EVIDENCE` and `FINAL PARTIAL-PEEL RULE AND STRICT SAMPLE QUORUM`. Intermediate SHA256 after the first append: `8cd0115c5f23fc06ef2ca101bdf74cce2f09cfe34f0d746e71db6c5806fd4e52`. The latest section overrides the earlier partial rules; the preceding instruction excluding rescue-only discoveries remains applicable. Continue appending every future spec-changing operator instruction verbatim before application and record the new whole-file digest.
 
-## Current controlling rules
+## Active rules and coverage
 
-| Rule | Applied disposition | Current regression requirement |
+| Rule | Current disposition | Test requirement |
 |---|---|---|
-| Sampling/success | Fixed full-sample alpha quorum; abstention never shrinks alpha | T13_full_sample_quorum_with_abstainers |
-| Consecutive threshold | beta_c=Btx, constant in D, 12 at epsilon=1e-9; no hypotheses, likelihood or match-rate estimator | T13_quorum_and_consecutive_constants |
-| No success and FINAL | Reset nonfinal c=0 on no success; immutable FINAL accepts no further updates | T13_no_success_resets_streak; T13_final_lifetime_immutable |
-| Gate | One pre-entry/pre-exit W mean after item updates; empty mean zero; simultaneous entries/exits | T13_gate_simultaneous_prechange_mean |
-| Capture/transfer | One M+P raw/Pending lifetime capture; post-capture items get no votes; Pending admission keeps its whole state, including FINAL-out | T13_capture_pending_and_postcapture_abstention; T13_pending_admission_preserves_whole_state |
-| Body delivery | Ordinary FetchBody both directions; wanted is for votes, not a body request; concurrent deduplication and alternate retry | T7_poll_success_reply_diff_bidirectional_fetch; retained T10 |
-| Reply grammar/bounds | Prefix REPLY has no mode/basis; conservative headers REPLY100/POLL116/DIFF109; shared byte/domain cap | T11_reply_removed_fields_and_header_bounds |
-| Partial observations | Captured absent/excluded=>NO; guarded scheduled zero-index>=1=>YES; otherwise abstain. Check CURRENT Pending; NO wins | T13_partial_yes_no_abstain_guarded; T13_partial_pending_guard_current_state |
-| Partial storage | Two explicitly charged compact masks; no second cell copy or evidence-only peel; rescue replaces classification | T13_partial_masks_capacity_and_lifetime |
-| Freeze | Nonempty W entirely FINAL-in, or R union Pending empty; no empty-W/nonempty-support freeze | T13_empty_W_nonempty_support_does_not_freeze; T13_truly_empty_state_freezes |
-| Retained accepted fixes | DIFF reconstructs from captured raw R; DIFF exact samples can shrink next request; no separate root accumulator | Excluded-local YES and DIFF-only-shrink cases |
+| Preference | Held but excluded is NO | T13_arrival_exclusion_overrides_presence |
+| MATCH | YES in captured W, NO for other captured items | T13_match_equals_full_candidate_observations |
+| Arrival explicit decode | Present/nonexcluded YES, absent/excluded NO | T13_partial_explicit_preference_observations |
+| Arrival residual | Other captured items abstain; no sharing inference | T13_partial_unclaimed_items_abstain |
+| Complete arrival | Other eligible captured reference items are shared unless excluded; complete DIFF determines captured Pending absence from its raw assertion | T13_complete_arrival_unclaimed_shared |
+| Later rescue | New discoveries/inferred sharing abstain that round; do not upgrade arrival observations, including same-call cascades | T13_rescue_only_discoveries_abstain |
+| Removed machinery | No zero-cell witness, current-Pending guard, proven-shared definition, per-reply observation masks or associated resource bound | T13_arrival_evidence_lifetime_and_storage |
+| Quorum | alpha=floor(((1+beta_adv)/2)*K)+1 against full sampled K; strict at beta_adv=0 too | T13_strict_quorum_zero_adversary_boundary |
+| Constants | At epsilon=1e-9, beta_c=12; D/K/alpha rows: 16/4/3, 32/8/5, 64/16/10, 128/32/20, 500/125/76 | T13_quorum_and_consecutive_constants |
 
-Q1–Q12 are closed. The latest general partial-vote wording uses the precise Pending-restricted shared witness supplied immediately before it; no instruction removes that guard. Its accepted yes-lean remains a simulation measurement obligation and is not reopened.
-
-## Still open
-
-**Q13:** beta_adv=0 with even K permits both sides to reach alpha in one round. Example D=5,K=2,alpha=1,yes=no=1. No priority or change to Config/alpha is invented. This is independent of the accepted partial-vote policy.
-
-Iteration-1 structural findings are also addressed: prefix cap respects max_symbol_index+1, DIFF missing IDs cannot already be in captured raw R, and exclusions must fit the reconstructed raw assertion. The removed special wanted-send path has no byte-accounting requirement left in core Stats.
+All other answered rules remain: fixed consecutive-success target, no-success reset for nonfinal items, immutable FINAL, captured lifetimes, whole-state Pending transfer, simultaneous gate, ordinary bidirectional fetch with retry, prefix REPLY grammar and exact freeze predicate. Existing raw-R DIFF reconstruction and exact-sample resizing are preserved.
 
 ## Verification and limits
 
-- PASS: 31 independent arithmetic, transition and document checks: five exact K/alpha/beta_c rows, 12-success finality, no-success reset, strict overtake/ties, immutable FINAL, simultaneous gate, freeze predicate, conservative wire/cap bounds, captured lifetime and partial guard text, and all 104 original frozen inventory rows.
-- PASS: unique final answers section, current whole-bundle digest pinned in both drafts, unique parent normative markers and unchanged source freeze-manifest digest `4aa896175e94e472f645c2d7ca25552a3efb079a789dd8aaca203b0e318906db`.
-- PASS: regenerated `normative-PROPOSED.diff`; direct `git apply --check` succeeds. This is a review patch; the parent document and rendered site remain unchanged.
-- No production implementation, compiled node acceptance, sanitizer, simulator, sizing-table generation, freeze, source pin, node data or publication was changed. Transition checks exercise the proposed rule independently; they do not establish implementation conformance or network agreement.
+- PASS: 25 independent quorum/classification/document checks, including the five strict-quorum rows, uniqueness over all supported populations at zero/default/near-upper adversary fractions, explicit partial observations, exclusion priority, complete-arrival sharing, MATCH, rescue-abstention rule/text, preserved input prefix and all 104 historical inventory rows.
+- Current input digest is pinned in both drafts. Parent normative markers are unique and the frozen source manifest SHA256 remains `4aa896175e94e472f645c2d7ca25552a3efb079a789dd8aaca203b0e318906db`.
+- PASS: regenerated `normative-PROPOSED.diff` and direct `git apply --check`; the parent document and rendered site remain unchanged.
+- No production/source-header/harness/oracle/manifest change, node acceptance build, sanitizer, simulator run, generated sizing table, freeze, source pin, node-data mutation or publication. Independent rule checks are not implementation conformance evidence.
 
 ## Version and stop
 
-Spec SHA256 `b7ee816078172b4e7230045376034930142629373e8e5fb00c23f90899d8aa86`; 77,283 bytes versus 76,234 original bytes: **1.376026% growth**, below 20% and smaller than iteration 1. Test-plan SHA256 `4145313dea1380c009f46aa2eec3ebe2fa99062c5c3c8c1b1d029087b8882884`; 52,128 bytes.
+Spec SHA256 `3eac40386ebb46f024e376ac49fee416791d956bec99525f692f5e41293b6eb2`; 76,725 bytes, **0.644070% growth** from the original 76,234-byte concept. Test-plan SHA256 `dc290e7a63b83bef86d838d43c08909bd4a4483ac5e1a6d2873323f8e30a2286`; 52,252 bytes.
 
-**STOP after iteration 2 of at most 4; not converged because Q13 is a new major concrete case.** No third iteration is run on the unchanged concept. Review records are in `.scratch/impcd/iteration-2/`. Commit input maintenance, in-place regeneration and review records together, as authorized.
+**STOP after iteration 3 of at most 4: no new blocker/major concrete finding; Q1–Q13 are closed.** The technical no-new-major stopping condition is met; implementation/network validation is not claimed. Provisional K remains the named experiment outcome. Records are in `.scratch/impcd/iteration-3/`.

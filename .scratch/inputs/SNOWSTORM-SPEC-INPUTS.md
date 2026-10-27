@@ -420,3 +420,25 @@ The Pending restriction prevents the fake-Pending-ID forgery of zero cells. The 
 ==================================================================
 
 Override of ACCEPTED-REVIEW-1 item 2: partial peels vote. For a reply still partially decoded at round end: yes for items proven shared by the peel, no for items decoded as absent or excluded, abstain for the rest. Append this to the inputs bundle and apply it.
+
+
+==================================================================
+## PER-ITEM REPLY VOTES — ARRIVAL EVIDENCE
+==================================================================
+
+Per-item votes from a reply (replaces ACCEPTED-REVIEW-1 item 2 and all earlier vote text). Votes are the peer’s preference; an item it holds but excludes is a no.
+REPLY_MATCH: yes for items in captured W; no for captured items outside W.
+Decoded at arrival: yes if decoded as present and not excluded; no if decoded as absent, or excluded.
+Residual remains: every other item abstains.
+No residual: every other captured item is shared, so it votes yes unless excluded.
+Decoded later in the round by rescue: abstain that round.
+The quorum α counts against the K sampled peers. Append this to the inputs bundle and apply it
+
+
+==================================================================
+## FINAL PARTIAL-PEEL RULE AND STRICT SAMPLE QUORUM
+==================================================================
+
+Final rule for partial peels, replacing both partial-peel overrides. A reply still partially decoded at round end votes per captured item: yes if decoded as present at the peer and not in its exclusions; no if decoded as absent at the peer, or in its exclusions; abstain otherwise. Remove the zero-cell witness, the current-Pending guard, the “proven shared” text and the per-reply observation masks (§6.2) and their resource bound.
+Q13: α = ⌊((1+β_adv)/2)·K⌋ + 1, a strict majority of the sample, so IN and OUT can never both succeed. Update the α table.
+Append this to the inputs bundle, apply it, STOP.
