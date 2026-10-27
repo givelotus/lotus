@@ -442,3 +442,17 @@ The quorum α counts against the K sampled peers. Append this to the inputs bund
 Final rule for partial peels, replacing both partial-peel overrides. A reply still partially decoded at round end votes per captured item: yes if decoded as present at the peer and not in its exclusions; no if decoded as absent at the peer, or in its exclusions; abstain otherwise. Remove the zero-cell witness, the current-Pending guard, the “proven shared” text and the per-reply observation masks (§6.2) and their resource bound.
 Q13: α = ⌊((1+β_adv)/2)·K⌋ + 1, a strict majority of the sample, so IN and OUT can never both succeed. Update the α table.
 Append this to the inputs bundle, apply it, STOP.
+
+
+==================================================================
+## F5 — FREEZE-ROUND DISTRIBUTION AND SAFETY ASSERTIONS
+==================================================================
+
+F5: drop the “≥99% of seeds freeze within 25 rounds” acceptance condition; it predates β_c = 12. Fixtures run to a horizon long enough to finish and report the freeze-round distribution. The hard assertions remain zero false freezes and zero split freezes. Append this to the inputs bundle, apply it, STOP.
+
+
+==================================================================
+## F1 — PREVIOUS-IN GATE VALUE
+==================================================================
+
+F1: the gate uses c only when the item’s previous success side is IN; otherwise its gate value is 0. The same applies when computing the mean over W. This replaces “remove the false implication only”. With it, a gate entrant after a freeze is FINAL-in. Append this to the inputs bundle, apply it, and continue the IMPCD iterations.
