@@ -362,6 +362,10 @@ class Project:
             if git(child_path, 'status', '--porcelain'):
                 raise RuntimeError(f'Dependent submodule {child_name} has uncommitted changes; cannot cascade {parent_name} update.')
             git(child_path, 'fetch', str(parent_path), new_parent_tip)
+            # A cascade that stopped on a conflict and was resolved by hand is already on the new tip.
+            if is_ancestor(child_path, new_parent_tip, 'HEAD'):
+                self.review['stages'][child_name]['input_commit'] = new_parent_tip
+                continue
             child_base = old_parent_tip
             if not (ref_exists(child_path, child_base) and is_ancestor(child_path, child_base, 'HEAD')):
                 recorded_input = self.review['stages'][child_name].get('input_commit')

@@ -297,6 +297,24 @@ class SourceRoutingTests(unittest.TestCase):
         git(v2_repo, 'merge-base', '--is-ancestor', v2_old, 'HEAD')
         self.assertEqual((v2_repo / 'shared.txt').read_text(), 'new\n')
 
+    def test_sync_keeps_a_child_already_on_the_new_parent_tip(self):
+        p = Project(self.root)
+        ecash_repo = p.source('ecash')[2]
+        v2_repo = p.source('v2')[2]
+        ecash_old = self._commit(ecash_repo, 'shared.txt', 'old\n', 'net: shared change')
+        git(v2_repo, 'fetch', str(ecash_repo), ecash_old)
+        git(v2_repo, 'checkout', '-B', 'main', ecash_old)
+        self._commit(v2_repo, 'native.txt', 'old\n', 'v2: native change')
+        p.sync('v2')
+        # A cascade that stopped on a conflict: the child was rebased by hand, and the pin still names the old tip.
+        ecash_new = self._commit(ecash_repo, 'shared.txt', 'new\n', 'net: follow-up')
+        git(v2_repo, 'fetch', str(ecash_repo), ecash_new)
+        git(v2_repo, 'rebase', '--onto', ecash_new, ecash_old, 'main')
+        resolved = git(v2_repo, 'rev-parse', 'HEAD')
+        Project(self.root).sync('v2')
+        self.assertEqual(git(v2_repo, 'rev-parse', 'HEAD'), resolved)
+        self.assertEqual(Project(self.root).sources['ecash']['pin'], ecash_new)
+
     def test_rebase_upstream_does_not_replay_bridged_history(self):
         ecash_repo, v2_repo, _, _ = self._bridged_stacks()
         base = Project(self.root).base_sha('ecash')
