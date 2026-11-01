@@ -381,3 +381,23 @@ Decided 2026-11-01:
 
 7. **Start:** approved, including pushing the unpushed Snowstorm commits to the public
    `lotusd` repository (phase 0).
+
+## Status, 2026-11-01
+
+Local only unless stated. Nothing below is published.
+
+| Phase | State |
+|---|---|
+| 0 Snapshot | Done |
+| 1 Tooling and docs | Done |
+| 2 Normalize | Done, except resetting `bitcoin-abc` `master` and its default branch, which need owner approval |
+| 3 Ledger | `daemon/stack-ledger.json` written. Retired branches aren't deleted |
+| 4 Integrate | a, b, c, d done on local `ecashd` and `main`, with the exclusions in `daemon/audit/integration-*.md`. e done as draft PRs |
+| 5 Move down | Not started. All `ecashd` commits still need identity normalized before publishing |
+| 6 ABC rebase, sweep, audit | Not started |
+| 7 Perf sweep | Not started; requires phases 4 to 6 |
+| 8 Upstream | Not started; first batch needs owner approval |
+
+Recommended for `givelotus/lotus` PRs: close #26, which targets a retired branch and is
+superseded by `daemon_sources.py`. Close #24 and #25 only after their MDBX patch files are
+ported to commits on the stacks or recorded as dropped.
