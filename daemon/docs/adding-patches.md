@@ -5,13 +5,12 @@ Use `daemon/sources.json` and the parent gitlinks as the exact source lock.
 changed checkouts. `make -C daemon source-verify` checks URLs, pins and trees.
 Builds use `daemon/.build/<series>`.
 
-Make ordinary authored commits in the appropriate submodule. Shared changes
-belong in `daemon/ecashd`; Lotus-specific changes belong in `daemon/lotusd` on
-its exact shared parent. The existing `sync`, `autosquash`, `sink-to-ecash`,
-`rebase-upstream` and `bridge-ours` commands are exposed by the daemon Makefile.
-A history bridge preserves the selected tree while recording earlier ancestry;
-it does not apply the other history's source changes. Review tree equality and
-source tests before publishing. Push source commits before parent gitlinks.
+See [`daemon/AGENTS.md`](../AGENTS.md) for the branches, tier rule, commands and bridge
+behaviour. Make ordinary authored commits in the appropriate submodule.
+
+The mailbox workflow below applies only to series that still use exported patches, such
+as V1 release metadata. `ecashd` and V2 don't use it; `daemon/patches/ecash` and `v2` are
+frozen exports.
 
 Archived mailboxes and candidate histories retain provenance. They are not read
 by normal setup/build and must not silently replace the selected source tree.
