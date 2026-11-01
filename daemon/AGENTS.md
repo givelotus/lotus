@@ -48,6 +48,8 @@ gitlinks in this repository. Publish source commits before the parent gitlinks.
 
 ## Making changes
 
+- Never run `git fetch --prune` here. Some old commits are held only by stale tracking refs
+  until the ledger accounts for them, and a prune can leave them unreferenced.
 - Check out the branch from the table in the existing submodule. Don't add worktrees
   or copy patch series unless you truly need isolation, and remove them afterwards.
 - A fix to an earlier commit is `git commit --fixup <sha>`, folded with `autosquash`.

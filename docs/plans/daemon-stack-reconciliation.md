@@ -53,7 +53,7 @@ Verified by fetching and comparing refs:
 
 | Group | Commits (approx.) | Source |
 |---|---|---|
-| Lock removal, radix indices, relay batching | 29 | `lotusd` `archive/merklix-snowball-20261024` |
+| Lock removal, radix indices, relay batching | 29 | `lotusd` `snowstorm/merklix-snowball` (see below) |
 | 10-23 perf (executor, inventory, radix, script reuse) | 12 | Same branch, also on `perf/*` |
 | Header history tree, `verifytxoutproof` binding | 7 | Same branch |
 | Snowball, miniblocks, fraud proofs | 11 | Same branch |
@@ -62,6 +62,10 @@ Verified by fetching and comparing refs:
 
 Tier placement in this table comes from subjects and file paths, so phase 3 has
 to confirm it against the diffs.
+
+That branch was first read from a stale `origin/archive/merklix-snowball-20261024` tracking
+ref. The remote branch had already been deleted, so its tip `71a6f793` was held only by the
+10-25 bundle and local objects. It was re-published on 2026-11-01 as `snowstorm/merklix-snowball`.
 
 ### Tooling defects
 
