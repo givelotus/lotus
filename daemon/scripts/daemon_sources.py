@@ -290,6 +290,9 @@ class Project:
         if not is_ancestor(path, start_commit, end_commit):
             raise RuntimeError(f'{end_commit[:12]} is not a descendant of {start_commit[:12]} in {path}')
         commits = git(path, 'rev-list', '--first-parent', '--reverse', f'{start_commit}..{end_commit}').splitlines()
+        marked = git(path, 'log', '--no-merges', '--format=%h %s', '-G^(<<<<<<<|>>>>>>>)( |$)', f'{start_commit}..{end_commit}')
+        if marked:
+            raise RuntimeError(f'Conflict markers in the stack:\n{marked}')
         linear = stack_head(path, end_commit)
         parent = start_commit
         rows = []

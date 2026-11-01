@@ -315,6 +315,13 @@ class SourceRoutingTests(unittest.TestCase):
         self.assertEqual(git(v2_repo, 'rev-parse', 'HEAD'), resolved)
         self.assertEqual(Project(self.root).sources['ecash']['pin'], ecash_new)
 
+    def test_sync_refuses_conflict_markers(self):
+        p = Project(self.root)
+        ecash_repo = p.source('ecash')[2]
+        self._commit(ecash_repo, 'shared.txt', '<<<<<<< HEAD\nold\n=======\nnew\n>>>>>>> other\n', 'net: bad merge')
+        with self.assertRaisesRegex(RuntimeError, 'Conflict markers'):
+            p.sync('ecash')
+
     def test_rebase_upstream_does_not_replay_bridged_history(self):
         ecash_repo, v2_repo, _, _ = self._bridged_stacks()
         base = Project(self.root).base_sha('ecash')
