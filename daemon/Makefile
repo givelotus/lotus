@@ -18,7 +18,7 @@ help:
 	@echo "  make status                                         Verify repos, pins and trees"
 	@echo "  make source-plan SERIES=v2                           Show shared then native order"
 	@echo "  make source-plan SERIES=v2 PLAN_ARGS=--commits       Show individual commit order"
-	@echo "  make source-verify                                  Check every source submodule"
+	@echo "  make source-verify                                  Check every submodule and that each stacked pin is its branch tip"
 	@echo "  make build/run SERIES=...                           Require promoted stack first"
 	@echo "  make sync/autosquash/bridge-ours SERIES=...          Maintain source histories"
 	@echo "Unfinished historical candidates remain separate from the selected source pins."
@@ -29,13 +29,12 @@ ifdef RESET
 else
 	SERIES=$(SERIES) $(SCRIPTS)/setup.sh
 endif
-	python3 $(SCRIPTS)/lotus-git.py init $(SERIES)
 
 source-plan:
 	python3 $(SCRIPTS)/daemon_sources.py plan $(SERIES) $(PLAN_ARGS)
 
 source-verify:
-	python3 $(SCRIPTS)/daemon_sources.py verify all
+	python3 $(SCRIPTS)/daemon_sources.py verify all --published
 
 source-path:
 	python3 $(SCRIPTS)/daemon_sources.py path $(SERIES)
@@ -68,7 +67,7 @@ extract-pr:
 ifndef BRANCH
 	$(error BRANCH is required: make extract-pr SERIES=ecash BRANCH=pr/my-feature COMMITS="<sha>")
 endif
-	python3 $(SCRIPTS)/daemon_sources.py extract-pr $(SERIES) --branch "$(BRANCH)" $(or $(COMMITS),HEAD)
+	python3 $(SCRIPTS)/daemon_sources.py extract-pr $(SERIES) --branch "$(BRANCH)" $(if $(ONTO),--onto "$(ONTO)") $(or $(COMMITS),HEAD)
 
 build:
 	SERIES=$(SERIES) FEATURES="$(FEATURES)" $(SCRIPTS)/build.sh

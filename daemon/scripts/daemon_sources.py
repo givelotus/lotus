@@ -16,7 +16,7 @@ ALIASES = {'ecashd': 'ecash', 'lotusd': 'v2', 'lotus': 'v2', 'lotusv1': 'v1',
            'bitcoincashd': 'bchn', 'bitcoind': 'bitcoin',
            'bitcoin-abc': 'ecash', 'bitcoin-core': 'bitcoin', 'doged-reference': 'doged'}
 DEFAULT_BRANCHES = {
-    'ecash': 'master',
+    'ecash': 'ecashd',
     'v2': 'main',
     'v1': 'lotusv1',
     'doged': 'master',
@@ -45,6 +45,60 @@ def is_ancestor(repo, ancestor, descendant):
         stderr=subprocess.DEVNULL,
     )
     return p.returncode == 0
+
+def is_bridge(repo, commit):
+    """True for a tree-preserving `-s ours` merge: two parents, first parent's tree."""
+    parents = git(repo, 'rev-list', '--parents', '-n', '1', commit).split()[1:]
+    return (len(parents) == 2
+            and git(repo, 'rev-parse', f'{commit}^{{tree}}') == git(repo, 'rev-parse', f'{parents[0]}^{{tree}}'))
+
+def stack_head(repo, ref='HEAD'):
+    """The linear stack below any bridges at the tip of `ref`."""
+    sha = git(repo, 'rev-parse', f'{ref}^{{commit}}')
+    while is_bridge(repo, sha):
+        sha = git(repo, 'rev-parse', f'{sha}^1')
+    return sha
+
+def stack_bridges(repo, start, end='HEAD'):
+    """Bridges on the first-parent path from `start` to `end`, oldest first."""
+    merges = git(repo, 'rev-list', '--first-parent', '--merges', '--reverse', f'{start}..{end}').splitlines()
+    return [c for c in merges if is_bridge(repo, c)]
+
+def linearize(repo, start):
+    """Drop bridges from `start..HEAD`, moving commits made above a bridge down into the stack."""
+    head = git(repo, 'rev-parse', 'HEAD')
+    bridges = stack_bridges(repo, start)
+    if not bridges:
+        return head
+    bridged = set(bridges)
+    rows = git(repo, 'rev-list', '--first-parent', '--reverse', f'{bridges[0]}..HEAD').splitlines()
+    git(repo, 'reset', '--hard', f'{bridges[0]}^1')
+    try:
+        for commit in rows:
+            if commit not in bridged:
+                git(repo, 'cherry-pick', commit)
+    except RuntimeError:
+        subprocess.run(['git', '-C', str(repo), 'cherry-pick', '--abort'], capture_output=True)
+        git(repo, 'reset', '--hard', head)
+        raise
+    return git(repo, 'rev-parse', 'HEAD')
+
+def rebase_stack(repo, onto, upstream, autosquash=False, keep_conflicts=False):
+    """Rebase only the linear stack, because `upstream..bridge` also selects the bridged history."""
+    head = git(repo, 'rev-parse', 'HEAD')
+    linearize(repo, upstream)
+    args = ['rebase', '-i', '--autosquash'] if autosquash else ['rebase']
+    env = dict(os.environ, GIT_SEQUENCE_EDITOR='true', GIT_EDITOR='true')
+    p = subprocess.run(['git', '-C', str(repo), *args, '--onto', onto, upstream],
+                       env=env, text=True, capture_output=True)
+    if p.returncode == 0:
+        return git(repo, 'rev-parse', 'HEAD')
+    if keep_conflicts:
+        raise RuntimeError(f'Rebase stopped in {repo}; resolve it, run `git rebase --continue`, then rerun sync. '
+                           f'Previous tip: {head}.\n{p.stdout.strip()}\n{p.stderr.strip()}')
+    subprocess.run(['git', '-C', str(repo), 'rebase', '--abort'], capture_output=True)
+    git(repo, 'reset', '--hard', head)
+    raise RuntimeError(p.stderr.strip() or p.stdout.strip() or f'rebase failed in {repo}')
 
 def identity(url):
     url = re.sub(r'^git@github.com:', 'https://github.com/', url)
@@ -127,7 +181,34 @@ class Project:
             return self.sources[source['parent_series']]['pin']
         return self.base_sha(name)
 
-    def verify(self, name):
+    def branch(self, name):
+        name, source, _ = self.source(name)
+        return source.get('branch') or DEFAULT_BRANCHES.get(name, 'main')
+
+    def remote_tip(self, name):
+        """The current tip of this source's named branch on origin, or None if it has none."""
+        name, _, path = self.source(name)
+        ref = f'refs/heads/{self.branch(name)}'
+        output = git(path, 'ls-remote', 'origin', ref)
+        return output.split()[0] if output else None
+
+    def verify_published(self, name):
+        """A stacked pin must be exactly its named branch's tip, or branches and pins have drifted."""
+        name, source, path = self.source(name)
+        if source['state'] != 'stacked':
+            return
+        branch = self.branch(name)
+        tip = self.remote_tip(name)
+        if tip is None:
+            raise RuntimeError(f'{name} is not published: origin has no branch {branch}')
+        if tip != source['pin']:
+            if not ref_exists(path, tip):
+                raise RuntimeError(f'{name}: origin branch {branch} is at {tip[:12]}, not the pin {source["pin"][:12]}; fetch it')
+            if is_ancestor(path, source['pin'], tip):
+                raise RuntimeError(f'{name}: origin branch {branch} is at {tip[:12]}, ahead of the pin {source["pin"][:12]}')
+            raise RuntimeError(f'{name} is not published: pin {source["pin"][:12]} is not on origin branch {branch} ({tip[:12]})')
+
+    def verify(self, name, published=False):
         name, source, path = self.source(name)
         if not (path / '.git').exists():
             raise RuntimeError(f'{source["path"]} is not initialized; run make -C daemon setup SERIES={name}')
@@ -148,6 +229,8 @@ class Project:
             raise RuntimeError(f'Source tree differs from recorded tree: {name}')
         if git(path, 'status', '--porcelain'):
             raise RuntimeError(f'{name} contains source changes; preserve them before setup/sync.')
+        if published:
+            self.verify_published(name)
         return name, source, path
 
     def setup(self, name):
@@ -207,6 +290,7 @@ class Project:
         if not is_ancestor(path, start_commit, end_commit):
             raise RuntimeError(f'{end_commit[:12]} is not a descendant of {start_commit[:12]} in {path}')
         commits = git(path, 'rev-list', '--first-parent', '--reverse', f'{start_commit}..{end_commit}').splitlines()
+        linear = stack_head(path, end_commit)
         parent = start_commit
         rows = []
         for c in commits:
@@ -218,7 +302,7 @@ class Project:
                     f'Unsquashed fixup/squash commit at {commit_sha[:12]} ("{subj}"). '
                     f'Run `make -C daemon autosquash` before syncing.'
                 )
-            is_bridge = False
+            bridge = False
             if parents != [parent]:
                 if (
                     allow_bridge_merge
@@ -226,14 +310,16 @@ class Project:
                     and parents[0] == parent
                     and git(path, 'rev-parse', f'{commit_sha}^{{tree}}') == git(path, 'rev-parse', f'{parent}^{{tree}}')
                 ):
-                    is_bridge = True
+                    bridge = True
                 else:
                     raise RuntimeError(
                         f'Non-linear history at {commit_sha[:12]} (parents {parents}, expected [{parent[:12]}]). '
                         f'Only linear commits or `-s ours` tree-preserving bridge merges are permitted.'
                     )
+            if bridge and is_ancestor(path, commit_sha, linear):
+                raise RuntimeError(f'Bridge {commit_sha[:12]} is not at the tip of {end_commit[:12]}; move it above the stack.')
             row = {'commit': commit_sha, 'parents': parents, 'subject': subj}
-            if is_bridge:
+            if bridge:
                 row['bridge_ours'] = True
             rows.append(row)
             parent = commit_sha
@@ -281,9 +367,14 @@ class Project:
                 recorded_input = self.review['stages'][child_name].get('input_commit')
                 if recorded_input and ref_exists(child_path, recorded_input) and is_ancestor(child_path, recorded_input, 'HEAD'):
                     child_base = recorded_input
+            if not (ref_exists(child_path, child_base) and is_ancestor(child_path, child_base, 'HEAD')):
+                # The parent may have just published a bridge over the commit this child already sits on.
+                linear_parent = stack_head(child_path, new_parent_tip)
+                if is_ancestor(child_path, linear_parent, 'HEAD'):
+                    child_base = linear_parent
             if ref_exists(child_path, child_base) and is_ancestor(child_path, child_base, 'HEAD'):
                 if child_base != new_parent_tip:
-                    git(child_path, 'rebase', '--onto', new_parent_tip, child_base, 'HEAD')
+                    rebase_stack(child_path, new_parent_tip, child_base, keep_conflicts=True)
                     self.review['stages'][child_name]['input_commit'] = new_parent_tip
 
     def sync(self, name, bridge_ours=False, push=False):
@@ -316,7 +407,7 @@ class Project:
                 if not is_ancestor(path, start_sha, 'HEAD'):
                     old_input = self.review['stages'][key].get('input_commit')
                     if old_input and ref_exists(path, old_input) and is_ancestor(path, old_input, 'HEAD'):
-                        git(path, 'rebase', '--onto', start_sha, old_input, 'HEAD')
+                        rebase_stack(path, start_sha, old_input, keep_conflicts=True)
                     else:
                         raise RuntimeError(f'{key} HEAD is not based on {parent_key} tip {start_sha[:12]}')
             else:
@@ -324,10 +415,24 @@ class Project:
                 if not is_ancestor(path, start_sha, 'HEAD'):
                     raise RuntimeError(f'{key} HEAD is not a descendant of base {start_sha[:12]}')
 
+            # A commit made on top of a published bridge belongs in the stack, below a new bridge.
+            head_before = git(path, 'rev-parse', 'HEAD')
+            if stack_head(path) != head_before or stack_bridges(path, start_sha):
+                if stack_bridges(path, start_sha, stack_head(path)):
+                    linearize(path, start_sha)
+                    self.bridge_ours(key, head_before)
+
             # First verify the code commits before any optional -s ours bridge
             self.verify_linear_and_no_fixups(path, start_sha, 'HEAD', allow_bridge_merge=True)
-            if bridge_ours and ref_exists(path, old_pin) and not is_ancestor(path, old_pin, 'HEAD'):
+            if (bridge_ours or push) and ref_exists(path, old_pin) and not is_ancestor(path, old_pin, 'HEAD'):
                 self.bridge_ours(key, old_pin)
+            if push:
+                remote = self.remote_tip(key)
+                if remote:
+                    if not ref_exists(path, remote):
+                        git(path, 'fetch', 'origin', remote)
+                    if not is_ancestor(path, remote, 'HEAD'):
+                        self.bridge_ours(key, remote)
 
             rows = self.verify_linear_and_no_fixups(path, start_sha, 'HEAD', allow_bridge_merge=True)
             head_sha = git(path, 'rev-parse', 'HEAD')
@@ -349,11 +454,7 @@ class Project:
                 self._cascade_children(key, old_tip, head_sha)
 
             if push:
-                branch = source.get('branch') or DEFAULT_BRANCHES.get(key, 'main')
-                push_args = ['push', 'origin', f'HEAD:refs/heads/{branch}']
-                if not bridge_ours:
-                    push_args.insert(1, '--force-with-lease')
-                git(path, *push_args)
+                git(path, 'push', 'origin', f'HEAD:refs/heads/{self.branch(key)}')
             print(f'synced {key}: {source["path"]} -> {head_sha[:12]} ({len(rows)} commits, state={source["state"]})')
 
         if any(s['state'] == 'stacked' for s in self.sources.values()):
@@ -369,10 +470,6 @@ class Project:
                 ordered.append(parent)
             if key not in ordered:
                 ordered.append(key)
-
-        env = dict(os.environ)
-        env['GIT_SEQUENCE_EDITOR'] = 'true'
-        env['GIT_EDITOR'] = 'true'
 
         for key in ordered:
             _, source, path = self.source(key)
@@ -390,16 +487,7 @@ class Project:
             old_head = git(path, 'rev-parse', 'HEAD')
             ts = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
             git(path, 'update-ref', f'refs/backups/pre-autosquash-{key}-{ts}', old_head)
-            p = subprocess.run(
-                ['git', '-C', str(path), 'rebase', '-i', '--autosquash', start_sha],
-                env=env,
-                text=True,
-                capture_output=True,
-            )
-            if p.returncode:
-                subprocess.run(['git', '-C', str(path), 'rebase', '--abort'], capture_output=True)
-                raise RuntimeError(p.stderr.strip() or f'autosquash failed in {key}')
-            new_head = git(path, 'rev-parse', 'HEAD')
+            new_head = rebase_stack(path, start_sha, start_sha, autosquash=True)
             if new_head != old_head or new_head != source['pin']:
                 self._cascade_children(key, old_head, new_head)
 
@@ -418,7 +506,9 @@ class Project:
         target_sha = git(v2_path, 'rev-parse', f'{commit}^{{commit}}')
         if not ref_exists(v2_path, ecash_head):
             git(v2_path, 'fetch', str(ecash_path), ecash_head)
-        v2_commits = git(v2_path, 'rev-list', '--first-parent', '--reverse', f'{ecash_head}..{v2_head}').splitlines()
+        v2_bridges = set(stack_bridges(v2_path, ecash_head))
+        v2_commits = [c for c in git(v2_path, 'rev-list', '--first-parent', '--reverse', f'{ecash_head}..{v2_head}').splitlines()
+                      if c not in v2_bridges]
         if target_sha not in v2_commits:
             raise RuntimeError(f'Commit {target_sha[:12]} is not in the native v2 range ({ecash_head[:12]}..{v2_head[:12]})')
 
@@ -431,6 +521,7 @@ class Project:
 
         try:
             git(ecash_path, 'fetch', str(v2_path), target_sha)
+            linearize(ecash_path, self.base_sha('ecash'))
             git(ecash_path, 'cherry-pick', target_sha)
             new_ecash_head = git(ecash_path, 'rev-parse', 'HEAD')
 
@@ -449,7 +540,7 @@ class Project:
             raise RuntimeError(f'Failed to sink commit {target_sha[:12]} to ecash: {exc}') from exc
 
         if not no_sync:
-            self.sync('v2')
+            self.sync('v2', bridge_ours=stack_head(ecash_path, ecash_head) != ecash_head or bool(v2_bridges))
 
     def rebase_upstream(self, name, onto, bridge_ours=False, no_sync=False):
         """Rebase a submodule stack (and any dependent child submodule) onto a new upstream base commit."""
@@ -475,23 +566,25 @@ class Project:
         if new_base != old_base:
             ts = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
             git(target_path, 'update-ref', f'refs/backups/pre-rebase-{target_key}-{ts}', old_head)
-            git(target_path, 'rebase', '--onto', new_base, old_base, 'HEAD')
-            new_head = git(target_path, 'rev-parse', 'HEAD')
-            self.review['stages'][target_key]['upstream_base'] = new_base
+            new_head = rebase_stack(target_path, new_base, old_base, keep_conflicts=True)
+            for key, stage in self.review['stages'].items():
+                if key == target_key or self.sources[key]['parent_series'] == target_key:
+                    stage['upstream_base'] = new_base
             pin_file = target_src.get('base_pin_file')
             if pin_file and (self.root / pin_file).is_file():
-                (self.root / pin_file).write_text(new_base + '\n')
+                pin_path = self.root / pin_file
+                pin_path.write_text(pin_path.read_text().replace(old_base, new_base))
             self._cascade_children(target_key, old_head, new_head)
 
         if not no_sync:
             self.sync(name, bridge_ours=bridge_ours)
 
-    def extract_pr(self, name, branch, commits):
-        """Cherry-pick selected commit(s) onto a clean branch based directly on upstream_base."""
+    def extract_pr(self, name, branch, commits, onto=None):
+        """Cherry-pick selected commit(s) onto a clean branch based on `onto` (default upstream_base)."""
         name, source, path = self.source(name)
         if git(path, 'status', '--porcelain'):
             raise RuntimeError(f'{name} has uncommitted changes; commit or stash first.')
-        base = self.base_sha(name)
+        base = git(path, 'rev-parse', f'{onto}^{{commit}}') if onto else self.base_sha(name)
         orig_head = git(path, 'rev-parse', 'HEAD')
         orig_branch = git(path, 'rev-parse', '--abbrev-ref', 'HEAD')
         resolved = []
@@ -521,6 +614,8 @@ def main(argv=None):
     for cmd in ['setup', 'init', 'status', 'verify', 'plan', 'path', 'canonical', 'require-ready', 'release-check']:
         p = sub.add_parser(cmd)
         p.add_argument('series', nargs='?', default='all')
+        if cmd == 'verify':
+            p.add_argument('--published', action='store_true', help='Also require each stacked pin to be its origin branch tip')
         if cmd == 'plan':
             p.add_argument('--json', action='store_true')
             p.add_argument('--commits', action='store_true')
@@ -530,7 +625,7 @@ def main(argv=None):
     p_sync = sub.add_parser('sync', help='Verify linear history, optionally bridge prior pin via -s ours, and update pins/gitlinks')
     p_sync.add_argument('series', nargs='?', default='v2')
     p_sync.add_argument('--bridge-ours', action='store_true', help='Record previous pin as merged via `git merge -s ours` for fast-forward history')
-    p_sync.add_argument('--push', action='store_true', help='Push updated branch to submodule origin')
+    p_sync.add_argument('--push', action='store_true', help='Bridge the previous pin and origin tip as needed, then fast-forward the named branch')
     p_sync.add_argument('--export-patches', action='store_true', help='Accepted for CLI compatibility')
     p_sync.add_argument('--verify-replay', action='store_true', help='Accepted for CLI compatibility')
 
@@ -559,6 +654,7 @@ def main(argv=None):
     p_pr = sub.add_parser('extract-pr', help='Cherry-pick selected commits onto a clean branch off upstream_base')
     p_pr.add_argument('series')
     p_pr.add_argument('--branch', required=True)
+    p_pr.add_argument('--onto', default=None, help='Upstream commit to extract onto (defaults to upstream_base)')
     p_pr.add_argument('commits', nargs='+')
 
     args = parser.parse_args(argv)
@@ -590,12 +686,12 @@ def main(argv=None):
         elif args.cmd == 'rebase-upstream':
             project.rebase_upstream(args.series, onto=args.onto, bridge_ours=args.bridge_ours, no_sync=args.no_sync)
         elif args.cmd == 'extract-pr':
-            project.extract_pr(args.series, args.branch, args.commits)
+            project.extract_pr(args.series, args.branch, args.commits, onto=args.onto)
         elif args.cmd in ['status', 'verify']:
             errors = []
             for name in project.names(args.series):
                 try:
-                    _, source, path = project.verify(name)
+                    _, source, path = project.verify(name, published=getattr(args, 'published', False))
                     print(f'{name:8} {source["path"]:23} {source["pin"][:12]} {source["state"]} {source["url"]}')
                 except RuntimeError as error:
                     errors.append(str(error))

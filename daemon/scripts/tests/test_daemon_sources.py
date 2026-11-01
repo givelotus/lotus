@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from daemon_sources import Project, git
+from daemon_sources import Project, git, stack_bridges, stack_head
 
 class SourceRoutingTests(unittest.TestCase):
     def setUp(self):
@@ -259,6 +259,197 @@ class SourceRoutingTests(unittest.TestCase):
         p_rebased.require_ready('v2')
         self.assertEqual(p_rebased.base_sha('ecash'), new_base)
         self.assertTrue((v2_repo / 'upstream2.txt').is_file())
+
+    def _commit(self, repo, name, content, message):
+        (repo / name).write_text(content)
+        git(repo, 'add', name)
+        git(repo, 'commit', '-m', message)
+        return git(repo, 'rev-parse', 'HEAD')
+
+    def _bridged_stacks(self):
+        """Both tiers published once, then rewritten and bridged over that history."""
+        p = Project(self.root)
+        ecash_repo = p.source('ecash')[2]
+        v2_repo = p.source('v2')[2]
+        self._commit(ecash_repo, 'shared.txt', 'old\n', 'net: shared change')
+        ecash_old = git(ecash_repo, 'rev-parse', 'HEAD')
+        git(v2_repo, 'fetch', str(ecash_repo), ecash_old)
+        git(v2_repo, 'checkout', '-B', 'main', ecash_old)
+        self._commit(v2_repo, 'native.txt', 'old\n', 'v2: native change')
+        v2_old = git(v2_repo, 'rev-parse', 'HEAD')
+        p.sync('v2')
+        # The rewrite changes the same lines, so replaying old history would conflict.
+        (ecash_repo / 'shared.txt').write_text('new\n')
+        git(ecash_repo, 'add', 'shared.txt')
+        git(ecash_repo, 'commit', '--amend', '--no-edit')
+        Project(self.root).sync('v2', bridge_ours=True)
+        p = Project(self.root)
+        p.require_ready('v2')
+        return ecash_repo, v2_repo, ecash_old, v2_old
+
+    def _assert_one_stack_commit(self, repo, start, subject):
+        rows = git(repo, 'log', '--first-parent', '--format=%s', f'{start}..HEAD').splitlines()
+        self.assertEqual([r for r in rows if r == subject], [subject])
+
+    def test_bridge_sync_keeps_old_tips_reachable_on_both_tiers(self):
+        ecash_repo, v2_repo, ecash_old, v2_old = self._bridged_stacks()
+        git(ecash_repo, 'merge-base', '--is-ancestor', ecash_old, 'HEAD')
+        git(v2_repo, 'merge-base', '--is-ancestor', v2_old, 'HEAD')
+        self.assertEqual((v2_repo / 'shared.txt').read_text(), 'new\n')
+
+    def test_rebase_upstream_does_not_replay_bridged_history(self):
+        ecash_repo, v2_repo, _, _ = self._bridged_stacks()
+        base = Project(self.root).base_sha('ecash')
+        git(ecash_repo, 'branch', 'upstream-next', base)
+        git(ecash_repo, 'checkout', '--quiet', 'upstream-next')
+        new_base = self._commit(ecash_repo, 'upstream.txt', 'u\n', 'upstream: next')
+        git(ecash_repo, 'checkout', '--quiet', 'test')
+        Project(self.root).rebase_upstream('v2', onto=new_base, bridge_ours=True)
+        p = Project(self.root)
+        p.require_ready('v2')
+        self.assertEqual(p.base_sha('ecash'), new_base)
+        self.assertEqual(p.review['stages']['v2']['upstream_base'], new_base)
+        self.assertEqual((v2_repo / 'shared.txt').read_text(), 'new\n')
+        self.assertTrue((v2_repo / 'upstream.txt').is_file())
+        self._assert_one_stack_commit(ecash_repo, new_base, 'net: shared change')
+
+    def test_rebase_upstream_keeps_pin_file_comments(self):
+        pin_file = self.root / 'daemon/abc-version'
+        p = Project(self.root)
+        ecash_repo = p.source('ecash')[2]
+        base = p.base_sha('ecash')
+        pin_file.write_text(f'{base}\n# selected by the reconciliation plan\n')
+        self.model['sources'] = json.loads((self.root / 'daemon/sources.json').read_text())['sources']
+        self.model['sources']['ecash']['base_pin_file'] = 'daemon/abc-version'
+        self.write()
+        v2_repo = p.source('v2')[2]
+        git(v2_repo, 'fetch', str(ecash_repo), base)
+        git(v2_repo, 'checkout', '-B', 'main', base)
+        Project(self.root).sync('v2')
+        git(ecash_repo, 'branch', 'upstream-next', base)
+        git(ecash_repo, 'checkout', '--quiet', 'upstream-next')
+        new_base = self._commit(ecash_repo, 'upstream.txt', 'u\n', 'upstream: next')
+        git(ecash_repo, 'checkout', '--quiet', 'test')
+        Project(self.root).rebase_upstream('ecash', onto=new_base)
+        self.assertEqual(pin_file.read_text(), f'{new_base}\n# selected by the reconciliation plan\n')
+
+    def test_autosquash_after_bridge(self):
+        ecash_repo, v2_repo, _, _ = self._bridged_stacks()
+        target = git(ecash_repo, 'log', '--first-parent', '--format=%H', '--grep', 'net: shared change', '-1')
+        (ecash_repo / 'shared.txt').write_text('newer\n')
+        git(ecash_repo, 'add', 'shared.txt')
+        git(ecash_repo, 'commit', '--fixup', target)
+        Project(self.root).autosquash('v2')
+        p = Project(self.root)
+        p.require_ready('v2')
+        self.assertEqual((v2_repo / 'shared.txt').read_text(), 'newer\n')
+        self._assert_one_stack_commit(ecash_repo, p.base_sha('ecash'), 'net: shared change')
+
+    def test_sink_after_bridge_keeps_bridges_at_the_tip(self):
+        ecash_repo, v2_repo, _, _ = self._bridged_stacks()
+        self._commit(v2_repo, 'net_batch.txt', 'batch\n', 'net: batch relay inventory')
+        Project(self.root).sink_to_ecash('HEAD')
+        p = Project(self.root)
+        p.require_ready('v2')
+        self.assertTrue((ecash_repo / 'net_batch.txt').is_file())
+        ecash_tip = p.sources['ecash']['pin']
+        self.assertEqual(git(v2_repo, 'log', '--first-parent', '--format=%s', f'{ecash_tip}..{stack_head(v2_repo)}').splitlines(),
+                         ['v2: native change'])
+        self.assertEqual(stack_bridges(ecash_repo, p.base_sha('ecash'), stack_head(ecash_repo)), [])
+
+    def test_commit_above_a_bridge_moves_below_a_new_bridge(self):
+        ecash_repo, v2_repo, ecash_old, _ = self._bridged_stacks()
+        self._commit(ecash_repo, 'later.txt', 'l\n', 'net: commit above a bridge')
+        above = git(ecash_repo, 'rev-parse', 'HEAD')
+        Project(self.root).sync('v2')
+        p = Project(self.root)
+        p.require_ready('v2')
+        base = p.base_sha('ecash')
+        self.assertEqual(git(ecash_repo, 'log', '--first-parent', '--format=%s', f'{base}..{stack_head(ecash_repo)}').splitlines(),
+                         ['net: commit above a bridge', 'net: shared change'])
+        self.assertEqual(stack_bridges(ecash_repo, base, stack_head(ecash_repo)), [])
+        git(ecash_repo, 'merge-base', '--is-ancestor', above, 'HEAD')
+        git(ecash_repo, 'merge-base', '--is-ancestor', ecash_old, 'HEAD')
+        self.assertTrue((v2_repo / 'later.txt').is_file())
+
+    def _origin(self, name):
+        """Replace a source's placeholder remote with a local bare repository."""
+        p = Project(self.root)
+        _, source, repo = p.source(name)
+        bare = self.root / f'{name}-origin.git'
+        git(self.root, 'init', '--bare', '-b', 'test', str(bare))
+        git(repo, 'remote', 'set-url', 'origin', str(bare))
+        model = json.loads((self.root / 'daemon/sources.json').read_text())
+        model['sources'][name]['url'] = str(bare)
+        (self.root / 'daemon/sources.json').write_text(json.dumps(model))
+        review = json.loads((self.root / 'daemon/stack-review.json').read_text())
+        review['stages'][name]['repository'] = str(bare)
+        payload = json.dumps(review)
+        (self.root / 'daemon/stack-review.json').write_text(payload)
+        model['stack_review_sha256'] = hashlib.sha256(payload.encode()).hexdigest()
+        (self.root / 'daemon/sources.json').write_text(json.dumps(model))
+        git(self.root, 'config', '-f', '.gitmodules', f'submodule.{source["path"]}.url', str(bare))
+        return bare
+
+    def test_push_bridges_the_remote_tip_and_only_fast_forwards(self):
+        ecash_bare = self._origin('ecash')
+        v2_bare = self._origin('v2')
+        p = Project(self.root)
+        ecash_repo = p.source('ecash')[2]
+        v2_repo = p.source('v2')[2]
+        self._commit(ecash_repo, 'shared.txt', 'old\n', 'net: shared change')
+        published = git(ecash_repo, 'rev-parse', 'HEAD')
+        git(ecash_repo, 'push', 'origin', 'HEAD:refs/heads/ecashd')
+        # The remote tip is not the pin: someone published a commit the pin never saw.
+        other = git(ecash_repo, 'commit-tree', '-p', published, '-m', 'published elsewhere', 'HEAD^{tree}')
+        git(ecash_repo, 'push', 'origin', f'{other}:refs/heads/ecashd')
+        (ecash_repo / 'shared.txt').write_text('new\n')
+        git(ecash_repo, 'add', 'shared.txt')
+        git(ecash_repo, 'commit', '--amend', '--no-edit')
+        ecash_new = git(ecash_repo, 'rev-parse', 'HEAD')
+        git(v2_repo, 'fetch', str(ecash_repo), ecash_new)
+        git(v2_repo, 'checkout', '-B', 'main', ecash_new)
+        Project(self.root).sync('ecash', push=True)
+        tip = git(ecash_bare, 'rev-parse', 'refs/heads/ecashd')
+        git(ecash_repo, 'merge-base', '--is-ancestor', other, tip)
+        self.assertEqual(git(ecash_repo, 'rev-parse', f'{tip}^{{tree}}'), git(ecash_repo, 'rev-parse', f'{ecash_new}^{{tree}}'))
+        Project(self.root).verify('ecash', published=True)
+        # The child series is restacked on the bridge and published with it.
+        v2_tip = git(v2_bare, 'rev-parse', 'refs/heads/main')
+        git(v2_repo, 'merge-base', '--is-ancestor', tip, v2_tip)
+        Project(self.root).verify('v2', published=True)
+
+    def test_published_verify_rejects_a_pin_off_its_branch(self):
+        self._origin('ecash')
+        p = Project(self.root)
+        ecash_repo = p.source('ecash')[2]
+        v2_repo = p.source('v2')[2]
+        tip = self._commit(ecash_repo, 'shared.txt', 'old\n', 'net: shared change')
+        git(v2_repo, 'fetch', str(ecash_repo), tip)
+        git(v2_repo, 'checkout', '-B', 'main', tip)
+        p.sync('ecash')
+        with self.assertRaisesRegex(RuntimeError, 'not published'):
+            Project(self.root).verify('ecash', published=True)
+        git(ecash_repo, 'push', 'origin', 'HEAD:refs/heads/ecashd')
+        Project(self.root).verify('ecash', published=True)
+        self._commit(ecash_repo, 'scratch.txt', 's\n', 'net: unpinned')
+        git(ecash_repo, 'push', 'origin', 'HEAD:refs/heads/ecashd')
+        git(ecash_repo, 'reset', '--hard', 'HEAD~1')
+        with self.assertRaisesRegex(RuntimeError, 'branch ecashd is at'):
+            Project(self.root).verify('ecash', published=True)
+
+    def test_extract_pr_onto_a_newer_upstream(self):
+        p = Project(self.root)
+        ecash_repo = p.source('ecash')[2]
+        base = p.base_sha('ecash')
+        change = self._commit(ecash_repo, 'shared.txt', 'old\n', 'net: shared change')
+        git(ecash_repo, 'branch', 'upstream-next', base)
+        git(ecash_repo, 'checkout', '--quiet', 'upstream-next')
+        newer = self._commit(ecash_repo, 'upstream.txt', 'u\n', 'upstream: next')
+        git(ecash_repo, 'checkout', '--quiet', 'test')
+        tip = p.extract_pr('ecash', 'upstream/shared', [change], onto=newer)
+        self.assertEqual(git(ecash_repo, 'rev-parse', f'{tip}^'), newer)
+        self.assertEqual(git(ecash_repo, 'rev-parse', 'HEAD'), change)
 
 if __name__ == '__main__':
     unittest.main()
