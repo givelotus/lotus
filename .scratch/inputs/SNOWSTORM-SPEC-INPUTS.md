@@ -513,3 +513,317 @@ Report whether any other attack still reaches FINAL with fewer than a majority o
 also:
 
 Style: C++ samples in the spec must follow the Lotus naming conventions in ~/repos/lotus/doc/developer-notes.md, not snake_case. Read that file and apply it to every C++ sample and identifier in SPEC-PROPOSED.md and TESTS-PROPOSED.md. If the file is silent on something, match the surrounding Lotus code. Report the convention you applied in one line.
+
+
+==================================================================
+## F5 — FINAL VOTING RULE AND POLICY OVERRIDE
+==================================================================
+
+AMENDMENT: F5 — FINAL VOTING RULE (from Shammah). Replaces rules 2–4, 13 and 14 of the evidence-weighted amendment and the later e-over-n correction. Drop the latest-vote-per-peer and sample top-up variants; they are not adopted.
+
+Votes are preferences. A reply votes yes for the responder's W and no for the rest of its R ∪ Pending; a responder never votes yes on an item it has not admitted. A poller's W is shaped by its own tallies, so votes carry neighbourhood information transitively. This is the Snowball metastability argument, and it is why the guarantee does not depend on D relative to network size.
+
+1. Success. A round is a success for side s on item x iff y ≥ ⌈0.8·K⌉, where y = sampled peers voting s on x. Non-answers, late, invalid and undecoded replies count for neither side.
+2. Evidence. A success adds e = −ln P(X ≥ y), X hypergeometric: K draws from D peers, ⌈D/2⌉ on side s.
+3. Streak. A round with no success, or a success for the other side, resets x's evidence to 0 (only the recent consecutive run counts, as in Snowball).
+4. FINAL on side s when the summed evidence reaches ln(1/ε) with at least 3 consecutive successes. FINAL is immutable and is the side reached (F1).
+5. Deadline: rule 10 as written (4 × upper median of measured request-to-reply times; doubling after a round in which fewer than ⌈0.8·K⌉ sampled peers answered).
+6. Tests: the one-fast-voter and nine-answer counterexamples produce no success; unanimous full rounds reach FINAL at the 3-round floor for D ≥ 64; print rounds-to-FINAL for D ∈ {16, 32, 64, 128, 500}.
+
+Re-run the reviewers against this rule and report any remaining counterexample. STOP.
+
+7. Policy override. A host policy rejection is not consensus invalidity. A node that rejected x on policy votes no on x. If x reaches FINAL-in at that node, the host fetches and admits x subject only to consensus validity, bypassing policy. A consensus-invalid x is never admitted regardless of votes; reaching FINAL-in on one is reported as an anomaly. Deterministic policy alignment is separate future work. Flag as OPEN: a FINAL-in x that conflicts with a held transaction (conflict resolution is out of scope per §1); do not invent a rule.
+
+
+==================================================================
+## F5 — FINAL VOTING, TALLY AND FREEZE
+==================================================================
+
+AMENDMENT: F5 — FINAL VOTING, TALLY AND FREEZE (from Shammah). Supersedes the β_c streak, c, the plain-Snowball freeze predicate, and the answer-floor drafts. Resolves F1, F5, the one-fast-voter and nine-answer counterexamples.
+
+VOTES
+1. Votes are preferences. A REPLY_MATCH votes yes for the poller's captured W and no for the rest of captured R ∪ Pending. A decoded REPLY_DIFF votes per item as now. A partial peel votes only on decoded items (present = yes; absent or excluded = no); the rest abstain. Silent, late, invalid and undecoded peers abstain. A node never votes yes on an item it has not admitted (Pending is never yes). Because a node's W reflects its own tallies, votes carry neighbourhood information transitively (Snowball metastability); the guarantee does not depend on D relative to network size.
+
+PER-ITEM TALLY (at round end, item x, side s, y = sampled peers voting s; non-answers count for neither side)
+2. Preference: if y > K/2, the round counts toward s in x's d counters; p follows the larger counter.
+3. Confidence: if y ≥ ⌈0.8·K⌉, the round is a success for s and adds e = −ln P(Bin(K, p0) ≥ y), with p0 = (1 + β_adv)/2. Binomial, not hypergeometric (claim is about the network, T → ∞ limit; no D, no infinite values). A round without a success for s, or a success for the other side, resets x's evidence to 0.
+4. x is FINAL on side s when its evidence reaches ln(1/ε) over at least 3 consecutive successes. FINAL is immutable and is the side reached (F1). FINAL-out items leave the sketched set and are never listed as exclusions again.
+5. W: at epoch start, the items held. An item with p = in joins W when its evidence ≥ the mean evidence over W (pre-round snapshot, simultaneous). An item leaves W when p becomes out. FINAL-in items never leave. No other exit rule.
+
+ROOT AND FREEZE
+6. The root is the commitment to W. A REPLY_MATCH is a vote for the poller's root; no new message or field. A round is a root success iff MATCH count ≥ ⌈0.8·K⌉, adding e by rule 3's formula. A round without a root success, or any change to W, resets root evidence to 0.
+7. Freeze iff root evidence ≥ ln(1/ε) over at least 3 consecutive root successes, and no FINAL-in item is still Pending (keep fetching from other yes-voting donors). An empty R ∪ Pending freezes immediately. A later gate entrant changes the root and invalidates the freeze. Per-item FINAL does not gate the freeze.
+
+POLICY
+8. A host policy rejection is not consensus invalidity. A node that rejected x on policy votes no. If x reaches FINAL-in there, the host fetches and admits x subject only to consensus validity. A consensus-invalid x is never admitted; FINAL-in on one is reported as an anomaly.
+
+TIMING AND SIZING
+9. Deadline: 4 × the upper median, over the K sampled peers, of each peer's most recent measured request-to-reply time (POLL sent to complete reply received, transfer included). Unmeasured peers use the upper median of measured ones; if none, the existing fallback. A round in which fewer than ⌈0.8·K⌉ sampled peers answered doubles the next deadline; otherwise the formula applies.
+10. A fallback reply to a probe is sized from the probe's difference estimate, not from 2 × (largest probe index + 1).
+
+OPEN (do not invent rules)
+11. A FINAL-in x that conflicts with a held transaction (conflict resolution is out of scope per §1).
+12. K at small D: poll all D peers; the point where K drops below D comes from the (f, K) grid.
+13. Network-size estimation and binomial weighting are future node-local speed-ups, not in this spec.
+
+F5 TARGET
+14. Remove the ≥99%-within-25-rounds target. Report the freeze-round distribution; zero false or split freezes remains required.
+
+TESTS
+15. Print evidence per round and rounds-to-FINAL at 80% and 100% agreement for D ∈ {16, 32, 64, 128, 500}. One-fast-voter (D = 16: one 1 ms YES, fifteen 250 ms NO): no success, deadline grows, x ends FINAL-out. Nine-answer (8 prompt YES, 1 prompt NO, 7 slow NO) and its mirror: no success either side. No FINAL with fewer than 3 successes even when one round's e exceeds ln(1/ε). A persistent 60/40 item converges to one side via preference. 80 intermediate items plus 2 FINAL do not drop intermediate items from W. 100 items each missing at a different 10% of peers: every item reaches 90% yes, no root success, no freeze until sets converge. A FINAL-in Pending item blocks the freeze. A policy-rejected item that reaches FINAL-in is admitted.
+
+ALSO
+16. C++ samples in the spec follow ~/repos/lotus/doc/developer-notes.md naming, not snake_case. Report the convention applied in one line.
+17. PLAN-SPEC.md is stale (SPRT/Λ/M1tx/B_root/C/±∞/CUSUM, RECON_REQ/waves/root_vote). Do not execute it; regenerate it from the final bundle SHA after convergence. No gate replaces my STOP instructions; no branch renames or commits without my approval. Do not declare the rateless-stream simulator superseded; Argon uses it.
+
+Append this to SNOWSTORM-SPEC-INPUTS.md, report the new SHA, regenerate, run IMPCD until it converges (cap 8 iterations), list anything still open, STOP.
+
+
+==================================================================
+## F5 — FINAL VOTING, TALLY AND FREEZE — ADDENDUM 18–19
+==================================================================
+
+ADDENDUM to AMENDMENT: F5 — FINAL VOTING, TALLY AND FREEZE (from Shammah). Add as items 18–19 and fold into the same regeneration.
+
+18. Censored sizing samples. A reply of m cells with no empty cell before peeling is censored. Its lower bound is max(the current L, the smallest Δ for which the decode table gives F(Δ, m) < ½), i.e. "more than m cells could decode", not the set-size difference. Argon's run (bundle fb140f92…) shows the old bound driving n to 2–6 cells and then 1,000–2,000.
+19. Probe fallback (replaces rule 10). A fallback reply to a probe is sized from the upper end of the probe's bracket: S(the smallest probe index whose cell is empty), or S(the largest index sent) if none is empty. Not the point estimate.
+
+Report the SHA after both are appended.
+
+
+==================================================================
+## ADDENDUM: §8 RATIONALE
+==================================================================
+
+ADDENDUM: §8 RATIONALE (from Shammah). Add a short "Rationale" subsection to §8 stating exactly the following, as complete sentences. No new rules.
+
+1. Each sampled vote is a Bernoulli trial with p equal to the network's fraction for that side, treating peers as draws from the network (the T → ∞ limit). A round's count is Binomial(K, p). Rounds draw fresh samples, so they are independent and their tail probabilities multiply; summing e is multiplying them.
+2. FINAL and freeze mean: the probability of this consecutive run of rounds, if the network were at or below p0 = (1 + β_adv)/2, is below ε. With at most β_adv of votes adversarial or erroneous, exceeding p0 means a strict majority of honest nodes holds that preference. β_adv is the only safety parameter.
+3. Every counted round must show at least 80% agreement, so the network is near or above 80% at FINAL in practice. p0 is the worst case ruled out, not the expected state.
+4. Votes are preferences shaped by each node's own tallies, so information spreads beyond a node's D peers (Snowball metastability). Once past the tipping point, the network converges with overwhelming probability. The guarantee does not depend on D relative to network size.
+5. Consecutive runs, not cumulative totals: only the recent run reflects the network's current state, and one round is one projection of a correlated neighbourhood. Hence the reset and the 3-round floor.
+6. Two thresholds, as in Avalanche's implementation: a simple majority moves preference so contested items resolve to a side; 80% is needed for confidence.
+7. Per-item agreement does not imply set agreement (100 items each missing at a different 10% of peers each show 90% yes, yet few peers hold identical sets). The freeze therefore uses a root vote, which costs nothing on the wire because REPLY_MATCH already carries it.
+8. Silence and delay count for neither side, so they can delay a decision but never push it either way.
+9. Unanimous rounds carry more evidence than marginal ones, so an honest network that already agrees freezes in 3 rounds at D ≥ 64; contested items take longer or never finalize.
+
+
+==================================================================
+## DISPOSITIONS FOR IMPCD ROUND 7
+==================================================================
+
+DISPOSITIONS FOR IMPCD ROUND 7 (from Shammah).
+
+A3/B3/A4/B4 — remove the evidence-mean entry gate entirely. W = admitted items with p = IN. Items held at epoch start start with p = IN. A fresh admission with no live Pending state starts with p = OUT (an admission that carries Pending state keeps it, as now). p moves only by the majority preference rule (y > K/2 counts toward that side's d counter). Votes follow W as before. A FINAL-in item is always in W; a FINAL-out item never is. Delete every gate rule, mean capture and gate test. Tests: the 10-node 60/40 case (six initial holders, four late admissions) converges to x IN and the root freezes; the 13/16 case finalizes and enters W; a transaction nobody held at epoch start stays OUT and does not move the root.
+
+A5/B5 — not a protocol defect. State the sampling assumption in §8 and §11: each node's peers are chosen at random across the network (as outbound peer selection is intended to do), so samples are representative of the network. A partitioned or clique-bridged topology violates it and may freeze different roots; Snowstorm is pseudo-consensus, so this delays block reception and never affects consensus validity. Scope the zero-split requirement to topologies meeting the assumption (random graphs in tests). Keep the clique-bridge case as a documented limitation test that reports, not fails.
+
+A1/B1 — delete the strict-majority early-end branch and its tests. Keep the all-answered early end.
+
+A2/B2 — the deadline is 4 × the ⌈0.8·K⌉-th smallest measured request-to-reply time among the K sampled peers (the quorum order statistic), not the upper median. Doubling after a round with fewer than ⌈0.8·K⌉ answers is unchanged. Test: 9 peers at 1 ms and 7 at 250 ms produce consecutive successes and freeze.
+
+Accept the reviewers' smallest fixes for A6, A7/B7 (m_ members, lower_snake_case namespaces per developer-notes), A8/B8 (no commit authorization; STOP), A9, A10, A11/B6 (calibrate at the recorded lowerSizingBound), A12/B9, A13.
+
+Regenerate, continue IMPCD to convergence, report the SHA, STOP.
+
+
+==================================================================
+## EXACT PER-RUN-LENGTH NULL THRESHOLDS
+==================================================================
+
+Option 3. ε must bound the decision error, not describe the observed score.
+
+Correction: for each run length r ≥ 3, threshold T_r(K) is computed exactly from the null distribution of a run's summed score under p = p0 (each round independently Binomial(K, p0), restricted to successes y ≥ ⌈0.8·K⌉, score e(y) = −ln P(Bin(K, p0) ≥ y)), such that P(sum of r scores ≥ T_r and all r rounds succeed | p0) ≤ ε·2^−(r−2). A run is FINAL (item) or freezes (root) at the first r where its sum reaches T_r. Σ_r ε·2^−(r−2) = ε. Compute the table once per K at startup; exact, no approximation. Test: the six permutations of (26, 28, 29) at K = 32 no longer fire unless their total null probability is within ε_3; print T_r and rounds-to-FINAL at 80% and 100% for D ∈ {16, 32, 64, 128, 500}.
+
+State the bound honestly: ε applies per run; the per-epoch error is at most ε × the number of runs started.
+
+
+==================================================================
+## DISPOSITIONS, ITERATION 9
+==================================================================
+
+Dispositions, iteration 9 (from Shammah).
+
+1. ε: Option 3 as sent (exact per-run-length thresholds T_r(K) from the null score distribution, spent as ε·2^−(r−2); per-epoch error ≤ ε × runs started). If not yet received, apply it now.
+
+2. Independence. Scope the guarantee to the neighbourhood: each round samples K of the node's D fixed peers afresh, so rounds are independent conditional on the neighbourhood, and ε bounds the probability of FINAL or freeze when at most p0 of the node's D peers prefer that side. Binomial(K, p0) is a conservative bound for sampling K of D. The step from neighbourhood to network is not bounded by ε: it rests on the stated random-peer-selection assumption and Snowball metastability (votes are preferences, so information spreads beyond D). Say exactly that in §8 and §11; claim nothing more. This also settles the binomial-scope wording.
+
+3. Conflict handling stays OPEN (out of scope, §1). K crossover stays OPEN (the (f, K) grid). Do not resolve either.
+
+4. Silence claim: state it as "non-answers count for neither side, so silence alone cannot produce a success or move a preference; it can delay decisions." If a reviewer has a counterexample where silence produces a success or moves a preference, report that exact trace; otherwise close it.
+
+Regenerate, continue IMPCD, report the SHA, STOP.
+
+
+==================================================================
+## ANSWER: PROSPECTIVE ATTEMPTS
+==================================================================
+
+Count prospective attempts, including failed first rounds
+
+
+==================================================================
+## PROSPECTIVE START-ROUND ACCOUNTING
+==================================================================
+
+Count prospective attempts. Every round is a potential run start; the calibrated unconditional event applies per start round, including starts whose first round fails. The lifecycle is unchanged (state still begins at the first observed success); only the accounting counts every round. State the bound as: per item (and for the root), the probability of a false FINAL or freeze in an epoch is at most ε × the number of rounds polled in that epoch. No conditional calibration.
+
+
+==================================================================
+## MINIMUM SAMPLE PRECONDITION — SUPERSEDED K ≥ 2
+==================================================================
+
+K = 1 is out of scope: Snowstorm requires K ≥ 2. A node that cannot sample at least 2 peers does not run Snowstorm and uses ordinary block relay. State the precondition; no K = 1 calibration or tests.
+
+
+==================================================================
+## MINIMUM SAMPLE PRECONDITION — K ≥ 3
+==================================================================
+
+Snowstorm requires K ≥ 3. A node that cannot sample at least 3 peers does not run Snowstorm and uses ordinary block relay. State the precondition in §8 and §11; no calibration or tests below K = 3.
+
+
+==================================================================
+## TWO-SIDED ITEM ALLOCATION
+==================================================================
+
+Allocate ε/2 to each item side; root keeps ε
+
+
+==================================================================
+## EMPTY ROOT USES ORDINARY ROOT VOTING
+==================================================================
+
+Delete the empty-state exception. An empty R ∪ Pending has an ordinary root (the commitment to the empty W) and freezes only through the root vote like any other root. Remove the sentence and its tests; add a test: an empty node whose peers hold {b} does not freeze empty, learns b, and freezes on {b}.
+
+
+==================================================================
+## PLAN-SPEC REVIEW — ROOT-PROGRESS DEADLINE AND STAGE APPROVALS
+==================================================================
+
+PLAN-SPEC review (from Shammah). Approved with these changes; do not execute any stage yet.
+
+1. Limitation 4 is a liveness attack within the β_adv budget (fast non-matching replies keep the deadline below the slow MATCH quorum). Fix in §6.6: the next deadline also doubles after any round with no root success in which at least one sampled peer had not answered; a round with a root success returns to the formula. All-answered early end unchanged. Add the K = 16 trace (10 fast MATCH, 3 fast non-match, 3 slow MATCH) as a test that must freeze. Run IMPCD on this one change only, then update PLAN-SPEC.
+2. Every numbered stage ends with STOP for my approval before the next begins.
+3. Stage 4 includes compact-block, Graphene and Erlay-style baselines under identical load and topology, reporting the same byte categories.
+4. Mark the 600 × 500 main evaluation scale as pending my confirmation.
+
+Report the new bundle SHA, STOP.
+
+
+==================================================================
+## EPOCH-NONDECREASING DEADLINE — AUTHOR CORRECTION
+==================================================================
+
+Option 1, scoped to the epoch: after a root-success round, nextDeadline = max(normalFormula, currentDeadline). The deadline returns to the normal formula only at epoch start (new tip). Within an epoch it never shrinks; the all-answered early end means a larger deadline costs time only when a sampled peer is silent.
+
+
+==================================================================
+## SIZING AMENDMENT — MATCH ZERO-DIFFERENCE SAMPLES
+==================================================================
+
+SIZING AMENDMENT (from Shammah). Replace "a MATCH-only or silent round keeps n": each REPLY_MATCH is a sizing sample with Δ = 0, used in the same resize as REPLY_DIFF samples; only a round with no usable samples (all silent) keeps n. Evidence: Argon's trace (bundle cf2e1509…) shows n held at 2,805–3,070 cells across all-MATCH rounds after a one-round transient when FINAL-out items left the sketch, inflating rounds to ~1.4 s and freeze times to 12–30 s. Add a test: a round with 26 MATCH and 6 replies decoding Δ ≈ 2,242 does not raise n. Run IMPCD on this change only, append, report the SHA, STOP.
+
+
+==================================================================
+## DEADLINE AMENDMENT — POSSIBLE ROOT SUCCESS BACKOFF
+==================================================================
+
+DEADLINE AMENDMENT (from Shammah). Replace the doubling condition "no root success with any unanswered sampled peer" by: double the next deadline iff the round had no root success AND MATCH count + unanswered sampled peers ≥ the root success threshold (the unanswered peers could have produced a success). Otherwise next = max(normalFormula, currentDuration) as now; reset at new tip unchanged. Evidence: Argon's smoke shows the old condition doubling through every convergence round (root success impossible while sets differ) and ratcheting deadlines to 3.5–5.6 s, so converged rounds with one late peer take ~3.6 s. Tests: the K = 16 fast non-match trace still freezes; a convergence round with 1 MATCH and 1 late peer does not double. Run IMPCD on this change only, append, report the SHA, STOP.
+
+
+==================================================================
+## EPOCH QUESTION — OWNER INTENT
+==================================================================
+
+EPOCH QUESTION (from Shammah). My intent is many frozen epochs between blocks, with the block being the union of frozen epochs. First confirm whether the spec does this today (quote the relevant sections). If it does not, propose the minimal amendment for my approval, along these lines: on freeze of epoch k a node starts epoch k+1 with all held items not in a frozen epoch (starting IN); POLL carries the epoch number; a responder ahead answers from its frozen epoch, a responder behind abstains; the block is the ordered union of frozen epoch roots; at a new tip, included epochs are removed and the unfrozen remainder starts epoch 1. List every section and test it touches. Do not apply it until I approve. STOP.
+
+
+==================================================================
+## APPROVED EPOCH PROPOSAL CONTEXT
+==================================================================
+
+Owner-approved proposal context, quoted from the preceding assistant response. These are proposal items 1–4 and 7–9 expressly approved by the correction below; they were not originally authored by Shammah. Former items 5–6 are replaced by that correction.
+
+1. **Separate tip lifetime from reconciliation epoch.** Each tip starts at epoch 1 and maintains an ordered archive of frozen epochs plus one active epoch.
+
+2. **Seal and advance.** When the existing root-confidence predicate freezes a **nonempty** W, archive its immutable root and canonical transaction membership, emit `Frozen{tipContext, epochNumber, root, transactionIDs}`, and immediately start epoch k+1. Previously frozen transactions cannot enter later epochs again.
+
+3. **Initialize the remainder.** All held transactions outside the frozen archive start the new epoch IN, with fresh preference counters, confidence and FINAL state. This includes held transactions previously OUT. Unadmitted Pending items remain OUT. Preserve same-tip fetch tokens, donor retries and host callback obligations, but reset their epoch-local tally state. Old-round replies cannot contribute to the new epoch.
+
+4. **Scope reconciliation to the requested epoch.** POLL carries its epoch number. A responder:
+   - at that epoch answers from its active state;
+   - ahead answers from the immutable frozen state for the requested epoch;
+   - behind abstains.
+
+   For a historical reply, the advertised set is that frozen epoch’s membership, with no exclusions. Existing MATCH/DIFF/fallback formats and decoding rules otherwise apply.
+
+7. **Reset on a new tip.** Remove transactions included by the accepted block, discard the old tip’s epoch archive/context, and start epoch 1 from surviving held transactions. Transactions from a locally frozen epoch that were omitted from the block return to that remainder. Reorgs use the same surviving-handle reset.
+
+8. **Keep storage bounded.** Retain frozen membership/body references until tip reset so lagging peers can reconcile. Charge archived and active storage together against explicit bounds; do not retain historical cell arrays. Advancing only on nonempty batches prevents unlimited empty epoch records. Empty-root confidence does not append or advance an epoch.
+
+9. **Preserve timing policy.** An epoch rollover is not a new tip: retain measured peer times and the deadline floor. Reset active-round captures, root evidence and active sizing state. The latest backoff predicate remains unchanged.
+
+
+==================================================================
+## EPOCH AMENDMENT — APPROVAL AND CUMULATIVE MERKLIX OVERLAYS
+==================================================================
+
+Correction to the epoch amendment, then approve (from Shammah). This was my explicit design: a new epoch starts every time the last one freezes.
+
+- Replace items 5 and 6. The commitment for frozen epoch k is the merklix root of the overlay = union of frozen epochs 1…k since the last block, computed with the same function as the block's transaction commitment. This binds the prefix; no separate prefix commitment or ordered manifest. POLL carries the epoch number and the current overlay root; a mismatching overlay root supplies no evidence.
+- GBT returns the latest frozen overlay.
+- On block receipt, the host computes the block's reconstructed merklix root and looks it up among the overlay roots frozen since the last block. A match is a snap block; no match falls back to ordinary block relay.
+- Items 1–4 and 7–9 as proposed.
+
+Apply, regenerate the bundle, proposals, conformance report, normative diff and PLAN-SPEC together, run IMPCD on the epoch amendment until it converges, report the SHA, STOP.
+
+
+==================================================================
+## EPOCH CLARIFICATION — SAME PREFIX VERSUS PREFIX SPLIT
+==================================================================
+
+Option 3. Distinguish the two cases. (a) Same frozen-prefix overlay root (epochs 1…k−1), different active W: normal per-item votes and root confidence, unchanged. (b) Different frozen-prefix overlay root at the same epoch number: no per-item votes and no root confidence for that reply, because active sets under different prefixes are not comparable (an item frozen earlier by one node appears absent to the other). Laggards poll their own epoch number and are answered from the matching frozen epoch, so (b) applies only to genuine prefix splits; state that as the existing limitation (resolved at the next block). Add tests for both cases and for a laggard catching up through historical replies.
+
+
+==================================================================
+## CONFLICT HANDLING — VOTES OVERRIDE FIRST-SEEN POLICY
+==================================================================
+
+CONFLICT HANDLING (from Shammah). First-seen is host policy, and votes override policy. For transactions that spend a common input (a conflict pair): a node holds the first seen and votes yes on it, no on the other. When the majority preference rule flips a node's preference to the conflicting transaction it does not hold, the host replaces the held one with it, subject only to consensus validity (as the policy override). FINAL-in on one implies the other is OUT. Both FINAL-in at one node is reported as an anomaly (bounded by ε). A contested 50/50 pair stays out of overlays until the majority tips. Remove conflict handling from OPEN; add tests: a 70/30 double spend converges to the majority in every honest node's overlay; a 50/50 pair is excluded until it tips; a replacement keeps fetch and Pending lifecycles intact. Run IMPCD on this change only, report the SHA, STOP.
+
+
+==================================================================
+## CONFLICT CLARIFICATION — FROZEN WINNER UNTIL NEXT BLOCK
+==================================================================
+
+Answer to the frozen-prefix conflict question: epoch1 froze a; epoch2 learns conflicting b and majority favors b. The chosen rule is stated verbatim below.
+
+Frozen winner excludes later conflicts until next block
+
+
+==================================================================
+## CONFLICT ANSWERS — EXISTING W SIGNALING AND PER-START ERROR SCOPE
+==================================================================
+
+Answers. (1) Remove the explicit 50/50 exclusion rule. A node holds one side of a conflict pair, so W never contains both; a split pair makes W differ across nodes, so no root success and no freeze until the majority preference tips and replacement converges W. Mid-epoch conflicts are fresh admissions starting OUT and do not affect active W. No new preference signalling. Test: a 50/50 pair held at epoch start delays the freeze until it tips, then the overlay contains only the winner. (2) Keep the existing per-start ε scope; a double FINAL-in implies a false FINAL-in already bounded per item; report it as an anomaly; no new guarantee. Continue IMPCD to convergence, report the SHA, STOP.
+
+
+==================================================================
+## LIVENESS AMENDMENT — CONFIDENCE ABOVE THE EXISTING NULL
+==================================================================
+
+LIVENESS AMENDMENT (from Shammah). Apply.
+
+Change the confidence gate from y ≥ ⌈0.8·K⌉ to y > p0·K, where p0 = (1 + β_adv)/2 (= 0.6K at β_adv = 0.2). No new constant: the gate is tied to the existing null. Applies to item confidence (both sides) and to the root vote (MATCH count). Everything else is unchanged: evidence e = −ln P(Bin(K, p0) ≥ y), consecutive runs with reset on a non-success, minimum 3 successes, ε/2 per item side and ε for the root with the existing run-length spending. Recompute the exact T_r(K) tables for the new gate so the ε bound stays exact. Keep the majority preference rule (y > K/2) as is. Update every rule that references the old gate to the new one, including the deadline-doubling condition (MATCH + unanswered ≥ the root success threshold).
+
+Evidence: Argon's R3/R4 at 20% adversaries froze only ~5% of honest nodes in 120 s, because per-round success at the 80% gate is ~50% at β_adv and runs never complete.
+
+Report the new rounds-to-FINAL table at 70%, 80% and 100% agreement for D ∈ {16, 32, 64, 128, 500}. Add tests: at 20% adversaries voting against, rounds succeed with probability > 0.99 at K = 32; unanimous rounds freeze in the same number of rounds as before; the six (26, 28, 29) permutations and all existing counterexample tests still hold. Run IMPCD on this change only until it converges, report the SHA, STOP.
+
+
+==================================================================
+## LIVENESS DISPOSITION — STRICT NULL UPPER-MEDIAN GATE
+==================================================================
+
+Use the null upper-median gate: a confidence success (items and root) requires y > the median of Bin(K, p0), so the null success probability is below 1/2 and every all-success run eventually qualifies under the existing ε·2^−(r−2) spending (restores the finite-R proof). Recompute T_r(K); apply the same threshold in the deadline-doubling condition. Tests: K = 16 with 10 fast MATCH + 6 slow MATCH freezes; K = 32 at 20% adversaries succeeds per round with probability reported (expected > 0.99); unanimous rounds unchanged; the (26, 28, 29) permutations still reject. Report the 70%/80%/100% rounds-to-FINAL table. Continue IMPCD to convergence, report the SHA, STOP.

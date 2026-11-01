@@ -1,43 +1,47 @@
-# Snowstorm proposal conformance — evidence-weighted amendment, iteration 6
+# Snowstorm conformance — strict null upper-median gate, round27
 
-Updated the existing SPEC-PROPOSED.md and TESTS-PROPOSED.md in place. All operator messages were appended verbatim, in order, including the main weighted-round amendment, rules10–12, exact Rule10, rules13–15 and C++style instruction. Earlier review histories remain unchanged. No source or canonical-parent change.
+Final input SHA256 **`a8d6f14d49f30a2fb75dafe6dd4925b25ae400bf1ff9c1b79133d8bc97795019`**, **86,794 bytes**. Prior84,341-byte prefix is preserved;the verbatim mean-gate liveness amendment is followed by the verbatim author upper-median disposition. The latter controls. Proposals are rendered in place from the accepted ledger. The normative diff is review-only against unchanged canonical documentation.
 
-## Input authority
+## Applied rule
 
-Current bundle SHA256 **`fb140f92e8287616f0979c4c1744863d88b0b9e2e9fa85afb3b3860c2515ce5c`**,54,599bytes. The previous49,197byte prefix and its digest remain unchanged. Intermediate hashes/messages are in iteration-6/author-amendment.json. Latest input is pinned in both proposals.
+For X~Binomial(K,p0),m=min{j:P[X<=j]>1/2} and successThreshold=m+1=min{y:P[X>=y]<1/2}. Item sides and root MATCH use this same confidence gate. At reference p0=3/5 the thresholds are11,20,39,78,301 forK16,32,64,128,500. Exact half-mass ties use the upper integer median;beta0,K3threshold3 avoids a nullsuccess probability of1/2. Since p0^K<(2/3)^3<1/2,successsupport is nonempty and0<q<1/2. This restores the finite all-successR and its exact qualified-tail representation without the old fixed80%endpoint lemma.
 
-## Applied amendment and naming
+Evidence e=-ln P[Bin(K,p0)>=y],strict-majority preference,min3,consecutive resets,epsilon/2per item side,epsilonroot and geometric length spending are unchanged. ExactT_rdefinitions are recalibrated to the new unconditional success support;do not renormalize or approximate decisions. Deadline normalorderstatistic and possible-root-success doubling use the same successThreshold. All other measured-time/imputation/nonshrink/new-tip/all-answered rules remain. Wire/proofs,MATCHzero sizing,epochs,conflict policy and per-start/error scope are retained.
 
-Weighted successes use80%of valid item votes, subject to n>=floor(K/2)+1. Add signed natural-log hypergeometric-tail evidence without resets; require at least3same-side successes for reached-side immutable FINAL. The old streakc/beta/reset policy is removed. The gate compares evidence under an explicitly unconfirmed signed-sum reading; missing mathematical choices are not invented. FINAL-in Pending vetoes freeze and retains ordinary fetch/donor/admission lifecycle. A node never advertisesYES for its own Pending, but may receive remoteYES for that lifetime.
+## Requested reference table
 
-At smallD poll allD; the crossover toK<D remains OPEN for the(f,K)grid. Exact deadline uses4*captured sampled upper median of latest complete POLL-to-reply measurements, transfer included, with specified imputation/bootstrap; below-majority answered rounds double next duration, majority-answer rounds restore formula. Probe fallback uses the existing difference estimator and RequiredSymbols, not twice the largest probe index. FINAL-out leaves derived advertisedA and W, never enters exclusions or receives further votes; physicalR retains bounded body/state ownership. Gate entries are restricted toA, including under a negative mean.
+Exact reference beta=1/5,p0=3/5,epsilon=1/10^9,K=D (comparison fixture,not production crossover). Each round repeats the fixed fully eligible countY=ceil(agreement*K);no reset/root change/Pending veto. Values are **item FINAL rounds(root qualification rounds)**,not random-network waiting-time estimates.
 
-Requested root developer-notes path does not exist. Read the complete canonical `/Users/shammah/repos/lotus/daemon/lotusd/doc/developer-notes.md`; source hash/mapping recorded in iteration-6/naming-map.json. Convention: **UpperCamelCase functions/methods, lowerCamelCase variables, m_members, UPPER_SNAKE_CASE constants, lower_snake_case namespaces**. Both proposed C++ interface and active test identifiers updated; real paths/std spellings/exact historical source references retained as provenance. No frozen C++file renamed or edited.
+| D=K | successThreshold | Y at70% /80% /100% |70% item(root)|80% item(root)|100% item(root)|
+|---:|---:|---|---:|---:|---:|
+| 16 | 11 | 12 / 13 / 16 | 45(44) | 22(21) | 3(3) |
+| 32 | 20 | 23 / 26 / 32 | 72(69) | 9(8) | 3(3) |
+| 64 | 39 | 45 / 52 / 64 | 33(31) | 4(4) | 3(3) |
+| 128 | 78 | 90 / 103 / 128 | 10(10) | 3(3) | 3(3) |
+| 500 | 301 | 350 / 400 / 500 | 3(3) | 3(3) | 3(3) |
 
-## Independent review and actual status
+All360accepted/rejected budget comparisons across184querycertificates are verified,including every earlier r>=3and first qualifying r for both budgets. Certificates use exact PMF integers,unconditional support,integer-power-proved directed score bounds,whole equal-score mass and carry-free exact GMP polynomial arithmetic. Common PMF factors are restored exactly;no normalization or rounded probability/log determines a decision. These certify the displayed exact first-qualification counts against the discrete null-tail definition. They do not claim materialized production startup tables or executed voting code. See [table evidence](../impcd/iteration-27/table-evidence.json) and reproducible scripts.
 
-Separate gpt-6-astra and gpt-6.1-sol formal revisions reviewed the same ledger/brief/input without seeing each other's output before submission. All11technical perspectives plusanchor documented, including fixed-population attacks. Both also independently validated a shared post-review terminal-reentry witness. Model consensus is not human-expert or execution evidence.
+The first reference computation hit a local allocation guard at an undecided query and stopped without a result. Exact common-factor optimization reduced arithmetic size;the completed run certifies every entry. The guard is not a protocol cutoff. Both independent reviewers checked the algebra/provenance and small-case exhaustive products;they audited all final comparison/coverage certificates ratherthan rerunning every heavy polynomial power.
 
-Accepted7shared claim repairs: physicalR operands→advertisedA, terminal gate filter and negative-mean regression, documented D1zero-weight nontermination, and explicit majority-answer selection counterexample/regression. Shared repair direction agrees; raw location disagreement3/9=0.333333 within tolerance0.50. Current renderings match ledger-accepted.json; metadata and substantive operations separated in decision.json. No locks added.
+## Regression evidence
 
-**Not converged;1of8permitted run iterations completed.** EW1–EW4 remain severity>=8 and require the author definitions already requested. The next scope is arithmetic EW1 once its definition arrives. Repeating unchanged missing choices cannot supply a corrective iteration or justify a fixed point; cap is not claimed exhausted. No growth/oscillation stop or cutback occurred.
+AtK32,20%against and all honest replies usable/timely in the binomial alternative,per-round success is925684794379590434816/931322574615478515625≈**0.9939464795662064**,above0.99. No corresponding promise is made for late/invalid/undecoded honest replies.
 
-## Still open
+Unanimous maximum-score mass remains p0^(Kr),so its first qualifying count is unchanged:3for every requested K=D row. The six(26,28,29)permutations stillreject;new full inclusive r3tail is≈2.6505964459675517e−8,above root5e−10 and item2.5e−10. Strict median ties,one-fast-voter,nine-answer controls,possible-quorum boundaries and the no-useless-convergence-doubling case pass exact reference checks.
 
-- **EW1:** full-population successes have H0,e∞; opposing successes before the3guard give undefined infinity-minus-infinity.
-- **EW2:** finite floor-valid histories can reach FINAL-in with retained pOUT, or FINAL-out with pIN; terminal preference/gate integration is unspecified.
-- **EW3:** gate quantity “IN-side sum” needs confirmation. With signedS, an immutable FINAL-in outsider at21.014529 can remain below frozen mean21.796289 forever.
-- **EW4:** nine answers biased8:1 meet the floor; three rounds can produce opposite immutable FINAL at honest pollers with mirrored delays. Hard zero false/split assertions remain unchanged; no hidden response-independence assumption.
-- **K crossover:** intentionally deferred to the named experiment, no number selected.
+K16new10fastMATCH1ms+6slowMATCH250ms with1ms bootstrap doubles4,8,16,32,64,128,256ms;seventh round receives all16. Three unanimous successes firstfreeze in round9 at1002ms. If true measuredtimes are already known,normaldeadline1000ms and all-answered250ms ending give freeze after3rounds/750ms. Retained10fastMATCH+3fastnonmatch+3slowMATCH case also backs off,then13MATCHper round qualifies its root after21successes:round27,5502ms referenceclock. No prior counterexample is waived. See [regression evidence](../impcd/iteration-27/regression-evidence.json).
 
-D1,H1,e0 implies nonempty nontermination; documented limitation rather than an invented minimumD or special weight.
+## Review stop and scope
 
-**Requested fewer-than-majority attack report:** none reaches a new FINAL under literal rule13: valid per-item votes<=answered peers, and below-floor rounds update neither sum nor successes. The one1msYES/fifteen250msNO scenario now doubles deadlines until NOs count, then reachesOUT in the independent rule trace. EW4 has9answers and remains a distinct safety failure.
+**CONVERGED in round27**,second of scoped cap8(26–33),not cap exhausted. Independent gpt-6-astra and gpt-6.1-sol reviewed the same final ledger/reference table without reading the other's current revision before submission. Eleven technical modeled perspectives include adversarial Snowball,DoS,liveness,C++implementer and minimalist;these are simulated reviews,not external human testimony. Both final revisions have no open finding and operations=[],all criteria answered. A retains the resolved minor certificate-provenance finding as history. Actual stop is emptyshared semantic step,no openmajor,criteriaanswered;nooscillation/growth/cap stop. No locking credit is assigned to the empty terminal step.
 
-## Verification and limits
+Prior26mean-gate failures remain historical exact counterexamples. Previous low-score sampling exampleD5,H3,K3 nowhasalpha3,hypergeomtail1/10<binomial27/125;that accepted low-score event is removed. Additional finite diagnostics found no new gate-success counterexample,but no new general sampling theorem is claimed. Neighbourhood assumptions/error scope remain as specified. Argon's R3/R4freeze-rate evidence is author-reported and was not rerun or relabelled as validation here.
 
-PASS: exact rational-tail/80digit log vectors and implied same-side rounds for D16,32,64,128,500 with allK/halfK; full-population and quarter-population K are declared arithmetic fixtures, not a chosen crossover. HalfK is below floor: contribution0/no success/no final. Verified finite preference/gate witnesses, majority-floor inequality and rule15timing trace;27ledger/input/inventory/naming/patch-integrity checks. All104historical source inventory rows and mandatory workload counts retained. Review patch regenerated/applies; Markdown/Python whitespace passes.
+[Decision](../impcd/iteration-27/decision.json),[findings](../impcd/iteration-27/findings.md),[minority report](../impcd/iteration-27/minority-report.md) and[accepted changes](../impcd/iteration-27/accepted-changes.md) preserve scope,evidence and reversibility. Fixedpoint means scoped document stability,not complete protocol proof or implementation acceptance.
 
-No current-protocol node acceptance, sanitizer, simulator, generated sizing table, frozen-artifact migration, source freeze, publication, deployment or human panel. Existing frozen sources implement an older contract. Acceptance-manifest SHA256 remains `4aa896175e94e472f645c2d7ca25552a3efb079a789dd8aaca203b0e318906db`; canonical parent remains unchanged. Exact arithmetic/local event traces are not a full-network implementation result.
+## Integrity and remaining work
 
-SPEC SHA256 **`8ed2ff8fd3617fcef1668bd25745e492d07c9fc894c532cc9d605ccb98e784f0`**,81,190bytes. TESTS SHA256 **`f620ba544bb9290ec1644bd67a21539aa8dbb97b8281c6e1f4ed12ba9dc2efa2`**,55,535bytes. Findings, minority report, accepted changes, both revisions and ledger history are under `.scratch/impcd/iteration-6/`.
+Checks preserve inputappend chain,ledger rendering,exact owner/reference operations,wire/coding/store/epoch/conflict rules,all104historical inventory rows and prescribed workloads,source pins/frozenmanifest/canonicalparent,review-patch applicability and whitespace. The current PLAN gate/timing/calibration descriptions and bundle pin are synchronized;all5approvalSTOPs,required compact-block/Graphene/Erlay-style baselines,identical-load bytecategories,pending600×500confirmation and Argon's active rateless-stream simulator remain.
+
+OPEN:K<Dcrossover from(f,K)grid. Identity/Sybil,network-inference and genuine prefix-split limitations are unchanged. Production exactstartup table representation/resources and public-API acceptance remain implementation-stage obligations;reference arithmetic is not that execution. No source/header/harness/oracle/frozenmanifest edit,build,stage,production table generation,simulator/baseline run,publication,deployment,commit or branch rename occurred. STOP.
