@@ -1,6 +1,6 @@
 # Header History Merkle Tree (`HEADER_HISTORY`)
 
-Status: **implemented in `lotusd` (`src/lotus_v2/header_history.{h,cpp}`) and specified in [P02](decisions/commitments-and-state.md)**.
+Status: **the consensus commitment is implemented in `lotusd` (`src/lotus_v2/header_history.{h,cpp}`) and specified in [P02](decisions/commitments-and-state.md). The proof RPCs are not implemented.** The tree and its verifier exist in the node, but nothing serves a proof, and the proof format can't yet be tied to a block header. Section 3.5 describes what is missing and the open anchor question. The light-client flow described in section 1 is the goal this enables, not something available today.
 
 ---
 
@@ -52,11 +52,13 @@ flowchart TD
     end
     subgraph RootFold["HeaderHistoryRoot(count = 6)"]
         R1["acc₁ = InternalHash(level=1, peaks[1], NULL_HASH)"]
-        R2["history_root = InternalHash(level=2, peaks[2], acc₁)"]
+        R2["tree_root = InternalHash(level=2, peaks[2], acc₁)"]
+        R3["history_root = CountBinding(count=6, tree_root)"]
     end
     P1 --> R1
     P2 --> R2
     R1 --> R2
+    R2 --> R3
 ```
 
 When block $H$ is appended (`AppendHeaderToFrontier`):
@@ -83,18 +85,22 @@ HeaderLeafHash(ChainID, height: u64, block_hash: h32) -> h32:
 
 HeaderInternalHash(ChainID, level: u8, left: h32, right: h32) -> h32:
   H_header_history(ChainID || 0x01 || u8(level) || left || right)
+
+HeaderCountBinding(ChainID, count: u64, tree_root: h32) -> h32:
+  H_header_history(ChainID || 0x02 || u64_le(count) || tree_root)
 ```
 
-- **Leaf vs. internal separation:** Prefix byte `0x00` vs. `0x01` prevents any internal node from colliding with a leaf preimage.
+- **Leaf, internal and root separation:** The prefix bytes `0x00`, `0x01` and `0x02` prevent a leaf, an internal node and a bound root from colliding with one another.
 - **Height & level binding:** `u64_le(height)` binds the leaf to its exact chain height; `u8(level)` ($0 \le \text{level} < 64$) binds every internal node to its exact subtree height ($2^{\text{level}}$ leaves).
+- **Count binding:** `u64_le(count)` binds the root to the number of leaves. Without it, a leaf whose path crosses only complete subtrees would verify against the same tree under many claimed counts. Leaf 0 of a 65-leaf tree, for example, would also verify with any count up to 128.
 
 ### 3.2 Computing `HeaderHistoryRoot` from `HeaderHistoryFrontier`
 
 Given `frontier` with `count` committed prior headers:
-- **Genesis (`count == 0`, height $H = 0$):** Returns `NULL_HASH` (`0x00^32`). In `MonetaryStateHash`, `history_root` is omitted when `history_root == NULL_HASH` so the Genesis block's `hashStateRoot` and PoW nonce are preserved verbatim.
+- **Genesis (`count == 0`, height $H = 0$):** Returns `NULL_HASH` (`0x00^32`). In `StateRoot`, `history_root` is omitted when `history_root == NULL_HASH` so the Genesis block's `hashStateRoot` and PoW nonce are preserved verbatim. A null root is only valid at height 0: a node derives the root for a fast-sync pivot from its own headers and rejects any other value, including null.
 - **Post-Genesis (`count >= 1`, height $H \ge 1$):**
   Let $k_0 = \text{ctz}(\text{count})$ be the index of the lowest set bit of `count` and $L = 63 - \text{clz}(\text{count})$ be the index of the highest set bit of `count`:
-  - **Exact power of two ($k_0 == L$):** Return `frontier.peaks[L]` directly (the tree is a single complete binary tree of height $L$).
+  - **Exact power of two ($k_0 == L$):** `tree_root = frontier.peaks[L]` (the tree is a single complete binary tree of height $L$).
   - **Non-power of two ($k_0 < L$):** Fold active peaks from lowest level $k_0$ up to $L$, promoting partial right edges with `NULL_HASH`:
     ```text
     acc = HeaderInternalHash(ChainID, k0, frontier.peaks[k0], NULL_HASH)
@@ -103,8 +109,9 @@ Given `frontier` with `count` committed prior headers:
             acc = HeaderInternalHash(ChainID, k, frontier.peaks[k], acc)
         else:
             acc = HeaderInternalHash(ChainID, k, acc, NULL_HASH)
-    return acc
+    tree_root = acc
     ```
+  - **In both cases:** `history_root = HeaderCountBinding(ChainID, frontier.count, tree_root)`.
 
 ### 3.3 Canonical Inclusion Proofs (`HeaderInclusionProof`)
 
@@ -133,15 +140,25 @@ HeaderInclusionProof =
      - Set `cur = HeaderInternalHash(ChainID, k, cur, siblings[k])`.
    - Else (`(idx & 1) == 1`, right child):
      - Set `cur = HeaderInternalHash(ChainID, k, siblings[k], cur)`.
-4. **Root comparison:** Return `cur == expected_root`.
+4. **Root comparison:** Return `HeaderCountBinding(ChainID, total_count, cur) == expected_root`.
 
-### 3.4 Node Persistence & RPC Interface
+`lotus_v2_header_history_tests` has known-answer vectors for these hashes, computed independently of the node from the formulas above.
 
-- **Full-node storage (`HeaderHistoryTree`):** Maintained on `Chainstate` (`m_header_history_tree`), storing complete subtree roots `m_levels[k][i]` at every level $k \ge 0$ so historical proofs at any anchor height are generated in $O(\log H)$ time without re-hashing historical headers, and persisted atomically to `<datadir>/blocks/header_history_v2.dat` (magic `"LV2HHT01"`).
-- **Delta snapshot files (`.bin`):** Appends `[4-byte LE frontier_len][frontier_bytes]` (`8 + popcount(count) * 32` bytes) after the coin records so FastSync and disk state snapshots restore `HeaderHistoryFrontier` and `MonetaryState::history_root` deterministically.
-- **RPC commands:**
-  - `getheaderhistoryproof(height, [anchor_height_or_hash])`: Returns `{leaf_height, total_count, block_hash, anchor_height, anchor_block_hash, history_root, siblings, proof_hex}`.
-  - `verifyheaderhistoryproof(proof_hex, [expected_root_or_anchor])`: Decodes `proof_hex`, resolves the anchor's `history_root`, and returns `{valid, leaf_height, total_count, block_hash, expected_root}`.
+### 3.4 Node Storage
+
+- **Tree (`HeaderHistoryTree`):** Kept in memory on `Chainstate` (`m_header_history_tree`), storing complete subtree roots `m_levels[k][i]` at every level $k \ge 0$, at about 96 bytes per block. It is not written to disk. It is derived entirely from the active chain and rebuilt at startup from `m_chain`, which holds every block hash whether block data has been pruned or the chain began from a snapshot. It doesn't feed consensus; block validation derives each root from the parent's frontier.
+- **State files (`.bin`):** Each `v2_state/<hash>.bin` ends with exactly one `[4-byte LE frontier_len][frontier_bytes]` trailer (`8 + popcount(count) * 32` bytes) after the coin records. A file with no trailer, or with bytes after it, is rejected.
+- **Missing frontier:** A block at height $H$ requires its parent's frontier to cover exactly $H - 1$ blocks. If it doesn't, the node reports a local error and doesn't mark the block invalid. It never computes a root from a substitute.
+
+### 3.5 Not Implemented: Proof RPCs
+
+No RPC serves or checks these proofs. An earlier draft defined `getheaderhistoryproof` and `verifyheaderhistoryproof`; they were left out because a proof built that way can't be tied to a chain header, so `valid: true` would only show that a hash chain is internally consistent.
+
+Before proofs can be offered, a design has to settle:
+
+1. **What the anchor is (open question).** Block $H$ commits only the $H$ blocks below it, so the root over blocks $0..H$ is committed by block $H + 1$. Either the anchor is "the highest block covered", in which case its root is committed by the next block and the root for the current tip isn't committed by anything yet, or the anchor is "the block whose header commits the root", in which case the count equals the anchor's height, height 0 can't be an anchor, and the tip can't prove itself.
+2. **How to open `state_root`.** `history_root` sits inside `StateRoot(chain, height, utxo_root, monetary || history_root)`. A client holding only a header needs `utxo_root` and the 56-byte monetary state as well, so the proof must carry them. The roughly 1 KB size in section 1 assumes this is solved and doesn't include them.
+3. **What the verifier takes.** It should resolve an anchor block and compare against its header, rather than accept a root from the caller.
 
 ---
 
