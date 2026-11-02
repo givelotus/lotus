@@ -390,7 +390,7 @@ Local only unless stated. Nothing below is published.
 |---|---|
 | 0 Snapshot | Done |
 | 1 Tooling and docs | Done |
-| 2 Normalize | Done, except resetting `bitcoin-abc` `master` and its default branch, which need owner approval |
+| 2 Normalize | Done: `bitcoin-abc` `ecashd` is the default branch and `master` mirrors ABC |
 | 3 Ledger | `daemon/stack-ledger.json` written. Retired branches aren't deleted |
 | 4 Integrate | a, b, c, d done on local `ecashd` and `main`, with the exclusions in `daemon/audit/integration-*.md`. e done as draft PRs |
 | 5 Move down | Not started. All `ecashd` commits still need identity normalized before publishing |
