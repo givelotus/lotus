@@ -10,6 +10,7 @@ import 'package:lotus_dart/lotus.dart';
 import 'package:vase/wallet/keys.dart';
 import 'package:vase/wallet/wallet.dart';
 import 'package:vase/wallet/storage/secure_storage.dart';
+import 'package:vase/wallet/recovery_material.dart';
 
 const SCHEMA_VERSION_KEY = 'schema_version';
 
@@ -19,6 +20,7 @@ const STORAGE_SEED_KEY = 'seed';
 const STORAGE_PASSWORD_KEY = 'password';
 const STORAGE_XPUB_KEY = 'rootKey';
 const storageBalanceKey = 'balance';
+const walletMaterialStorageKey = 'wallet_material_v1';
 
 /// Generate a fresh wallet.
 Future<Wallet> generateNewWallet(
@@ -37,6 +39,9 @@ class WalletModel with ChangeNotifier {
   bool _initialized = false;
   String? _seed = '';
   String? _password = '';
+  bool _restoring = false;
+  bool _usesMaterialRecord = false;
+  Future<void> _persistenceTail = Future.value();
   // Internally use a ValueNotifier here, as we don't want the entire wallet
   // to refresh when this field is updated.
   // We should probably introduce a secondary model of some sort.
@@ -84,18 +89,8 @@ class WalletModel with ChangeNotifier {
         }
         _wallet = await _walletFactory(_seed, _password);
       }
-      wallet!.balanceUpdateHandler = (balance) async {
-        this.balance = balance;
-        notifyListeners();
-        if (balance.balance != null) {
-          await _storage.write(
-            key: storageBalanceKey,
-            value: balance.balance.toString(),
-          );
-        }
-      };
-      wallet!.initialize();
-      initialized = true;
+      if (_usesMaterialRecord) balance = WalletBalance();
+      _activateWallet(wallet!);
     } catch (error, stack) {
       assert(() {
         debugPrint(
@@ -134,21 +129,57 @@ class WalletModel with ChangeNotifier {
   String? get seed => _seed;
   String? get password => _password;
 
-  void setSeed(String newValue, {String password = ''}) {
-    _seed = newValue;
-    _password = password;
-    balance = null;
-    _initialized = false;
-    notifyListeners();
-    generateNewWallet(_seed, chronik, password: _password).then((newWallet) {
-      _wallet = newWallet;
-      wallet!.balanceUpdateHandler = (balance) {
-        this.balance = balance;
-        notifyListeners();
-      };
-      wallet!.initialize();
-      initialized = true;
-    });
+  /// Derive first, persist one authoritative record, then replace the session.
+  /// Failed construction/storage leaves the current wallet and keys untouched.
+  Future<void> setSeed(String newValue, {String password = ''}) async {
+    if (_restoring)
+      throw StateError('Wallet restoration is already in progress');
+    if (isMnemonicMaterial(newValue) &&
+        !Mnemonic().validateMnemonic(newValue)) {
+      throw const FormatException('Invalid recovery words');
+    }
+    _restoring = true;
+    try {
+      final candidate = await _walletFactory(newValue, password);
+      await _persistMaterial(newValue, password);
+      _seed = newValue;
+      _password = password;
+      _wallet = candidate;
+      _usesMaterialRecord = true;
+      balance = WalletBalance();
+      _activateWallet(candidate);
+    } finally {
+      _restoring = false;
+    }
+  }
+
+  void _activateWallet(Wallet current) {
+    current.balanceUpdateHandler = (next) async {
+      if (!identical(_wallet, current)) return;
+      balance = next;
+      notifyListeners();
+      if (!_usesMaterialRecord && next.balance != null) {
+        await _storage.write(
+          key: storageBalanceKey,
+          value: next.balance.toString(),
+        );
+      }
+    };
+    current.initialize();
+    initialized = true;
+  }
+
+  Future<void> _persistMaterial(String material, String passphrase) {
+    final encoded = encodeWalletMaterial(material, passphrase);
+    final write = _persistenceTail.then(
+      (_) => _storage.write(key: walletMaterialStorageKey, value: encoded),
+    );
+    // Future writes can proceed after a failure, but this caller receives it.
+    _persistenceTail = write.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace __) {},
+    );
+    return write;
   }
 
   bool get initialized => _initialized;
@@ -172,16 +203,21 @@ class WalletModel with ChangeNotifier {
   }
 
   Future<void> writeToDisk() async {
-    if (!initialized || wallet == null) return;
-    // Persist schema version
-    await writeSchemaVersion();
-
-    // Persist keys
-    // TODO: keys.keys is silly naming
-    await writeKeysToDisk();
+    if (!initialized || wallet == null || _restoring) return;
+    await _persistMaterial(_seed!, _password ?? '');
+    _usesMaterialRecord = true;
   }
 
   Future<bool> readFromDisk() async {
+    final encoded = await _storage.read(key: walletMaterialStorageKey);
+    if (encoded != null) {
+      final record = decodeWalletMaterial(encoded);
+      _seed = record.material;
+      _password = record.passphrase;
+      _wallet = await _walletFactory(_seed, _password);
+      _usesMaterialRecord = true;
+      return true;
+    }
     final schemaVersion = await readSchemaVersion();
     if (schemaVersion != CURRENT_SCHEMA_VERSION) return false;
     _seed = await readSeedFromDisk();
@@ -194,24 +230,7 @@ class WalletModel with ChangeNotifier {
   }
 
   Future<void> writeKeysToDisk() async {
-    // Write private keys
-    try {
-      // Persist seed
-      await _storage.write(key: STORAGE_SEED_KEY, value: seed);
-
-      // Persist password
-      await _storage.write(key: STORAGE_PASSWORD_KEY, value: password);
-
-      // Persist XPub
-      await _storage.write(
-        key: STORAGE_XPUB_KEY,
-        value: wallet!.keys.rootKey.toString(),
-      );
-
-      // TODO: Write metadata
-    } catch (err) {
-      print(err);
-    }
+    await writeToDisk();
   }
 
   Future<String?> readSeedFromDisk() async {

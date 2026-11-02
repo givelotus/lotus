@@ -31,8 +31,9 @@ class _FixtureModel extends WalletModel {
   @override
   Future<void> writeToDisk() async {} // No platform wallet storage in this harness.
   @override
-  void setSeed(String newValue, {String password = ''}) =>
-      throw UnsupportedError('Regtest preview uses fixed public fixture keys');
+  Future<void> setSeed(String newValue, {String password = ''}) async {
+    throw UnsupportedError('Regtest preview uses fixed public fixture keys');
+  }
 }
 
 Future<void> main() async {
