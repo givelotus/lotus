@@ -56,3 +56,10 @@ func SaveUserInfo(ctx context.Context, pool *pgxpool.Pool, info UserInfo) error 
 		return nil
 	})
 }
+
+// RemoveNotificationRegistration treats possession of the push token as the same
+// capability as the existing registration API. Location history is preserved.
+func RemoveNotificationRegistration(ctx context.Context, pool *pgxpool.Pool, info UserInfo) error {
+	_, err := pool.Exec(ctx, `DELETE FROM addresses WHERE push_token=$1 AND address=$2`, info.PushToken, info.Address)
+	return err
+}

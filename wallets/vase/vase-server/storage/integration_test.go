@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"vase.givelotus.org/server/notifications"
 )
 
 //go:embed testdata/legacy_schema.sql
@@ -217,4 +218,89 @@ func TestPostgresPersistenceCompatibility(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNotificationOutboxDurability(t *testing.T) {
+	pool := isolatedPostgres(t)
+	ctx := context.Background()
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	lat, lon := float32(0), float32(0)
+	info := UserInfo{PushToken: "dummy-token", Address: "dummy-address", Latitude: &lat, Longitude: &lon}
+	if err := SaveUserInfo(ctx, pool, info); err != nil {
+		t.Fatal(err)
+	}
+	store := notifications.PGStore{Pool: pool}
+	regs := []notifications.Registration{{Token: info.PushToken, Address: info.Address}}
+	for range 2 {
+		if err := store.Enqueue(ctx, regs, "dummy-txid"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d, err := store.Next(ctx)
+	if err != nil || d == nil {
+		t.Fatalf("next: %v %v", d, err)
+	}
+	if err := store.Finish(ctx, *d, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if next, err := store.Next(ctx); err != nil || next != nil {
+		t.Fatalf("retry should back off: %v %v", next, err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE notification_outbox SET next_attempt_at=now()"); err != nil {
+		t.Fatal(err)
+	}
+	// A new store instance observes the durable retry with the same identity.
+	d2, err := (notifications.PGStore{Pool: pool}).Next(ctx)
+	if err != nil || d2 == nil || d2.ID != d.ID || d2.Attempts != 1 {
+		t.Fatalf("durable retry: %v %v", d2, err)
+	}
+	if err := store.Finish(ctx, *d2, true, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Enqueue(ctx, regs, "dummy-txid"); err != nil {
+		t.Fatal(err)
+	}
+	if next, err := store.Next(ctx); err != nil || next != nil {
+		t.Fatalf("duplicate after success: %v %v", next, err)
+	}
+	if err := store.Enqueue(ctx, regs, "dummy-second-txid"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE addresses SET deleted_at=now()"); err != nil {
+		t.Fatal(err)
+	}
+	if next, err := store.Next(ctx); err != nil || next != nil {
+		t.Fatalf("deleted target: %v %v", next, err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE addresses SET deleted_at=NULL"); err != nil {
+		t.Fatal(err)
+	}
+	for range 12 {
+		if _, err := pool.Exec(ctx, "UPDATE notification_outbox SET next_attempt_at=now() WHERE completed_at IS NULL"); err != nil {
+			t.Fatal(err)
+		}
+		attempt, err := store.Next(ctx)
+		if err != nil || attempt == nil {
+			t.Fatalf("retry: %v %v", attempt, err)
+		}
+		if err := store.Finish(ctx, *attempt, false, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if next, err := store.Next(ctx); err != nil || next != nil {
+		t.Fatalf("retry bound: %v %v", next, err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE notification_outbox SET created_at=now()-interval '8 days'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Next(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var retained int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM notification_outbox").Scan(&retained); err != nil || retained != 0 {
+		t.Fatalf("retention: %d %v", retained, err)
+	}
+
 }
