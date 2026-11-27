@@ -24,13 +24,27 @@ for the multi-chain framework design.
 
 ### V1 Chain State
 
-The canonical *correct* Lotus chain stalled at block 927,381 (Dec 21, 2024) after
-the Ruth epoch upgrade shipped with two consensus bugs: missing replay protection and
-the Ruth IFP validation check falling through to the Judges epoch check. Maff released
-a hotfix (v8.3.3-hotfix) but subsequent 9.x/10.x releases were built on top of the
-diverged fork. The ~1.2M block chain is self-consistent within its own ruleset but
-no correctly-validating Ruth node would accept it. V1 compatibility means compatibility
-with Maff's fork, not the spec.
+The canonical *correct* Lotus chain paused, rather than stalled, at block 927,381
+(Dec 21, 2024) after the Ruth epoch upgrade (`v8.3.3`) shipped two
+consensus-critical bugs. `GetMinerFundRequiredOutputs` had no `IsRuthEnabled`
+case, so at Ruth activation it fell through to the Judges case and kept paying
+the Judges address; and replay protection was present but mis-scheduled —
+`IsReplayProtectionEnabled` defaulted to `ruthActivationTime` instead of
+`firstSamuelActivationTime`, activating the signature change one epoch early.
+Maff released `v8.3.3-hotfix`, commit `2e59ea5cc` ("Fix broken replay protection
+and minerfund outputs"), adding the `IsRuthEnabled` branch in `src/minerfund.cpp`
+and moving the replay-protection default in `src/validation.cpp`. The hotfix is
+not a diverged fork: `2e59ea5cc` is an ancestor of `master` in the daemon
+repository `LotusiaStewardship/lotusd`, and `v9.4.6` and `v10.4.10` both contain
+it, so subsequent 9.x/10.x releases inherited the fix, not the bug. The buggy
+(Judges) fork at height 927,382 is the orphaned block; the Ruth block is the one
+the chain is built on. At height 927,381 two blocks compete and both are on the
+public explorer, timestamped 2024-12-21 09:32 UTC (Judges) and 15:11 UTC (Ruth),
+the latter about 5h40m after 927,381 at 09:31 UTC. The canonical chain's
+miner-fund epoch progression is correct throughout; a correctly validating Ruth
+node accepts every block. The complete, independently-verifiable record is
+published at `https://github.com/LotusiaStewardship/lotusd/blob/master/doc/ruth-recovery.md`.
+V1 compatibility means compatibility with Maff's fork, not the spec.
 
 ### doged Notes
 
